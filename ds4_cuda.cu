@@ -331,6 +331,23 @@ typedef struct {
     int      target_device;
 } ds4_tensor_range;
 
+/* ds4_cuda.cu does not include ds4_gpu.h, so mirror this public
+ * descriptor's field layout here as well. */
+typedef struct {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t gate_type;
+    uint32_t up_type;
+    uint32_t down_type;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t up_expert_bytes;
+    uint64_t up_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+} ds4_gpu_laguna_moe_desc;
+
 struct cuda_device_cache {
     void   *base;     /* device-side slab base */
     size_t  bytes;
@@ -25922,8 +25939,10 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
-        uint32_t                mid_token_stride) {
+        uint32_t                mid_token_stride,
+        bool                    force_resident) {
     (void)layer_index; (void)n_total_expert;
+    (void)force_resident;
     if (!out || !mid || !x || !selected || !weights || !model_map ||
         n_tokens == 0 || n_expert == 0 ||
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
@@ -26275,7 +26294,6 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         bool                    force_resident) {
-    (void)force_resident;
     return ds4_gpu_glm_routed_moe_batch_tensor(out, mid,
             model_map, model_size,
             gate_offset, up_offset, down_offset,
@@ -26285,7 +26303,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, layer_index,
-            x, 1, n_expert * expert_mid_dim);
+            x, 1, n_expert * expert_mid_dim, force_resident);
 }
 
 /* Parallel router select: 256 threads compute sigmoid probs, then top-k

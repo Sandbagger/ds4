@@ -140,8 +140,12 @@ static int run_norm_rope_case(const float *weights,
         uint64_t max_index = 0;
         for (uint64_t i = 0; i < count; i++) {
             if (!isfinite(actual[i])) {
-                fprintf(stderr, "norm-rope/%s: non-finite output at %llu\n",
-                        c->name, (unsigned long long)i);
+                const uint64_t row = i / head_dim;
+                fprintf(stderr,
+                        "norm-rope/%s: non-finite output at token=%llu head=%llu dim=%llu\n",
+                        c->name, (unsigned long long)(row / c->n_head),
+                        (unsigned long long)(row % c->n_head),
+                        (unsigned long long)(i % head_dim));
                 goto cleanup;
             }
             const float error = fabsf(actual[i] - reference[i]);
@@ -250,8 +254,15 @@ static int run_qk_norm_rope_case(const float *q_weights,
         const float reference = i < q_count ? q_reference[i] :
             k_reference[i - q_count];
         if (!isfinite(actual)) {
-            fprintf(stderr, "qk-norm-rope: non-finite output at %llu\n",
-                    (unsigned long long)i);
+            const int is_q = i < q_count;
+            const uint64_t local_index = is_q ? i : i - q_count;
+            const uint64_t row = local_index / head_dim;
+            const uint32_t n_head = is_q ? n_q_head : n_k_head;
+            fprintf(stderr,
+                    "qk-norm-rope: non-finite output at tensor=%c token=%llu head=%llu dim=%llu\n",
+                    is_q ? 'q' : 'k', (unsigned long long)(row / n_head),
+                    (unsigned long long)(row % n_head),
+                    (unsigned long long)(local_index % head_dim));
             goto cleanup;
         }
         const float error = fabsf(actual - reference);

@@ -167,6 +167,105 @@ cleanup:
     return rc;
 }
 
+static int run_qk_norm_rope_case(const float *q_weights,
+                                 const float *k_weights) {
+    const uint32_t n_tokens = 4;
+    const uint32_t n_q_head = 48;
+    const uint32_t n_k_head = 8;
+    const uint32_t head_dim = 128;
+    const uint32_t n_rot = 64;
+    const uint32_t pos0 = 8191;
+    const uint64_t q_count = (uint64_t)n_tokens * n_q_head * head_dim;
+    const uint64_t k_count = (uint64_t)n_tokens * n_k_head * head_dim;
+    const uint64_t weight_bytes = head_dim * sizeof(*q_weights);
+    float *q_input = (float *)malloc((size_t)q_count * sizeof(*q_input));
+    float *k_input = (float *)malloc((size_t)k_count * sizeof(*k_input));
+    float *q_reference = (float *)malloc((size_t)q_count * sizeof(*q_reference));
+    float *k_reference = (float *)malloc((size_t)k_count * sizeof(*k_reference));
+    float *q_actual = (float *)malloc((size_t)q_count * sizeof(*q_actual));
+    float *k_actual = (float *)malloc((size_t)k_count * sizeof(*k_actual));
+    ds4_gpu_tensor *q = NULL;
+    ds4_gpu_tensor *k = NULL;
+    int rc = 1;
+
+    if (!q_input || !k_input || !q_reference || !k_reference || !q_actual ||
+        !k_actual) goto cleanup;
+    for (uint64_t i = 0; i < q_count; i++) {
+        q_input[i] = ((float)((int)((i * 13u) % 31u) - 15)) / 17.0f;
+    }
+    for (uint64_t i = 0; i < k_count; i++) {
+        k_input[i] = ((float)((int)((i * 19u) % 37u) - 18)) / 19.0f;
+    }
+    reference_head_rms_rope(q_reference, q_input, q_weights, n_tokens,
+                            n_q_head, head_dim, n_rot, pos0, 8192,
+                            500000.0f, 1.0f / 32.0f, 1.0f, 1.0f, 32.0f,
+                            1.0f, 1.0e-6f);
+    reference_head_rms_rope(k_reference, k_input, k_weights, n_tokens,
+                            n_k_head, head_dim, n_rot, pos0, 8192,
+                            500000.0f, 1.0f / 32.0f, 1.0f, 1.0f, 32.0f,
+                            1.0f, 1.0e-6f);
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_input));
+    k = ds4_gpu_tensor_alloc(k_count * sizeof(*k_input));
+    if (!q || !k ||
+        !ds4_gpu_tensor_write(q, 0, q_input, q_count * sizeof(*q_input)) ||
+        !ds4_gpu_tensor_write(k, 0, k_input, k_count * sizeof(*k_input))) {
+        fprintf(stderr, "qk-norm-rope: synthetic tensor setup failed\n");
+        goto cleanup;
+    }
+    const int wrapper_ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+        q, k, q_weights, 2u * weight_bytes, 0, weight_bytes, n_tokens,
+        n_q_head, n_k_head, head_dim, n_rot, pos0, 8192, 500000.0f,
+        1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (sync != cudaSuccess) {
+        fprintf(stderr, "qk-norm-rope: cudaDeviceSynchronize: %s\n",
+                cudaGetErrorString(sync));
+        goto cleanup;
+    }
+    if (!wrapper_ok) {
+        fprintf(stderr, "qk-norm-rope: expected red failure at Laguna CUDA stub\n");
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(q, 0, q_actual, q_count * sizeof(*q_actual)) ||
+        !ds4_gpu_tensor_read(k, 0, k_actual, k_count * sizeof(*k_actual))) {
+        fprintf(stderr, "qk-norm-rope: output read failed\n");
+        goto cleanup;
+    }
+    double square_error = 0.0;
+    float max_abs = 0.0f;
+    for (uint64_t i = 0; i < q_count + k_count; i++) {
+        const float actual = i < q_count ? q_actual[i] : k_actual[i - q_count];
+        const float reference = i < q_count ? q_reference[i] :
+            k_reference[i - q_count];
+        if (!isfinite(actual)) {
+            fprintf(stderr, "qk-norm-rope: non-finite output at %llu\n",
+                    (unsigned long long)i);
+            goto cleanup;
+        }
+        const float error = fabsf(actual - reference);
+        max_abs = fmaxf(max_abs, error);
+        square_error += (double)error * error;
+    }
+    const double rms_error = sqrt(square_error / (double)(q_count + k_count));
+    if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
+        fprintf(stderr, "qk-norm-rope: parity max_abs=%g rms=%g exceeds tolerance\n",
+                (double)max_abs, rms_error);
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    free(k_actual);
+    free(q_actual);
+    free(k_reference);
+    free(q_reference);
+    free(k_input);
+    free(q_input);
+    return rc;
+}
+
 static void usage(const char *program) {
     fprintf(stderr, "usage: %s --case norm-rope|all\n", program);
 }
@@ -182,7 +281,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     const uint32_t head_dim = 128;
-    float *weights = (float *)malloc(head_dim * sizeof(*weights));
+    float *weights = (float *)malloc(2u * head_dim * sizeof(*weights));
     if (!weights) {
         fprintf(stderr, "norm-rope: synthetic weights allocation failed\n");
         ds4_gpu_cleanup();
@@ -190,8 +289,9 @@ int main(int argc, char **argv) {
     }
     for (uint32_t i = 0; i < head_dim; i++) {
         weights[i] = 0.70f + 0.01f * (float)(i % 17u);
+        weights[head_dim + i] = 0.55f + 0.01f * (float)((i * 3u) % 23u);
     }
-    if (!ds4_gpu_set_model_map(weights, head_dim * sizeof(*weights))) {
+    if (!ds4_gpu_set_model_map(weights, 2u * head_dim * sizeof(*weights))) {
         fprintf(stderr, "norm-rope: synthetic model map setup failed\n");
         ds4_gpu_cleanup();
         free(weights);
@@ -209,6 +309,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (run_norm_rope_case(weights, &cases[i]) != 0) rc = 1;
     }
+    if (run_qk_norm_rope_case(weights, weights + head_dim) != 0) rc = 1;
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
     free(weights);

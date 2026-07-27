@@ -27737,6 +27737,104 @@ extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
     return 0;
 }
 
+__global__ static void laguna_head_rms_norm_rope_neox_kernel(
+        float *x, const float *weight, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow, float eps) {
+    const uint64_t row_idx = (uint64_t)blockIdx.x;
+    const uint32_t token = (uint32_t)(row_idx / n_head);
+    float *row = x + row_idx * head_dim;
+
+    float sum = 0.0f;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float v = row[d];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        row[d] = row[d] * scale * weight[d];
+    }
+    __syncthreads();
+
+    float corr0 = 0.0f;
+    float corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig /
+                (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig /
+                (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1u), corr1);
+    }
+
+    const uint32_t half_rot = n_rot >> 1u;
+    for (uint32_t d = threadIdx.x; d < half_rot; d += blockDim.x) {
+        const uint32_t rel_i0 = d * 2u;
+        const float theta_extrap = (float)(pos0 + token) *
+            powf(freq_base, -((float)rel_i0) / (float)n_rot);
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float mix = rope_yarn_ramp_dev(corr0, corr1, (int)rel_i0) *
+                ext_factor;
+            theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        const float c = cosf(theta) * mscale;
+        const float s = sinf(theta) * mscale;
+        const float x0 = row[d];
+        const float x1 = row[d + half_rot];
+        row[d] = x0 * c - x1 * s;
+        row[d + half_rot] = x0 * s + x1 * c;
+    }
+}
+
+static int laguna_norm_rope_tensor_bytes(uint32_t n_tokens, uint32_t n_head,
+                                          uint32_t head_dim, uint32_t n_rot,
+                                          float eps, uint64_t *bytes_out) {
+    if (!bytes_out || n_tokens == 0u || n_head == 0u || head_dim == 0u ||
+        n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u ||
+        !isfinite(eps) || eps <= 0.0f) {
+        return 0;
+    }
+    const uint64_t rows = (uint64_t)n_tokens * n_head;
+    if (rows > UINT_MAX || rows > UINT64_MAX / head_dim) return 0;
+    const uint64_t elems = rows * head_dim;
+    if (elems > UINT64_MAX / sizeof(float)) return 0;
+    *bytes_out = elems * sizeof(float);
+    return 1;
+}
+
+static int laguna_norm_rope_params_valid(float freq_base, float freq_scale,
+                                         float ext_factor, float attn_factor,
+                                         float beta_fast, float beta_slow,
+                                         uint32_t n_ctx_orig) {
+    if (!isfinite(freq_base) || !isfinite(freq_scale) ||
+        !isfinite(ext_factor) || !isfinite(attn_factor) ||
+        !isfinite(beta_fast) || !isfinite(beta_slow) ||
+        freq_base <= 1.0f || freq_scale <= 0.0f || ext_factor < 0.0f) {
+        return 0;
+    }
+    if (ext_factor != 0.0f &&
+        (n_ctx_orig == 0u || beta_fast <= 0.0f || beta_slow <= 0.0f)) {
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
         ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
@@ -27744,11 +27842,37 @@ extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
         uint32_t n_ctx_orig, float freq_base, float freq_scale,
         float ext_factor, float attn_factor, float beta_fast,
         float beta_slow, float eps) {
-    (void)x; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)n_tokens; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
-    (void)n_ctx_orig; (void)freq_base; (void)freq_scale; (void)ext_factor;
-    (void)attn_factor; (void)beta_fast; (void)beta_slow; (void)eps;
-    return 0;
+    uint64_t tensor_bytes = 0;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    if (!x || !x->ptr || !model_map || pos0 > UINT32_MAX - n_tokens ||
+        !laguna_norm_rope_tensor_bytes(n_tokens, n_head, head_dim, n_rot,
+                                       eps, &tensor_bytes) ||
+        !laguna_norm_rope_params_valid(freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow,
+                                       n_ctx_orig) ||
+        weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < tensor_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(x);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        const float *weight = (const float *)cuda_resolve_weight_ptr(
+                model_map, weight_offset, weight_bytes, logical_tier,
+                "laguna_head_rms_weight");
+        if (weight) {
+            laguna_head_rms_norm_rope_neox_kernel<<<
+                    (unsigned)((uint64_t)n_tokens * n_head), 256>>>(
+                    (float *)x->ptr, weight, n_head, head_dim, n_rot, pos0,
+                    n_ctx_orig, freq_base, freq_scale, ext_factor,
+                    attn_factor, beta_fast, beta_slow, eps);
+            ok = cuda_ok(cudaGetLastError(), "laguna head rms norm rope launch");
+        }
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
@@ -27759,13 +27883,58 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
         float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, float eps) {
-    (void)q; (void)k; (void)model_map; (void)model_size;
-    (void)q_weight_offset; (void)k_weight_offset; (void)n_tokens;
-    (void)n_q_head; (void)n_k_head; (void)head_dim; (void)n_rot;
-    (void)pos0; (void)n_ctx_orig; (void)freq_base; (void)freq_scale;
-    (void)ext_factor; (void)attn_factor; (void)beta_fast;
-    (void)beta_slow; (void)eps;
-    return 0;
+    uint64_t q_bytes = 0;
+    uint64_t k_bytes = 0;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    if (!q || !q->ptr || !k || !k->ptr || !model_map ||
+        pos0 > UINT32_MAX - n_tokens ||
+        !laguna_norm_rope_tensor_bytes(n_tokens, n_q_head, head_dim, n_rot,
+                                       eps, &q_bytes) ||
+        !laguna_norm_rope_tensor_bytes(n_tokens, n_k_head, head_dim, n_rot,
+                                       eps, &k_bytes) ||
+        !laguna_norm_rope_params_valid(freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow,
+                                       n_ctx_orig) ||
+        q_weight_offset > model_size ||
+        weight_bytes > model_size - q_weight_offset ||
+        k_weight_offset > model_size ||
+        weight_bytes > model_size - k_weight_offset ||
+        q->bytes < q_bytes || k->bytes < k_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(q);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(k) != logical_tier) {
+        return 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        const float *q_weight = (const float *)cuda_resolve_weight_ptr(
+                model_map, q_weight_offset, weight_bytes, logical_tier,
+                "laguna_q_rms_weight");
+        const float *k_weight = (const float *)cuda_resolve_weight_ptr(
+                model_map, k_weight_offset, weight_bytes, logical_tier,
+                "laguna_k_rms_weight");
+        if (q_weight && k_weight) {
+            laguna_head_rms_norm_rope_neox_kernel<<<
+                    (unsigned)((uint64_t)n_tokens * n_q_head), 256>>>(
+                    (float *)q->ptr, q_weight, n_q_head, head_dim, n_rot,
+                    pos0, n_ctx_orig, freq_base, freq_scale, ext_factor,
+                    attn_factor, beta_fast, beta_slow, eps);
+            ok = cuda_ok(cudaGetLastError(), "laguna q head rms norm rope launch");
+            if (ok) {
+                laguna_head_rms_norm_rope_neox_kernel<<<
+                        (unsigned)((uint64_t)n_tokens * n_k_head), 256>>>(
+                        (float *)k->ptr, k_weight, n_k_head, head_dim, n_rot,
+                        pos0, n_ctx_orig, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow, eps);
+                ok = cuda_ok(cudaGetLastError(),
+                             "laguna k head rms norm rope launch");
+            }
+        }
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_laguna_store_attention_tensor(

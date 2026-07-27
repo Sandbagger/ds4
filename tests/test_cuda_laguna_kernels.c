@@ -89,6 +89,60 @@ typedef struct {
     float beta_slow;
 } laguna_norm_rope_case;
 
+typedef struct {
+    const char *name;
+    const float *actual;
+    const float *reference;
+    uint64_t count;
+} laguna_parity_span;
+
+static int laguna_parity_spans_within_limits(
+        const char *case_name, const laguna_parity_span *spans,
+        size_t n_spans) {
+    double square_error = 0.0;
+    float max_abs = 0.0f;
+    uint64_t count = 0;
+    for (size_t span = 0; span < n_spans; span++) {
+        for (uint64_t i = 0; i < spans[span].count; i++) {
+            if (!isfinite(spans[span].actual[i])) {
+                fprintf(stderr, "%s/%s: non-finite output\n", case_name,
+                        spans[span].name);
+                return 0;
+            }
+            const float error = fabsf(spans[span].actual[i] -
+                                      spans[span].reference[i]);
+            if (error > max_abs) max_abs = error;
+            square_error += (double)error * error;
+            count++;
+        }
+    }
+    const double rms_error = sqrt(square_error / (double)count);
+    if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
+        fprintf(stderr, "%s: parity max_abs=%g rms=%g exceeds tolerance\n",
+                case_name, (double)max_abs, rms_error);
+        return 0;
+    }
+    return 1;
+}
+
+static int run_qk_metric_dilution_case(void) {
+    static const float q_actual[6] = { 0 };
+    static const float q_reference[6] = { 0 };
+    static const float k_actual[1] = { 1.0e-4f };
+    static const float k_reference[1] = { 0 };
+    static const laguna_parity_span spans[] = {
+        { "q", q_actual, q_reference, 6 },
+        { "k", k_actual, k_reference, 1 },
+    };
+    if (laguna_parity_spans_within_limits("qk-metric-dilution", spans,
+                                          sizeof(spans) / sizeof(spans[0]))) {
+        fprintf(stderr,
+                "qk-metric-dilution: accepted a K-only RMS error above the limit\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int run_norm_rope_case(const float *weights,
                               const laguna_norm_rope_case *c) {
     const uint32_t head_dim = 128;
@@ -246,48 +300,13 @@ static int run_qk_norm_rope_case(const float *q_weights,
         fprintf(stderr, "qk-norm-rope: output read failed\n");
         goto cleanup;
     }
-    double square_error = 0.0;
-    float max_abs = 0.0f;
-    uint64_t max_index = 0;
-    for (uint64_t i = 0; i < q_count + k_count; i++) {
-        const float actual = i < q_count ? q_actual[i] : k_actual[i - q_count];
-        const float reference = i < q_count ? q_reference[i] :
-            k_reference[i - q_count];
-        if (!isfinite(actual)) {
-            const int is_q = i < q_count;
-            const uint64_t local_index = is_q ? i : i - q_count;
-            const uint64_t row = local_index / head_dim;
-            const uint32_t n_head = is_q ? n_q_head : n_k_head;
-            fprintf(stderr,
-                    "qk-norm-rope: non-finite output at tensor=%c token=%llu head=%llu dim=%llu\n",
-                    is_q ? 'q' : 'k', (unsigned long long)(row / n_head),
-                    (unsigned long long)(row % n_head),
-                    (unsigned long long)(local_index % head_dim));
-            goto cleanup;
-        }
-        const float error = fabsf(actual - reference);
-        if (error > max_abs) {
-            max_abs = error;
-            max_index = i;
-        }
-        square_error += (double)error * error;
-    }
-    const double rms_error = sqrt(square_error / (double)(q_count + k_count));
-    if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-        const int is_q = max_index < q_count;
-        const uint64_t local_index = is_q ? max_index : max_index - q_count;
-        const uint64_t row = local_index / head_dim;
-        const uint32_t n_head = is_q ? n_q_head : n_k_head;
-        const float actual = is_q ? q_actual[local_index] : k_actual[local_index];
-        const float reference = is_q ? q_reference[local_index] :
-            k_reference[local_index];
-        fprintf(stderr,
-                "qk-norm-rope: parity max_abs=%g rms=%g tensor=%c token=%llu head=%llu dim=%llu actual=%g reference=%g exceeds tolerance\n",
-                (double)max_abs, rms_error, is_q ? 'q' : 'k',
-                (unsigned long long)(row / n_head),
-                (unsigned long long)(row % n_head),
-                (unsigned long long)(local_index % head_dim),
-                (double)actual, (double)reference);
+    static const char *span_names[] = { "q", "k" };
+    const laguna_parity_span spans[] = {
+        { span_names[0], q_actual, q_reference, q_count },
+        { span_names[1], k_actual, k_reference, k_count },
+    };
+    if (!laguna_parity_spans_within_limits("qk-norm-rope", spans,
+                                           sizeof(spans) / sizeof(spans[0]))) {
         goto cleanup;
     }
     rc = 0;
@@ -348,6 +367,7 @@ int main(int argc, char **argv) {
         if (run_norm_rope_case(weights, &cases[i]) != 0) rc = 1;
     }
     if (run_qk_norm_rope_case(weights, weights + head_dim) != 0) rc = 1;
+    if (run_qk_metric_dilution_case() != 0) rc = 1;
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
     free(weights);

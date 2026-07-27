@@ -153,10 +153,14 @@ static int run_norm_rope_case(const float *weights,
         }
         const double rms_error = sqrt(square_error / (double)count);
         if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
+            const uint64_t row = max_index / head_dim;
             fprintf(stderr,
-                    "norm-rope/%s: parity max_abs=%g rms=%g index=%llu actual=%g reference=%g exceeds tolerance\n",
+                    "norm-rope/%s: parity max_abs=%g rms=%g token=%llu head=%llu dim=%llu actual=%g reference=%g exceeds tolerance\n",
                     c->name, (double)max_abs, rms_error,
-                    (unsigned long long)max_index, (double)actual[max_index],
+                    (unsigned long long)(row / c->n_head),
+                    (unsigned long long)(row % c->n_head),
+                    (unsigned long long)(max_index % head_dim),
+                    (double)actual[max_index],
                     (double)reference[max_index]);
             goto cleanup;
         }
@@ -259,13 +263,19 @@ static int run_qk_norm_rope_case(const float *q_weights,
     }
     const double rms_error = sqrt(square_error / (double)(q_count + k_count));
     if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-        const float actual = max_index < q_count ? q_actual[max_index] :
-            k_actual[max_index - q_count];
-        const float reference = max_index < q_count ? q_reference[max_index] :
-            k_reference[max_index - q_count];
+        const int is_q = max_index < q_count;
+        const uint64_t local_index = is_q ? max_index : max_index - q_count;
+        const uint64_t row = local_index / head_dim;
+        const uint32_t n_head = is_q ? n_q_head : n_k_head;
+        const float actual = is_q ? q_actual[local_index] : k_actual[local_index];
+        const float reference = is_q ? q_reference[local_index] :
+            k_reference[local_index];
         fprintf(stderr,
-                "qk-norm-rope: parity max_abs=%g rms=%g index=%llu actual=%g reference=%g exceeds tolerance\n",
-                (double)max_abs, rms_error, (unsigned long long)max_index,
+                "qk-norm-rope: parity max_abs=%g rms=%g tensor=%c token=%llu head=%llu dim=%llu actual=%g reference=%g exceeds tolerance\n",
+                (double)max_abs, rms_error, is_q ? 'q' : 'k',
+                (unsigned long long)(row / n_head),
+                (unsigned long long)(row % n_head),
+                (unsigned long long)(local_index % head_dim),
                 (double)actual, (double)reference);
         goto cleanup;
     }

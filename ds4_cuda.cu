@@ -27782,16 +27782,17 @@ __global__ static void laguna_head_rms_norm_rope_neox_kernel(
     const uint32_t half_rot = n_rot >> 1u;
     for (uint32_t d = threadIdx.x; d < half_rot; d += blockDim.x) {
         const uint32_t rel_i0 = d * 2u;
-        const double theta_extrap = (double)(pos0 + token) *
-            pow((double)freq_base, -((double)rel_i0) / (double)n_rot);
-        const double theta_interp = (double)freq_scale * theta_extrap;
-        double theta = theta_interp;
+        const float freq = (float)pow((double)freq_base,
+                                      -((double)rel_i0) / (double)n_rot);
+        const float theta_extrap = (float)(pos0 + token) * freq;
+        const float theta_interp = freq_scale * theta_extrap;
+        double theta = (double)theta_interp;
         float mscale = attn_factor;
         if (ext_factor != 0.0f) {
             const float mix = rope_yarn_ramp_dev(corr0, corr1, (int)rel_i0) *
                 ext_factor;
-            theta = theta_interp * (1.0 - (double)mix) +
-                theta_extrap * (double)mix;
+            theta = (double)(theta_interp * (1.0f - mix) +
+                             theta_extrap * mix);
             mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
         }
         const float c = (float)cos(theta) * mscale;

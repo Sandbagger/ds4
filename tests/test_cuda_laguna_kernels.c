@@ -137,6 +137,7 @@ static int run_norm_rope_case(const float *weights,
         }
         float max_abs = 0.0f;
         double square_error = 0.0;
+        uint64_t max_index = 0;
         for (uint64_t i = 0; i < count; i++) {
             if (!isfinite(actual[i])) {
                 fprintf(stderr, "norm-rope/%s: non-finite output at %llu\n",
@@ -144,13 +145,19 @@ static int run_norm_rope_case(const float *weights,
                 goto cleanup;
             }
             const float error = fabsf(actual[i] - reference[i]);
-            max_abs = fmaxf(max_abs, error);
+            if (error > max_abs) {
+                max_abs = error;
+                max_index = i;
+            }
             square_error += (double)error * error;
         }
         const double rms_error = sqrt(square_error / (double)count);
         if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-            fprintf(stderr, "norm-rope/%s: parity max_abs=%g rms=%g exceeds tolerance\n",
-                    c->name, (double)max_abs, rms_error);
+            fprintf(stderr,
+                    "norm-rope/%s: parity max_abs=%g rms=%g index=%llu actual=%g reference=%g exceeds tolerance\n",
+                    c->name, (double)max_abs, rms_error,
+                    (unsigned long long)max_index, (double)actual[max_index],
+                    (double)reference[max_index]);
             goto cleanup;
         }
         rc = 0;
@@ -233,6 +240,7 @@ static int run_qk_norm_rope_case(const float *q_weights,
     }
     double square_error = 0.0;
     float max_abs = 0.0f;
+    uint64_t max_index = 0;
     for (uint64_t i = 0; i < q_count + k_count; i++) {
         const float actual = i < q_count ? q_actual[i] : k_actual[i - q_count];
         const float reference = i < q_count ? q_reference[i] :
@@ -243,13 +251,22 @@ static int run_qk_norm_rope_case(const float *q_weights,
             goto cleanup;
         }
         const float error = fabsf(actual - reference);
-        max_abs = fmaxf(max_abs, error);
+        if (error > max_abs) {
+            max_abs = error;
+            max_index = i;
+        }
         square_error += (double)error * error;
     }
     const double rms_error = sqrt(square_error / (double)(q_count + k_count));
     if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-        fprintf(stderr, "qk-norm-rope: parity max_abs=%g rms=%g exceeds tolerance\n",
-                (double)max_abs, rms_error);
+        const float actual = max_index < q_count ? q_actual[max_index] :
+            k_actual[max_index - q_count];
+        const float reference = max_index < q_count ? q_reference[max_index] :
+            k_reference[max_index - q_count];
+        fprintf(stderr,
+                "qk-norm-rope: parity max_abs=%g rms=%g index=%llu actual=%g reference=%g exceeds tolerance\n",
+                (double)max_abs, rms_error, (unsigned long long)max_index,
+                (double)actual, (double)reference);
         goto cleanup;
     }
     rc = 0;

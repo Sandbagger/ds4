@@ -98,29 +98,32 @@ typedef struct {
 
 static int laguna_parity_spans_within_limits(
         const char *case_name, const laguna_parity_span *spans,
-        size_t n_spans) {
-    double square_error = 0.0;
-    float max_abs = 0.0f;
-    uint64_t count = 0;
+        size_t n_spans, int report) {
     for (size_t span = 0; span < n_spans; span++) {
+        double square_error = 0.0;
+        float max_abs = 0.0f;
         for (uint64_t i = 0; i < spans[span].count; i++) {
             if (!isfinite(spans[span].actual[i])) {
-                fprintf(stderr, "%s/%s: non-finite output\n", case_name,
-                        spans[span].name);
+                if (report) {
+                    fprintf(stderr, "%s/%s: non-finite output\n", case_name,
+                            spans[span].name);
+                }
                 return 0;
             }
             const float error = fabsf(spans[span].actual[i] -
                                       spans[span].reference[i]);
             if (error > max_abs) max_abs = error;
             square_error += (double)error * error;
-            count++;
         }
-    }
-    const double rms_error = sqrt(square_error / (double)count);
-    if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-        fprintf(stderr, "%s: parity max_abs=%g rms=%g exceeds tolerance\n",
-                case_name, (double)max_abs, rms_error);
-        return 0;
+        const double rms_error = sqrt(square_error / (double)spans[span].count);
+        if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
+            if (report) {
+                fprintf(stderr,
+                        "%s/%s: parity max_abs=%g rms=%g exceeds tolerance\n",
+                        case_name, spans[span].name, (double)max_abs, rms_error);
+            }
+            return 0;
+        }
     }
     return 1;
 }
@@ -135,7 +138,7 @@ static int run_qk_metric_dilution_case(void) {
         { "k", k_actual, k_reference, 1 },
     };
     if (laguna_parity_spans_within_limits("qk-metric-dilution", spans,
-                                          sizeof(spans) / sizeof(spans[0]))) {
+                                          sizeof(spans) / sizeof(spans[0]), 0)) {
         fprintf(stderr,
                 "qk-metric-dilution: accepted a K-only RMS error above the limit\n");
         return 1;
@@ -225,8 +228,7 @@ static int run_norm_rope_case(const float *weights,
         rc = 0;
         goto cleanup;
     }
-    fprintf(stderr, "norm-rope/%s: expected red failure at Laguna CUDA stub\n",
-            c->name);
+    fprintf(stderr, "norm-rope/%s: CUDA wrapper returned failure\n", c->name);
 
 cleanup:
     ds4_gpu_tensor_free(x);
@@ -236,14 +238,14 @@ cleanup:
     return rc;
 }
 
-static int run_qk_norm_rope_case(const float *q_weights,
-                                 const float *k_weights) {
-    const uint32_t n_tokens = 4;
-    const uint32_t n_q_head = 48;
+static int run_qk_norm_rope_case(const float *q_weights, const float *k_weights,
+                                 const laguna_norm_rope_case *c) {
+    const uint32_t n_tokens = c->n_tokens;
+    const uint32_t n_q_head = c->n_head;
     const uint32_t n_k_head = 8;
     const uint32_t head_dim = 128;
-    const uint32_t n_rot = 64;
-    const uint32_t pos0 = 8191;
+    const uint32_t n_rot = c->n_rot;
+    const uint32_t pos0 = c->pos0;
     const uint64_t q_count = (uint64_t)n_tokens * n_q_head * head_dim;
     const uint64_t k_count = (uint64_t)n_tokens * n_k_head * head_dim;
     const uint64_t weight_bytes = head_dim * sizeof(*q_weights);
@@ -266,13 +268,15 @@ static int run_qk_norm_rope_case(const float *q_weights,
         k_input[i] = ((float)((int)((i * 19u) % 37u) - 18)) / 19.0f;
     }
     reference_head_rms_rope(q_reference, q_input, q_weights, n_tokens,
-                            n_q_head, head_dim, n_rot, pos0, 8192,
-                            500000.0f, 1.0f / 32.0f, 1.0f, 1.0f, 32.0f,
-                            1.0f, 1.0e-6f);
+                            n_q_head, head_dim, n_rot, pos0, c->n_ctx_orig,
+                            c->freq_base, c->freq_scale, c->ext_factor,
+                            c->attn_factor, c->beta_fast, c->beta_slow,
+                            1.0e-6f);
     reference_head_rms_rope(k_reference, k_input, k_weights, n_tokens,
-                            n_k_head, head_dim, n_rot, pos0, 8192,
-                            500000.0f, 1.0f / 32.0f, 1.0f, 1.0f, 32.0f,
-                            1.0f, 1.0e-6f);
+                            n_k_head, head_dim, n_rot, pos0, c->n_ctx_orig,
+                            c->freq_base, c->freq_scale, c->ext_factor,
+                            c->attn_factor, c->beta_fast, c->beta_slow,
+                            1.0e-6f);
     q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_input));
     k = ds4_gpu_tensor_alloc(k_count * sizeof(*k_input));
     if (!q || !k ||
@@ -283,8 +287,9 @@ static int run_qk_norm_rope_case(const float *q_weights,
     }
     const int wrapper_ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         q, k, q_weights, 2u * weight_bytes, 0, weight_bytes, n_tokens,
-        n_q_head, n_k_head, head_dim, n_rot, pos0, 8192, 500000.0f,
-        1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+        n_q_head, n_k_head, head_dim, n_rot, pos0, c->n_ctx_orig,
+        c->freq_base, c->freq_scale, c->ext_factor, c->attn_factor,
+        c->beta_fast, c->beta_slow, 1.0e-6f);
     const cudaError_t sync = cudaDeviceSynchronize();
     if (sync != cudaSuccess) {
         fprintf(stderr, "qk-norm-rope: cudaDeviceSynchronize: %s\n",
@@ -292,7 +297,8 @@ static int run_qk_norm_rope_case(const float *q_weights,
         goto cleanup;
     }
     if (!wrapper_ok) {
-        fprintf(stderr, "qk-norm-rope: expected red failure at Laguna CUDA stub\n");
+        fprintf(stderr, "qk-norm-rope/%s: CUDA wrapper returned failure\n",
+                c->name);
         goto cleanup;
     }
     if (!ds4_gpu_tensor_read(q, 0, q_actual, q_count * sizeof(*q_actual)) ||
@@ -300,13 +306,12 @@ static int run_qk_norm_rope_case(const float *q_weights,
         fprintf(stderr, "qk-norm-rope: output read failed\n");
         goto cleanup;
     }
-    static const char *span_names[] = { "q", "k" };
     const laguna_parity_span spans[] = {
-        { span_names[0], q_actual, q_reference, q_count },
-        { span_names[1], k_actual, k_reference, k_count },
+        { "q", q_actual, q_reference, q_count },
+        { "k", k_actual, k_reference, k_count },
     };
-    if (!laguna_parity_spans_within_limits("qk-norm-rope", spans,
-                                           sizeof(spans) / sizeof(spans[0]))) {
+    if (!laguna_parity_spans_within_limits(c->name, spans,
+                                           sizeof(spans) / sizeof(spans[0]), 1)) {
         goto cleanup;
     }
     rc = 0;
@@ -366,7 +371,18 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (run_norm_rope_case(weights, &cases[i]) != 0) rc = 1;
     }
-    if (run_qk_norm_rope_case(weights, weights + head_dim) != 0) rc = 1;
+    static const laguna_norm_rope_case qk_cases[] = {
+        { "qk-global-yarn-frontier", 4, 48, 64, 8191, 8192, 500000.0f,
+          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f },
+        { "qk-swa-ring-frontier", 4, 72, 128, 510, 262144, 10000.0f,
+          1.0f, 0.0f, 1.0f, 0.0f, 0.0f },
+    };
+    for (size_t i = 0; i < sizeof(qk_cases) / sizeof(qk_cases[0]); i++) {
+        if (run_qk_norm_rope_case(weights, weights + head_dim,
+                                  &qk_cases[i]) != 0) {
+            rc = 1;
+        }
+    }
     if (run_qk_metric_dilution_case() != 0) rc = 1;
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();

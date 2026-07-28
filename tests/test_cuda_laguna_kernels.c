@@ -427,6 +427,7 @@ typedef struct {
     uint32_t key_start;
     uint32_t key_count;
     float gate;
+    bool mixed_gates;
 } laguna_decode_attention_case;
 
 static float reference_softplus(float value) {
@@ -497,7 +498,10 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         key_expected[current_base + i] = reference_f32_to_f16(k_host[i]);
         value_expected[current_base + i] = reference_f32_to_f16(v_host[i]);
     }
-    for (uint32_t h = 0; h < c->n_head; h++) gate_host[h] = c->gate;
+    static const float mixed_gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
+    for (uint32_t h = 0; h < c->n_head; h++) {
+        gate_host[h] = c->mixed_gates ? mixed_gates[h % 5u] : c->gate;
+    }
 
     const uint32_t heads_per_kv = c->n_head / c->n_head_kv;
     for (uint32_t h = 0; h < c->n_head; h++) {
@@ -662,7 +666,7 @@ static int run_decode_attention_cases(void) {
             const uint32_t key_count = global_counts[count_i];
             const laguna_decode_attention_case c = {
                 "gqa6-global", 48u, 8u, 2048u, key_count - 1u, 0u,
-                key_count, gates[gate_i],
+                key_count, gates[gate_i], false,
             };
             if (run_decode_attention_case(&c) != 0) rc = 1;
         }
@@ -673,10 +677,21 @@ static int run_decode_attention_cases(void) {
             const uint32_t key_count = pos < 512u ? pos + 1u : 512u;
             const laguna_decode_attention_case c = {
                 "gqa9-swa", 72u, 8u, 512u, pos, pos + 1u - key_count,
-                key_count, gates[gate_i],
+                key_count, gates[gate_i], false,
             };
             if (run_decode_attention_case(&c) != 0) rc = 1;
         }
+    }
+    const laguna_decode_attention_case mutation_cases[] = {
+        { "gqa6-global-mixed-gates", 48u, 8u, 2048u, 16u, 0u, 17u,
+          0.0f, true },
+        { "gqa6-global-nonpow", 48u, 8u, 8202u, 16u, 0u, 17u,
+          0.0f, true },
+        { "gqa6-shifted-partial-ring", 48u, 8u, 17u, 20u, 18u, 3u,
+          0.0f, true },
+    };
+    for (size_t i = 0; i < sizeof(mutation_cases) / sizeof(mutation_cases[0]); i++) {
+        if (run_decode_attention_case(&mutation_cases[i]) != 0) rc = 1;
     }
     return rc;
 }

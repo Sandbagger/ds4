@@ -621,8 +621,8 @@ cleanup:
 
 static int run_decode_attention_cases(void) {
     static const float gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
-    const uint32_t global_counts[] = { 1023u, 1024u, 1025u };
-    const uint32_t swa_positions[] = { 510u, 511u, 512u, 513u };
+    const uint32_t global_counts[] = { 1u, 1023u, 1024u, 1025u };
+    const uint32_t swa_positions[] = { 0u, 510u, 511u, 512u, 513u };
     int rc = 0;
     for (size_t count_i = 0; count_i < sizeof(global_counts) / sizeof(global_counts[0]); count_i++) {
         for (size_t gate_i = 0; gate_i < sizeof(gates) / sizeof(gates[0]); gate_i++) {

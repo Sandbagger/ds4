@@ -571,6 +571,51 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         goto cleanup;
     }
 
+    /* Rejections must happen before either production launch: exercise the
+     * scalar/causal/null boundary against the same fully valid fixture. */
+    const struct {
+        const char *name;
+        uint32_t key_start;
+        uint32_t key_count;
+        uint32_t n_head;
+        uint32_t n_head_kv;
+        float scale;
+    } rejected[] = {
+        { "non-integral-gqa", c->key_start, c->key_count, 50u, 8u, scale },
+        { "zero-keys", c->key_start, 0u, c->n_head, c->n_head_kv, scale },
+        { "too-many-keys", c->key_start, c->cache_cap + 1u, c->n_head,
+          c->n_head_kv, scale },
+        { "key-start-after-pos", c->pos + 1u, 1u, c->n_head,
+          c->n_head_kv, scale },
+        { "non-causal-range", c->key_start, c->key_count - 1u, c->n_head,
+          c->n_head_kv, scale },
+        { "zero-scale", c->key_start, c->key_count, c->n_head,
+          c->n_head_kv, 0.0f },
+        { "nan-scale", c->key_start, c->key_count, c->n_head,
+          c->n_head_kv, NAN },
+    };
+    (void)cudaGetLastError();
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        if (ds4_gpu_laguna_store_attention_tensor(
+                heads, key_cache, value_cache, q, k, v, gate, c->pos,
+                c->cache_cap, rejected[i].key_start, rejected[i].key_count,
+                rejected[i].n_head, rejected[i].n_head_kv, head_dim,
+                rejected[i].scale)) {
+            fprintf(stderr, "decode-attention/%s: accepted %s\n", c->family,
+                    rejected[i].name);
+            goto cleanup;
+        }
+    }
+    if (ds4_gpu_laguna_store_attention_tensor(
+            NULL, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
+            c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim,
+            scale) || cudaDeviceSynchronize() != cudaSuccess ||
+        cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "decode-attention/%s: rejection left CUDA error\n",
+                c->family);
+        goto cleanup;
+    }
+
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
         heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
         c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);

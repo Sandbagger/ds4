@@ -9,15 +9,13 @@
 
 /* This is deliberately independent of CUDA's half helpers: the attention
  * reference owns the exact FP32-to-FP16 cache contract that decode reads. */
-static uint16_t reference_f32_to_f16(float value) {
-    uint32_t bits = 0;
-    memcpy(&bits, &value, sizeof(bits));
+static uint16_t reference_f32_bits_to_f16(uint32_t bits) {
     const uint32_t sign = (bits >> 16) & 0x8000u;
     uint32_t exponent = (bits >> 23) & 0xffu;
     uint32_t mantissa = bits & 0x7fffffu;
     if (exponent == 0xffu) return (uint16_t)(sign | (mantissa ? 0x7e00u : 0x7c00u));
     if (exponent <= 112u) {
-        if (exponent < 103u) return (uint16_t)sign;
+        if (exponent < 102u) return (uint16_t)sign;
         mantissa |= 0x800000u;
         const uint32_t shift = 126u - exponent;
         uint32_t rounded = mantissa >> shift;
@@ -36,6 +34,41 @@ static uint16_t reference_f32_to_f16(float value) {
     }
     if (exponent >= 31u) return (uint16_t)(sign | 0x7c00u);
     return (uint16_t)(sign | (exponent << 10) | (mantissa >> 13));
+}
+
+static uint16_t reference_f32_to_f16(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return reference_f32_bits_to_f16(bits);
+}
+
+static int run_f32_to_f16_reference_cases(void) {
+    const struct {
+        const char *name;
+        uint32_t input_bits;
+        uint16_t expected;
+    } cases[] = {
+        { "+zero", 0x00000000u, 0x0000u },
+        { "-zero", 0x80000000u, 0x8000u },
+        { "halfway-subnormal", 0x33000000u, 0x0000u },
+        { "above-halfway-subnormal", 0x33000001u, 0x0001u },
+        { "minimum-subnormal", 0x33800000u, 0x0001u },
+        { "minimum-normal", 0x38800000u, 0x0400u },
+        { "maximum-finite", 0x477fe000u, 0x7bffu },
+        { "+infinity", 0x7f800000u, 0x7c00u },
+        { "-infinity", 0xff800000u, 0xfc00u },
+        { "quiet-nan", 0x7fc00000u, 0x7e00u },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint16_t actual = reference_f32_bits_to_f16(cases[i].input_bits);
+        if (actual != cases[i].expected) {
+            fprintf(stderr,
+                    "f32-to-f16/%s: got 0x%04x expected 0x%04x\n",
+                    cases[i].name, actual, cases[i].expected);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static float reference_f16_to_f32(uint16_t value) {
@@ -660,27 +693,16 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    const bool run_norm = strcmp(argv[2], "norm-rope") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_decode = strcmp(argv[2], "decode-attention") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    if (run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
         fprintf(stderr, "norm-rope: ds4_gpu_init failed\n");
         return 1;
     }
-    const uint32_t head_dim = 128;
-    float *weights = (float *)malloc(2u * head_dim * sizeof(*weights));
-    if (!weights) {
-        fprintf(stderr, "norm-rope: synthetic weights allocation failed\n");
-        ds4_gpu_cleanup();
-        return 1;
-    }
-    for (uint32_t i = 0; i < head_dim; i++) {
-        weights[i] = 0.70f + 0.01f * (float)(i % 17u);
-        weights[head_dim + i] = 0.55f + 0.01f * (float)((i * 3u) % 23u);
-    }
-    if (!ds4_gpu_set_model_map(weights, 2u * head_dim * sizeof(*weights))) {
-        fprintf(stderr, "norm-rope: synthetic model map setup failed\n");
-        ds4_gpu_cleanup();
-        free(weights);
-        return 1;
-    }
+    float *weights = NULL;
     static const laguna_norm_rope_case cases[] = {
         { "global-pos0", 1, 48, 64, 0, 8192, 500000.0f,
           1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f },
@@ -690,23 +712,42 @@ int main(int argc, char **argv) {
           1.0f, 0.0f, 1.0f, 0.0f, 0.0f },
     };
     int rc = 0;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        if (run_norm_rope_case(weights, &cases[i]) != 0) rc = 1;
-    }
+    if (run_norm) {
+        const uint32_t head_dim = 128;
+        weights = (float *)malloc(2u * head_dim * sizeof(*weights));
+        if (!weights) {
+            fprintf(stderr, "norm-rope: synthetic weights allocation failed\n");
+            ds4_gpu_cleanup();
+            return 1;
+        }
+        for (uint32_t i = 0; i < head_dim; i++) {
+            weights[i] = 0.70f + 0.01f * (float)(i % 17u);
+            weights[head_dim + i] = 0.55f + 0.01f * (float)((i * 3u) % 23u);
+        }
+        if (!ds4_gpu_set_model_map(weights, 2u * head_dim * sizeof(*weights))) {
+            fprintf(stderr, "norm-rope: synthetic model map setup failed\n");
+            ds4_gpu_cleanup();
+            free(weights);
+            return 1;
+        }
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            if (run_norm_rope_case(weights, &cases[i]) != 0) rc = 1;
+        }
     static const laguna_norm_rope_case qk_cases[] = {
         { "qk-global-yarn-frontier", 4, 48, 64, 8191, 8192, 500000.0f,
           1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f },
         { "qk-swa-ring-frontier", 4, 72, 128, 510, 262144, 10000.0f,
           1.0f, 0.0f, 1.0f, 0.0f, 0.0f },
     };
-    for (size_t i = 0; i < sizeof(qk_cases) / sizeof(qk_cases[0]); i++) {
-        if (run_qk_norm_rope_case(weights, weights + head_dim,
-                                  &qk_cases[i]) != 0) {
-            rc = 1;
+        for (size_t i = 0; i < sizeof(qk_cases) / sizeof(qk_cases[0]); i++) {
+            if (run_qk_norm_rope_case(weights, weights + head_dim,
+                                      &qk_cases[i]) != 0) {
+                rc = 1;
+            }
         }
+        if (run_qk_metric_dilution_case() != 0) rc = 1;
     }
-    if (run_qk_metric_dilution_case() != 0) rc = 1;
-    if (strcmp(argv[2], "norm-rope") != 0 && run_decode_attention_cases() != 0) {
+    if (run_decode && run_decode_attention_cases() != 0) {
         rc = 1;
     }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */

@@ -27939,6 +27939,64 @@ extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
     return ok;
 }
 
+__global__ static void laguna_store_kv_f16_kernel(
+        const float *k, const float *v, __half *key_cache,
+        __half *value_cache, uint64_t cache_row, uint64_t kv_values) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_values) return;
+    const uint64_t dst = cache_row * kv_values + i;
+    key_cache[dst] = __float2half_rn(k[i]);
+    value_cache[dst] = __float2half_rn(v[i]);
+}
+
+/* Correctness-first decode path: one block owns one query head and thread zero
+ * performs a stable online reduction over the caller's causal logical rows.
+ * This is intentionally not grouped, flash, or fused; later work can replace
+ * it once this revised ring layout has a locked parity baseline. */
+__global__ static void laguna_attention_decode_gqa_f16_kernel(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const float *gate, uint32_t key_start,
+        uint32_t key_count, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, float scale) {
+    const uint32_t head = blockIdx.x;
+    if (threadIdx.x != 0u || head >= n_head) return;
+
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const float *query = q + (uint64_t)head * head_dim;
+    float acc[128] = {0.0f};
+    float max_score = -INFINITY;
+    float sum = 0.0f;
+    for (uint32_t r = 0u; r < key_count; r++) {
+        const uint32_t row = (key_start + r) % cache_cap;
+        const uint64_t base = (uint64_t)row * kv_width +
+            (uint64_t)kv_head * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0u; d < head_dim; d++) {
+            dot += query[d] * __half2float(key_cache[base + d]);
+        }
+        const float score = scale * dot;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = max_score == -INFINITY ?
+            0.0f : expf(max_score - next_max);
+        const float value_scale = expf(score - next_max);
+        sum = sum * old_scale + value_scale;
+        for (uint32_t d = 0u; d < head_dim; d++) {
+            acc[d] = acc[d] * old_scale +
+                value_scale * __half2float(value_cache[base + d]);
+        }
+        max_score = next_max;
+    }
+    const float gate_value = gate[head];
+    const float gate_scale = gate_value > 0.0f ?
+        gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    float *out = heads + (uint64_t)head * head_dim;
+    for (uint32_t d = 0u; d < head_dim; d++) {
+        out[d] = acc[d] / sum * gate_scale;
+    }
+}
+
 extern "C" int ds4_gpu_laguna_store_attention_tensor(
         ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
         ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *q,
@@ -27946,11 +28004,60 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
         const ds4_gpu_tensor *gate, uint32_t pos, uint32_t cache_cap,
         uint32_t key_start, uint32_t key_count, uint32_t n_head,
         uint32_t n_head_kv, uint32_t head_dim, float scale) {
-    (void)heads; (void)key_cache; (void)value_cache; (void)q; (void)k;
-    (void)v; (void)gate; (void)pos; (void)cache_cap; (void)key_start;
-    (void)key_count; (void)n_head; (void)n_head_kv; (void)head_dim;
-    (void)scale;
-    return 0;
+    if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !heads->ptr || !key_cache->ptr || !value_cache->ptr || !q->ptr ||
+        !k->ptr || !v->ptr || !gate->ptr || cache_cap == 0u ||
+        key_count == 0u || key_count > cache_cap || n_head == 0u ||
+        n_head_kv == 0u || n_head % n_head_kv != 0u || head_dim != 128u ||
+        !isfinite(scale) || scale <= 0.0f || key_start > pos ||
+        key_count - 1u != pos - key_start) {
+        return 0;
+    }
+    const uint64_t q_values = (uint64_t)n_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_head_kv * head_dim;
+    if (kv_values == 0u || cache_cap > UINT64_MAX / kv_values) return 0;
+    const uint64_t cache_values = (uint64_t)cache_cap * kv_values;
+    if (q_values > UINT64_MAX / sizeof(float) ||
+        kv_values > UINT64_MAX / sizeof(float) ||
+        cache_values > UINT64_MAX / sizeof(__half) ||
+        kv_values > (uint64_t)UINT_MAX * 256u ||
+        q->bytes < q_values * sizeof(float) ||
+        k->bytes < kv_values * sizeof(float) ||
+        v->bytes < kv_values * sizeof(float) ||
+        gate->bytes < (uint64_t)n_head * sizeof(float) ||
+        heads->bytes < q_values * sizeof(float) ||
+        key_cache->bytes < cache_values * sizeof(__half) ||
+        value_cache->bytes < cache_values * sizeof(__half)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(key_cache) != logical_tier ||
+        ds4_tensor_device_idx(value_cache) != logical_tier ||
+        ds4_tensor_device_idx(q) != logical_tier ||
+        ds4_tensor_device_idx(k) != logical_tier ||
+        ds4_tensor_device_idx(v) != logical_tier ||
+        ds4_tensor_device_idx(gate) != logical_tier) {
+        return 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        laguna_store_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
+                (const float *)k->ptr, (const float *)v->ptr,
+                (__half *)key_cache->ptr, (__half *)value_cache->ptr,
+                (uint64_t)(pos % cache_cap), kv_values);
+        ok = cuda_ok(cudaGetLastError(), "laguna KV store launch");
+        if (ok) {
+            laguna_attention_decode_gqa_f16_kernel<<<n_head, 1>>>(
+                    (float *)heads->ptr, (const float *)q->ptr,
+                    (const __half *)key_cache->ptr,
+                    (const __half *)value_cache->ptr, (const float *)gate->ptr,
+                    key_start, key_count, cache_cap, n_head, n_head_kv,
+                    head_dim, scale);
+            ok = cuda_ok(cudaGetLastError(), "laguna decode attention launch");
+        }
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_laguna_attention_prefill_tensor(

@@ -7,6 +7,63 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* This is deliberately independent of CUDA's half helpers: the attention
+ * reference owns the exact FP32-to-FP16 cache contract that decode reads. */
+static uint16_t reference_f32_to_f16(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    uint32_t exponent = (bits >> 23) & 0xffu;
+    uint32_t mantissa = bits & 0x7fffffu;
+    if (exponent == 0xffu) return (uint16_t)(sign | (mantissa ? 0x7e00u : 0x7c00u));
+    if (exponent <= 112u) {
+        if (exponent < 103u) return (uint16_t)sign;
+        mantissa |= 0x800000u;
+        const uint32_t shift = 126u - exponent;
+        uint32_t rounded = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1u);
+        if (remainder > halfway || (remainder == halfway && (rounded & 1u))) {
+            rounded++;
+        }
+        return (uint16_t)(sign | rounded);
+    }
+    exponent -= 112u;
+    mantissa += 0x0fffu + ((mantissa >> 13) & 1u);
+    if (mantissa & 0x00800000u) {
+        mantissa = 0;
+        exponent++;
+    }
+    if (exponent >= 31u) return (uint16_t)(sign | 0x7c00u);
+    return (uint16_t)(sign | (exponent << 10) | (mantissa >> 13));
+}
+
+static float reference_f16_to_f32(uint16_t value) {
+    const uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fu;
+    uint32_t mantissa = value & 0x03ffu;
+    uint32_t bits;
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            bits = sign;
+        } else {
+            exponent = 113u;
+            while ((mantissa & 0x0400u) == 0u) {
+                mantissa <<= 1u;
+                exponent--;
+            }
+            bits = sign | (exponent << 23) | ((mantissa & 0x03ffu) << 13);
+        }
+    } else if (exponent == 31u) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
 static float yarn_ramp(float low, float high, int i) {
     const float y = ((float)(i / 2) - low) / fmaxf(0.001f, high - low);
     return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
@@ -328,13 +385,278 @@ cleanup:
     return rc;
 }
 
+typedef struct {
+    const char *family;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t cache_cap;
+    uint32_t pos;
+    uint32_t key_start;
+    uint32_t key_count;
+    float gate;
+} laguna_decode_attention_case;
+
+static float reference_softplus(float value) {
+    return value > 0.0f ? value + log1pf(expf(-value)) : log1pf(expf(value));
+}
+
+static int run_decode_attention_case(const laguna_decode_attention_case *c) {
+    const uint32_t head_dim = 128u;
+    const uint64_t q_count = (uint64_t)c->n_head * head_dim;
+    const uint64_t kv_width = (uint64_t)c->n_head_kv * head_dim;
+    const uint64_t cache_values = (uint64_t)c->cache_cap * kv_width;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    float *q_host = NULL;
+    float *k_host = NULL;
+    float *v_host = NULL;
+    float *gate_host = NULL;
+    float *scores = NULL;
+    float *reference = NULL;
+    float *actual = NULL;
+    uint16_t *key_expected = NULL;
+    uint16_t *value_expected = NULL;
+    uint16_t *key_actual = NULL;
+    uint16_t *value_actual = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *key_cache = NULL;
+    ds4_gpu_tensor *value_cache = NULL;
+    ds4_gpu_tensor *q = NULL;
+    ds4_gpu_tensor *k = NULL;
+    ds4_gpu_tensor *v = NULL;
+    ds4_gpu_tensor *gate = NULL;
+    int rc = 1;
+
+    q_host = (float *)malloc((size_t)q_count * sizeof(*q_host));
+    k_host = (float *)malloc((size_t)kv_width * sizeof(*k_host));
+    v_host = (float *)malloc((size_t)kv_width * sizeof(*v_host));
+    gate_host = (float *)malloc((size_t)c->n_head * sizeof(*gate_host));
+    scores = (float *)malloc((size_t)c->key_count * sizeof(*scores));
+    reference = (float *)malloc((size_t)q_count * sizeof(*reference));
+    actual = (float *)malloc((size_t)q_count * sizeof(*actual));
+    key_expected = (uint16_t *)malloc((size_t)cache_values * sizeof(*key_expected));
+    value_expected = (uint16_t *)malloc((size_t)cache_values * sizeof(*value_expected));
+    key_actual = (uint16_t *)malloc((size_t)cache_values * sizeof(*key_actual));
+    value_actual = (uint16_t *)malloc((size_t)cache_values * sizeof(*value_actual));
+    if (!q_host || !k_host || !v_host || !gate_host || !scores || !reference || !actual ||
+        !key_expected || !value_expected || !key_actual || !value_actual) {
+        fprintf(stderr, "decode-attention: host allocation failed\n");
+        goto cleanup;
+    }
+
+    for (uint64_t i = 0; i < q_count; i++) {
+        q_host[i] = (float)((int)((i * 17u) % 41u) - 20) / 23.0f;
+    }
+    for (uint64_t i = 0; i < kv_width; i++) {
+        k_host[i] = (float)((int)((i * 11u) % 37u) - 18) / 29.0f;
+        v_host[i] = (float)((int)((i * 23u) % 43u) - 21) / 31.0f;
+    }
+    for (uint64_t i = 0; i < cache_values; i++) {
+        const float key_value = (float)((int)((i * 7u) % 47u) - 23) / 37.0f;
+        const float value_value = (float)((int)((i * 29u) % 53u) - 26) / 41.0f;
+        key_expected[i] = reference_f32_to_f16(key_value);
+        value_expected[i] = reference_f32_to_f16(value_value);
+    }
+    memcpy(key_actual, key_expected, (size_t)cache_values * sizeof(*key_actual));
+    memcpy(value_actual, value_expected,
+           (size_t)cache_values * sizeof(*value_actual));
+    const uint64_t current_base = (uint64_t)(c->pos % c->cache_cap) * kv_width;
+    for (uint64_t i = 0; i < kv_width; i++) {
+        key_expected[current_base + i] = reference_f32_to_f16(k_host[i]);
+        value_expected[current_base + i] = reference_f32_to_f16(v_host[i]);
+    }
+    for (uint32_t h = 0; h < c->n_head; h++) gate_host[h] = c->gate;
+
+    const uint32_t heads_per_kv = c->n_head / c->n_head_kv;
+    for (uint32_t h = 0; h < c->n_head; h++) {
+        const uint32_t kv_head = h / heads_per_kv;
+        float max_score = -INFINITY;
+        for (uint32_t r = 0; r < c->key_count; r++) {
+            const uint32_t row = (c->key_start + r) % c->cache_cap;
+            const uint64_t base = (uint64_t)row * kv_width +
+                (uint64_t)kv_head * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dot += q_host[(uint64_t)h * head_dim + d] *
+                    reference_f16_to_f32(key_expected[base + d]);
+            }
+            scores[r] = scale * dot;
+            if (scores[r] > max_score) max_score = scores[r];
+        }
+        float sum = 0.0f;
+        for (uint32_t r = 0; r < c->key_count; r++) {
+            const uint32_t row = (c->key_start + r) % c->cache_cap;
+            const uint64_t base = (uint64_t)row * kv_width +
+                (uint64_t)kv_head * head_dim;
+            (void)base;
+            sum += expf(scores[r] - max_score);
+        }
+        const float gate_scale = reference_softplus(gate_host[h]);
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float weighted_value = 0.0f;
+            for (uint32_t r = 0; r < c->key_count; r++) {
+                const uint32_t row = (c->key_start + r) % c->cache_cap;
+                const uint64_t base = (uint64_t)row * kv_width +
+                    (uint64_t)kv_head * head_dim;
+                weighted_value += expf(scores[r] - max_score) *
+                    reference_f16_to_f32(value_expected[base + d]);
+            }
+            reference[(uint64_t)h * head_dim + d] =
+                weighted_value / sum * gate_scale;
+        }
+    }
+    for (uint64_t i = 0; i < q_count; i++) {
+        if (!isfinite(reference[i])) {
+            fprintf(stderr, "decode-attention/%s: independent reference is non-finite\n",
+                    c->family);
+            goto cleanup;
+        }
+    }
+
+    heads = ds4_gpu_tensor_alloc(q_count * sizeof(*actual));
+    key_cache = ds4_gpu_tensor_alloc(cache_values * sizeof(*key_expected));
+    value_cache = ds4_gpu_tensor_alloc(cache_values * sizeof(*value_expected));
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_host));
+    k = ds4_gpu_tensor_alloc(kv_width * sizeof(*k_host));
+    v = ds4_gpu_tensor_alloc(kv_width * sizeof(*v_host));
+    gate = ds4_gpu_tensor_alloc((uint64_t)c->n_head * sizeof(*gate_host));
+    if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(key_cache, 0, key_actual,
+                              cache_values * sizeof(*key_actual)) ||
+        !ds4_gpu_tensor_write(value_cache, 0, value_actual,
+                              cache_values * sizeof(*value_actual)) ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(*q_host)) ||
+        !ds4_gpu_tensor_write(k, 0, k_host, kv_width * sizeof(*k_host)) ||
+        !ds4_gpu_tensor_write(v, 0, v_host, kv_width * sizeof(*v_host)) ||
+        !ds4_gpu_tensor_write(gate, 0, gate_host,
+                              (uint64_t)c->n_head * sizeof(*gate_host))) {
+        fprintf(stderr, "decode-attention/%s: synthetic tensor setup failed\n",
+                c->family);
+        goto cleanup;
+    }
+
+    const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
+        heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
+        c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);
+    /* Each case submits one KV-store + decode-attention pipeline. */
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (sync != cudaSuccess) {
+        fprintf(stderr, "decode-attention/%s: cudaDeviceSynchronize: %s\n",
+                c->family, cudaGetErrorString(sync));
+        goto cleanup;
+    }
+    if (!wrapper_ok) {
+        fprintf(stderr,
+                "decode-attention/%s: CUDA wrapper returned failure (pos=%u keys=%u gate=%g)\n",
+                c->family, c->pos, c->key_count, (double)c->gate);
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(key_cache, 0, key_actual,
+                             cache_values * sizeof(*key_actual)) ||
+        !ds4_gpu_tensor_read(value_cache, 0, value_actual,
+                             cache_values * sizeof(*value_actual)) ||
+        !ds4_gpu_tensor_read(heads, 0, actual, q_count * sizeof(*actual))) {
+        fprintf(stderr, "decode-attention/%s: output read failed\n", c->family);
+        goto cleanup;
+    }
+    if (memcmp(key_actual, key_expected,
+               (size_t)cache_values * sizeof(*key_actual)) != 0 ||
+        memcmp(value_actual, value_expected,
+               (size_t)cache_values * sizeof(*value_actual)) != 0) {
+        fprintf(stderr,
+                "decode-attention/%s: F32-to-F16 KV ring mapping differs (pos=%u keys=%u)\n",
+                c->family, c->pos, c->key_count);
+        goto cleanup;
+    }
+    float max_abs = 0.0f;
+    double square_error = 0.0;
+    uint64_t max_index = 0;
+    for (uint64_t i = 0; i < q_count; i++) {
+        if (!isfinite(actual[i])) {
+            fprintf(stderr,
+                    "decode-attention/%s: non-finite output head=%llu dim=%llu\n",
+                    c->family, (unsigned long long)(i / head_dim),
+                    (unsigned long long)(i % head_dim));
+            goto cleanup;
+        }
+        const float error = fabsf(actual[i] - reference[i]);
+        if (error > max_abs) {
+            max_abs = error;
+            max_index = i;
+        }
+        square_error += (double)error * error;
+    }
+    const double rms = sqrt(square_error / (double)q_count);
+    if (max_abs > 1.0e-3f || rms > 2.0e-4) {
+        fprintf(stderr,
+                "decode-attention/%s: parity max_abs=%g rms=%g head=%llu dim=%llu actual=%g reference=%g exceeds tolerance\n",
+                c->family, (double)max_abs, rms,
+                (unsigned long long)(max_index / head_dim),
+                (unsigned long long)(max_index % head_dim),
+                (double)actual[max_index], (double)reference[max_index]);
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    free(value_actual);
+    free(key_actual);
+    free(value_expected);
+    free(key_expected);
+    free(actual);
+    free(reference);
+    free(gate_host);
+    free(scores);
+    free(v_host);
+    free(k_host);
+    free(q_host);
+    return rc;
+}
+
+static int run_decode_attention_cases(void) {
+    static const float gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
+    const uint32_t global_counts[] = { 1023u, 1024u, 1025u };
+    const uint32_t swa_positions[] = { 510u, 511u, 512u, 513u };
+    int rc = 0;
+    for (size_t count_i = 0; count_i < sizeof(global_counts) / sizeof(global_counts[0]); count_i++) {
+        for (size_t gate_i = 0; gate_i < sizeof(gates) / sizeof(gates[0]); gate_i++) {
+            const uint32_t key_count = global_counts[count_i];
+            const laguna_decode_attention_case c = {
+                "gqa6-global", 48u, 8u, 2048u, key_count - 1u, 0u,
+                key_count, gates[gate_i],
+            };
+            if (run_decode_attention_case(&c) != 0) rc = 1;
+        }
+    }
+    for (size_t pos_i = 0; pos_i < sizeof(swa_positions) / sizeof(swa_positions[0]); pos_i++) {
+        for (size_t gate_i = 0; gate_i < sizeof(gates) / sizeof(gates[0]); gate_i++) {
+            const uint32_t pos = swa_positions[pos_i];
+            const uint32_t key_count = pos < 512u ? pos + 1u : 512u;
+            const laguna_decode_attention_case c = {
+                "gqa9-swa", 72u, 8u, 512u, pos, pos + 1u - key_count,
+                key_count, gates[gate_i],
+            };
+            if (run_decode_attention_case(&c) != 0) rc = 1;
+        }
+    }
+    return rc;
+}
+
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|all\n", program);
 }
 
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(argv[1], "--case") != 0 ||
-        (strcmp(argv[2], "norm-rope") != 0 && strcmp(argv[2], "all") != 0)) {
+        (strcmp(argv[2], "norm-rope") != 0 &&
+         strcmp(argv[2], "decode-attention") != 0 &&
+         strcmp(argv[2], "all") != 0)) {
         usage(argv[0]);
         return 2;
     }
@@ -384,6 +706,9 @@ int main(int argc, char **argv) {
         }
     }
     if (run_qk_metric_dilution_case() != 0) rc = 1;
+    if (strcmp(argv[2], "norm-rope") != 0 && run_decode_attention_cases() != 0) {
+        rc = 1;
+    }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
     free(weights);

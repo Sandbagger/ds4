@@ -1349,6 +1349,102 @@ static float laguna_max_delta(const float *a, const float *b, uint32_t count) {
     return maximum;
 }
 
+static int run_routed_moe_selected_validation_case(void) {
+    const uint64_t row_bytes = sizeof(laguna_q4k_block);
+    const uint64_t expert_bytes = LAGUNA_MOE_DIM * row_bytes;
+    const uint64_t projection_bytes = LAGUNA_MOE_EXPERTS * expert_bytes;
+    const uint64_t model_size = 3u * projection_bytes;
+    unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+    float input[LAGUNA_MOE_DIM];
+    float router[LAGUNA_MOE_USED];
+    int32_t selected[LAGUNA_MOE_USED];
+    ds4_gpu_tensor *mid = NULL, *selected_t = NULL, *router_t = NULL, *x = NULL;
+    laguna_guarded_output out = {0};
+    laguna_tensor_snapshot snapshots[5] = {0};
+    int validation_enabled = 0;
+    int rc = 1;
+
+    if (!model) goto cleanup;
+    for (uint32_t projection = 0; projection < 3u; projection++) {
+        laguna_q4k_block *matrix =
+            (laguna_q4k_block *)(model + projection * projection_bytes);
+        for (uint32_t expert = 0; expert < LAGUNA_MOE_EXPERTS; expert++) {
+            laguna_fill_q4k_matrix(matrix + (uint64_t)expert * LAGUNA_MOE_DIM,
+                                   expert, projection);
+        }
+    }
+    for (uint32_t i = 0; i < LAGUNA_MOE_DIM; i++) {
+        input[i] = 0.031f + 0.00029f * (float)((i * 11u) % 197u);
+    }
+    for (uint32_t slot = 0; slot < LAGUNA_MOE_USED; slot++) {
+        selected[slot] = (int32_t)slot;
+        router[slot] = 0.05f + 0.01f * (float)slot;
+    }
+    selected[4] = (int32_t)LAGUNA_MOE_EXPERTS;
+
+    if (!ds4_gpu_set_model_map(model, model_size)) goto cleanup;
+    mid = ds4_gpu_tensor_alloc((uint64_t)LAGUNA_MOE_USED * LAGUNA_MOE_DIM * sizeof(float));
+    selected_t = ds4_gpu_tensor_alloc(sizeof(selected));
+    router_t = ds4_gpu_tensor_alloc(sizeof(router));
+    x = ds4_gpu_tensor_alloc(sizeof(input));
+    if (!mid || !selected_t || !router_t || !x ||
+        !ds4_gpu_tensor_write(selected_t, 0, selected, sizeof(selected)) ||
+        !ds4_gpu_tensor_write(router_t, 0, router, sizeof(router)) ||
+        !ds4_gpu_tensor_write(x, 0, input, sizeof(input)) ||
+        !laguna_guarded_output_init(&out, LAGUNA_MOE_DIM) ||
+        !laguna_guarded_output_prepare(&out)) goto cleanup;
+
+    const laguna_tensor_snapshot initial_snapshots[] = {
+        { "output", out.base,
+          (uint64_t)(LAGUNA_MOE_DIM + 2u * LAGUNA_MOE_GUARD) * sizeof(float), NULL },
+        { "mid", mid, (uint64_t)LAGUNA_MOE_USED * LAGUNA_MOE_DIM * sizeof(float), NULL },
+        { "selected", selected_t, sizeof(selected), NULL },
+        { "router", router_t, sizeof(router), NULL },
+        { "input", x, sizeof(input), NULL },
+    };
+    memcpy(snapshots, initial_snapshots, sizeof(snapshots));
+    for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
+        if (!laguna_capture_tensor_snapshot(&snapshots[i])) goto cleanup;
+    }
+    if (setenv("DS4_CUDA_VALIDATE_SELECTED", "1", 1) != 0) goto cleanup;
+    validation_enabled = 1;
+    (void)cudaGetLastError();
+    if (ds4_gpu_glm_routed_moe_batch_tensor(
+            out.view, mid, model, model_size,
+            0u, projection_bytes, 2u * projection_bytes,
+            12u, 12u, 12u,
+            expert_bytes, row_bytes, expert_bytes, row_bytes,
+            expert_bytes, row_bytes,
+            LAGUNA_MOE_DIM, LAGUNA_MOE_DIM, LAGUNA_MOE_DIM,
+            selected_t, router_t, LAGUNA_MOE_EXPERTS, LAGUNA_MOE_USED,
+            0u, x, 1u, LAGUNA_MOE_USED * LAGUNA_MOE_DIM, true)) {
+        fprintf(stderr, "routed-moe/selected-validation: accepted invalid selected ID\n");
+        goto cleanup;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "routed-moe/selected-validation: rejection left CUDA error\n");
+        goto cleanup;
+    }
+    for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
+        if (!laguna_tensor_matches_snapshot(&snapshots[i], "routed-moe/selected-validation")) {
+            goto cleanup;
+        }
+    }
+    rc = 0;
+cleanup:
+    if (validation_enabled) (void)unsetenv("DS4_CUDA_VALIDATE_SELECTED");
+    for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
+        free(snapshots[i].snapshot);
+    }
+    laguna_guarded_output_free(&out);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(router_t);
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(mid);
+    free(model);
+    return rc;
+}
+
 static int run_routed_moe_cases(void) {
     const uint64_t row_bytes = sizeof(laguna_q4k_block), expert_bytes = LAGUNA_MOE_DIM * row_bytes, projection_bytes = LAGUNA_MOE_EXPERTS * expert_bytes, model_size = 3u * projection_bytes + 3u * expert_bytes;
     unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
@@ -1357,6 +1453,7 @@ static int run_routed_moe_cases(void) {
     ds4_gpu_tensor *routed_mid = NULL, *shared_mid = NULL, *selected_t = NULL, *router_t = NULL, *shared_selected_t = NULL, *shared_weight_t = NULL, *x = NULL;
     laguna_guarded_output routed_output = {0}, shared_output = {0};
     laguna_guarded_output routed_growth = {0}, shared_growth = {0}; int rc = 1;
+    if (run_routed_moe_selected_validation_case() != 0) return 1;
     if (!model) goto cleanup;
     ds4_gpu_laguna_moe_desc routed = { .gate_offset = 0u, .up_offset = projection_bytes, .down_offset = 2u * projection_bytes, .gate_type = 12u, .up_type = 12u, .down_type = 12u, .gate_expert_bytes = expert_bytes, .gate_row_bytes = row_bytes, .up_expert_bytes = expert_bytes, .up_row_bytes = row_bytes, .down_expert_bytes = expert_bytes, .down_row_bytes = row_bytes };
     ds4_gpu_laguna_moe_desc shared = { .gate_offset = 3u * projection_bytes, .up_offset = 3u * projection_bytes + expert_bytes, .down_offset = 3u * projection_bytes + 2u * expert_bytes, .gate_type = 12u, .up_type = 12u, .down_type = 12u, .gate_expert_bytes = expert_bytes, .gate_row_bytes = row_bytes, .up_expert_bytes = expert_bytes, .up_row_bytes = row_bytes, .down_expert_bytes = expert_bytes, .down_row_bytes = row_bytes };

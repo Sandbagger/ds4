@@ -40349,7 +40349,7 @@ static int glm_graph_routed_moe_batch_dispatch(
                                                force_resident);
     }
 
-    if (direct_scalar_q4) {
+    if (direct_scalar_q4 && force_resident) {
         return ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
                 out,
                 mid,

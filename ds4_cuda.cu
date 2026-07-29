@@ -25305,8 +25305,46 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride) {
-    fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor\n");
-    return 0;
+    if (!out || !mid || !model_map || !selected || !weights || !x ||
+        gate_type != 12u || up_type != 12u || down_type != 12u ||
+        n_tokens == 0u || n_expert == 0u || n_total_expert == 0u ||
+        mid_token_stride != n_expert * expert_mid_dim ||
+        gate_expert_bytes != up_expert_bytes ||
+        gate_row_bytes != up_row_bytes ||
+        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= DS4_MAX_GPUS || ds4_tensor_device_idx(mid) != tier ||
+        ds4_tensor_device_idx(selected) != tier || ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(x) != tier) return 0;
+    const uint64_t gate_bytes = (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
+    const uint64_t down_bytes = (uint64_t)n_tokens * n_expert * out_dim * sizeof(float);
+    static ds4_gpu_tensor *gate_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *up_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *down_scratch[DS4_MAX_GPUS] = {0};
+    if (!gate_scratch[tier] || gate_scratch[tier]->bytes < gate_bytes) {
+        ds4_gpu_tensor_free(gate_scratch[tier]);
+        gate_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, gate_bytes);
+    }
+    if (!up_scratch[tier] || up_scratch[tier]->bytes < gate_bytes) {
+        ds4_gpu_tensor_free(up_scratch[tier]);
+        up_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, gate_bytes);
+    }
+    if (!down_scratch[tier] || down_scratch[tier]->bytes < down_bytes) {
+        ds4_gpu_tensor_free(down_scratch[tier]);
+        down_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, down_bytes);
+    }
+    if (!gate_scratch[tier] || !up_scratch[tier] || !down_scratch[tier]) return 0;
+    return routed_moe_launch(out, gate_scratch[tier], up_scratch[tier], mid,
+                             down_scratch[tier], model_map, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_type, down_type,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes,
+                             expert_in_dim, expert_mid_dim, out_dim,
+                             selected, weights, n_total_expert, n_expert,
+                             0.0f, x, layer_index, n_tokens, 0, 0);
 }
 
 /* Scalar-correct GLM routed MoE (q2_K experts): per (token, slot) block
@@ -25941,12 +25979,24 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         uint32_t                mid_token_stride,
         bool                    force_resident) {
-    (void)layer_index; (void)n_total_expert;
-    (void)force_resident;
+    (void)layer_index;
     if (!out || !mid || !x || !selected || !weights || !model_map ||
         n_tokens == 0 || n_expert == 0 ||
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
+    }
+    if (gate_type == 12u && up_type == 12u && down_type == 12u) {
+        if (!force_resident) return 0;
+        return ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
+                out, mid, model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                gate_type, up_type, down_type,
+                gate_expert_bytes, gate_row_bytes,
+                up_expert_bytes, up_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert,
+                layer_index, x, n_tokens, mid_token_stride);
     }
     if (gate_type != 10u || up_type != 10u || down_type != 10u) {
         fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",

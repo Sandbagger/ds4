@@ -648,13 +648,13 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         memcmp(actual, q_host, q_count * sizeof(*actual)) ||
         !ds4_gpu_tensor_read(q, 0, actual, q_count * sizeof(*actual)) ||
         memcmp(actual, q_host, q_count * sizeof(*actual)) ||
-        !ds4_gpu_tensor_read(k, 0, reference, kv_width * sizeof(*reference)) ||
-        memcmp(reference, k_host, kv_width * sizeof(*reference)) ||
-        !ds4_gpu_tensor_read(v, 0, reference, kv_width * sizeof(*reference)) ||
-        memcmp(reference, v_host, kv_width * sizeof(*reference)) ||
-        !ds4_gpu_tensor_read(gate, 0, reference,
-                             (uint64_t)c->n_head * sizeof(*reference)) ||
-        memcmp(reference, gate_host, (uint64_t)c->n_head * sizeof(*reference)) ||
+        !ds4_gpu_tensor_read(k, 0, actual, kv_width * sizeof(*actual)) ||
+        memcmp(actual, k_host, kv_width * sizeof(*actual)) ||
+        !ds4_gpu_tensor_read(v, 0, actual, kv_width * sizeof(*actual)) ||
+        memcmp(actual, v_host, kv_width * sizeof(*actual)) ||
+        !ds4_gpu_tensor_read(gate, 0, actual,
+                             (uint64_t)c->n_head * sizeof(*actual)) ||
+        memcmp(actual, gate_host, (uint64_t)c->n_head * sizeof(*actual)) ||
         !ds4_gpu_tensor_read(key_cache, 0, key_expected,
                              cache_values * sizeof(*key_expected)) ||
         memcmp(key_expected, key_actual, cache_values * sizeof(*key_expected)) ||

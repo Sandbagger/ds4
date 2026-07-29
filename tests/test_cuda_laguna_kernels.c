@@ -807,6 +807,11 @@ static int run_prefill_attention_stub_case(void) {
     ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(kv_values * sizeof(float));
     ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(n_head * sizeof(float));
     const int ok = heads && key_cache && value_cache && staged_key && staged_value && q && k && v && gate &&
+        ds4_gpu_tensor_fill_f32(heads, 0.0f, q_values) &&
+        ds4_gpu_tensor_fill_f32(q, 0.0f, q_values) &&
+        ds4_gpu_tensor_fill_f32(k, 0.0f, kv_values) &&
+        ds4_gpu_tensor_fill_f32(v, 0.0f, kv_values) &&
+        ds4_gpu_tensor_fill_f32(gate, 0.0f, n_head) &&
         ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, 0u, 1u, cache_cap, n_head, n_head_kv, head_dim, 1.0f / sqrtf((float)head_dim));
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q);
     ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key); ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(heads);

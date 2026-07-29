@@ -557,6 +557,7 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
     v = ds4_gpu_tensor_alloc(kv_width * sizeof(*v_host));
     gate = ds4_gpu_tensor_alloc((uint64_t)c->n_head * sizeof(*gate_host));
     if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(heads, 0, q_host, q_count * sizeof(*q_host)) ||
         !ds4_gpu_tensor_write(key_cache, 0, key_actual,
                               cache_values * sizeof(*key_actual)) ||
         !ds4_gpu_tensor_write(value_cache, 0, value_actual,
@@ -643,6 +644,30 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         ds4_gpu_tensor_free(short_gate); ds4_gpu_tensor_free(short_v); ds4_gpu_tensor_free(short_k); goto cleanup;
     }
     ds4_gpu_tensor_free(short_gate); ds4_gpu_tensor_free(short_v); ds4_gpu_tensor_free(short_k);
+    if (!ds4_gpu_tensor_read(heads, 0, actual, q_count * sizeof(*actual)) ||
+        memcmp(actual, q_host, q_count * sizeof(*actual)) ||
+        !ds4_gpu_tensor_read(q, 0, actual, q_count * sizeof(*actual)) ||
+        memcmp(actual, q_host, q_count * sizeof(*actual)) ||
+        !ds4_gpu_tensor_read(k, 0, reference, kv_width * sizeof(*reference)) ||
+        memcmp(reference, k_host, kv_width * sizeof(*reference)) ||
+        !ds4_gpu_tensor_read(v, 0, reference, kv_width * sizeof(*reference)) ||
+        memcmp(reference, v_host, kv_width * sizeof(*reference)) ||
+        !ds4_gpu_tensor_read(gate, 0, reference,
+                             (uint64_t)c->n_head * sizeof(*reference)) ||
+        memcmp(reference, gate_host, (uint64_t)c->n_head * sizeof(*reference)) ||
+        !ds4_gpu_tensor_read(key_cache, 0, key_expected,
+                             cache_values * sizeof(*key_expected)) ||
+        memcmp(key_expected, key_actual, cache_values * sizeof(*key_expected)) ||
+        !ds4_gpu_tensor_read(value_cache, 0, value_expected,
+                             cache_values * sizeof(*value_expected)) ||
+        memcmp(value_expected, value_actual, cache_values * sizeof(*value_expected))) {
+        fprintf(stderr, "decode-attention/%s: rejection changed caller buffer\n", c->family);
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < kv_width; i++) {
+        key_expected[current_base + i] = reference_f32_to_f16(k_host[i]);
+        value_expected[current_base + i] = reference_f32_to_f16(v_host[i]);
+    }
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
         heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
         c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);

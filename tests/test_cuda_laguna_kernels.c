@@ -793,14 +793,37 @@ static int run_decode_attention_cases(void) {
     return rc;
 }
 
+static int run_prefill_attention_stub_case(void) {
+    const uint32_t n_head = 48u, n_head_kv = 8u, head_dim = 128u, cache_cap = 4u;
+    const uint64_t q_values = (uint64_t)n_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_head_kv * head_dim;
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_values * sizeof(float));
+    ds4_gpu_tensor *key_cache = ds4_gpu_tensor_alloc((uint64_t)cache_cap * kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *value_cache = ds4_gpu_tensor_alloc((uint64_t)cache_cap * kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *staged_key = ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *staged_value = ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_values * sizeof(float));
+    ds4_gpu_tensor *k = ds4_gpu_tensor_alloc(kv_values * sizeof(float));
+    ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(kv_values * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(n_head * sizeof(float));
+    const int ok = heads && key_cache && value_cache && staged_key && staged_value && q && k && v && gate &&
+        ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, 0u, 1u, cache_cap, n_head, n_head_kv, head_dim, 1.0f / sqrtf((float)head_dim));
+    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key); ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(heads);
+    if (ok) { fprintf(stderr, "prefill-attention: CUDA stub unexpectedly succeeded\n"); return 1; }
+    fprintf(stderr, "prefill-attention: CUDA stub returned 0\n");
+    return 1;
+}
+
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|all\n", program);
 }
 
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(argv[1], "--case") != 0 ||
         (strcmp(argv[2], "norm-rope") != 0 &&
          strcmp(argv[2], "decode-attention") != 0 &&
+         strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "all") != 0)) {
         usage(argv[0]);
         return 2;
@@ -808,6 +831,8 @@ int main(int argc, char **argv) {
     const bool run_norm = strcmp(argv[2], "norm-rope") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_decode = strcmp(argv[2], "decode-attention") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_prefill = strcmp(argv[2], "prefill-attention") == 0 ||
         strcmp(argv[2], "all") == 0;
     if (run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
@@ -862,6 +887,7 @@ int main(int argc, char **argv) {
     if (run_decode && run_decode_attention_cases() != 0) {
         rc = 1;
     }
+    if (run_prefill && run_prefill_attention_stub_case() != 0) rc = 1;
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
     free(weights);

@@ -632,6 +632,17 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         ds4_gpu_tensor_free(short_value); ds4_gpu_tensor_free(short_key); ds4_gpu_tensor_free(short_heads); goto cleanup;
     }
     ds4_gpu_tensor_free(short_value); ds4_gpu_tensor_free(short_key); ds4_gpu_tensor_free(short_heads);
+    ds4_gpu_tensor *short_k = ds4_gpu_tensor_view(k, 0, kv_width * sizeof(*k_host) - 1u);
+    ds4_gpu_tensor *short_v = ds4_gpu_tensor_view(v, 0, kv_width * sizeof(*v_host) - 1u);
+    ds4_gpu_tensor *short_gate = ds4_gpu_tensor_view(gate, 0, (uint64_t)c->n_head * sizeof(*gate_host) - 1u);
+    if (!short_k || !short_v || !short_gate ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, q, short_k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, q, k, short_v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, q, k, v, short_gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale)) {
+        fprintf(stderr, "decode-attention/%s: accepted undersized input view\n", c->family);
+        ds4_gpu_tensor_free(short_gate); ds4_gpu_tensor_free(short_v); ds4_gpu_tensor_free(short_k); goto cleanup;
+    }
+    ds4_gpu_tensor_free(short_gate); ds4_gpu_tensor_free(short_v); ds4_gpu_tensor_free(short_k);
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
         heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
         c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);

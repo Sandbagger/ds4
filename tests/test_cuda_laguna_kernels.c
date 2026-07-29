@@ -806,13 +806,21 @@ static int run_prefill_attention_stub_case(void) {
     ds4_gpu_tensor *k = ds4_gpu_tensor_alloc(kv_values * sizeof(float));
     ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(kv_values * sizeof(float));
     ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(n_head * sizeof(float));
-    const int ok = heads && key_cache && value_cache && staged_key && staged_value && q && k && v && gate &&
+    uint16_t *cache_zero = (uint16_t *)calloc((size_t)cache_cap * kv_values, sizeof(*cache_zero));
+    uint16_t *stage_zero = (uint16_t *)calloc((size_t)kv_values, sizeof(*stage_zero));
+    const int initialized = cache_zero && stage_zero &&
+        ds4_gpu_tensor_write(key_cache, 0, cache_zero, (uint64_t)cache_cap * kv_values * sizeof(*cache_zero)) &&
+        ds4_gpu_tensor_write(value_cache, 0, cache_zero, (uint64_t)cache_cap * kv_values * sizeof(*cache_zero)) &&
+        ds4_gpu_tensor_write(staged_key, 0, stage_zero, kv_values * sizeof(*stage_zero)) &&
+        ds4_gpu_tensor_write(staged_value, 0, stage_zero, kv_values * sizeof(*stage_zero));
+    const int ok = initialized && heads && key_cache && value_cache && staged_key && staged_value && q && k && v && gate &&
         ds4_gpu_tensor_fill_f32(heads, 0.0f, q_values) &&
         ds4_gpu_tensor_fill_f32(q, 0.0f, q_values) &&
         ds4_gpu_tensor_fill_f32(k, 0.0f, kv_values) &&
         ds4_gpu_tensor_fill_f32(v, 0.0f, kv_values) &&
         ds4_gpu_tensor_fill_f32(gate, 0.0f, n_head) &&
         ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, 0u, 1u, cache_cap, n_head, n_head_kv, head_dim, 1.0f / sqrtf((float)head_dim));
+    free(stage_zero); free(cache_zero);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q);
     ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key); ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(heads);
     if (ok) { fprintf(stderr, "prefill-attention: CUDA stub unexpectedly succeeded\n"); return 1; }

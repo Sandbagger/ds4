@@ -25950,6 +25950,73 @@ static int glm_routed_moe_finish_batch(
                    "glm routed moe local output copy");
 }
 
+__global__ static void glm_routed_moe_validate_selected_kernel(
+        const int32_t *selected,
+        uint64_t n_selected,
+        uint32_t n_total_expert,
+        int *invalid) {
+    const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= n_selected) return;
+    const int32_t expert = selected[index];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) {
+        atomicExch(invalid, 1);
+    }
+}
+
+static int glm_routed_moe_selected_ids_valid(
+        const ds4_gpu_tensor *selected,
+        uint64_t n_selected,
+        uint32_t n_total_expert) {
+    int *device_invalid = NULL;
+    int host_invalid = 0;
+    int previous_device = -1;
+    int ok = 0;
+    uint64_t blocks = 0;
+    if (!selected || !selected->ptr || n_selected == 0u ||
+        n_total_expert == 0u) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(selected);
+    if (tier < 0 || tier >= DS4_MAX_GPUS) {
+        return 0;
+    }
+    if (!cuda_ok(cudaGetDevice(&previous_device),
+                 "glm routed moe selected validation get device") ||
+        !cuda_ok(cudaSetDevice(g_gpu[tier].device_id),
+                 "glm routed moe selected validation set device") ||
+        !cuda_ok(cudaMalloc(&device_invalid, sizeof(*device_invalid)),
+                 "glm routed moe selected validation alloc") ||
+        !cuda_ok(cudaMemset(device_invalid, 0, sizeof(*device_invalid)),
+                 "glm routed moe selected validation clear")) {
+        goto cleanup;
+    }
+    blocks = (n_selected + 255u) / 256u;
+    if (blocks > 0xffffffffu) goto cleanup;
+    glm_routed_moe_validate_selected_kernel<<<(uint32_t)blocks, 256>>>(
+            (const int32_t *)selected->ptr, n_selected, n_total_expert,
+            device_invalid);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm routed moe selected validation launch") ||
+        !cuda_ok(cudaMemcpy(&host_invalid, device_invalid,
+                            sizeof(host_invalid), cudaMemcpyDeviceToHost),
+                 "glm routed moe selected validation readback")) {
+        goto cleanup;
+    }
+    ok = host_invalid == 0;
+cleanup:
+    if (device_invalid &&
+        !cuda_ok(cudaFree(device_invalid),
+                 "glm routed moe selected validation free")) {
+        ok = 0;
+    }
+    if (previous_device >= 0 &&
+        !cuda_ok(cudaSetDevice(previous_device),
+                 "glm routed moe selected validation restore device")) {
+        ok = 0;
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -25985,8 +26052,16 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
     }
-    if (gate_type == 12u && up_type == 12u && down_type == 12u) {
+    const bool q4_types =
+        gate_type == 12u && up_type == 12u && down_type == 12u;
+    if (q4_types) {
         if (!force_resident) return 0;
+        if (getenv("DS4_CUDA_VALIDATE_SELECTED") != NULL &&
+            !glm_routed_moe_selected_ids_valid(
+                    selected, (uint64_t)n_tokens * n_expert,
+                    n_total_expert)) {
+            return 0;
+        }
         return ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
                 out, mid, model_map, model_size,
                 gate_offset, up_offset, down_offset,

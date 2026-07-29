@@ -9,15 +9,13 @@
 
 /* This is deliberately independent of CUDA's half helpers: the attention
  * reference owns the exact FP32-to-FP16 cache contract that decode reads. */
-static uint16_t reference_f32_to_f16(float value) {
-    uint32_t bits = 0;
-    memcpy(&bits, &value, sizeof(bits));
+static uint16_t reference_f32_bits_to_f16(uint32_t bits) {
     const uint32_t sign = (bits >> 16) & 0x8000u;
     uint32_t exponent = (bits >> 23) & 0xffu;
     uint32_t mantissa = bits & 0x7fffffu;
     if (exponent == 0xffu) return (uint16_t)(sign | (mantissa ? 0x7e00u : 0x7c00u));
     if (exponent <= 112u) {
-        if (exponent < 103u) return (uint16_t)sign;
+        if (exponent < 102u) return (uint16_t)sign;
         mantissa |= 0x800000u;
         const uint32_t shift = 126u - exponent;
         uint32_t rounded = mantissa >> shift;
@@ -36,6 +34,41 @@ static uint16_t reference_f32_to_f16(float value) {
     }
     if (exponent >= 31u) return (uint16_t)(sign | 0x7c00u);
     return (uint16_t)(sign | (exponent << 10) | (mantissa >> 13));
+}
+
+static uint16_t reference_f32_to_f16(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return reference_f32_bits_to_f16(bits);
+}
+
+static int run_f32_to_f16_reference_cases(void) {
+    const struct {
+        const char *name;
+        uint32_t input_bits;
+        uint16_t expected;
+    } cases[] = {
+        { "+zero", 0x00000000u, 0x0000u },
+        { "-zero", 0x80000000u, 0x8000u },
+        { "halfway-subnormal", 0x33000000u, 0x0000u },
+        { "above-halfway-subnormal", 0x33000001u, 0x0001u },
+        { "minimum-subnormal", 0x33800000u, 0x0001u },
+        { "minimum-normal", 0x38800000u, 0x0400u },
+        { "maximum-finite", 0x477fe000u, 0x7bffu },
+        { "+infinity", 0x7f800000u, 0x7c00u },
+        { "-infinity", 0xff800000u, 0xfc00u },
+        { "quiet-nan", 0x7fc00000u, 0x7e00u },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint16_t actual = reference_f32_bits_to_f16(cases[i].input_bits);
+        if (actual != cases[i].expected) {
+            fprintf(stderr,
+                    "f32-to-f16/%s: got 0x%04x expected 0x%04x\n",
+                    cases[i].name, actual, cases[i].expected);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static float reference_f16_to_f32(uint16_t value) {
@@ -144,6 +177,7 @@ typedef struct {
     float attn_factor;
     float beta_fast;
     float beta_slow;
+    uint64_t weight_offset;
 } laguna_norm_rope_case;
 
 typedef struct {
@@ -152,6 +186,34 @@ typedef struct {
     const float *reference;
     uint64_t count;
 } laguna_parity_span;
+
+typedef struct {
+    const char *name;
+    const ds4_gpu_tensor *tensor;
+    uint64_t bytes;
+    void *snapshot;
+} laguna_tensor_snapshot;
+
+static int laguna_capture_tensor_snapshot(laguna_tensor_snapshot *snapshot) {
+    snapshot->snapshot = malloc((size_t)snapshot->bytes);
+    return snapshot->snapshot != NULL &&
+        ds4_gpu_tensor_read(snapshot->tensor, 0, snapshot->snapshot,
+                            snapshot->bytes);
+}
+
+static int laguna_tensor_matches_snapshot(const laguna_tensor_snapshot *snapshot,
+                                          const char *case_name) {
+    void *actual = malloc((size_t)snapshot->bytes);
+    const int matches = actual != NULL &&
+        ds4_gpu_tensor_read(snapshot->tensor, 0, actual, snapshot->bytes) &&
+        memcmp(actual, snapshot->snapshot, (size_t)snapshot->bytes) == 0;
+    if (!matches) {
+        fprintf(stderr, "%s: rejected call changed %s\n", case_name,
+                snapshot->name);
+    }
+    free(actual);
+    return matches;
+}
 
 static int laguna_parity_spans_within_limits(
         const char *case_name, const laguna_parity_span *spans,
@@ -203,7 +265,8 @@ static int run_qk_metric_dilution_case(void) {
     return 0;
 }
 
-static int run_norm_rope_case(const float *weights,
+static int run_norm_rope_case(const float *model_map, uint64_t model_size,
+                              const float *weights,
                               const laguna_norm_rope_case *c) {
     const uint32_t head_dim = 128;
     const uint64_t count = (uint64_t)c->n_tokens * c->n_head * head_dim;
@@ -234,7 +297,7 @@ static int run_norm_rope_case(const float *weights,
         goto cleanup;
     }
     const int wrapper_ok = ds4_gpu_laguna_head_rms_norm_rope_tensor(
-        x, weights, head_dim * sizeof(*weights), 0, c->n_tokens, c->n_head,
+        x, model_map, model_size, c->weight_offset, c->n_tokens, c->n_head,
         head_dim, c->n_rot, c->pos0, c->n_ctx_orig, c->freq_base,
         c->freq_scale, c->ext_factor, c->attn_factor, c->beta_fast,
         c->beta_slow, 1.0e-6f);
@@ -394,6 +457,7 @@ typedef struct {
     uint32_t key_start;
     uint32_t key_count;
     float gate;
+    bool mixed_gates;
 } laguna_decode_attention_case;
 
 static float reference_softplus(float value) {
@@ -424,6 +488,7 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
     ds4_gpu_tensor *k = NULL;
     ds4_gpu_tensor *v = NULL;
     ds4_gpu_tensor *gate = NULL;
+    laguna_tensor_snapshot snapshots[7] = {0};
     int rc = 1;
 
     q_host = (float *)malloc((size_t)q_count * sizeof(*q_host));
@@ -464,7 +529,10 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         key_expected[current_base + i] = reference_f32_to_f16(k_host[i]);
         value_expected[current_base + i] = reference_f32_to_f16(v_host[i]);
     }
-    for (uint32_t h = 0; h < c->n_head; h++) gate_host[h] = c->gate;
+    static const float mixed_gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
+    for (uint32_t h = 0; h < c->n_head; h++) {
+        gate_host[h] = c->mixed_gates ? mixed_gates[h % 5u] : c->gate;
+    }
 
     const uint32_t heads_per_kv = c->n_head / c->n_head_kv;
     for (uint32_t h = 0; h < c->n_head; h++) {
@@ -519,7 +587,9 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
     k = ds4_gpu_tensor_alloc(kv_width * sizeof(*k_host));
     v = ds4_gpu_tensor_alloc(kv_width * sizeof(*v_host));
     gate = ds4_gpu_tensor_alloc((uint64_t)c->n_head * sizeof(*gate_host));
+    memset(actual, 0xa5, (size_t)q_count * sizeof(*actual));
     if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(heads, 0, actual, q_count * sizeof(*actual)) ||
         !ds4_gpu_tensor_write(key_cache, 0, key_actual,
                               cache_values * sizeof(*key_actual)) ||
         !ds4_gpu_tensor_write(value_cache, 0, value_actual,
@@ -532,6 +602,113 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         fprintf(stderr, "decode-attention/%s: synthetic tensor setup failed\n",
                 c->family);
         goto cleanup;
+    }
+
+    const laguna_tensor_snapshot initial_snapshots[] = {
+        { "heads", heads, q_count * sizeof(*actual), NULL },
+        { "key cache", key_cache, cache_values * sizeof(*key_actual), NULL },
+        { "value cache", value_cache, cache_values * sizeof(*value_actual), NULL },
+        { "q", q, q_count * sizeof(*q_host), NULL },
+        { "k", k, kv_width * sizeof(*k_host), NULL },
+        { "v", v, kv_width * sizeof(*v_host), NULL },
+        { "gate", gate, (uint64_t)c->n_head * sizeof(*gate_host), NULL },
+    };
+    memcpy(snapshots, initial_snapshots, sizeof(snapshots));
+    for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
+        if (!laguna_capture_tensor_snapshot(&snapshots[i])) {
+            fprintf(stderr, "decode-attention/%s: snapshot setup failed\n",
+                    c->family);
+            goto cleanup;
+        }
+    }
+
+    /* Rejections must happen before either production launch: exercise the
+     * scalar/causal/null boundary against the same fully valid fixture. */
+    const struct {
+        const char *name;
+        uint32_t key_start;
+        uint32_t key_count;
+        uint32_t n_head;
+        uint32_t n_head_kv;
+        float scale;
+    } rejected[] = {
+        { "non-integral-gqa", c->key_start, c->key_count, 50u, 8u, scale },
+        { "zero-keys", c->key_start, 0u, c->n_head, c->n_head_kv, scale },
+        { "too-many-keys", c->key_start, c->cache_cap + 1u, c->n_head,
+          c->n_head_kv, scale },
+        { "key-start-after-pos", c->pos + 1u, 1u, c->n_head,
+          c->n_head_kv, scale },
+        { "non-causal-range", c->key_start, c->key_count - 1u, c->n_head,
+          c->n_head_kv, scale },
+        { "zero-scale", c->key_start, c->key_count, c->n_head,
+          c->n_head_kv, 0.0f },
+        { "nan-scale", c->key_start, c->key_count, c->n_head,
+          c->n_head_kv, NAN },
+    };
+    (void)cudaGetLastError();
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        if (ds4_gpu_laguna_store_attention_tensor(
+                heads, key_cache, value_cache, q, k, v, gate, c->pos,
+                c->cache_cap, rejected[i].key_start, rejected[i].key_count,
+                rejected[i].n_head, rejected[i].n_head_kv, head_dim,
+                rejected[i].scale)) {
+            fprintf(stderr, "decode-attention/%s: accepted %s\n", c->family,
+                    rejected[i].name);
+            goto cleanup;
+        }
+    }
+    static const char *null_names[] = {
+        "heads", "key cache", "value cache", "q", "k", "v", "gate",
+    };
+    for (size_t i = 0; i < sizeof(null_names) / sizeof(null_names[0]); i++) {
+        if (ds4_gpu_laguna_store_attention_tensor(
+                i == 0 ? NULL : heads, i == 1 ? NULL : key_cache,
+                i == 2 ? NULL : value_cache, i == 3 ? NULL : q,
+                i == 4 ? NULL : k, i == 5 ? NULL : v,
+                i == 6 ? NULL : gate, c->pos, c->cache_cap, c->key_start,
+                c->key_count, c->n_head, c->n_head_kv, head_dim, scale)) {
+            fprintf(stderr, "decode-attention/%s: accepted null %s\n",
+                    c->family, null_names[i]);
+            goto cleanup;
+        }
+    }
+    ds4_gpu_tensor *short_q = ds4_gpu_tensor_view(q, 0,
+                                                    q_count * sizeof(*q_host) - 1u);
+    if (!short_q || ds4_gpu_laguna_store_attention_tensor(
+            heads, key_cache, value_cache, short_q, k, v, gate, c->pos,
+            c->cache_cap, c->key_start, c->key_count, c->n_head,
+            c->n_head_kv, head_dim, scale)) {
+        fprintf(stderr, "decode-attention/%s: accepted undersized q view\n",
+                c->family);
+        ds4_gpu_tensor_free(short_q);
+        goto cleanup;
+    }
+    ds4_gpu_tensor_free(short_q);
+    ds4_gpu_tensor *short_heads = ds4_gpu_tensor_view(heads, 0, q_count * sizeof(*actual) - 1u);
+    ds4_gpu_tensor *short_k = ds4_gpu_tensor_view(k, 0, kv_width * sizeof(*k_host) - 1u);
+    ds4_gpu_tensor *short_v = ds4_gpu_tensor_view(v, 0, kv_width * sizeof(*v_host) - 1u);
+    ds4_gpu_tensor *short_gate = ds4_gpu_tensor_view(gate, 0, (uint64_t)c->n_head * sizeof(*gate_host) - 1u);
+    ds4_gpu_tensor *short_key = ds4_gpu_tensor_view(key_cache, 0, cache_values * sizeof(*key_expected) - 1u);
+    ds4_gpu_tensor *short_value = ds4_gpu_tensor_view(value_cache, 0, cache_values * sizeof(*value_expected) - 1u);
+    const int short_accepted = !short_heads || !short_k || !short_v || !short_gate || !short_key || !short_value ||
+        ds4_gpu_laguna_store_attention_tensor(short_heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, short_key, value_cache, q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, short_value, q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, q, short_k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, q, k, short_v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, q, k, v, short_gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);
+    ds4_gpu_tensor_free(short_value); ds4_gpu_tensor_free(short_key); ds4_gpu_tensor_free(short_gate);
+    ds4_gpu_tensor_free(short_v); ds4_gpu_tensor_free(short_k); ds4_gpu_tensor_free(short_heads);
+    if (short_accepted) { fprintf(stderr, "decode-attention/%s: accepted undersized view\n", c->family); goto cleanup; }
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "decode-attention/%s: rejection left CUDA error\n",
+                c->family);
+        goto cleanup;
+    }
+    for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
+        if (!laguna_tensor_matches_snapshot(&snapshots[i], c->family)) {
+            goto cleanup;
+        }
     }
 
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
@@ -598,6 +775,9 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
     rc = 0;
 
 cleanup:
+    for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
+        free(snapshots[i].snapshot);
+    }
     ds4_gpu_tensor_free(gate);
     ds4_gpu_tensor_free(v);
     ds4_gpu_tensor_free(k);
@@ -629,7 +809,7 @@ static int run_decode_attention_cases(void) {
             const uint32_t key_count = global_counts[count_i];
             const laguna_decode_attention_case c = {
                 "gqa6-global", 48u, 8u, 2048u, key_count - 1u, 0u,
-                key_count, gates[gate_i],
+                key_count, gates[gate_i], false,
             };
             if (run_decode_attention_case(&c) != 0) rc = 1;
         }
@@ -640,10 +820,21 @@ static int run_decode_attention_cases(void) {
             const uint32_t key_count = pos < 512u ? pos + 1u : 512u;
             const laguna_decode_attention_case c = {
                 "gqa9-swa", 72u, 8u, 512u, pos, pos + 1u - key_count,
-                key_count, gates[gate_i],
+                key_count, gates[gate_i], false,
             };
             if (run_decode_attention_case(&c) != 0) rc = 1;
         }
+    }
+    const laguna_decode_attention_case mutation_cases[] = {
+        { "gqa6-global-mixed-gates", 48u, 8u, 2048u, 16u, 0u, 17u,
+          0.0f, true },
+        { "gqa6-global-nonpow", 48u, 8u, 8202u, 16u, 0u, 17u,
+          0.0f, true },
+        { "gqa6-shifted-partial-ring", 48u, 8u, 17u, 20u, 18u, 3u,
+          0.0f, true },
+    };
+    for (size_t i = 0; i < sizeof(mutation_cases) / sizeof(mutation_cases[0]); i++) {
+        if (run_decode_attention_case(&mutation_cases[i]) != 0) rc = 1;
     }
     return rc;
 }
@@ -660,53 +851,72 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    const bool run_norm = strcmp(argv[2], "norm-rope") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_decode = strcmp(argv[2], "decode-attention") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    if (run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
         fprintf(stderr, "norm-rope: ds4_gpu_init failed\n");
         return 1;
     }
-    const uint32_t head_dim = 128;
-    float *weights = (float *)malloc(2u * head_dim * sizeof(*weights));
-    if (!weights) {
-        fprintf(stderr, "norm-rope: synthetic weights allocation failed\n");
-        ds4_gpu_cleanup();
-        return 1;
-    }
-    for (uint32_t i = 0; i < head_dim; i++) {
-        weights[i] = 0.70f + 0.01f * (float)(i % 17u);
-        weights[head_dim + i] = 0.55f + 0.01f * (float)((i * 3u) % 23u);
-    }
-    if (!ds4_gpu_set_model_map(weights, 2u * head_dim * sizeof(*weights))) {
-        fprintf(stderr, "norm-rope: synthetic model map setup failed\n");
-        ds4_gpu_cleanup();
-        free(weights);
-        return 1;
-    }
+    float *weights = NULL;
     static const laguna_norm_rope_case cases[] = {
         { "global-pos0", 1, 48, 64, 0, 8192, 500000.0f,
-          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f },
+          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 0u },
         { "global-yarn-frontier", 4, 48, 64, 8191, 8192, 500000.0f,
-          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f },
+          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 0u },
         { "swa-ring-frontier", 4, 72, 128, 510, 262144, 10000.0f,
-          1.0f, 0.0f, 1.0f, 0.0f, 0.0f },
+          1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0u },
+        { "k-global-prefill-one", 1, 8, 64, 8193, 8192, 500000.0f,
+          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f,
+          128u * sizeof(float) },
+        { "k-swa-prefill-many", 4, 8, 128, 510, 262144, 10000.0f,
+          1.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+          128u * sizeof(float) },
     };
     int rc = 0;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        if (run_norm_rope_case(weights, &cases[i]) != 0) rc = 1;
-    }
+    if (run_norm) {
+        const uint32_t head_dim = 128;
+        weights = (float *)malloc(2u * head_dim * sizeof(*weights));
+        if (!weights) {
+            fprintf(stderr, "norm-rope: synthetic weights allocation failed\n");
+            ds4_gpu_cleanup();
+            return 1;
+        }
+        for (uint32_t i = 0; i < head_dim; i++) {
+            weights[i] = 0.70f + 0.01f * (float)(i % 17u);
+            weights[head_dim + i] = 0.55f + 0.01f * (float)((i * 3u) % 23u);
+        }
+        if (!ds4_gpu_set_model_map(weights, 2u * head_dim * sizeof(*weights))) {
+            fprintf(stderr, "norm-rope: synthetic model map setup failed\n");
+            ds4_gpu_cleanup();
+            free(weights);
+            return 1;
+        }
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            if (run_norm_rope_case(
+                    weights, 2u * head_dim * sizeof(*weights),
+                    weights + cases[i].weight_offset / sizeof(*weights),
+                    &cases[i]) != 0) {
+                rc = 1;
+            }
+        }
     static const laguna_norm_rope_case qk_cases[] = {
         { "qk-global-yarn-frontier", 4, 48, 64, 8191, 8192, 500000.0f,
-          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f },
+          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 0u },
         { "qk-swa-ring-frontier", 4, 72, 128, 510, 262144, 10000.0f,
-          1.0f, 0.0f, 1.0f, 0.0f, 0.0f },
+          1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0u },
     };
-    for (size_t i = 0; i < sizeof(qk_cases) / sizeof(qk_cases[0]); i++) {
-        if (run_qk_norm_rope_case(weights, weights + head_dim,
-                                  &qk_cases[i]) != 0) {
-            rc = 1;
+        for (size_t i = 0; i < sizeof(qk_cases) / sizeof(qk_cases[0]); i++) {
+            if (run_qk_norm_rope_case(weights, weights + head_dim,
+                                      &qk_cases[i]) != 0) {
+                rc = 1;
+            }
         }
+        if (run_qk_metric_dilution_case() != 0) rc = 1;
     }
-    if (run_qk_metric_dilution_case() != 0) rc = 1;
-    if (strcmp(argv[2], "norm-rope") != 0 && run_decode_attention_cases() != 0) {
+    if (run_decode && run_decode_attention_cases() != 0) {
         rc = 1;
     }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */

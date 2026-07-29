@@ -616,6 +616,22 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
         goto cleanup;
     }
 
+    ds4_gpu_tensor *short_q = ds4_gpu_tensor_view(q, 0, q_count * sizeof(*q_host) - 1u);
+    if (!short_q || ds4_gpu_laguna_store_attention_tensor(heads, key_cache, value_cache, short_q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale)) {
+        fprintf(stderr, "decode-attention/%s: accepted undersized q view\n", c->family); ds4_gpu_tensor_free(short_q); goto cleanup;
+    }
+    ds4_gpu_tensor_free(short_q);
+    ds4_gpu_tensor *short_heads = ds4_gpu_tensor_view(heads, 0, q_count * sizeof(*actual) - 1u);
+    ds4_gpu_tensor *short_key = ds4_gpu_tensor_view(key_cache, 0, cache_values * sizeof(*key_expected) - 1u);
+    ds4_gpu_tensor *short_value = ds4_gpu_tensor_view(value_cache, 0, cache_values * sizeof(*value_expected) - 1u);
+    if (!short_heads || !short_key || !short_value ||
+        ds4_gpu_laguna_store_attention_tensor(short_heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, short_key, value_cache, q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale) ||
+        ds4_gpu_laguna_store_attention_tensor(heads, key_cache, short_value, q, k, v, gate, c->pos, c->cache_cap, c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale)) {
+        fprintf(stderr, "decode-attention/%s: accepted undersized output/cache view\n", c->family);
+        ds4_gpu_tensor_free(short_value); ds4_gpu_tensor_free(short_key); ds4_gpu_tensor_free(short_heads); goto cleanup;
+    }
+    ds4_gpu_tensor_free(short_value); ds4_gpu_tensor_free(short_key); ds4_gpu_tensor_free(short_heads);
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
         heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
         c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);

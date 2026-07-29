@@ -954,6 +954,8 @@ static int run_prefill_ring_case(const char *name, uint32_t pos0,
     float *scores = calloc((size_t)cache_cap, sizeof(*scores));
     uint16_t *key_expected = calloc((size_t)cache_count, sizeof(*key_expected));
     uint16_t *value_expected = calloc((size_t)cache_count, sizeof(*value_expected));
+    uint16_t *key_initial = calloc((size_t)cache_count, sizeof(*key_initial));
+    uint16_t *value_initial = calloc((size_t)cache_count, sizeof(*value_initial));
     uint16_t *key_actual = calloc((size_t)cache_count, sizeof(*key_actual));
     uint16_t *value_actual = calloc((size_t)cache_count, sizeof(*value_actual));
     ds4_gpu_tensor *heads = NULL, *key_cache = NULL, *value_cache = NULL;
@@ -961,12 +963,15 @@ static int run_prefill_ring_case(const char *name, uint32_t pos0,
     ds4_gpu_tensor *v = NULL, *gate = NULL;
     int rc = 1;
     if (!q_host || !k_host || !v_host || !gates || !expected || !actual || !scores ||
-        !key_expected || !value_expected || !key_actual || !value_actual) goto cleanup;
+        !key_expected || !value_expected || !key_initial || !value_initial ||
+        !key_actual || !value_actual) goto cleanup;
     for (uint32_t p = 0; p < pos0; p++) for (uint64_t i = 0; i < kv_width; i++) {
         const uint64_t dst = (uint64_t)(p % cache_cap) * kv_width + i;
         key_expected[dst] = reference_f32_to_f16(prefill_fixture_value(p, i, 13u, 61u, -30));
         value_expected[dst] = reference_f32_to_f16(prefill_fixture_value(p, i, 19u, 67u, -33));
     }
+    memcpy(key_initial, key_expected, cache_count * sizeof(*key_initial));
+    memcpy(value_initial, value_expected, cache_count * sizeof(*value_initial));
     static const float mixed_gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
     for (uint32_t t = 0; t < n_tokens; t++) {
         const uint32_t p = pos0 + t;
@@ -1022,6 +1027,8 @@ static int run_prefill_ring_case(const char *name, uint32_t pos0,
         !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(*q_host)) ||
         !ds4_gpu_tensor_write(k, 0, k_host, kv_count * sizeof(*k_host)) ||
         !ds4_gpu_tensor_write(v, 0, v_host, kv_count * sizeof(*v_host)) ||
+        !ds4_gpu_tensor_write(key_cache, 0, key_initial, cache_count * sizeof(*key_initial)) ||
+        !ds4_gpu_tensor_write(value_cache, 0, value_initial, cache_count * sizeof(*value_initial)) ||
         !ds4_gpu_tensor_write(gate, 0, gates, (uint64_t)n_tokens * n_head * sizeof(*gates))) goto cleanup;
     if (!ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, pos0, n_tokens, cache_cap, n_head, n_head_kv, head_dim, scale)) {
         fprintf(stderr, "prefill-attention/%s: CUDA prefill stub returned failure\n", name); goto cleanup;
@@ -1034,7 +1041,7 @@ static int run_prefill_ring_case(const char *name, uint32_t pos0,
     rc = 0;
 cleanup:
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key); ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(heads);
-    free(value_actual); free(key_actual); free(value_expected); free(key_expected); free(scores); free(actual); free(expected); free(gates); free(v_host); free(k_host); free(q_host);
+    free(value_actual); free(key_actual); free(value_initial); free(key_initial); free(value_expected); free(key_expected); free(scores); free(actual); free(expected); free(gates); free(v_host); free(k_host); free(q_host);
     return rc;
 }
 
@@ -1076,7 +1083,7 @@ static int run_prefill_rejection_cases(void) {
     const uint64_t gate_bytes = (uint64_t)n_head * sizeof(float);
     ds4_gpu_tensor *t[9] = {0};
     laguna_tensor_snapshot snapshots[9] = {0};
-    const uint64_t sizes[] = { q_bytes, cache_bytes, cache_bytes, kv_bytes, kv_bytes,
+    const uint64_t sizes[] = { q_bytes, cache_bytes, cache_bytes, kv_bytes / 2u, kv_bytes / 2u,
         q_bytes, kv_bytes, kv_bytes, gate_bytes };
     const char *names[] = { "heads", "key cache", "value cache", "staged key",
         "staged value", "q", "k", "v", "gate" };
@@ -1152,13 +1159,13 @@ cleanup:
 
 static int run_prefill_attention_cases(void) {
     int rc = run_prefill_rejection_cases();
-    if (run_prefill_attention_case(1u) != 0) rc = 1;
-    if (run_prefill_attention_case(3u) != 0) rc = 1;
-    if (run_prefill_ring_case("resumed-global", 3u, 2u, 16u) != 0) rc = 1;
-    if (run_prefill_ring_case("swa-512-crossing", 509u, 4u, 512u) != 0) rc = 1;
-    if (run_prefill_ring_case("multi-wrap-4", 0u, 9u, 4u) != 0) rc = 1;
-    if (run_prefill_causal_mutation_case(1u) != 0) rc = 1;
-    if (run_prefill_causal_mutation_case(2u) != 0) rc = 1;
+    if (run_prefill_attention_case(1u) != 0) { fprintf(stderr, "prefill-attention/1: contract failure\n"); rc = 1; }
+    if (run_prefill_attention_case(3u) != 0) { fprintf(stderr, "prefill-attention/3: contract failure\n"); rc = 1; }
+    if (run_prefill_ring_case("resumed-global", 3u, 2u, 16u) != 0) { fprintf(stderr, "prefill-attention/resumed-global: contract failure\n"); rc = 1; }
+    if (run_prefill_ring_case("swa-512-crossing", 509u, 4u, 512u) != 0) { fprintf(stderr, "prefill-attention/swa-512-crossing: contract failure\n"); rc = 1; }
+    if (run_prefill_ring_case("multi-wrap-4", 0u, 9u, 4u) != 0) { fprintf(stderr, "prefill-attention/multi-wrap-4: contract failure\n"); rc = 1; }
+    if (run_prefill_causal_mutation_case(1u) != 0) { fprintf(stderr, "prefill-attention/causal-mutation-1: contract failure\n"); rc = 1; }
+    if (run_prefill_causal_mutation_case(2u) != 0) { fprintf(stderr, "prefill-attention/causal-mutation-2: contract failure\n"); rc = 1; }
     return rc;
 }
 

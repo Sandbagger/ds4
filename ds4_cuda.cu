@@ -28060,6 +28060,86 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
     return ok;
 }
 
+/* Stage every incoming KV row before attention, then make attention read the
+ * staged copy for rows in this chunk.  The final cache commit is deliberately
+ * a later launch: a wrapped chunk must never make a future row visible by
+ * overwriting an older logical cache slot before that older query ran. */
+__global__ static void laguna_stage_kv_f16_kernel(
+        const float *k, const float *v, __half *staged_key,
+        __half *staged_value, uint64_t values) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < values) {
+        staged_key[i] = __float2half_rn(k[i]);
+        staged_value[i] = __float2half_rn(v[i]);
+    }
+}
+
+__global__ static void laguna_attention_prefill_gqa_f16_kernel(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const __half *staged_key,
+        const __half *staged_value, const float *gate, uint32_t pos0,
+        uint32_t n_tokens, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, float scale) {
+    const uint32_t row = blockIdx.x / n_head;
+    const uint32_t head = blockIdx.x % n_head;
+    if (threadIdx.x != 0u || row >= n_tokens || head >= n_head) return;
+    const uint32_t pos = pos0 + row;
+    const uint32_t key_start = pos + 1u > cache_cap ? pos + 1u - cache_cap : 0u;
+    const uint32_t key_count = pos - key_start + 1u;
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const float *query = q + ((uint64_t)row * n_head + head) * head_dim;
+    float acc[128] = {0.0f};
+    float max_score = -INFINITY;
+    float sum = 0.0f;
+    for (uint32_t r = 0; r < key_count; r++) {
+        const uint32_t logical = key_start + r;
+        const __half *key_row;
+        const __half *value_row;
+        if (logical >= pos0) {
+            const uint64_t staged_row = (uint64_t)(logical - pos0) * kv_width;
+            key_row = staged_key + staged_row + (uint64_t)kv_head * head_dim;
+            value_row = staged_value + staged_row + (uint64_t)kv_head * head_dim;
+        } else {
+            const uint64_t cache_row = (uint64_t)(logical % cache_cap) * kv_width;
+            key_row = key_cache + cache_row + (uint64_t)kv_head * head_dim;
+            value_row = value_cache + cache_row + (uint64_t)kv_head * head_dim;
+        }
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += query[d] * __half2float(key_row[d]);
+        const float score = scale * dot;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = max_score == -INFINITY ? 0.0f : expf(max_score - next_max);
+        const float value_scale = expf(score - next_max);
+        sum = sum * old_scale + value_scale;
+        for (uint32_t d = 0; d < head_dim; d++)
+            acc[d] = acc[d] * old_scale + value_scale * __half2float(value_row[d]);
+        max_score = next_max;
+    }
+    const float gate_value = gate[(uint64_t)row * n_head + head];
+    const float gate_scale = gate_value > 0.0f ? gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    float *out = heads + ((uint64_t)row * n_head + head) * head_dim;
+    for (uint32_t d = 0; d < head_dim; d++) out[d] = acc[d] / sum * gate_scale;
+}
+
+__global__ static void laguna_commit_kv_f16_kernel(
+        const __half *staged_key, const __half *staged_value,
+        __half *key_cache, __half *value_cache, uint32_t pos0,
+        uint32_t n_tokens, uint32_t cache_cap, uint64_t kv_width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t values = (uint64_t)n_tokens * kv_width;
+    if (i >= values) return;
+    const uint32_t token = (uint32_t)(i / kv_width);
+    /* Later staged rows own a wrapped cache slot.  Skipping older rows makes
+     * the commit race-free and leaves exactly the newest cache_cap rows. */
+    if (token + cache_cap < n_tokens) return;
+    const uint64_t column = i - (uint64_t)token * kv_width;
+    const uint64_t dst = (uint64_t)((pos0 + token) % cache_cap) * kv_width + column;
+    key_cache[dst] = staged_key[i];
+    value_cache[dst] = staged_value[i];
+}
+
 extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
         ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
@@ -28068,10 +28148,52 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
         uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
         uint32_t head_dim, float scale) {
-    (void)heads; (void)key_cache; (void)value_cache; (void)staged_key;
-    (void)staged_value; (void)q; (void)k; (void)v; (void)gate;
-    (void)pos0; (void)n_tokens; (void)cache_cap; (void)n_head;
-    (void)n_head_kv; (void)head_dim; (void)scale;
-    return 0;
+    if (!heads || !key_cache || !value_cache || !staged_key || !staged_value ||
+        !q || !k || !v || !gate || !heads->ptr || !key_cache->ptr ||
+        !value_cache->ptr || !staged_key->ptr || !staged_value->ptr ||
+        !q->ptr || !k->ptr || !v->ptr || !gate->ptr || n_tokens == 0u ||
+        pos0 > UINT32_MAX - n_tokens || cache_cap == 0u || n_head == 0u ||
+        n_head_kv == 0u || n_head % n_head_kv != 0u || head_dim != 128u ||
+        !isfinite(scale) || scale <= 0.0f) return 0;
+    const uint64_t q_values = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_tokens * n_head_kv * head_dim;
+    const uint64_t cache_values = (uint64_t)cache_cap * n_head_kv * head_dim;
+    if (q_values > UINT64_MAX / sizeof(float) || kv_values > UINT64_MAX / sizeof(float) ||
+        cache_values > UINT64_MAX / sizeof(__half) || q_values > UINT_MAX ||
+        kv_values > UINT_MAX || heads->bytes < q_values * sizeof(float) ||
+        q->bytes < q_values * sizeof(float) || k->bytes < kv_values * sizeof(float) ||
+        v->bytes < kv_values * sizeof(float) || gate->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
+        key_cache->bytes < cache_values * sizeof(__half) || value_cache->bytes < cache_values * sizeof(__half) ||
+        staged_key->bytes < kv_values * sizeof(__half) || staged_value->bytes < kv_values * sizeof(__half)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(key_cache) != logical_tier || ds4_tensor_device_idx(value_cache) != logical_tier ||
+        ds4_tensor_device_idx(staged_key) != logical_tier || ds4_tensor_device_idx(staged_value) != logical_tier ||
+        ds4_tensor_device_idx(q) != logical_tier || ds4_tensor_device_idx(k) != logical_tier ||
+        ds4_tensor_device_idx(v) != logical_tier || ds4_tensor_device_idx(gate) != logical_tier) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        laguna_stage_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
+                (const float *)k->ptr, (const float *)v->ptr,
+                (__half *)staged_key->ptr, (__half *)staged_value->ptr, kv_values);
+        ok = cuda_ok(cudaGetLastError(), "laguna KV stage launch");
+        if (ok) {
+            laguna_attention_prefill_gqa_f16_kernel<<<(unsigned)((uint64_t)n_tokens * n_head), 1>>>(
+                    (float *)heads->ptr, (const float *)q->ptr,
+                    (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
+                    (const __half *)staged_key->ptr, (const __half *)staged_value->ptr,
+                    (const float *)gate->ptr, pos0, n_tokens, cache_cap, n_head,
+                    n_head_kv, head_dim, scale);
+            ok = cuda_ok(cudaGetLastError(), "laguna prefill attention launch");
+        }
+        if (ok) {
+            laguna_commit_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
+                    (const __half *)staged_key->ptr, (const __half *)staged_value->ptr,
+                    (__half *)key_cache->ptr, (__half *)value_cache->ptr,
+                    pos0, n_tokens, cache_cap, (uint64_t)n_head_kv * head_dim);
+            ok = cuda_ok(cudaGetLastError(), "laguna KV commit launch");
+        }
+    }
+    return ok;
 }
 #pragma GCC diagnostic pop

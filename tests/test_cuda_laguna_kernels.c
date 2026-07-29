@@ -911,6 +911,8 @@ static int run_prefill_attention_case(uint32_t n_tokens) {
         !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(*q_host)) ||
         !ds4_gpu_tensor_write(k, 0, k_host, kv_count * sizeof(*k_host)) ||
         !ds4_gpu_tensor_write(v, 0, v_host, kv_count * sizeof(*v_host)) ||
+        !ds4_gpu_tensor_write(key_cache, 0, key_actual, cache_count * sizeof(*key_actual)) ||
+        !ds4_gpu_tensor_write(value_cache, 0, value_actual, cache_count * sizeof(*value_actual)) ||
         !ds4_gpu_tensor_write(gate, 0, gate_host, (uint64_t)n_tokens * n_head * sizeof(*gate_host))) goto cleanup;
     if (!ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, 0u, n_tokens, cache_cap, n_head, n_head_kv, head_dim, scale)) {
         fprintf(stderr, "prefill-attention/%u: CUDA prefill stub returned failure\n", n_tokens);
@@ -919,9 +921,22 @@ static int run_prefill_attention_case(uint32_t n_tokens) {
     if (cudaDeviceSynchronize() != cudaSuccess ||
         !ds4_gpu_tensor_read(heads, 0, actual, q_count * sizeof(*actual)) ||
         !ds4_gpu_tensor_read(key_cache, 0, key_actual, cache_count * sizeof(*key_actual)) ||
-        !ds4_gpu_tensor_read(value_cache, 0, value_actual, cache_count * sizeof(*value_actual))) goto cleanup;
-    for (uint64_t i = 0; i < q_count; i++) if (!isfinite(actual[i]) || fabsf(actual[i] - reference[i]) > 1.0e-3f) goto cleanup;
-    if (memcmp(key_actual, key_expected, cache_count * sizeof(*key_actual)) || memcmp(value_actual, value_expected, cache_count * sizeof(*value_actual))) goto cleanup;
+        !ds4_gpu_tensor_read(value_cache, 0, value_actual, cache_count * sizeof(*value_actual))) {
+        fprintf(stderr, "prefill-attention/%u: synchronization or read failed\n", n_tokens);
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < q_count; i++) {
+        if (!isfinite(actual[i]) || fabsf(actual[i] - reference[i]) > 1.0e-3f) {
+            fprintf(stderr, "prefill-attention/%u: output[%llu]=%g expected=%g\n", n_tokens,
+                    (unsigned long long)i, (double)actual[i], (double)reference[i]);
+            goto cleanup;
+        }
+    }
+    if (memcmp(key_actual, key_expected, cache_count * sizeof(*key_actual)) ||
+        memcmp(value_actual, value_expected, cache_count * sizeof(*value_actual))) {
+        fprintf(stderr, "prefill-attention/%u: cache mismatch\n", n_tokens);
+        goto cleanup;
+    }
     rc = 0;
 cleanup:
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q);

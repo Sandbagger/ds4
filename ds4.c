@@ -47705,67 +47705,7 @@ static bool laguna_graph_forward_token(
                 l->ffn_up_exps->dim[1] * up_row_bytes;
             const uint64_t down_expert_bytes =
                 l->ffn_down_exps->dim[1] * down_row_bytes;
-            const uint64_t shared_gate_row_bytes =
-                routed_expert_row_bytes(l->ffn_gate_shexp);
-            const uint64_t shared_up_row_bytes =
-                routed_expert_row_bytes(l->ffn_up_shexp);
-            const uint64_t shared_down_row_bytes =
-                routed_expert_row_bytes(l->ffn_down_shexp);
-            const ds4_gpu_laguna_moe_desc routed_moe = {
-                .gate_offset = l->ffn_gate_exps->abs_offset,
-                .up_offset = l->ffn_up_exps->abs_offset,
-                .down_offset = l->ffn_down_exps->abs_offset,
-                .gate_type = l->ffn_gate_exps->type,
-                .up_type = l->ffn_up_exps->type,
-                .down_type = l->ffn_down_exps->type,
-                .gate_expert_bytes = gate_expert_bytes,
-                .gate_row_bytes = gate_row_bytes,
-                .up_expert_bytes = up_expert_bytes,
-                .up_row_bytes = up_row_bytes,
-                .down_expert_bytes = down_expert_bytes,
-                .down_row_bytes = down_row_bytes,
-            };
-            const ds4_gpu_laguna_moe_desc shared_moe = {
-                .gate_offset = l->ffn_gate_shexp->abs_offset,
-                .up_offset = l->ffn_up_shexp->abs_offset,
-                .down_offset = l->ffn_down_shexp->abs_offset,
-                .gate_type = l->ffn_gate_shexp->type,
-                .up_type = l->ffn_up_shexp->type,
-                .down_type = l->ffn_down_shexp->type,
-                .gate_expert_bytes =
-                    l->ffn_gate_shexp->dim[1] * shared_gate_row_bytes,
-                .gate_row_bytes = shared_gate_row_bytes,
-                .up_expert_bytes =
-                    l->ffn_up_shexp->dim[1] * shared_up_row_bytes,
-                .up_row_bytes = shared_up_row_bytes,
-                .down_expert_bytes =
-                    l->ffn_down_shexp->dim[1] * shared_down_row_bytes,
-                .down_row_bytes = shared_down_row_bytes,
-            };
-            /* The legacy recipe can co-dispatch routed and shared Q4 work.
-             * The replacement keeps routed experts Q4 but makes the shared
-             * expert Q8, so each uses its native fast kernel family. */
-            if (ok && l->ffn_gate_shexp->type == DS4_TENSOR_Q4_K) {
-                ok = ds4_gpu_laguna_routed_shared_moe_one_tensor(
-                        g->ffn_out,
-                        g->routed_mid,
-                        g->shared_out,
-                        g->ffn_mid,
-                        model->map,
-                        model->size,
-                        &routed_moe,
-                        &shared_moe,
-                        DS4_N_EMBD,
-                        DS4_N_FF_EXP,
-                        DS4_N_EMBD,
-                        g->router_selected,
-                        g->router_weights,
-                        DS4_N_EXPERT,
-                        DS4_N_EXPERT_USED,
-                        g->shared_selected,
-                        g->shared_weight,
-                        g->ffn_norm) != 0;
-            } else if (ok) {
+            if (ok) {
                 ok = ds4_gpu_glm_routed_moe_one_tensor(
                         g->ffn_out,
                         g->routed_mid,

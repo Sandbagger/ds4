@@ -2254,43 +2254,6 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         bool                    force_resident);
 
-typedef struct {
-    uint64_t gate_offset;
-    uint64_t up_offset;
-    uint64_t down_offset;
-    uint32_t gate_type;
-    uint32_t up_type;
-    uint32_t down_type;
-    uint64_t gate_expert_bytes;
-    uint64_t gate_row_bytes;
-    uint64_t up_expert_bytes;
-    uint64_t up_row_bytes;
-    uint64_t down_expert_bytes;
-    uint64_t down_row_bytes;
-} ds4_gpu_laguna_moe_desc;
-
-/* Decode-only Laguna path. Routed and shared experts use independent thread
- * groups in two common dispatches, preserving each projection's arithmetic. */
-int ds4_gpu_laguna_routed_shared_moe_one_tensor(
-        ds4_gpu_tensor                   *routed_out,
-        ds4_gpu_tensor                   *routed_mid,
-        ds4_gpu_tensor                   *shared_out,
-        ds4_gpu_tensor                   *shared_mid,
-        const void                       *model_map,
-        uint64_t                          model_size,
-        const ds4_gpu_laguna_moe_desc    *routed,
-        const ds4_gpu_laguna_moe_desc    *shared,
-        uint32_t                          expert_in_dim,
-        uint32_t                          expert_mid_dim,
-        uint32_t                          out_dim,
-        const ds4_gpu_tensor             *selected,
-        const ds4_gpu_tensor             *weights,
-        uint32_t                          n_total_expert,
-        uint32_t                          n_expert,
-        const ds4_gpu_tensor             *shared_selected,
-        const ds4_gpu_tensor             *shared_weight,
-        const ds4_gpu_tensor             *x);
-
 int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,

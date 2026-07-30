@@ -1195,6 +1195,13 @@ static int run_prefill_attention_cases(void) {
 typedef struct { uint16_t d, dmin; uint8_t scales[12]; uint8_t qs[LAGUNA_QK_K / 2u]; } laguna_q4k_block;
 typedef struct { float d; int8_t qs[LAGUNA_QK_K]; int16_t bsums[LAGUNA_QK_K / 16u]; } laguna_q8k_block;
 typedef struct { ds4_gpu_tensor *base, *view; float *host; uint32_t count; } laguna_guarded_output;
+typedef struct {
+    uint64_t gate_offset, up_offset, down_offset;
+    uint32_t gate_type, up_type, down_type;
+    uint64_t gate_expert_bytes, gate_row_bytes;
+    uint64_t up_expert_bytes, up_row_bytes;
+    uint64_t down_expert_bytes, down_row_bytes;
+} laguna_moe_desc;
 
 static void laguna_q4k_scale_min(uint32_t group, const uint8_t *scales, uint8_t *scale, uint8_t *minimum) {
     if (group < 4u) { *scale = scales[group] & 63u; *minimum = scales[group + 4u] & 63u; }
@@ -1259,7 +1266,7 @@ static float laguna_silu(float value) { return value >= 0.0f ? value / (1.0f + e
 static void laguna_reference_routed_moe(
         float *out,
         const unsigned char *model,
-        const ds4_gpu_laguna_moe_desc *routed,
+        const laguna_moe_desc *routed,
         const int32_t *selected,
         const float *router,
         const float *x,
@@ -1536,7 +1543,7 @@ static int run_routed_moe_cases(void) {
     int rc = 1;
     if (run_routed_moe_selected_validation_case() != 0) return 1;
     if (!model) goto cleanup;
-    ds4_gpu_laguna_moe_desc routed = {
+    laguna_moe_desc routed = {
         .gate_offset = 0u, .up_offset = projection_bytes,
         .down_offset = 2u * projection_bytes,
         .gate_type = 12u, .up_type = 12u, .down_type = 12u,

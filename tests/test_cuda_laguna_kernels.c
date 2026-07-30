@@ -185,6 +185,10 @@ typedef struct {
     const float *actual;
     const float *reference;
     uint64_t count;
+    uint32_t n_heads;
+    uint32_t head_dim;
+    float max_abs_limit;
+    float rms_limit;
 } laguna_parity_span;
 
 typedef struct {
@@ -219,29 +223,67 @@ static int laguna_parity_spans_within_limits(
         const char *case_name, const laguna_parity_span *spans,
         size_t n_spans, int report) {
     for (size_t span = 0; span < n_spans; span++) {
-        double square_error = 0.0;
-        float max_abs = 0.0f;
-        for (uint64_t i = 0; i < spans[span].count; i++) {
-            if (!isfinite(spans[span].actual[i])) {
+        const uint64_t values_per_token =
+            (uint64_t)spans[span].n_heads * spans[span].head_dim;
+        if (spans[span].n_heads == 0u || spans[span].head_dim == 0u ||
+            spans[span].count == 0u ||
+            spans[span].count % values_per_token != 0u) {
+            if (report) {
+                fprintf(stderr, "%s/%s: invalid parity shape\n", case_name,
+                        spans[span].name);
+            }
+            return 0;
+        }
+        for (uint64_t base = 0; base < spans[span].count;
+             base += spans[span].head_dim) {
+            double square_error = 0.0;
+            float max_abs = 0.0f;
+            uint32_t max_dim = 0u;
+            const uint64_t flat_head = base / spans[span].head_dim;
+            const uint64_t token = flat_head / spans[span].n_heads;
+            const uint64_t head = flat_head % spans[span].n_heads;
+            for (uint32_t dim = 0; dim < spans[span].head_dim; dim++) {
+                const uint64_t i = base + dim;
+                if (!isfinite(spans[span].actual[i]) ||
+                    !isfinite(spans[span].reference[i])) {
+                    if (report) {
+                        fprintf(stderr,
+                                "%s/%s: non-finite actual/reference token=%llu head=%llu dim=%u actual=%g reference=%g\n",
+                                case_name, spans[span].name,
+                                (unsigned long long)token,
+                                (unsigned long long)head, dim,
+                                (double)spans[span].actual[i],
+                                (double)spans[span].reference[i]);
+                    }
+                    return 0;
+                }
+                const float error = fabsf(spans[span].actual[i] -
+                                          spans[span].reference[i]);
+                if (error > max_abs) {
+                    max_abs = error;
+                    max_dim = dim;
+                }
+                square_error += (double)error * error;
+            }
+            const double rms_error =
+                sqrt(square_error / (double)spans[span].head_dim);
+            if (max_abs > spans[span].max_abs_limit ||
+                rms_error > spans[span].rms_limit) {
                 if (report) {
-                    fprintf(stderr, "%s/%s: non-finite output\n", case_name,
-                            spans[span].name);
+                    const uint64_t max_index = base + max_dim;
+                    fprintf(stderr,
+                            "%s/%s: parity token=%llu head=%llu dim=%u actual=%g reference=%g max_abs=%g limit=%g local_rms=%g limit=%g\n",
+                            case_name, spans[span].name,
+                            (unsigned long long)token,
+                            (unsigned long long)head, max_dim,
+                            (double)spans[span].actual[max_index],
+                            (double)spans[span].reference[max_index],
+                            (double)max_abs,
+                            (double)spans[span].max_abs_limit,
+                            rms_error, (double)spans[span].rms_limit);
                 }
                 return 0;
             }
-            const float error = fabsf(spans[span].actual[i] -
-                                      spans[span].reference[i]);
-            if (error > max_abs) max_abs = error;
-            square_error += (double)error * error;
-        }
-        const double rms_error = sqrt(square_error / (double)spans[span].count);
-        if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-            if (report) {
-                fprintf(stderr,
-                        "%s/%s: parity max_abs=%g rms=%g exceeds tolerance\n",
-                        case_name, spans[span].name, (double)max_abs, rms_error);
-            }
-            return 0;
         }
     }
     return 1;
@@ -253,8 +295,8 @@ static int run_qk_metric_dilution_case(void) {
     static const float k_actual[1] = { 1.0e-4f };
     static const float k_reference[1] = { 0 };
     static const laguna_parity_span spans[] = {
-        { "q", q_actual, q_reference, 6 },
-        { "k", k_actual, k_reference, 1 },
+        { "q", q_actual, q_reference, 6, 1, 6, 2.0e-4f, 5.0e-5f },
+        { "k", k_actual, k_reference, 1, 1, 1, 2.0e-4f, 5.0e-5f },
     };
     if (laguna_parity_spans_within_limits("qk-metric-dilution", spans,
                                           sizeof(spans) / sizeof(spans[0]), 0)) {
@@ -263,6 +305,36 @@ static int run_qk_metric_dilution_case(void) {
         return 1;
     }
     return 0;
+}
+
+static int run_grouped_metric_contract_cases(void) {
+    float actual[2u * 128u] = {0};
+    float reference[2u * 128u] = {0};
+    int rc = 0;
+    for (uint32_t i = 0; i < 128u; i++) actual[i] = 6.0e-5f;
+    const laguna_parity_span grouped = {
+        "grouped-rms", actual, reference, 2u * 128u,
+        2u, 128u, 2.0e-4f, 5.0e-5f,
+    };
+    if (laguna_parity_spans_within_limits(
+            "metric-contract", &grouped, 1u, 0)) {
+        fprintf(stderr,
+                "metric-contract: whole-tensor RMS hid a bad head\n");
+        rc = 1;
+    }
+    memset(actual, 0, sizeof(actual));
+    reference[0] = NAN;
+    const laguna_parity_span nonfinite = {
+        "reference-finite", actual, reference, 2u * 128u,
+        2u, 128u, 2.0e-4f, 5.0e-5f,
+    };
+    if (laguna_parity_spans_within_limits(
+            "metric-contract", &nonfinite, 1u, 0)) {
+        fprintf(stderr,
+                "metric-contract: accepted a non-finite host reference\n");
+        rc = 1;
+    }
+    return rc;
 }
 
 static int run_norm_rope_case(const float *model_map, uint64_t model_size,
@@ -285,12 +357,6 @@ static int run_norm_rope_case(const float *model_map, uint64_t model_size,
                             c->n_ctx_orig, c->freq_base, c->freq_scale,
                             c->ext_factor, c->attn_factor, c->beta_fast,
                             c->beta_slow, 1.0e-6f);
-    for (uint64_t i = 0; i < count; i++) {
-        if (!isfinite(reference[i])) {
-            fprintf(stderr, "norm-rope: independent reference is non-finite\n");
-            goto cleanup;
-        }
-    }
     x = ds4_gpu_tensor_alloc(count * sizeof(*input));
     if (!x || !ds4_gpu_tensor_write(x, 0, input, count * sizeof(*input))) {
         fprintf(stderr, "norm-rope: synthetic tensor setup failed\n");
@@ -312,37 +378,12 @@ static int run_norm_rope_case(const float *model_map, uint64_t model_size,
             fprintf(stderr, "norm-rope: output read failed\n");
             goto cleanup;
         }
-        float max_abs = 0.0f;
-        double square_error = 0.0;
-        uint64_t max_index = 0;
-        for (uint64_t i = 0; i < count; i++) {
-            if (!isfinite(actual[i])) {
-                const uint64_t row = i / head_dim;
-                fprintf(stderr,
-                        "norm-rope/%s: non-finite output at token=%llu head=%llu dim=%llu\n",
-                        c->name, (unsigned long long)(row / c->n_head),
-                        (unsigned long long)(row % c->n_head),
-                        (unsigned long long)(i % head_dim));
-                goto cleanup;
-            }
-            const float error = fabsf(actual[i] - reference[i]);
-            if (error > max_abs) {
-                max_abs = error;
-                max_index = i;
-            }
-            square_error += (double)error * error;
-        }
-        const double rms_error = sqrt(square_error / (double)count);
-        if (max_abs > 2.0e-4f || rms_error > 5.0e-5) {
-            const uint64_t row = max_index / head_dim;
-            fprintf(stderr,
-                    "norm-rope/%s: parity max_abs=%g rms=%g token=%llu head=%llu dim=%llu actual=%g reference=%g exceeds tolerance\n",
-                    c->name, (double)max_abs, rms_error,
-                    (unsigned long long)(row / c->n_head),
-                    (unsigned long long)(row % c->n_head),
-                    (unsigned long long)(max_index % head_dim),
-                    (double)actual[max_index],
-                    (double)reference[max_index]);
+        const laguna_parity_span span = {
+            "x", actual, reference, count, c->n_head, head_dim,
+            2.0e-4f, 5.0e-5f,
+        };
+        if (!laguna_parity_spans_within_limits(
+                c->name, &span, 1u, 1)) {
             goto cleanup;
         }
         rc = 0;
@@ -427,8 +468,10 @@ static int run_qk_norm_rope_case(const float *q_weights, const float *k_weights,
         goto cleanup;
     }
     const laguna_parity_span spans[] = {
-        { "q", q_actual, q_reference, q_count },
-        { "k", k_actual, k_reference, k_count },
+        { "q", q_actual, q_reference, q_count, n_q_head, head_dim,
+          2.0e-4f, 5.0e-5f },
+        { "k", k_actual, k_reference, k_count, n_k_head, head_dim,
+          2.0e-4f, 5.0e-5f },
     };
     if (!laguna_parity_spans_within_limits(c->name, spans,
                                            sizeof(spans) / sizeof(spans[0]), 1)) {
@@ -744,32 +787,12 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
                 c->family, c->pos, c->key_count);
         goto cleanup;
     }
-    float max_abs = 0.0f;
-    double square_error = 0.0;
-    uint64_t max_index = 0;
-    for (uint64_t i = 0; i < q_count; i++) {
-        if (!isfinite(actual[i])) {
-            fprintf(stderr,
-                    "decode-attention/%s: non-finite output head=%llu dim=%llu\n",
-                    c->family, (unsigned long long)(i / head_dim),
-                    (unsigned long long)(i % head_dim));
-            goto cleanup;
-        }
-        const float error = fabsf(actual[i] - reference[i]);
-        if (error > max_abs) {
-            max_abs = error;
-            max_index = i;
-        }
-        square_error += (double)error * error;
-    }
-    const double rms = sqrt(square_error / (double)q_count);
-    if (max_abs > 1.0e-3f || rms > 2.0e-4) {
-        fprintf(stderr,
-                "decode-attention/%s: parity max_abs=%g rms=%g head=%llu dim=%llu actual=%g reference=%g exceeds tolerance\n",
-                c->family, (double)max_abs, rms,
-                (unsigned long long)(max_index / head_dim),
-                (unsigned long long)(max_index % head_dim),
-                (double)actual[max_index], (double)reference[max_index]);
+    const laguna_parity_span span = {
+        "heads", actual, reference, q_count, c->n_head, head_dim,
+        1.0e-3f, 2.0e-4f,
+    };
+    if (!laguna_parity_spans_within_limits(
+            c->family, &span, 1u, 1)) {
         goto cleanup;
     }
     rc = 0;
@@ -1774,7 +1797,8 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
-    if (run_f32_to_f16_reference_cases() != 0) return 1;
+    if ((run_decode || run_prefill || run_routed_moe) &&
+        run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
         fprintf(stderr, "norm-rope: ds4_gpu_init failed\n");
         return 1;
@@ -1822,6 +1846,10 @@ int main(int argc, char **argv) {
             }
         }
     static const laguna_norm_rope_case qk_cases[] = {
+        { "qk-global-decode-one", 1, 48, 64, 8193, 8192, 500000.0f,
+          1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 0u },
+        { "qk-swa-decode-one", 1, 72, 128, 513, 262144, 10000.0f,
+          1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0u },
         { "qk-global-yarn-frontier", 4, 48, 64, 8191, 8192, 500000.0f,
           1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 0u },
         { "qk-swa-ring-frontier", 4, 72, 128, 510, 262144, 10000.0f,
@@ -1834,6 +1862,7 @@ int main(int argc, char **argv) {
             }
         }
         if (run_qk_metric_dilution_case() != 0) rc = 1;
+        if (run_grouped_metric_contract_cases() != 0) rc = 1;
     }
     if (run_decode && run_decode_attention_cases() != 0) {
         rc = 1;

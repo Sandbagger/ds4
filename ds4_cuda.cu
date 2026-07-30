@@ -28229,6 +28229,41 @@ __global__ static void laguna_commit_kv_f16_kernel(
     value_cache[dst] = staged_value[i];
 }
 
+static int laguna_prefill_tensor_sizes(
+        uint32_t n_tokens, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, uint64_t *q_values_out,
+        uint64_t *kv_values_out, uint64_t *cache_values_out,
+        uint64_t *gate_values_out) {
+    if (!q_values_out || !kv_values_out || !cache_values_out ||
+        !gate_values_out || n_tokens == 0u || cache_cap == 0u ||
+        n_head == 0u || n_head_kv == 0u || head_dim == 0u) {
+        return 0;
+    }
+    const uint64_t q_rows = (uint64_t)n_tokens * n_head;
+    const uint64_t kv_rows = (uint64_t)n_tokens * n_head_kv;
+    const uint64_t cache_rows = (uint64_t)cache_cap * n_head_kv;
+    if (q_rows > UINT64_MAX / head_dim ||
+        kv_rows > UINT64_MAX / head_dim ||
+        cache_rows > UINT64_MAX / head_dim) {
+        return 0;
+    }
+    const uint64_t q_values = q_rows * head_dim;
+    const uint64_t kv_values = kv_rows * head_dim;
+    const uint64_t cache_values = cache_rows * head_dim;
+    if (q_values > UINT_MAX || kv_values > UINT_MAX ||
+        q_values > UINT64_MAX / sizeof(float) ||
+        kv_values > UINT64_MAX / sizeof(float) ||
+        cache_values > UINT64_MAX / sizeof(__half) ||
+        q_rows > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    *q_values_out = q_values;
+    *kv_values_out = kv_values;
+    *cache_values_out = cache_values;
+    *gate_values_out = q_rows;
+    return 1;
+}
+
 extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
         ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
@@ -28244,14 +28279,15 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         pos0 > UINT32_MAX - n_tokens || cache_cap == 0u || n_head == 0u ||
         n_head_kv == 0u || n_head % n_head_kv != 0u || head_dim != 128u ||
         !isfinite(scale) || scale <= 0.0f) return 0;
-    const uint64_t q_values = (uint64_t)n_tokens * n_head * head_dim;
-    const uint64_t kv_values = (uint64_t)n_tokens * n_head_kv * head_dim;
-    const uint64_t cache_values = (uint64_t)cache_cap * n_head_kv * head_dim;
-    if (q_values > UINT64_MAX / sizeof(float) || kv_values > UINT64_MAX / sizeof(float) ||
-        cache_values > UINT64_MAX / sizeof(__half) || q_values > UINT_MAX ||
-        kv_values > UINT_MAX || heads->bytes < q_values * sizeof(float) ||
+    uint64_t q_values = 0u, kv_values = 0u, cache_values = 0u;
+    uint64_t gate_values = 0u;
+    if (!laguna_prefill_tensor_sizes(
+            n_tokens, cache_cap, n_head, n_head_kv, head_dim,
+            &q_values, &kv_values, &cache_values, &gate_values) ||
+        heads->bytes < q_values * sizeof(float) ||
         q->bytes < q_values * sizeof(float) || k->bytes < kv_values * sizeof(float) ||
-        v->bytes < kv_values * sizeof(float) || gate->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
+        v->bytes < kv_values * sizeof(float) ||
+        gate->bytes < gate_values * sizeof(float) ||
         key_cache->bytes < cache_values * sizeof(__half) || value_cache->bytes < cache_values * sizeof(__half) ||
         staged_key->bytes < kv_values * sizeof(__half) || staged_value->bytes < kv_values * sizeof(__half)) return 0;
     const int logical_tier = ds4_tensor_device_idx(heads);

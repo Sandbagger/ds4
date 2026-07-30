@@ -1138,6 +1138,8 @@ static int run_prefill_rejection_cases(void) {
     const struct { const char *name; uint32_t pos, ntok, cap, nh, nkh, dim; float scale; } bad[] = {
         { "zero-tokens", 0u, 0u, cache_cap, n_head, n_head_kv, head_dim, scale },
         { "position-overflow", UINT32_MAX, 1u, cache_cap, n_head, n_head_kv, head_dim, scale },
+        { "dimension-product-overflow", 0u, 0x7fff0001u, 0x7fff0001u,
+          0x80010001u, 0x80010001u, head_dim, scale },
         { "zero-cache", 0u, n_tokens, 0u, n_head, n_head_kv, head_dim, scale },
         { "zero-heads", 0u, n_tokens, cache_cap, 0u, n_head_kv, head_dim, scale },
         { "zero-kv-heads", 0u, n_tokens, cache_cap, n_head, 0u, head_dim, scale },

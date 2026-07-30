@@ -1370,11 +1370,21 @@ static int run_prefill_rejection_cases(void) {
         q_bytes, kv_bytes, kv_bytes, gate_bytes };
     const char *names[] = { "heads", "key cache", "value cache", "staged key",
         "staged value", "q", "k", "v", "gate" };
+    uint64_t fixture_bytes = 0;
+    unsigned char *fixture = NULL;
     int rc = 1;
+    for (size_t i = 0; i < 9; i++) {
+        if (sizes[i] > fixture_bytes) fixture_bytes = sizes[i];
+    }
+    fixture = malloc((size_t)fixture_bytes);
+    if (!fixture) goto cleanup;
+    memset(fixture, 0xa5, (size_t)fixture_bytes);
     for (size_t i = 0; i < 9; i++) {
         t[i] = ds4_gpu_tensor_alloc(sizes[i]);
         snapshots[i] = (laguna_tensor_snapshot){ names[i], t[i], sizes[i], NULL };
-        if (!t[i] || !laguna_capture_tensor_snapshot(&snapshots[i])) goto cleanup;
+        if (!t[i] ||
+            !ds4_gpu_tensor_write(t[i], 0, fixture, sizes[i]) ||
+            !laguna_capture_tensor_snapshot(&snapshots[i])) goto cleanup;
     }
     const float scale = 1.0f / sqrtf((float)head_dim);
 #define PREFILL_CALL(a, pos, ntok, cap, nh, nkh, dim, s) \
@@ -1439,6 +1449,7 @@ cleanup:
         free(snapshots[i].snapshot);
         ds4_gpu_tensor_free(t[i]);
     }
+    free(fixture);
     return rc;
 }
 
@@ -1707,6 +1718,7 @@ static int run_routed_moe_selected_validation_case(void) {
     const uint64_t model_size = 3u * projection_bytes;
     unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
     float input[LAGUNA_MOE_DIM];
+    float mid_fixture[LAGUNA_MOE_USED * LAGUNA_MOE_DIM];
     float router[LAGUNA_MOE_USED];
     int32_t selected[LAGUNA_MOE_USED];
     ds4_gpu_tensor *mid = NULL, *selected_t = NULL, *router_t = NULL, *x = NULL;
@@ -1732,6 +1744,7 @@ static int run_routed_moe_selected_validation_case(void) {
         router[slot] = 0.05f + 0.01f * (float)slot;
     }
     selected[4] = (int32_t)LAGUNA_MOE_EXPERTS;
+    memset(mid_fixture, 0xa5, sizeof(mid_fixture));
 
     if (!ds4_gpu_set_model_map(model, model_size)) goto cleanup;
     mid = ds4_gpu_tensor_alloc((uint64_t)LAGUNA_MOE_USED * LAGUNA_MOE_DIM * sizeof(float));
@@ -1739,6 +1752,7 @@ static int run_routed_moe_selected_validation_case(void) {
     router_t = ds4_gpu_tensor_alloc(sizeof(router));
     x = ds4_gpu_tensor_alloc(sizeof(input));
     if (!mid || !selected_t || !router_t || !x ||
+        !ds4_gpu_tensor_write(mid, 0, mid_fixture, sizeof(mid_fixture)) ||
         !ds4_gpu_tensor_write(selected_t, 0, selected, sizeof(selected)) ||
         !ds4_gpu_tensor_write(router_t, 0, router, sizeof(router)) ||
         !ds4_gpu_tensor_write(x, 0, input, sizeof(input)) ||

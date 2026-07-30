@@ -862,112 +862,6 @@ static int run_decode_attention_cases(void) {
     return rc;
 }
 
-static int run_prefill_attention_case(uint32_t n_tokens) {
-    const uint32_t n_head = 48u, n_head_kv = 8u, head_dim = 128u;
-    const uint32_t cache_cap = 4u;
-    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
-    const uint64_t kv_count = (uint64_t)n_tokens * n_head_kv * head_dim;
-    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
-    const uint64_t cache_count = (uint64_t)cache_cap * kv_width;
-    const float scale = 1.0f / sqrtf((float)head_dim);
-    float *q_host = calloc((size_t)q_count, sizeof(*q_host));
-    float *k_host = calloc((size_t)kv_count, sizeof(*k_host));
-    float *v_host = calloc((size_t)kv_count, sizeof(*v_host));
-    float *gate_host = calloc((size_t)n_tokens * n_head, sizeof(*gate_host));
-    float *reference = calloc((size_t)q_count, sizeof(*reference));
-    float *actual = calloc((size_t)q_count, sizeof(*actual));
-    uint16_t *key_expected = calloc((size_t)cache_count, sizeof(*key_expected));
-    uint16_t *value_expected = calloc((size_t)cache_count, sizeof(*value_expected));
-    uint16_t *key_actual = calloc((size_t)cache_count, sizeof(*key_actual));
-    uint16_t *value_actual = calloc((size_t)cache_count, sizeof(*value_actual));
-    ds4_gpu_tensor *heads = NULL, *key_cache = NULL, *value_cache = NULL;
-    ds4_gpu_tensor *staged_key = NULL, *staged_value = NULL, *q = NULL, *k = NULL;
-    ds4_gpu_tensor *v = NULL, *gate = NULL;
-    int rc = 1;
-    if (!q_host || !k_host || !v_host || !gate_host || !reference || !actual ||
-        !key_expected || !value_expected || !key_actual || !value_actual) goto cleanup;
-    for (uint64_t i = 0; i < q_count; i++) q_host[i] = ((int)(i * 17u % 37u) - 18) / 29.0f;
-    for (uint64_t i = 0; i < kv_count; i++) {
-        k_host[i] = ((int)(i * 11u % 41u) - 20) / 31.0f;
-        v_host[i] = ((int)(i * 23u % 43u) - 21) / 37.0f;
-    }
-    static const float gates[] = { -2.0f, 0.0f, 2.0f, 20.0f, -20.0f };
-    for (uint32_t t = 0; t < n_tokens; t++) for (uint32_t h = 0; h < n_head; h++)
-        gate_host[(uint64_t)t * n_head + h] = gates[(3u * t + h) % 5u];
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const uint64_t row = (uint64_t)(t % cache_cap) * kv_width;
-        for (uint64_t i = 0; i < kv_width; i++) {
-            key_expected[row + i] = reference_f32_to_f16(k_host[(uint64_t)t * kv_width + i]);
-            value_expected[row + i] = reference_f32_to_f16(v_host[(uint64_t)t * kv_width + i]);
-        }
-        for (uint32_t h = 0; h < n_head; h++) {
-            const uint32_t kv_head = h / (n_head / n_head_kv);
-            float scores[4], max_score = -INFINITY, sum = 0.0f;
-            for (uint32_t r = 0; r <= t; r++) {
-                const uint64_t base = (uint64_t)r * kv_width + (uint64_t)kv_head * head_dim;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += q_host[((uint64_t)t * n_head + h) * head_dim + d] * reference_f16_to_f32(key_expected[base + d]);
-                scores[r] = scale * dot;
-                if (scores[r] > max_score) max_score = scores[r];
-            }
-            for (uint32_t r = 0; r <= t; r++) sum += expf(scores[r] - max_score);
-            for (uint32_t d = 0; d < head_dim; d++) {
-                float weighted = 0.0f;
-                for (uint32_t r = 0; r <= t; r++) {
-                    const uint64_t base = (uint64_t)r * kv_width + (uint64_t)kv_head * head_dim;
-                    weighted += expf(scores[r] - max_score) * reference_f16_to_f32(value_expected[base + d]);
-                }
-                reference[((uint64_t)t * n_head + h) * head_dim + d] = weighted / sum * reference_softplus(gate_host[(uint64_t)t * n_head + h]);
-            }
-        }
-    }
-    heads = ds4_gpu_tensor_alloc(q_count * sizeof(*actual));
-    key_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(*key_actual));
-    value_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(*value_actual));
-    staged_key = ds4_gpu_tensor_alloc(kv_count * sizeof(*key_actual));
-    staged_value = ds4_gpu_tensor_alloc(kv_count * sizeof(*value_actual));
-    q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_host));
-    k = ds4_gpu_tensor_alloc(kv_count * sizeof(*k_host));
-    v = ds4_gpu_tensor_alloc(kv_count * sizeof(*v_host));
-    gate = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_head * sizeof(*gate_host));
-    if (!heads || !key_cache || !value_cache || !staged_key || !staged_value || !q || !k || !v || !gate ||
-        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(*q_host)) ||
-        !ds4_gpu_tensor_write(k, 0, k_host, kv_count * sizeof(*k_host)) ||
-        !ds4_gpu_tensor_write(v, 0, v_host, kv_count * sizeof(*v_host)) ||
-        !ds4_gpu_tensor_write(key_cache, 0, key_actual, cache_count * sizeof(*key_actual)) ||
-        !ds4_gpu_tensor_write(value_cache, 0, value_actual, cache_count * sizeof(*value_actual)) ||
-        !ds4_gpu_tensor_write(gate, 0, gate_host, (uint64_t)n_tokens * n_head * sizeof(*gate_host))) goto cleanup;
-    if (!ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, 0u, n_tokens, cache_cap, n_head, n_head_kv, head_dim, scale)) {
-        fprintf(stderr, "prefill-attention/%u: CUDA prefill stub returned failure\n", n_tokens);
-        goto cleanup;
-    }
-    if (cudaDeviceSynchronize() != cudaSuccess ||
-        !ds4_gpu_tensor_read(heads, 0, actual, q_count * sizeof(*actual)) ||
-        !ds4_gpu_tensor_read(key_cache, 0, key_actual, cache_count * sizeof(*key_actual)) ||
-        !ds4_gpu_tensor_read(value_cache, 0, value_actual, cache_count * sizeof(*value_actual))) {
-        fprintf(stderr, "prefill-attention/%u: synchronization or read failed\n", n_tokens);
-        goto cleanup;
-    }
-    for (uint64_t i = 0; i < q_count; i++) {
-        if (!isfinite(actual[i]) || fabsf(actual[i] - reference[i]) > 1.0e-3f) {
-            fprintf(stderr, "prefill-attention/%u: output[%llu]=%g expected=%g\n", n_tokens,
-                    (unsigned long long)i, (double)actual[i], (double)reference[i]);
-            goto cleanup;
-        }
-    }
-    if (memcmp(key_actual, key_expected, cache_count * sizeof(*key_actual)) ||
-        memcmp(value_actual, value_expected, cache_count * sizeof(*value_actual))) {
-        fprintf(stderr, "prefill-attention/%u: cache mismatch\n", n_tokens);
-        goto cleanup;
-    }
-    rc = 0;
-cleanup:
-    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q);
-    ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key); ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(heads);
-    free(value_actual); free(key_actual); free(value_expected); free(key_expected); free(actual); free(reference); free(gate_host); free(v_host); free(k_host); free(q_host);
-    return rc;
-}
-
 static float prefill_fixture_value(uint32_t logical_pos, uint64_t element,
                                    uint32_t multiplier, uint32_t modulus,
                                    int32_t bias) {
@@ -975,141 +869,492 @@ static float prefill_fixture_value(uint32_t logical_pos, uint64_t element,
         (float)(modulus - 1u);
 }
 
-static int run_prefill_ring_case(const char *name, uint32_t pos0,
-                                 uint32_t n_tokens, uint32_t cache_cap) {
-    const uint32_t n_head = 48u, n_head_kv = 8u, head_dim = 128u;
-    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
-    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
-    const uint64_t kv_count = (uint64_t)n_tokens * kv_width;
-    const uint64_t cache_count = (uint64_t)cache_cap * kv_width;
+typedef struct {
+    const char *name;
+    uint32_t pos0;
+    uint32_t n_tokens;
+    uint32_t cache_cap;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+} laguna_prefill_case;
+
+typedef struct {
+    float *heads;
+    uint16_t *key_cache;
+    uint16_t *value_cache;
+} laguna_prefill_result;
+
+static int laguna_prefill_result_init(
+        laguna_prefill_result *result, uint64_t q_count,
+        uint64_t cache_count) {
+    result->heads = (float *)malloc((size_t)q_count * sizeof(*result->heads));
+    result->key_cache =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*result->key_cache));
+    result->value_cache =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*result->value_cache));
+    return result->heads && result->key_cache && result->value_cache;
+}
+
+static void laguna_prefill_result_free(laguna_prefill_result *result) {
+    free(result->value_cache);
+    free(result->key_cache);
+    free(result->heads);
+    memset(result, 0, sizeof(*result));
+}
+
+static int laguna_run_prefill_once(
+        const laguna_prefill_case *c, const char *arm,
+        const float *q_host, const float *k_host, const float *v_host,
+        const float *gate_host, const uint16_t *key_initial,
+        const uint16_t *value_initial, laguna_prefill_result *result) {
+    const uint32_t head_dim = 128u;
+    const uint64_t q_count =
+        (uint64_t)c->n_tokens * c->n_head * head_dim;
+    const uint64_t kv_count =
+        (uint64_t)c->n_tokens * c->n_head_kv * head_dim;
+    const uint64_t cache_count =
+        (uint64_t)c->cache_cap * c->n_head_kv * head_dim;
+    const uint64_t gate_count = (uint64_t)c->n_tokens * c->n_head;
     const float scale = 1.0f / sqrtf((float)head_dim);
-    float *q_host = calloc((size_t)q_count, sizeof(*q_host));
-    float *k_host = calloc((size_t)kv_count, sizeof(*k_host));
-    float *v_host = calloc((size_t)kv_count, sizeof(*v_host));
-    float *gates = calloc((size_t)n_tokens * n_head, sizeof(*gates));
-    float *expected = calloc((size_t)q_count, sizeof(*expected));
-    float *actual = calloc((size_t)q_count, sizeof(*actual));
-    float *scores = calloc((size_t)cache_cap, sizeof(*scores));
-    uint16_t *key_expected = calloc((size_t)cache_count, sizeof(*key_expected));
-    uint16_t *value_expected = calloc((size_t)cache_count, sizeof(*value_expected));
-    uint16_t *key_initial = calloc((size_t)cache_count, sizeof(*key_initial));
-    uint16_t *value_initial = calloc((size_t)cache_count, sizeof(*value_initial));
-    uint16_t *key_actual = calloc((size_t)cache_count, sizeof(*key_actual));
-    uint16_t *value_actual = calloc((size_t)cache_count, sizeof(*value_actual));
     ds4_gpu_tensor *heads = NULL, *key_cache = NULL, *value_cache = NULL;
-    ds4_gpu_tensor *staged_key = NULL, *staged_value = NULL, *q = NULL, *k = NULL;
-    ds4_gpu_tensor *v = NULL, *gate = NULL;
+    ds4_gpu_tensor *staged_key = NULL, *staged_value = NULL;
+    ds4_gpu_tensor *q = NULL, *k = NULL, *v = NULL, *gate = NULL;
     int rc = 1;
-    if (!q_host || !k_host || !v_host || !gates || !expected || !actual || !scores ||
-        !key_expected || !value_expected || !key_initial || !value_initial ||
-        !key_actual || !value_actual) goto cleanup;
-    for (uint32_t p = 0; p < pos0; p++) for (uint64_t i = 0; i < kv_width; i++) {
-        const uint64_t dst = (uint64_t)(p % cache_cap) * kv_width + i;
-        key_expected[dst] = reference_f32_to_f16(prefill_fixture_value(p, i, 13u, 61u, -30));
-        value_expected[dst] = reference_f32_to_f16(prefill_fixture_value(p, i, 19u, 67u, -33));
+
+    heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    key_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t));
+    value_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t));
+    staged_key = ds4_gpu_tensor_alloc(kv_count * sizeof(uint16_t));
+    staged_value = ds4_gpu_tensor_alloc(kv_count * sizeof(uint16_t));
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    k = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+    v = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+    gate = ds4_gpu_tensor_alloc(gate_count * sizeof(float));
+    for (uint64_t i = 0; i < q_count; i++) result->heads[i] = NAN;
+    if (!heads || !key_cache || !value_cache || !staged_key ||
+        !staged_value || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(heads, 0, result->heads,
+                              q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(key_cache, 0, key_initial,
+                              cache_count * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(value_cache, 0, value_initial,
+                              cache_count * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(k, 0, k_host, kv_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(v, 0, v_host, kv_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(gate, 0, gate_host,
+                              gate_count * sizeof(float))) {
+        fprintf(stderr, "prefill-attention/%s/%s: tensor setup failed\n",
+                c->name, arm);
+        goto cleanup;
     }
-    memcpy(key_initial, key_expected, cache_count * sizeof(*key_initial));
-    memcpy(value_initial, value_expected, cache_count * sizeof(*value_initial));
-    static const float mixed_gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const uint32_t p = pos0 + t;
-        for (uint64_t i = 0; i < kv_width; i++) {
-            k_host[(uint64_t)t * kv_width + i] = prefill_fixture_value(p, i, 13u, 61u, -30);
-            v_host[(uint64_t)t * kv_width + i] = prefill_fixture_value(p, i, 19u, 67u, -33);
-            const uint64_t dst = (uint64_t)(p % cache_cap) * kv_width + i;
-            key_expected[dst] = reference_f32_to_f16(k_host[(uint64_t)t * kv_width + i]);
-            value_expected[dst] = reference_f32_to_f16(v_host[(uint64_t)t * kv_width + i]);
-        }
-        for (uint32_t h = 0; h < n_head; h++) {
-            gates[(uint64_t)t * n_head + h] = mixed_gates[(3u * t + h) % 5u];
-            for (uint32_t d = 0; d < head_dim; d++) {
-                q_host[((uint64_t)t * n_head + h) * head_dim + d] =
-                    prefill_fixture_value(p + h, d, 7u, 59u, -29);
-            }
-        }
-        const uint32_t key_start = p + 1u > cache_cap ? p + 1u - cache_cap : 0u;
-        const uint32_t key_count = p - key_start + 1u;
-        for (uint32_t h = 0; h < n_head; h++) {
-            const uint32_t kv_head = h / (n_head / n_head_kv);
-            float max_score = -INFINITY, sum = 0.0f;
-            for (uint32_t r = 0; r < key_count; r++) {
-                const uint64_t base = (uint64_t)((key_start + r) % cache_cap) * kv_width +
-                    (uint64_t)kv_head * head_dim;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot +=
-                    q_host[((uint64_t)t * n_head + h) * head_dim + d] * reference_f16_to_f32(key_expected[base + d]);
-                scores[r] = scale * dot;
-                if (scores[r] > max_score) max_score = scores[r];
-            }
-            for (uint32_t r = 0; r < key_count; r++) sum += expf(scores[r] - max_score);
-            for (uint32_t d = 0; d < head_dim; d++) {
-                float weighted = 0.0f;
-                for (uint32_t r = 0; r < key_count; r++) {
-                    const uint64_t base = (uint64_t)((key_start + r) % cache_cap) * kv_width +
-                        (uint64_t)kv_head * head_dim;
-                    weighted += expf(scores[r] - max_score) * reference_f16_to_f32(value_expected[base + d]);
-                }
-                expected[((uint64_t)t * n_head + h) * head_dim + d] =
-                    weighted / sum * reference_softplus(gates[(uint64_t)t * n_head + h]);
-            }
-        }
+    const int wrapper_ok = ds4_gpu_laguna_attention_prefill_tensor(
+            heads, key_cache, value_cache, staged_key, staged_value,
+            q, k, v, gate, c->pos0, c->n_tokens, c->cache_cap,
+            c->n_head, c->n_head_kv, head_dim, scale);
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (!wrapper_ok || sync != cudaSuccess) {
+        fprintf(stderr,
+                "prefill-attention/%s/%s: wrapper=%d sync=%s\n",
+                c->name, arm, wrapper_ok, cudaGetErrorString(sync));
+        goto cleanup;
     }
-    heads = ds4_gpu_tensor_alloc(q_count * sizeof(*actual));
-    key_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(*key_actual));
-    value_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(*value_actual));
-    staged_key = ds4_gpu_tensor_alloc(kv_count * sizeof(*key_actual));
-    staged_value = ds4_gpu_tensor_alloc(kv_count * sizeof(*value_actual));
-    q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_host)); k = ds4_gpu_tensor_alloc(kv_count * sizeof(*k_host));
-    v = ds4_gpu_tensor_alloc(kv_count * sizeof(*v_host)); gate = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_head * sizeof(*gates));
-    if (!heads || !key_cache || !value_cache || !staged_key || !staged_value || !q || !k || !v || !gate ||
-        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(*q_host)) ||
-        !ds4_gpu_tensor_write(k, 0, k_host, kv_count * sizeof(*k_host)) ||
-        !ds4_gpu_tensor_write(v, 0, v_host, kv_count * sizeof(*v_host)) ||
-        !ds4_gpu_tensor_write(key_cache, 0, key_initial, cache_count * sizeof(*key_initial)) ||
-        !ds4_gpu_tensor_write(value_cache, 0, value_initial, cache_count * sizeof(*value_initial)) ||
-        !ds4_gpu_tensor_write(gate, 0, gates, (uint64_t)n_tokens * n_head * sizeof(*gates))) goto cleanup;
-    if (!ds4_gpu_laguna_attention_prefill_tensor(heads, key_cache, value_cache, staged_key, staged_value, q, k, v, gate, pos0, n_tokens, cache_cap, n_head, n_head_kv, head_dim, scale)) {
-        fprintf(stderr, "prefill-attention/%s: CUDA prefill stub returned failure\n", name); goto cleanup;
+    if (!ds4_gpu_tensor_read(heads, 0, result->heads,
+                             q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(key_cache, 0, result->key_cache,
+                             cache_count * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_read(value_cache, 0, result->value_cache,
+                             cache_count * sizeof(uint16_t))) {
+        fprintf(stderr, "prefill-attention/%s/%s: output read failed\n",
+                c->name, arm);
+        goto cleanup;
     }
-    if (cudaDeviceSynchronize() != cudaSuccess || !ds4_gpu_tensor_read(heads, 0, actual, q_count * sizeof(*actual)) ||
-        !ds4_gpu_tensor_read(key_cache, 0, key_actual, cache_count * sizeof(*key_actual)) ||
-        !ds4_gpu_tensor_read(value_cache, 0, value_actual, cache_count * sizeof(*value_actual))) goto cleanup;
-    for (uint64_t i = 0; i < q_count; i++) if (!isfinite(actual[i]) || fabsf(actual[i] - expected[i]) > 1.0e-3f) goto cleanup;
-    if (memcmp(key_actual, key_expected, cache_count * sizeof(*key_actual)) || memcmp(value_actual, value_expected, cache_count * sizeof(*value_actual))) goto cleanup;
     rc = 0;
 cleanup:
-    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key); ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(heads);
-    free(value_actual); free(key_actual); free(value_initial); free(key_initial); free(value_expected); free(key_expected); free(scores); free(actual); free(expected); free(gates); free(v_host); free(k_host); free(q_host);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(staged_value);
+    ds4_gpu_tensor_free(staged_key);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
     return rc;
 }
 
-static int run_prefill_causal_mutation_case(uint32_t first_changed) {
-    const uint32_t n_head = 48u, n_head_kv = 8u, head_dim = 128u, n_tokens = 3u, cache_cap = 4u;
-    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
-    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim, kv_count = (uint64_t)n_tokens * kv_width;
-    const uint64_t cache_count = (uint64_t)cache_cap * kv_width;
+static int laguna_run_decode_sequence(
+        const laguna_prefill_case *c, const float *q_host,
+        const float *k_host, const float *v_host, const float *gate_host,
+        const uint16_t *key_initial, const uint16_t *value_initial,
+        laguna_prefill_result *result) {
+    const uint32_t head_dim = 128u;
+    const uint64_t q_row_count = (uint64_t)c->n_head * head_dim;
+    const uint64_t kv_row_count = (uint64_t)c->n_head_kv * head_dim;
+    const uint64_t q_count = (uint64_t)c->n_tokens * q_row_count;
+    const uint64_t kv_count = (uint64_t)c->n_tokens * kv_row_count;
+    const uint64_t cache_count = (uint64_t)c->cache_cap * kv_row_count;
+    const uint64_t gate_count = (uint64_t)c->n_tokens * c->n_head;
     const float scale = 1.0f / sqrtf((float)head_dim);
-    float *q_host = calloc((size_t)q_count, sizeof(*q_host)), *k_a = calloc((size_t)kv_count, sizeof(*k_a)), *v_a = calloc((size_t)kv_count, sizeof(*v_a));
-    float *k_b = calloc((size_t)kv_count, sizeof(*k_b)), *v_b = calloc((size_t)kv_count, sizeof(*v_b)), *gate_host = calloc((size_t)n_tokens * n_head, sizeof(*gate_host));
-    float *out_a = calloc((size_t)q_count, sizeof(*out_a)), *out_b = calloc((size_t)q_count, sizeof(*out_b));
-    ds4_gpu_tensor *heads[2] = {0}, *key_cache[2] = {0}, *value_cache[2] = {0}, *staged_key[2] = {0}, *staged_value[2] = {0}, *q[2] = {0}, *k[2] = {0}, *v[2] = {0}, *gate[2] = {0};
+    ds4_gpu_tensor *heads = NULL, *key_cache = NULL, *value_cache = NULL;
+    ds4_gpu_tensor *q = NULL, *k = NULL, *v = NULL, *gate = NULL;
+    ds4_gpu_tensor **head_rows = NULL, **q_rows = NULL, **k_rows = NULL;
+    ds4_gpu_tensor **v_rows = NULL, **gate_rows = NULL;
     int rc = 1;
-    if (!q_host || !k_a || !v_a || !k_b || !v_b || !gate_host || !out_a || !out_b) goto cleanup;
-    for (uint64_t i = 0; i < q_count; i++) q_host[i] = ((int)(i % 31u) - 15) / 17.0f;
-    for (uint64_t i = 0; i < kv_count; i++) k_a[i] = k_b[i] = v_a[i] = v_b[i] = ((int)(i % 29u) - 14) / 19.0f;
-    for (uint32_t h = 0; h < n_head; h++) for (uint32_t t = 0; t < n_tokens; t++) gate_host[(uint64_t)t * n_head + h] = (float)((int)((h + t) % 5u) - 2);
-    for (uint64_t i = (uint64_t)first_changed * kv_width; i < kv_count; i++) { k_b[i] += 0.75f; v_b[i] -= 0.5f; }
-    for (uint32_t arm = 0; arm < 2; arm++) {
-        heads[arm] = ds4_gpu_tensor_alloc(q_count * sizeof(float)); key_cache[arm] = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t)); value_cache[arm] = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t)); staged_key[arm] = ds4_gpu_tensor_alloc(kv_count * sizeof(uint16_t)); staged_value[arm] = ds4_gpu_tensor_alloc(kv_count * sizeof(uint16_t)); q[arm] = ds4_gpu_tensor_alloc(q_count * sizeof(float)); k[arm] = ds4_gpu_tensor_alloc(kv_count * sizeof(float)); v[arm] = ds4_gpu_tensor_alloc(kv_count * sizeof(float)); gate[arm] = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_head * sizeof(float));
-        if (!heads[arm] || !key_cache[arm] || !value_cache[arm] || !staged_key[arm] || !staged_value[arm] || !q[arm] || !k[arm] || !v[arm] || !gate[arm] || !ds4_gpu_tensor_write(q[arm], 0, q_host, q_count * sizeof(float)) || !ds4_gpu_tensor_write(k[arm], 0, arm ? k_b : k_a, kv_count * sizeof(float)) || !ds4_gpu_tensor_write(v[arm], 0, arm ? v_b : v_a, kv_count * sizeof(float)) || !ds4_gpu_tensor_write(gate[arm], 0, gate_host, (uint64_t)n_tokens * n_head * sizeof(float))) goto cleanup;
-        if (!ds4_gpu_laguna_attention_prefill_tensor(heads[arm], key_cache[arm], value_cache[arm], staged_key[arm], staged_value[arm], q[arm], k[arm], v[arm], gate[arm], 0u, n_tokens, cache_cap, n_head, n_head_kv, head_dim, scale)) { fprintf(stderr, "prefill-attention/causal-mutation: CUDA prefill stub returned failure\n"); goto cleanup; }
-        if (cudaDeviceSynchronize() != cudaSuccess || !ds4_gpu_tensor_read(heads[arm], 0, arm ? out_b : out_a, q_count * sizeof(float))) goto cleanup;
+
+    head_rows = (ds4_gpu_tensor **)calloc(c->n_tokens, sizeof(*head_rows));
+    q_rows = (ds4_gpu_tensor **)calloc(c->n_tokens, sizeof(*q_rows));
+    k_rows = (ds4_gpu_tensor **)calloc(c->n_tokens, sizeof(*k_rows));
+    v_rows = (ds4_gpu_tensor **)calloc(c->n_tokens, sizeof(*v_rows));
+    gate_rows = (ds4_gpu_tensor **)calloc(c->n_tokens, sizeof(*gate_rows));
+    heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    key_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t));
+    value_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t));
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    k = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+    v = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+    gate = ds4_gpu_tensor_alloc(gate_count * sizeof(float));
+    for (uint64_t i = 0; i < q_count; i++) result->heads[i] = NAN;
+    if (!head_rows || !q_rows || !k_rows || !v_rows || !gate_rows ||
+        !heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(heads, 0, result->heads,
+                              q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(key_cache, 0, key_initial,
+                              cache_count * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(value_cache, 0, value_initial,
+                              cache_count * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(k, 0, k_host, kv_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(v, 0, v_host, kv_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(gate, 0, gate_host,
+                              gate_count * sizeof(float))) {
+        fprintf(stderr, "prefill-attention/%s/sequential: setup failed\n",
+                c->name);
+        goto cleanup;
     }
-    if (memcmp(out_a, out_b, (uint64_t)first_changed * n_head * head_dim * sizeof(float)) != 0) { fprintf(stderr, "prefill-attention/causal-mutation: later KV changed earlier output\n"); goto cleanup; }
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        head_rows[t] = ds4_gpu_tensor_view(
+                heads, (uint64_t)t * q_row_count * sizeof(float),
+                q_row_count * sizeof(float));
+        q_rows[t] = ds4_gpu_tensor_view(
+                q, (uint64_t)t * q_row_count * sizeof(float),
+                q_row_count * sizeof(float));
+        k_rows[t] = ds4_gpu_tensor_view(
+                k, (uint64_t)t * kv_row_count * sizeof(float),
+                kv_row_count * sizeof(float));
+        v_rows[t] = ds4_gpu_tensor_view(
+                v, (uint64_t)t * kv_row_count * sizeof(float),
+                kv_row_count * sizeof(float));
+        gate_rows[t] = ds4_gpu_tensor_view(
+                gate, (uint64_t)t * c->n_head * sizeof(float),
+                (uint64_t)c->n_head * sizeof(float));
+        if (!head_rows[t] || !q_rows[t] || !k_rows[t] || !v_rows[t] ||
+            !gate_rows[t]) {
+            fprintf(stderr,
+                    "prefill-attention/%s/sequential: row view failed\n",
+                    c->name);
+            goto cleanup;
+        }
+    }
+    int wrappers_ok = 1;
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const uint32_t pos = c->pos0 + t;
+        const uint32_t key_start =
+            pos + 1u > c->cache_cap ? pos + 1u - c->cache_cap : 0u;
+        const uint32_t key_count = pos - key_start + 1u;
+        if (!ds4_gpu_laguna_store_attention_tensor(
+                head_rows[t], key_cache, value_cache, q_rows[t], k_rows[t],
+                v_rows[t], gate_rows[t], pos, c->cache_cap, key_start,
+                key_count, c->n_head, c->n_head_kv, head_dim, scale)) {
+            wrappers_ok = 0;
+            break;
+        }
+    }
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (!wrappers_ok || sync != cudaSuccess) {
+        fprintf(stderr,
+                "prefill-attention/%s/sequential: wrapper=%d sync=%s\n",
+                c->name, wrappers_ok, cudaGetErrorString(sync));
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(heads, 0, result->heads,
+                             q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(key_cache, 0, result->key_cache,
+                             cache_count * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_read(value_cache, 0, result->value_cache,
+                             cache_count * sizeof(uint16_t))) {
+        fprintf(stderr,
+                "prefill-attention/%s/sequential: output read failed\n",
+                c->name);
+        goto cleanup;
+    }
     rc = 0;
 cleanup:
-    for (uint32_t arm = 0; arm < 2; arm++) { ds4_gpu_tensor_free(gate[arm]); ds4_gpu_tensor_free(v[arm]); ds4_gpu_tensor_free(k[arm]); ds4_gpu_tensor_free(q[arm]); ds4_gpu_tensor_free(staged_value[arm]); ds4_gpu_tensor_free(staged_key[arm]); ds4_gpu_tensor_free(value_cache[arm]); ds4_gpu_tensor_free(key_cache[arm]); ds4_gpu_tensor_free(heads[arm]); }
-    free(out_b); free(out_a); free(gate_host); free(v_b); free(k_b); free(v_a); free(k_a); free(q_host); return rc;
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        if (gate_rows) ds4_gpu_tensor_free(gate_rows[t]);
+        if (v_rows) ds4_gpu_tensor_free(v_rows[t]);
+        if (k_rows) ds4_gpu_tensor_free(k_rows[t]);
+        if (q_rows) ds4_gpu_tensor_free(q_rows[t]);
+        if (head_rows) ds4_gpu_tensor_free(head_rows[t]);
+    }
+    free(gate_rows);
+    free(v_rows);
+    free(k_rows);
+    free(q_rows);
+    free(head_rows);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    return rc;
+}
+
+static int run_prefill_contract_case(const laguna_prefill_case *c) {
+    const uint32_t head_dim = 128u;
+    const uint64_t q_row_count = (uint64_t)c->n_head * head_dim;
+    const uint64_t kv_width = (uint64_t)c->n_head_kv * head_dim;
+    const uint64_t q_count = (uint64_t)c->n_tokens * q_row_count;
+    const uint64_t kv_count = (uint64_t)c->n_tokens * kv_width;
+    const uint64_t cache_count = (uint64_t)c->cache_cap * kv_width;
+    const uint64_t gate_count = (uint64_t)c->n_tokens * c->n_head;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    float *q_host = (float *)calloc((size_t)q_count, sizeof(*q_host));
+    float *k_host = (float *)calloc((size_t)kv_count, sizeof(*k_host));
+    float *v_host = (float *)calloc((size_t)kv_count, sizeof(*v_host));
+    float *gate_host =
+        (float *)calloc((size_t)gate_count, sizeof(*gate_host));
+    float *reference =
+        (float *)calloc((size_t)q_count, sizeof(*reference));
+    float *scores =
+        (float *)calloc((size_t)c->cache_cap, sizeof(*scores));
+    float *mutated_k =
+        (float *)calloc((size_t)kv_count, sizeof(*mutated_k));
+    float *mutated_v =
+        (float *)calloc((size_t)kv_count, sizeof(*mutated_v));
+    uint16_t *staged_key =
+        (uint16_t *)calloc((size_t)kv_count, sizeof(*staged_key));
+    uint16_t *staged_value =
+        (uint16_t *)calloc((size_t)kv_count, sizeof(*staged_value));
+    uint16_t *key_initial =
+        (uint16_t *)calloc((size_t)cache_count, sizeof(*key_initial));
+    uint16_t *value_initial =
+        (uint16_t *)calloc((size_t)cache_count, sizeof(*value_initial));
+    uint16_t *key_expected =
+        (uint16_t *)calloc((size_t)cache_count, sizeof(*key_expected));
+    uint16_t *value_expected =
+        (uint16_t *)calloc((size_t)cache_count, sizeof(*value_expected));
+    laguna_prefill_result prefill = {0}, sequential = {0}, mutation = {0};
+    int rc = 1;
+
+    if (!q_host || !k_host || !v_host || !gate_host || !reference ||
+        !scores || !mutated_k || !mutated_v || !staged_key ||
+        !staged_value || !key_initial || !value_initial || !key_expected ||
+        !value_expected ||
+        !laguna_prefill_result_init(&prefill, q_count, cache_count) ||
+        !laguna_prefill_result_init(&sequential, q_count, cache_count) ||
+        !laguna_prefill_result_init(&mutation, q_count, cache_count)) {
+        fprintf(stderr, "prefill-attention/%s: host allocation failed\n",
+                c->name);
+        goto cleanup;
+    }
+
+    const uint32_t prior_start = c->pos0 > c->cache_cap
+        ? c->pos0 - c->cache_cap
+        : 0u;
+    for (uint32_t logical = prior_start; logical < c->pos0; logical++) {
+        const uint64_t row = (uint64_t)(logical % c->cache_cap) * kv_width;
+        for (uint64_t i = 0; i < kv_width; i++) {
+            key_initial[row + i] = reference_f32_to_f16(
+                    prefill_fixture_value(logical, i, 13u, 61u, -30));
+            value_initial[row + i] = reference_f32_to_f16(
+                    prefill_fixture_value(logical, i, 19u, 67u, -33));
+        }
+    }
+    static const float mixed_gates[] = {
+        -20.0f, -2.0f, 0.0f, 2.0f, 20.0f,
+    };
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const uint32_t logical = c->pos0 + t;
+        for (uint64_t i = 0; i < kv_width; i++) {
+            const uint64_t src = (uint64_t)t * kv_width + i;
+            k_host[src] =
+                prefill_fixture_value(logical, i, 13u, 61u, -30);
+            v_host[src] =
+                prefill_fixture_value(logical, i, 19u, 67u, -33);
+            staged_key[src] = reference_f32_to_f16(k_host[src]);
+            staged_value[src] = reference_f32_to_f16(v_host[src]);
+        }
+        for (uint32_t h = 0; h < c->n_head; h++) {
+            gate_host[(uint64_t)t * c->n_head + h] =
+                mixed_gates[(3u * t + h) % 5u];
+            for (uint32_t d = 0; d < head_dim; d++) {
+                q_host[((uint64_t)t * c->n_head + h) * head_dim + d] =
+                    prefill_fixture_value(logical + h, d, 7u, 59u, -29);
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const uint32_t pos = c->pos0 + t;
+        const uint32_t key_start =
+            pos + 1u > c->cache_cap ? pos + 1u - c->cache_cap : 0u;
+        const uint32_t key_count = pos - key_start + 1u;
+        for (uint32_t h = 0; h < c->n_head; h++) {
+            const uint32_t kv_head = h / (c->n_head / c->n_head_kv);
+            float max_score = -INFINITY;
+            float sum = 0.0f;
+            for (uint32_t r = 0; r < key_count; r++) {
+                const uint32_t logical = key_start + r;
+                const uint16_t *key_row = logical < c->pos0
+                    ? key_initial +
+                        (uint64_t)(logical % c->cache_cap) * kv_width
+                    : staged_key +
+                        (uint64_t)(logical - c->pos0) * kv_width;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += q_host[
+                            ((uint64_t)t * c->n_head + h) * head_dim + d] *
+                        reference_f16_to_f32(
+                                key_row[(uint64_t)kv_head * head_dim + d]);
+                }
+                scores[r] = scale * dot;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            for (uint32_t r = 0; r < key_count; r++) {
+                sum += expf(scores[r] - max_score);
+            }
+            const float gate_scale = reference_softplus(
+                    gate_host[(uint64_t)t * c->n_head + h]);
+            for (uint32_t d = 0; d < head_dim; d++) {
+                float weighted = 0.0f;
+                for (uint32_t r = 0; r < key_count; r++) {
+                    const uint32_t logical = key_start + r;
+                    const uint16_t *value_row = logical < c->pos0
+                        ? value_initial +
+                            (uint64_t)(logical % c->cache_cap) * kv_width
+                        : staged_value +
+                            (uint64_t)(logical - c->pos0) * kv_width;
+                    weighted += expf(scores[r] - max_score) *
+                        reference_f16_to_f32(
+                                value_row[(uint64_t)kv_head * head_dim + d]);
+                }
+                reference[
+                        ((uint64_t)t * c->n_head + h) * head_dim + d] =
+                    weighted / sum * gate_scale;
+            }
+        }
+    }
+
+    memcpy(key_expected, key_initial,
+           (size_t)cache_count * sizeof(*key_expected));
+    memcpy(value_expected, value_initial,
+           (size_t)cache_count * sizeof(*value_expected));
+    const uint32_t commit_start = c->n_tokens > c->cache_cap
+        ? c->n_tokens - c->cache_cap
+        : 0u;
+    for (uint32_t t = commit_start; t < c->n_tokens; t++) {
+        const uint64_t dst =
+            (uint64_t)((c->pos0 + t) % c->cache_cap) * kv_width;
+        memcpy(key_expected + dst, staged_key + (uint64_t)t * kv_width,
+               (size_t)kv_width * sizeof(*key_expected));
+        memcpy(value_expected + dst,
+               staged_value + (uint64_t)t * kv_width,
+               (size_t)kv_width * sizeof(*value_expected));
+    }
+
+    if (laguna_run_prefill_once(
+            c, "prefill", q_host, k_host, v_host, gate_host,
+            key_initial, value_initial, &prefill) != 0 ||
+        laguna_run_decode_sequence(
+            c, q_host, k_host, v_host, gate_host,
+            key_initial, value_initial, &sequential) != 0) {
+        goto cleanup;
+    }
+    const laguna_parity_span spans[] = {
+        { "prefill-host", prefill.heads, reference, q_count,
+          c->n_head, head_dim, 1.0e-3f, 2.0e-4f },
+        { "decode-host", sequential.heads, reference, q_count,
+          c->n_head, head_dim, 1.0e-3f, 2.0e-4f },
+        { "prefill-decode", prefill.heads, sequential.heads, q_count,
+          c->n_head, head_dim, 1.0e-3f, 2.0e-4f },
+    };
+    if (!laguna_parity_spans_within_limits(
+            c->name, spans, sizeof(spans) / sizeof(spans[0]), 1)) {
+        goto cleanup;
+    }
+    if (memcmp(prefill.key_cache, key_expected,
+               (size_t)cache_count * sizeof(*key_expected)) != 0 ||
+        memcmp(prefill.value_cache, value_expected,
+               (size_t)cache_count * sizeof(*value_expected)) != 0 ||
+        memcmp(sequential.key_cache, key_expected,
+               (size_t)cache_count * sizeof(*key_expected)) != 0 ||
+        memcmp(sequential.value_cache, value_expected,
+               (size_t)cache_count * sizeof(*value_expected)) != 0 ||
+        memcmp(prefill.key_cache, sequential.key_cache,
+               (size_t)cache_count * sizeof(*key_expected)) != 0 ||
+        memcmp(prefill.value_cache, sequential.value_cache,
+               (size_t)cache_count * sizeof(*value_expected)) != 0) {
+        fprintf(stderr,
+                "prefill-attention/%s: final cache differs from host/decode\n",
+                c->name);
+        goto cleanup;
+    }
+
+    for (uint32_t j = 0; j + 1u < c->n_tokens; j++) {
+        memcpy(mutated_k, k_host, (size_t)kv_count * sizeof(*mutated_k));
+        memcpy(mutated_v, v_host, (size_t)kv_count * sizeof(*mutated_v));
+        const uint64_t first_changed = (uint64_t)(j + 1u) * kv_width;
+        for (uint64_t i = first_changed; i < kv_count; i++) {
+            mutated_k[i] += 0.75f + 0.001f * (float)(i % 17u);
+            mutated_v[i] -= 0.50f + 0.001f * (float)(i % 13u);
+        }
+        char arm[64];
+        snprintf(arm, sizeof(arm), "causal-after-%u", j);
+        if (laguna_run_prefill_once(
+                c, arm, q_host, mutated_k, mutated_v, gate_host,
+                key_initial, value_initial, &mutation) != 0) {
+            goto cleanup;
+        }
+        const uint64_t prefix_count = (uint64_t)(j + 1u) * q_row_count;
+        if (memcmp(prefill.heads, mutation.heads,
+                   (size_t)prefix_count * sizeof(float)) != 0) {
+            fprintf(stderr,
+                    "prefill-attention/%s/%s: later KV changed output prefix\n",
+                    c->name, arm);
+            goto cleanup;
+        }
+        if (memcmp(prefill.heads + prefix_count,
+                   mutation.heads + prefix_count,
+                   (size_t)(q_count - prefix_count) * sizeof(float)) == 0) {
+            fprintf(stderr,
+                    "prefill-attention/%s/%s: mutation did not change suffix\n",
+                    c->name, arm);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+cleanup:
+    laguna_prefill_result_free(&mutation);
+    laguna_prefill_result_free(&sequential);
+    laguna_prefill_result_free(&prefill);
+    free(value_expected);
+    free(key_expected);
+    free(value_initial);
+    free(key_initial);
+    free(staged_value);
+    free(staged_key);
+    free(mutated_v);
+    free(mutated_k);
+    free(scores);
+    free(reference);
+    free(gate_host);
+    free(v_host);
+    free(k_host);
+    free(q_host);
+    return rc;
 }
 
 static int run_prefill_rejection_cases(void) {
@@ -1199,13 +1444,16 @@ cleanup:
 
 static int run_prefill_attention_cases(void) {
     int rc = run_prefill_rejection_cases();
-    if (run_prefill_attention_case(1u) != 0) { fprintf(stderr, "prefill-attention/1: contract failure\n"); rc = 1; }
-    if (run_prefill_attention_case(3u) != 0) { fprintf(stderr, "prefill-attention/3: contract failure\n"); rc = 1; }
-    if (run_prefill_ring_case("resumed-global", 3u, 2u, 16u) != 0) { fprintf(stderr, "prefill-attention/resumed-global: contract failure\n"); rc = 1; }
-    if (run_prefill_ring_case("swa-512-crossing", 509u, 4u, 512u) != 0) { fprintf(stderr, "prefill-attention/swa-512-crossing: contract failure\n"); rc = 1; }
-    if (run_prefill_ring_case("multi-wrap-4", 0u, 9u, 4u) != 0) { fprintf(stderr, "prefill-attention/multi-wrap-4: contract failure\n"); rc = 1; }
-    if (run_prefill_causal_mutation_case(1u) != 0) { fprintf(stderr, "prefill-attention/causal-mutation-1: contract failure\n"); rc = 1; }
-    if (run_prefill_causal_mutation_case(2u) != 0) { fprintf(stderr, "prefill-attention/causal-mutation-2: contract failure\n"); rc = 1; }
+    static const laguna_prefill_case cases[] = {
+        { "global-one", 0u, 1u, 16u, 48u, 8u },
+        { "global-three", 0u, 3u, 16u, 48u, 8u },
+        { "resumed-global", 3u, 2u, 16u, 48u, 8u },
+        { "swa-512-crossing", 509u, 4u, 512u, 72u, 8u },
+        { "multi-wrap-4", 0u, 9u, 4u, 48u, 8u },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (run_prefill_contract_case(&cases[i]) != 0) rc = 1;
+    }
     return rc;
 }
 

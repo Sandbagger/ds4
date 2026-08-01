@@ -77,3 +77,83 @@ To inspect a local top-logprob dump manually:
   --dump-logprobs /tmp/long_code_audit.ds4.json \
   --logprobs-top-k 20
 ```
+
+## Laguna S 2.1 resident-CUDA oracle
+
+`laguna-resident/` defines a fail-closed, two-oracle model-parity contract for
+`poolside/Laguna-S-2.1-GGUF`. The admitted artifact is
+`laguna-s-2.1-Q4_K_M.gguf` at revision
+`706fa69799926b6afde1af9e24ca2a4923f110a1`, exactly `68248759648` bytes,
+with SHA-256
+`e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`.
+The independent Poolside reference is pinned to llama.cpp commit
+`04b2b72cb54048ead292884adbe11f284e3ec950`.
+
+The checked-in inputs are `cases.json`, `short.txt`, the deterministic prompt
+generator, and its generated `benchmark-32768.txt` seed. Regenerate the seed
+and confirm the output before any capture. Their SHA-256 values are
+`118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d` and
+`aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206`,
+respectively:
+
+```sh
+python3 tests/test-vectors/laguna-resident/generate_benchmark_prompt.py \
+  --output tests/test-vectors/laguna-resident/benchmark-32768.txt
+sha256sum tests/test-vectors/laguna-resident/generate_benchmark_prompt.py \
+  tests/test-vectors/laguna-resident/benchmark-32768.txt
+```
+
+Build the pinned Poolside capture helper and materialize the exact 513, 8193,
+and 32768-token raw prompts from the shared seed:
+
+```sh
+make -C gguf-tools quality-laguna-logits \
+  LLAMA_CPP_DIR="$LLAMA_LAGUNA_DIR" \
+  LLAMA_CPP_BUILD="$LLAMA_LAGUNA_DIR/build"
+gguf-tools/quality-testing/dump_llama_logits \
+  --model "$LAGUNA_MODEL" \
+  --cases tests/test-vectors/laguna-resident/cases.json \
+  --seed-prompt tests/test-vectors/laguna-resident/benchmark-32768.txt \
+  --materialize-prompts tests/test-vectors/laguna-resident \
+  --out "$LAGUNA_LLAMA_OUT"
+```
+
+Capture the same four frontiers and eight teacher-forced continuation rows
+with DwarfStar Metal into `$LAGUNA_METAL_OUT`, then promote only when the two
+tokenizations, argmaxes, continuations, and fixed numeric gates agree:
+
+```sh
+python3 gguf-tools/quality-testing/compare_laguna_logits.py \
+  --ds4 ./ds4 \
+  --metal "$LAGUNA_METAL_OUT" \
+  --llama "$LAGUNA_LLAMA_OUT" \
+  --promote tests/test-vectors/laguna-resident
+```
+
+Promotion writes one Metal and one Poolside little-endian float32 vector for
+each of `short`, `swa-513`, `yarn-8193`, and `deep-32768`, plus the eight-ID
+little-endian continuation and `manifest.json`. It requires centered RMS
+`<= 0.02`, centered maximum absolute error `<= 0.10`, top-20 overlap `>= 18`,
+and exact argmax and continuation agreement. Materialized prompts and promoted
+vectors are intentionally absent until both independent captures pass.
+
+Task 6 admission must run the non-mutating verifier with all runtime and GGUF
+pins supplied explicitly:
+
+```sh
+python3 gguf-tools/quality-testing/compare_laguna_logits.py \
+  --verify-promoted tests/test-vectors/laguna-resident \
+  --dwarfstar-commit "$LAGUNA_CONTRACT_COMMIT" \
+  --llama-commit 04b2b72cb54048ead292884adbe11f284e3ec950 \
+  --gguf-size 68248759648 \
+  --gguf-sha256 e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
+```
+
+Verification rejects missing or extra files, bad sizes or hashes, stale pins,
+token disagreement, or widened gates without modifying the fixture tree. The
+model-backed CUDA target is deliberately excluded from ordinary `make test`;
+run it explicitly with the verified local model:
+
+```sh
+DS4_TEST_MODEL="$LAGUNA_MODEL" make test-cuda-laguna-model
+```

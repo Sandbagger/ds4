@@ -1,0 +1,35 @@
+{
+  "schema": "laguna-resident-oracle-v1",
+  "vocab_size": 100352,
+  "continuation_case": "yarn-8193",
+  "continuation_tokens": 8,
+  "cases": [
+    {
+      "id": "short",
+      "render": "laguna-ds4",
+      "prompt": "short.txt",
+      "ctx": 1024
+    },
+    {
+      "id": "swa-513",
+      "render": "raw",
+      "prompt": "swa-513.prompt",
+      "frontier": 513,
+      "ctx": 1024
+    },
+    {
+      "id": "yarn-8193",
+      "render": "raw",
+      "prompt": "yarn-8193.prompt",
+      "frontier": 8193,
+      "ctx": 8202
+    },
+    {
+      "id": "deep-32768",
+      "render": "raw",
+      "prompt": "deep-32768.prompt",
+      "frontier": 32768,
+      "ctx": 32768
+    }
+  ]
+}

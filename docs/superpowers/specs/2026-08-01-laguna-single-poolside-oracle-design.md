@@ -340,8 +340,10 @@ removed from the branch gate because the approved assurance model has changed.
   leaves pre-existing fixed inputs and prompts unchanged.
 - A stale partial publication without a manifest fails and lists its paths; it
   requires explicit operator cleanup rather than automatic deletion.
-- The DGX model-service stop/restore wrapper remains mandatory for any new
-  full-model capture.
+- Any new full-model capture requires an external isolation attestation. The
+  invoking deployment/operator harness, outside DS4, owns stopping and
+  restoring model services; DS4 consumes the attestation and never controls
+  peer-service lifecycle.
 
 ## Non-goals
 

@@ -770,9 +770,11 @@ Expected: no stale live contract text.
 - [ ] **Step 4: Run the complete ordered DGX gate**
 
 ```sh
-LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(git rev-parse HEAD)" \
-DS4_TEST_MODEL="$LAGUNA_MODEL" \
-make test-cuda-laguna-resident
+export LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(
+  python3 -c 'import json; print(json.load(open("tests/test-vectors/laguna-resident/manifest.json", encoding="utf-8"))["provenance"]["tokenizer_runtime_commit"])'
+)"
+test "${#LAGUNA_TOKENIZER_RUNTIME_COMMIT}" -eq 40
+DS4_TEST_MODEL="$LAGUNA_MODEL" make test-cuda-laguna-resident
 ```
 
 Expected before CUDA admission:

@@ -172,6 +172,8 @@ if call_number == int(os.environ.get("FAKE_DS4_MUTATE_ON_CALL", "0")):
         )
 kind, value = token_map[payload_sha]
 tokens = value if kind == "tokens" else [index % 100352 for index in range(value)]
+if os.environ.get("FAKE_DS4_EXTRA_SHA256") == payload_sha:
+    tokens.append(23)
 if os.environ.get("FAKE_DS4_MISMATCH_SHA256") == payload_sha:
     tokens[0] = (tokens[0] + 1) % 100352
 print(tokens)
@@ -879,6 +881,47 @@ class CompareLagunaLogitsTest(unittest.TestCase):
 
             self.assertEqual(tree_digest(destination), before)
 
+    def test_promotion_derives_the_short_frontier_from_the_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, _, _, ds4, head, destination = make_promotion_workspace(Path(tmp))
+            short_tokens = [*case_tokens("short", 3), 23]
+            short_tokens_payload = i32_bytes(short_tokens)
+            (capture / "short.tokens.i32").write_bytes(short_tokens_payload)
+
+            def extend_short_frontier(data: dict[str, Any]) -> None:
+                data["cases"][0]["frontier"] = len(short_tokens)
+                data["cases"][0]["token_count"] = len(short_tokens)
+                data["files"]["short.tokens.i32"] = sha256(short_tokens_payload)
+
+            digest = rewrite_capture(capture, extend_short_frontier)
+            with mock.patch.dict(
+                os.environ,
+                {"FAKE_DS4_EXTRA_SHA256": sha256(short_rendered_prompt())},
+            ):
+                call_promote(self.tool_module, ds4, capture, destination, digest)
+
+            manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["cases"][0]["frontier"], len(short_tokens))
+            self.assertEqual(manifest["cases"][0]["poolside_tokens"], short_tokens)
+            verified = self.run_verify(destination, head, digest)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_promotion_rejects_surplus_ds4_tokens_for_an_exact_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, digest, _, ds4, _, destination = make_promotion_workspace(Path(tmp))
+            before = tree_digest(destination)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"FAKE_DS4_EXTRA_SHA256": sha256(short_rendered_prompt())},
+                ),
+                self.assertRaises(self.tool_module.ContractError),
+            ):
+                call_promote(self.tool_module, ds4, capture, destination, digest)
+
+            self.assertEqual(tree_digest(destination), before)
+
     def test_promotion_accepts_byte_exact_existing_prompts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             capture, digest, _, ds4, _, destination = make_promotion_workspace(
@@ -1326,6 +1369,54 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             )
             self.assertFalse(destination.with_name(f".{destination.name}.lock").exists())
             self.assertEqual({path.name for path in root.iterdir()}, parent_entries)
+
+    def test_link_cleanup_never_claims_a_pre_return_external_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture, digest, _, ds4, _, destination = make_promotion_workspace(
+                root, preexisting_prompts=True
+            )
+            real_link = os.link
+            link_count = 0
+            replaced_target: Path | None = None
+            external_sentinel = b"replacement installed before os.link returns"
+
+            def replacing_link(
+                source: os.PathLike[str],
+                target: os.PathLike[str],
+                *args: Any,
+                **kwargs: Any,
+            ) -> None:
+                nonlocal link_count, replaced_target
+                target_path = Path(target)
+                if target_path.parent != destination:
+                    real_link(source, target, *args, **kwargs)
+                    return
+                link_count += 1
+                if link_count == 2:
+                    raise OSError("forced failure after external replacement")
+                real_link(source, target, *args, **kwargs)
+                replaced_target = target_path
+                target_path.unlink()
+                target_path.write_bytes(external_sentinel)
+
+            with (
+                mock.patch.object(self.tool_module.os, "link", side_effect=replacing_link),
+                self.assertRaises(self.tool_module.ContractError),
+            ):
+                call_promote(self.tool_module, ds4, capture, destination, digest)
+
+            self.assertEqual(link_count, 2)
+            self.assertIsNotNone(replaced_target)
+            assert replaced_target is not None
+            self.assertEqual(replaced_target.read_bytes(), external_sentinel)
+            self.assertFalse(destination.with_name(f".{destination.name}.lock").exists())
+            self.assertFalse(
+                any(
+                    path.name.startswith(f".{destination.name}.tmp-")
+                    for path in destination.parent.iterdir()
+                )
+            )
 
     def test_legacy_cli_arguments_are_rejected_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

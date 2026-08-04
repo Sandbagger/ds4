@@ -843,8 +843,10 @@ def recheck_repository(repository: Path, expected_head: str) -> None:
 
 
 def parse_tokenizer_output(output: str, label: str) -> list[int]:
+    lines = output.splitlines()
+    machine_readable = lines[0].strip() if lines else ""
     try:
-        value = ast.literal_eval(output.strip())
+        value = ast.literal_eval(machine_readable)
     except (SyntaxError, ValueError) as exc:
         fail(f"{label}: invalid token dump: {exc}")
     items = require_list(value, label)

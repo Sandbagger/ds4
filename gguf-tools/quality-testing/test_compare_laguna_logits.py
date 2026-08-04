@@ -625,6 +625,19 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         self.assertIn("verification failed:", completed.stderr)
         self.assertEqual(tree_digest(fixture), before)
 
+    def test_tokenizer_parser_accepts_the_real_ds4_detail_rows(self) -> None:
+        output = (
+            "[2, 97, 1437]\n"
+            "     2  \u3008|EOS|\u3009\n"
+            "    97  <\n"
+            "  1437  user\n"
+        )
+
+        self.assertEqual(
+            self.tool_module.parse_tokenizer_output(output, "short prompt"),
+            [2, 97, 1437],
+        )
+
     def test_valid_fixture_verifies_without_mutation_and_has_exact_file_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Path(tmp) / "promoted"

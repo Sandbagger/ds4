@@ -360,6 +360,12 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Synchronize a prompt for logits inspection. Prompts shorter than the
+ * context use ordinary sync. Exact-context success is restricted to local
+ * Laguna CUDA and permanently makes the session logits-only terminal. */
+int ds4_session_sync_logits_only(
+        ds4_session *s, const ds4_tokens *prompt,
+        char *err, size_t errlen);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

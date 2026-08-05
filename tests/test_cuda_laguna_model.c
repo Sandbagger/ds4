@@ -1,9 +1,9 @@
 /* Model-backed CUDA parity contract for poolside/Laguna-S-2.1-GGUF.
  *
  * This is intentionally outside `make test`: it needs the pinned 68 GB GGUF,
- * promoted Metal/llama.cpp oracle vectors, and a CUDA machine.  The test uses
- * only the public engine/session API.  It is expected to stay red at the
- * Laguna Metal-only engine admission gate until resident CUDA execution lands.
+ * one pinned Poolside oracle, and a CUDA machine.  The test uses only the
+ * public engine/session API.  It is expected to stay red at the Laguna CUDA
+ * engine admission gate until resident CUDA execution lands.
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/laguna-s-2.1-Q4_K_M.gguf \
@@ -31,9 +31,13 @@
 
 typedef struct {
     const char *id;
-    float *metal;
-    float *llama;
+    float *poolside;
 } oracle_case;
+
+typedef struct {
+    int pos;
+    float *logits;
+} session_state;
 
 typedef struct {
     oracle_case cases[4];
@@ -116,10 +120,9 @@ static char *read_text(const char *name) {
     return (char *)read_exact_bytes(path, (size_t)st.st_size, true);
 }
 
-static float *read_vector(const char *case_id, const char *oracle) {
+static float *read_vector(const char *case_id) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/%s.%s.f32",
-             FIXTURE_DIR, case_id, oracle);
+    snprintf(path, sizeof(path), "%s/%s.llama.f32", FIXTURE_DIR, case_id);
     unsigned char *bytes = read_exact_bytes(path, VECTOR_BYTES, false);
     if (!bytes) return NULL;
 
@@ -147,10 +150,8 @@ static float *read_vector(const char *case_id, const char *oracle) {
 static void free_fixtures(oracle_fixtures *fixtures) {
     if (!fixtures) return;
     for (size_t i = 0; i < sizeof(fixtures->cases) / sizeof(fixtures->cases[0]); i++) {
-        free(fixtures->cases[i].metal);
-        free(fixtures->cases[i].llama);
-        fixtures->cases[i].metal = NULL;
-        fixtures->cases[i].llama = NULL;
+        free(fixtures->cases[i].poolside);
+        fixtures->cases[i].poolside = NULL;
     }
 }
 
@@ -158,9 +159,8 @@ static bool load_fixtures(oracle_fixtures *fixtures) {
     memset(fixtures, 0, sizeof(*fixtures));
     for (size_t i = 0; i < sizeof(case_ids) / sizeof(case_ids[0]); i++) {
         fixtures->cases[i].id = case_ids[i];
-        fixtures->cases[i].metal = read_vector(case_ids[i], "metal");
-        fixtures->cases[i].llama = read_vector(case_ids[i], "llama");
-        if (!fixtures->cases[i].metal || !fixtures->cases[i].llama) {
+        fixtures->cases[i].poolside = read_vector(case_ids[i]);
+        if (!fixtures->cases[i].poolside) {
             free_fixtures(fixtures);
             return false;
         }
@@ -279,7 +279,7 @@ static bool compare_one_oracle(
     return ok;
 }
 
-static bool compare_session_oracles(
+static bool compare_session_oracle(
         ds4_session *session, const oracle_case *fixture, const char *scenario) {
     float *actual = malloc(VECTOR_BYTES);
     if (!actual) return fail_message("allocate CUDA logits", scenario);
@@ -288,12 +288,10 @@ static bool compare_session_oracles(
         return fail_message("copy CUDA logits", scenario);
     }
     const int session_argmax = ds4_session_argmax(session);
-    const bool metal_ok = compare_one_oracle(
-            scenario, "metal", actual, fixture->metal, session_argmax);
-    const bool llama_ok = compare_one_oracle(
-            scenario, "llama", actual, fixture->llama, session_argmax);
+    const bool ok = compare_one_oracle(
+            scenario, "poolside", actual, fixture->poolside, session_argmax);
     free(actual);
-    return metal_ok && llama_ok;
+    return ok;
 }
 
 static bool create_and_sync(
@@ -330,7 +328,7 @@ static bool run_short(ds4_engine *engine, const oracle_case *fixture) {
     ds4_session *session = NULL;
     const bool synced = create_and_sync(
             engine, &tokens, 1024, &session, "short");
-    const bool ok = synced && compare_session_oracles(session, fixture, "short");
+    const bool ok = synced && compare_session_oracle(session, fixture, "short");
     ds4_session_free(session);
     ds4_tokens_free(&tokens);
     return ok;
@@ -369,7 +367,7 @@ static bool run_raw_frontier(
         ds4_tokens_free(&tokens);
         return false;
     }
-    bool ok = compare_session_oracles(session, fixture, case_id);
+    bool ok = compare_session_oracle(session, fixture, case_id);
     if (ok && continuation) {
         char err[256] = {0};
         for (int step = 0; step < CONTINUATION_COUNT; step++) {
@@ -390,6 +388,235 @@ static bool run_raw_frontier(
             }
         }
     }
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    return ok;
+}
+
+static void session_state_free(session_state *state) {
+    if (!state) return;
+    free(state->logits);
+    memset(state, 0, sizeof(*state));
+}
+
+static bool session_state_capture(
+        ds4_session *session, session_state *state, const char *scenario) {
+    state->logits = malloc(VECTOR_BYTES);
+    if (!state->logits) return fail_message("allocate session-state logits", scenario);
+    if (ds4_session_copy_logits(
+                session, state->logits, LAGUNA_VOCAB) != LAGUNA_VOCAB) {
+        session_state_free(state);
+        return fail_message("copy session-state logits", scenario);
+    }
+    state->pos = ds4_session_pos(session);
+    return true;
+}
+
+static bool session_state_unchanged(
+        ds4_session *session, const session_state *before, const char *scenario) {
+    float *after = malloc(VECTOR_BYTES);
+    if (!after) return fail_message("allocate unchanged-state logits", scenario);
+    if (ds4_session_copy_logits(session, after, LAGUNA_VOCAB) != LAGUNA_VOCAB) {
+        free(after);
+        return fail_message("copy unchanged-state logits", scenario);
+    }
+    const int after_pos = ds4_session_pos(session);
+    const bool ok = after_pos == before->pos &&
+                    memcmp(after, before->logits, VECTOR_BYTES) == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "FAIL: %s changed terminal state pos=%d/%d logits_equal=%d\n",
+                scenario, after_pos, before->pos,
+                memcmp(after, before->logits, VECTOR_BYTES) == 0);
+    }
+    free(after);
+    return ok;
+}
+
+static bool terminal_rejected(int rc, const char *operation, const char *err) {
+    if (rc == 0) {
+        fprintf(stderr, "FAIL: terminal %s unexpectedly succeeded\n", operation);
+        return false;
+    }
+    if (!err || !strstr(err, "logits-only terminal")) {
+        fprintf(stderr, "FAIL: terminal %s returned the wrong error: %s\n",
+                operation, err ? err : "");
+        return false;
+    }
+    return true;
+}
+
+static bool run_deep_exact_context(
+        ds4_engine *engine, const oracle_case *fixture) {
+    ds4_tokens tokens = {0};
+    ds4_session *session = NULL;
+    ds4_session *control = NULL;
+    float *seed_logits = NULL;
+    session_state fresh = {0};
+    session_state terminal = {0};
+    session_state control_before = {0};
+    uint8_t snapshot_marker = UINT8_C(0xa5);
+    char staged_marker[] = "unchanged-stage-output";
+    ds4_session_snapshot snapshot = {
+        .ptr = &snapshot_marker,
+        .len = UINT64_C(17),
+        .cap = UINT64_C(19),
+    };
+    ds4_session_payload_file staged = {
+        .path = staged_marker,
+        .bytes = UINT64_C(23),
+    };
+    char err[256] = {0};
+    bool ok = tokenize_raw_fixture(
+            engine, "deep-32768.prompt", 32768, &tokens);
+
+    if (ok && ds4_session_create(&session, engine, 32768) != 0) {
+        ok = fail_message("session create", "deep-32768");
+    }
+    if (ok) {
+        seed_logits = calloc(LAGUNA_VOCAB, sizeof(*seed_logits));
+        if (!seed_logits) ok = fail_message("allocate deep boundary logits", NULL);
+    }
+    if (ok && ds4_session_set_logits(
+                      session, seed_logits, LAGUNA_VOCAB) != 0) {
+        ok = fail_message("seed deep boundary logits", NULL);
+    }
+    free(seed_logits);
+    seed_logits = NULL;
+    if (ok) ok = session_state_capture(session, &fresh, "deep ordinary boundary");
+    if (ok && ds4_session_sync(session, &tokens, err, sizeof(err)) == 0) {
+        ok = fail_message("deep ordinary equality sync unexpectedly succeeded", NULL);
+    }
+    if (ok) {
+        ok = session_state_unchanged(session, &fresh, "deep ordinary boundary");
+    }
+
+    memset(err, 0, sizeof(err));
+    if (ok && ds4_session_sync_logits_only(
+                      session, &tokens, err, sizeof(err)) != 0) {
+        ok = fail_message("deep logits-only equality sync", err);
+    }
+    if (ok && ds4_session_pos(session) != 32768) {
+        ok = fail_message("deep logits-only position", NULL);
+    }
+    if (ok) ok = compare_session_oracle(session, fixture, "deep-32768");
+    if (ok) ok = session_state_capture(session, &terminal, "deep terminal");
+    const int terminal_token = ok ? ds4_session_argmax(session) : 0;
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ok = terminal_rejected(
+                ds4_session_eval(session, terminal_token, err, sizeof(err)),
+                "direct decode", err);
+    }
+    if (ok) ok = session_state_unchanged(session, &terminal, "terminal direct decode");
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ds4_session_rewind(session, terminal.pos - 1);
+        ok = terminal_rejected(
+                ds4_session_eval(session, terminal_token, err, sizeof(err)),
+                "rewind followed by decode", err);
+    }
+    if (ok) {
+        ok = session_state_unchanged(
+                session, &terminal, "terminal rewind followed by decode");
+    }
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ok = terminal_rejected(
+                ds4_session_rewrite_from_common(
+                        session, &tokens, tokens.len - 1, err, sizeof(err)),
+                "rewrite", err);
+    }
+    if (ok) ok = session_state_unchanged(session, &terminal, "terminal rewrite");
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ok = terminal_rejected(
+                ds4_session_sync(session, &tokens, err, sizeof(err)),
+                "ordinary repeat sync", err);
+    }
+    if (ok) {
+        ok = session_state_unchanged(
+                session, &terminal, "terminal ordinary repeat sync");
+    }
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ok = terminal_rejected(
+                ds4_session_sync_logits_only(session, &tokens, err, sizeof(err)),
+                "logits-only repeat sync", err);
+    }
+    if (ok) {
+        ok = session_state_unchanged(
+                session, &terminal, "terminal logits-only repeat sync");
+    }
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ok = terminal_rejected(
+                ds4_session_save_snapshot(session, &snapshot, err, sizeof(err)),
+                "snapshot save", err);
+    }
+    if (ok && (snapshot.ptr != &snapshot_marker ||
+               snapshot.len != UINT64_C(17) ||
+               snapshot.cap != UINT64_C(19))) {
+        ok = fail_message("terminal snapshot save changed output", NULL);
+    }
+    if (ok) ok = session_state_unchanged(session, &terminal, "terminal snapshot save");
+
+    memset(err, 0, sizeof(err));
+    if (ok) {
+        ok = terminal_rejected(
+                ds4_session_stage_payload(session, &staged, err, sizeof(err)),
+                "staged payload export", err);
+    }
+    if (ok && (staged.path != staged_marker || staged.bytes != UINT64_C(23))) {
+        ok = fail_message("terminal staged payload changed output", NULL);
+    }
+    if (ok) {
+        ok = session_state_unchanged(
+                session, &terminal, "terminal staged payload export");
+    }
+
+    ds4_tokens control_prompt = tokens;
+    control_prompt.len = 512;
+    if (ok) {
+        ok = create_and_sync(
+                engine, &control_prompt, 1024, &control, "terminal batch control");
+    }
+    if (ok) {
+        ok = session_state_capture(
+                control, &control_before, "terminal batch control");
+    }
+    if (ok) {
+        ds4_decode_item items[2] = {
+            {control, ds4_session_argmax(control)},
+            {session, terminal_token},
+        };
+        memset(err, 0, sizeof(err));
+        ok = terminal_rejected(
+                ds4_sessions_eval_batch(items, 2, err, sizeof(err)),
+                "batch decode", err);
+    }
+    if (ok) {
+        ok = session_state_unchanged(
+                control, &control_before, "terminal batch nonterminal member");
+    }
+    if (ok) {
+        ok = session_state_unchanged(
+                session, &terminal, "terminal batch terminal member");
+    }
+
+    if (staged.path != staged_marker) ds4_session_payload_file_free(&staged);
+    if (snapshot.ptr != &snapshot_marker) ds4_session_snapshot_free(&snapshot);
+    session_state_free(&control_before);
+    session_state_free(&terminal);
+    session_state_free(&fresh);
+    free(seed_logits);
+    ds4_session_free(control);
     ds4_session_free(session);
     ds4_tokens_free(&tokens);
     return ok;
@@ -607,11 +834,7 @@ int main(void) {
                 &fixtures.cases[2], fixtures.continuation);
     }
     /* run_raw_frontier frees the 8202-token session before deep allocation. */
-    if (ok) {
-        ok = run_raw_frontier(
-                engine, "deep-32768", "deep-32768.prompt", 32768, 32768,
-                &fixtures.cases[3], NULL);
-    }
+    if (ok) ok = run_deep_exact_context(engine, &fixtures.cases[3]);
     /* The deep session is freed before either multi-session scenario. */
     if (ok) ok = run_decode_batch(engine);
     if (ok) ok = run_mixed_batch(engine);
@@ -620,7 +843,7 @@ int main(void) {
     free_fixtures(&fixtures);
     if (!ok) return 1;
     fprintf(stderr,
-            "test_cuda_laguna_model PASS cases=4 vectors=8 continuation=8 "
+            "test_cuda_laguna_model PASS oracle=poolside cases=4 vectors=4 continuation=8 "
             "decode_batch=2 mixed=1+2\n");
     return 0;
 }

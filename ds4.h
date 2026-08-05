@@ -447,6 +447,16 @@ typedef enum {
     DS4_TEST_GRAPH_FAMILY_LAGUNA,
 } ds4_test_graph_family;
 
+typedef struct {
+    int family;
+    int variant;
+    uint32_t layer_count;
+    uint64_t compress_ratios_hash;
+    uint64_t head_counts_hash;
+} ds4_test_model_shape_state;
+
+typedef void (*ds4_test_thread_sync_fn)(void *context);
+
 int ds4_test_logits_only_sync_mode(
         bool native_cuda_build,
         bool laguna, ds4_backend backend,
@@ -527,6 +537,11 @@ int ds4_test_qualification_plan_preflight(
         bool gpu_config_requested,
         char *err,
         size_t errcap);
+bool ds4_test_failure_trap_thread_probe(
+        ds4_test_thread_sync_fn synchronize,
+        void *context);
+void ds4_test_model_shape_state_get(ds4_test_model_shape_state *out);
+void ds4_test_force_qualification_shape_failure(bool enabled);
 bool ds4_test_laguna_file_identity_capture(
         int fd,
         uint64_t *device,

@@ -10,6 +10,7 @@
 #include "ds4_runtime.h"
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -238,10 +239,118 @@ static void test_qualification_frontend_allowlist(void) {
           "inline qualification path is rejected by the plan-mode gate");
 }
 
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int arrived;
+    int target;
+} qualification_thread_gate;
+
+typedef struct {
+    qualification_thread_gate *gate;
+    bool isolated;
+} qualification_thread_probe;
+
+static void qualification_thread_gate_wait(void *opaque) {
+    qualification_thread_gate *gate = opaque;
+    pthread_mutex_lock(&gate->mutex);
+    gate->arrived++;
+    if (gate->arrived >= gate->target) {
+        pthread_cond_broadcast(&gate->condition);
+    }
+    while (gate->arrived < gate->target) {
+        pthread_cond_wait(&gate->condition, &gate->mutex);
+    }
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void *qualification_thread_probe_run(void *opaque) {
+    qualification_thread_probe *probe = opaque;
+    probe->isolated = ds4_test_failure_trap_thread_probe(
+        qualification_thread_gate_wait, probe->gate);
+    return NULL;
+}
+
+static void test_qualification_failure_trap_thread_isolation(void) {
+    qualification_thread_gate gate = {
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .condition = PTHREAD_COND_INITIALIZER,
+        .target = 2,
+    };
+    qualification_thread_probe probes[2] = {
+        { .gate = &gate },
+        { .gate = &gate },
+    };
+    pthread_t threads[2];
+    int created = 0;
+    for (; created < 2; created++) {
+        if (pthread_create(
+                &threads[created], NULL,
+                qualification_thread_probe_run, &probes[created]) != 0) {
+            break;
+        }
+    }
+    if (created != 2) {
+        pthread_mutex_lock(&gate.mutex);
+        gate.target = created;
+        pthread_cond_broadcast(&gate.condition);
+        pthread_mutex_unlock(&gate.mutex);
+    }
+    for (int i = 0; i < created; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    CHECK(created == 2, "qualification trap isolation starts two threads");
+    if (created == 2) {
+        CHECK(probes[0].isolated && probes[1].isolated,
+              "each qualification thread retains its own failure trap");
+    }
+    CHECK(pthread_cond_destroy(&gate.condition) == 0,
+          "qualification trap test condition is destroyed");
+    CHECK(pthread_mutex_destroy(&gate.mutex) == 0,
+          "qualification trap test mutex is destroyed");
+}
+
+static void test_qualification_shape_state_restoration(void) {
+    char plan_path[] = "/tmp/ds4-qualification-state.XXXXXX";
+    const int placeholder_fd = mkstemp(plan_path);
+    CHECK(placeholder_fd >= 0,
+          "qualification state test reserves an output path");
+    if (placeholder_fd < 0) return;
+    CHECK(close(placeholder_fd) == 0 && unlink(plan_path) == 0,
+          "qualification state output target begins absent");
+
+    char sidecar_path[sizeof(plan_path) + 8u];
+    snprintf(sidecar_path, sizeof(sidecar_path), "%s.sha256", plan_path);
+
+    ds4_test_model_shape_state before;
+    ds4_test_model_shape_state after;
+    ds4_test_model_shape_state_get(&before);
+
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    ds4_engine_options opt = reference_qualification_options(8u * gib);
+    opt.qualification_plan_path = plan_path;
+    char err[256] = {0};
+    ds4_test_force_qualification_shape_failure(true);
+    const int rc = ds4_engine_write_qualification_plan(
+        &opt, err, sizeof(err));
+    ds4_test_force_qualification_shape_failure(false);
+    ds4_test_model_shape_state_get(&after);
+
+    CHECK(rc == 2 && strstr(err, "injected shape failure") != NULL,
+          "injected qualification failure uses the public error contract");
+    CHECK(memcmp(&before, &after, sizeof(before)) == 0,
+          "qualification failure restores shape and per-layer globals");
+    CHECK(access(plan_path, F_OK) != 0 && access(sidecar_path, F_OK) != 0,
+          "shape failure publishes neither plan artifact");
+}
+
 static void test_options(void) {
     test_qualification_option_preflight();
     test_qualification_model_identity();
     test_qualification_frontend_allowlist();
+    test_qualification_failure_trap_thread_isolation();
+    test_qualification_shape_state_restoration();
     check_parse_ok("1", UINT64_C(1));
     check_parse_ok("8589934592", UINT64_C(8589934592));
     check_parse_ok("18446744073709551615", UINT64_MAX);

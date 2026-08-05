@@ -188,6 +188,15 @@ typedef enum {
 } ds4_laguna_cache_status;
 
 typedef enum {
+    DS4_LAGUNA_CACHE_ACQUIRE_NONE = 0,
+    DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED = 1,
+    DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER = 2,
+    DS4_LAGUNA_CACHE_ACQUIRE_BUSY_LOADING = 3,
+    DS4_LAGUNA_CACHE_ACQUIRE_BUSY_IN_USE = 4,
+    DS4_LAGUNA_CACHE_ACQUIRE_PRESSURE = 5,
+} ds4_laguna_cache_acquire_outcome;
+
+typedef enum {
     DS4_LAGUNA_CACHE_SLOT_EMPTY = 0,
     DS4_LAGUNA_CACHE_SLOT_LOADING = 1,
     DS4_LAGUNA_CACHE_SLOT_READY = 2,
@@ -216,6 +225,8 @@ typedef char ds4_laguna_cache_slot_must_be_32_bytes[
 typedef struct {
     uint32_t slot_index;
     uint64_t generation;
+    size_t entry_index;
+    ds4_laguna_expert_key key;
 } ds4_laguna_cache_handle;
 
 typedef struct {
@@ -278,11 +289,21 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_note_route(
     ds4_laguna_cache_policy *policy,
     ds4_laguna_expert_key key);
 
+ds4_laguna_cache_status ds4_laguna_cache_policy_note_routes(
+    ds4_laguna_cache_policy *policy,
+    const ds4_laguna_expert_key *keys,
+    size_t key_count);
+
+/* HIT_RESERVED and LOAD_OWNER are the only outcomes that return a valid,
+ * generation-and-key-bound handle. HIT_RESERVED enters IN_USE with one ref;
+ * publishing LOAD_OWNER does the same. BUSY and PRESSURE return an invalid
+ * handle and require the caller to retry rather than mutate another owner's
+ * slot. */
 ds4_laguna_cache_status ds4_laguna_cache_policy_acquire(
     ds4_laguna_cache_policy *policy,
     ds4_laguna_expert_key key,
     ds4_laguna_cache_handle *handle,
-    bool *hit);
+    ds4_laguna_cache_acquire_outcome *outcome);
 
 ds4_laguna_cache_status ds4_laguna_cache_policy_publish(
     ds4_laguna_cache_policy *policy,
@@ -307,10 +328,22 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_cancel(
 ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
     ds4_laguna_cache_policy *policy);
 
+/* Full O(entry_count + slot_count log entry_count) invariant audit for
+ * startup, tests, and fault boundaries. Hot transitions intentionally perform
+ * only touched-key/slot/map checks. */
+ds4_laguna_cache_status ds4_laguna_cache_policy_audit(
+    const ds4_laguna_cache_policy *policy);
+
 /* `selected` is flattened token-major input for one routed layer. The helper
  * emits unique keys in stable first-occurrence order and slot-sized group
- * descriptors into caller-owned buffers. All output capacity is zero-filled
- * so repeated inputs produce byte-identical output, including padding. */
+ * descriptors into caller-owned buffers. `grouped_keys == selected` supports
+ * exact in-place stable compaction; any partial overlap, or overlap involving
+ * `groups`, is unsafe and rejected before either array is modified. Successful
+ * output capacity is zero-filled for byte-identical repeated output. The
+ * disjoint path uses allocation-free O(selected_count * unique) stable
+ * deduplication. Exact in-place compaction adds an O(selected_count^2)
+ * preflight so capacity failure can preserve the input; caller-owned scratch
+ * remains deferred until measured usage warrants extending the contract. */
 ds4_laguna_cache_status ds4_laguna_cache_policy_group(
     const ds4_laguna_cache_policy *policy,
     const ds4_laguna_expert_key *selected,

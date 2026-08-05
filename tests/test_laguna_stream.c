@@ -1557,6 +1557,91 @@ static void test_cache_cancellation_states(void) {
           "in-use cancellation can be completed by the normal unpin path");
 }
 
+static void test_cache_fault_boundaries_refuse_stray_maps(void) {
+    cache_fixture fail_fixture;
+    ds4_laguna_cache_handle fail_owner = {0};
+    ds4_laguna_cache_acquire_outcome outcome =
+        DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(cache_fixture_init(&fail_fixture, 1u, 1u) &&
+              ds4_laguna_cache_policy_acquire(
+                  &fail_fixture.policy, fixture_key(0), &fail_owner,
+                  &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "fault-boundary fail fixture owns one loading slot");
+    fail_fixture.entry_to_slot[7] = fail_owner.slot_index;
+    ds4_laguna_cache_slot fail_slots_before[CACHE_FIXTURE_SLOT_COUNT];
+    uint32_t fail_maps_before[CACHE_FIXTURE_ENTRY_COUNT];
+    memcpy(fail_slots_before, fail_fixture.slots,
+           sizeof(fail_slots_before));
+    memcpy(fail_maps_before, fail_fixture.entry_to_slot,
+           sizeof(fail_maps_before));
+    CHECK(ds4_laguna_cache_policy_audit(&fail_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              ds4_laguna_cache_policy_fail(
+                  &fail_fixture.policy, fail_owner) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              memcmp(fail_slots_before, fail_fixture.slots,
+                     sizeof(fail_slots_before)) == 0 &&
+              memcmp(fail_maps_before, fail_fixture.entry_to_slot,
+                     sizeof(fail_maps_before)) == 0 &&
+              ds4_laguna_cache_policy_audit(&fail_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE,
+          "load failure refuses globally corrupt state without partial restoration");
+
+    cache_fixture cancel_fixture;
+    ds4_laguna_cache_handle cancel_owner = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(cache_fixture_init(&cancel_fixture, 1u, 1u) &&
+              ds4_laguna_cache_policy_acquire(
+                  &cancel_fixture.policy, fixture_key(0), &cancel_owner,
+                  &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "fault-boundary cancel fixture owns one loading slot");
+    cancel_fixture.entry_to_slot[7] = cancel_owner.slot_index;
+    ds4_laguna_cache_slot cancel_slots_before[CACHE_FIXTURE_SLOT_COUNT];
+    uint32_t cancel_maps_before[CACHE_FIXTURE_ENTRY_COUNT];
+    memcpy(cancel_slots_before, cancel_fixture.slots,
+           sizeof(cancel_slots_before));
+    memcpy(cancel_maps_before, cancel_fixture.entry_to_slot,
+           sizeof(cancel_maps_before));
+    CHECK(ds4_laguna_cache_policy_audit(&cancel_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              ds4_laguna_cache_policy_cancel(
+                  &cancel_fixture.policy, cancel_owner) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              memcmp(cancel_slots_before, cancel_fixture.slots,
+                     sizeof(cancel_slots_before)) == 0 &&
+              memcmp(cancel_maps_before, cancel_fixture.entry_to_slot,
+                     sizeof(cancel_maps_before)) == 0 &&
+              ds4_laguna_cache_policy_audit(&cancel_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE,
+          "load cancellation refuses globally corrupt state without partial restoration");
+
+    cache_fixture drain_fixture;
+    ds4_laguna_cache_handle ready = {0};
+    CHECK(cache_fixture_init(&drain_fixture, 1u, 1u) &&
+              cache_load(&drain_fixture, fixture_key(0), &ready),
+          "fault-boundary drain fixture owns one ready slot");
+    drain_fixture.entry_to_slot[7] = ready.slot_index;
+    ds4_laguna_cache_slot drain_slots_before[CACHE_FIXTURE_SLOT_COUNT];
+    uint32_t drain_maps_before[CACHE_FIXTURE_ENTRY_COUNT];
+    memcpy(drain_slots_before, drain_fixture.slots,
+           sizeof(drain_slots_before));
+    memcpy(drain_maps_before, drain_fixture.entry_to_slot,
+           sizeof(drain_maps_before));
+    CHECK(ds4_laguna_cache_policy_audit(&drain_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              ds4_laguna_cache_policy_drain(&drain_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              memcmp(drain_slots_before, drain_fixture.slots,
+                     sizeof(drain_slots_before)) == 0 &&
+              memcmp(drain_maps_before, drain_fixture.entry_to_slot,
+                     sizeof(drain_maps_before)) == 0 &&
+              ds4_laguna_cache_policy_audit(&drain_fixture.policy) ==
+                  DS4_LAGUNA_CACHE_UNSAFE,
+          "drain refuses globally corrupt state without partial teardown");
+}
+
 static void test_cache_victim_ordering(void) {
     cache_fixture f;
     ds4_laguna_cache_handle handles[4];
@@ -1750,6 +1835,7 @@ static void test_cache_policy(void) {
     test_cache_hotness_saturates();
     test_cache_failed_load_and_stale_completion();
     test_cache_cancellation_states();
+    test_cache_fault_boundaries_refuse_stray_maps();
     test_cache_victim_ordering();
     test_cache_pins_and_drain();
     test_cache_unsafe_boundaries();

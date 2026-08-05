@@ -147,6 +147,9 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
+/* Pre-init probe for the device used by ds4_gpu_init()'s single-tier path. */
+uint64_t ds4_gpu_default_device_working_set_size(
+        uint32_t *visible_devices_out);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {

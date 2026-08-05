@@ -890,12 +890,69 @@ static void test_batch_atomic_rejections(void) {
     ds4_session_free(terminal_prefill);
 }
 
+static void test_exact_cache_session_safety(void) {
+    int oversized_rc = -1;
+    int first_rc = -1;
+    int second_rc = -1;
+    int reuse_rc = -1;
+    CHECK(ds4_test_session_limit_lifecycle(
+              true, true, 32768, 32768, 32769,
+              &oversized_rc, &first_rc, &second_rc, &reuse_rc) == 0,
+          "exact-cache lifecycle fixture");
+    CHECK(oversized_rc == 2,
+          "oversized exact-cache session returned %d, want 2", oversized_rc);
+    CHECK(first_rc == 0,
+          "first exact-cache session returned %d, want 0", first_rc);
+    CHECK(second_rc == 2,
+          "second live exact-cache session returned %d, want 2", second_rc);
+    CHECK(reuse_rc == 0,
+          "exact-cache slot after free returned %d, want 0", reuse_rc);
+
+    oversized_rc = first_rc = second_rc = reuse_rc = -1;
+    CHECK(ds4_test_session_limit_lifecycle(
+              false, true, 0, 32768, 32769,
+              &oversized_rc, &first_rc, &second_rc, &reuse_rc) == 0,
+          "legacy-cache lifecycle fixture");
+    CHECK(oversized_rc == 0 && first_rc == 0 && second_rc == 0 && reuse_rc == 0,
+          "legacy sessions were restricted: oversized=%d first=%d second=%d reuse=%d",
+          oversized_rc, first_rc, second_rc, reuse_rc);
+
+    oversized_rc = first_rc = second_rc = reuse_rc = -1;
+    CHECK(ds4_test_session_limit_lifecycle(
+              true, false, 0, 32768, 32769,
+              &oversized_rc, &first_rc, &second_rc, &reuse_rc) == 0,
+          "non-graph exact-cache lifecycle fixture");
+    CHECK(oversized_rc == 0 && first_rc == 0 && second_rc == 0 && reuse_rc == 0,
+          "non-graph sessions were restricted: oversized=%d first=%d second=%d reuse=%d",
+          oversized_rc, first_rc, second_rc, reuse_rc);
+
+    oversized_rc = -1;
+    int concurrent_rc = -1;
+    reuse_rc = -1;
+    int diagnostic_rc = -1;
+    CHECK(ds4_test_direct_graph_limit_lifecycle(
+              &oversized_rc, &concurrent_rc, &reuse_rc,
+              &diagnostic_rc) == 0,
+          "direct graph lifecycle fixture");
+    CHECK(oversized_rc == 2,
+          "oversized direct graph returned %d, want 2", oversized_rc);
+    CHECK(concurrent_rc == 2,
+          "direct graph alongside a live session returned %d, want 2",
+          concurrent_rc);
+    CHECK(reuse_rc == 0,
+          "direct graph after session free returned %d, want 0", reuse_rc);
+    CHECK(diagnostic_rc == 2,
+          "exact-cache direct graph diagnostic returned %d, want 2",
+          diagnostic_rc);
+}
+
 int main(void) {
     test_eligibility_matrix();
     test_allowed_reads();
     test_scalar_mutation_rejections();
     test_payload_snapshot_rejections();
     test_batch_atomic_rejections();
+    test_exact_cache_session_safety();
 
     if (failures != 0) {
         fprintf(stderr, "test_session_logits_only FAIL failures=%d\n", failures);

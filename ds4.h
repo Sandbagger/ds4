@@ -154,12 +154,18 @@ typedef struct {
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    /* The legacy NGB spelling also fills cache_bytes; retain its provenance. */
+    bool ssd_streaming_cache_experts_set;
+    bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
+    /* Declared simultaneously live sessions; zero preserves the one-slot
+     * default for existing callers. */
+    uint32_t session_slots;
     bool first_token_test;
     bool metal_graph_test;
     bool load_slice;
@@ -194,6 +200,17 @@ typedef struct {
     uint64_t bytes;
 } ds4_session_payload_file;
 
+struct ds4_gpu_config;
+
+/* Validate model-independent configuration before tokenizer/model access. */
+int ds4_engine_options_preflight(const ds4_engine_options *opt,
+                                 char *err,
+                                 size_t errcap);
+int ds4_engine_options_preflight_with_gpu_config(
+        const ds4_engine_options *opt,
+        const struct ds4_gpu_config *gpu_cfg,
+        char *err,
+        size_t errcap);
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 
 /* Multi-GPU pipeline-parallel entry point (wave 2).
@@ -212,7 +229,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 /* ds4_gpu_config is declared in ds4_gpu_mgpu.h, which callers should
  * include separately. We forward-declare it here so this header can be
  * used as-is (callers passing NULL don't need the struct definition). */
-struct ds4_gpu_config;
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg);
@@ -399,6 +415,13 @@ typedef struct {
     uint64_t layer_payload_dispatches;
 } ds4_test_session_state;
 
+typedef enum {
+    DS4_TEST_GRAPH_FAMILY_FLASH,
+    DS4_TEST_GRAPH_FAMILY_PRO,
+    DS4_TEST_GRAPH_FAMILY_GLM,
+    DS4_TEST_GRAPH_FAMILY_LAGUNA,
+} ds4_test_graph_family;
+
 int ds4_test_logits_only_sync_mode(
         bool native_cuda_build,
         bool laguna, ds4_backend backend,
@@ -416,6 +439,76 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
 uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_laguna_decode_fallback_count(void);
 uint64_t ds4_test_laguna_mixed_fallback_count(void);
+int ds4_test_exact_cache_options_preflight(
+        bool ssd_streaming,
+        bool exact_cache_bytes_set,
+        bool legacy_cache_experts_set,
+        uint64_t configured_cache_bytes,
+        bool safe_cache_bytes_known,
+        uint64_t safe_cache_bytes,
+        char *err,
+        size_t errcap);
+uint64_t ds4_test_graph_cache_safe_bytes(
+        uint64_t recommended_working_set_bytes,
+        uint64_t graph_context_bytes);
+uint64_t ds4_test_graph_context_bound(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk);
+uint64_t ds4_test_graph_context_max_bound(
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        ds4_test_graph_family *worst_family_out);
+bool ds4_test_exact_cache_plan_make(uint64_t configured_cache_bytes,
+                                    uint64_t slot_stride_bytes,
+                                    uint64_t *effective_cache_bytes_out,
+                                    uint32_t *slot_count_out);
+bool ds4_test_post_prefill_cache_budget(uint64_t current_cache_bytes,
+                                        uint64_t reclaimed_headroom_bytes,
+                                        bool exact_cache_bytes,
+                                        uint64_t *out);
+int ds4_test_engine_exact_cache_preflight(
+        bool recommended_known,
+        uint64_t recommended_bytes,
+        uint64_t configured_cache_bytes,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        uint32_t session_slots,
+        bool share_session_prefill_workspace,
+        char *err,
+        size_t errcap);
+int ds4_test_session_limit_lifecycle(
+        bool exact_cache,
+        bool graph_backend,
+        int declared_context,
+        int requested_context,
+        int oversized_context,
+        int *oversized_rc,
+        int *first_rc,
+        int *second_rc,
+        int *reuse_rc);
+int ds4_test_direct_graph_limit_lifecycle(
+        int *oversized_rc,
+        int *concurrent_rc,
+        int *reuse_rc,
+        int *diagnostic_rc);
+int ds4_test_exact_cache_cuda_topology_preflight(
+        uint32_t device_count,
+        int device_index,
+        char *err,
+        size_t errcap);
+bool ds4_test_gpu_config_working_set_bytes(
+        const uint64_t *budgets,
+        size_t count,
+        uint64_t *out);
+bool ds4_test_default_single_tier_working_set_bytes(
+        uint64_t default_device_bytes,
+        uint32_t visible_devices,
+        uint64_t *out);
+uint64_t ds4_test_graph_context_memory_bytes(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

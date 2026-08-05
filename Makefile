@@ -4,9 +4,11 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 SAMPLING_TEST :=
+TEST_GC_LDFLAGS := -Wl,-dead_strip
 else
 NATIVE_CPU_FLAG ?= -march=native
 SAMPLING_TEST := tests/test_sampling
+TEST_GC_LDFLAGS := -Wl,--gc-sections
 endif
 
 DEBUG_FLAGS ?= -g
@@ -47,7 +49,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-resident dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-resident dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -281,6 +283,20 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_laguna_stream.o: tests/test_laguna_stream.c ds4.h ds4_ssd.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<
+
+ds4_bound_test_hooks.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS \
+		-DDS4_TEST_FORCE_GRAPH_CACHE_F32 -ffunction-sections \
+		-fdata-sections -c -o $@ ds4.c
+
+tests/test_laguna_stream: tests/test_laguna_stream.o ds4_bound_test_hooks.o ds4_ssd.o
+	$(CC) $(CFLAGS) $(TEST_GC_LDFLAGS) -o $@ $^ $(LDLIBS)
+
+test-laguna-stream: tests/test_laguna_stream
+	./tests/test_laguna_stream --case options
+
 ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
@@ -406,7 +422,7 @@ test-laguna-compact-python:
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-laguna-compact-python \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_session_logits_only $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_session_logits_only tests/test_laguna_stream $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -414,6 +430,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-laguna-compact-python \
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_session_logits_only
+	./tests/test_laguna_stream --case options
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling
@@ -449,4 +466,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

@@ -202,6 +202,228 @@ if [ -x ./ds4 ]; then
     fi
 fi
 
+# 8: compact-runtime canonical options are shared by every inference binary.
+INFERENCE_BINS=(./ds4 ./ds4-server ./ds4-bench ./ds4-agent ./ds4-eval)
+INFERENCE_NAMES=(ds4 ds4-server ds4-bench ds4-agent ds4-eval)
+
+run_inference_option() {
+    local name=$1
+    local bin=$2
+    shift 2
+    if [ "$name" = "ds4-bench" ]; then
+        "$bin" "$@" -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+    else
+        "$bin" "$@" -m /dev/null > "$LOG" 2>&1
+    fi
+}
+
+assert_before_model_open() {
+    local name=$1
+    local expected=$2
+    local rc=$3
+    if [ "$rc" -eq 2 ] && grep -q -- "$expected" "$LOG" &&
+       ! grep -qE "model file is too small|failed to open model|another ds4 process" "$LOG"; then
+        ok "$name"
+    else
+        fail "$name (expected config exit 2 before model open, got $rc)"
+        sed -n '1,12p' "$LOG" | sed 's/^/    /'
+    fi
+}
+
+assert_reaches_model_open() {
+    local name=$1
+    local rc=$2
+    if [ "$rc" -ne 0 ] &&
+       grep -qE "model file is too small|failed to open model|another ds4 process" "$LOG" &&
+       ! grep -qE "unknown option|must be canonical|cannot be combined|conflicts with" "$LOG"; then
+        ok "$name"
+    else
+        fail "$name (canonical option did not reach model open, got $rc)"
+        sed -n '1,12p' "$LOG" | sed 's/^/    /'
+    fi
+}
+
+for i in "${!INFERENCE_BINS[@]}"; do
+    name=${INFERENCE_NAMES[$i]}; bin=${INFERENCE_BINS[$i]}
+    if [ ! -x "$bin" ]; then
+        fail "$name not built — skipping compact-runtime option checks"
+        continue
+    fi
+
+    "$bin" --help > "$LOG" 2>&1 || true
+    assert_grep "$name --help mentions --ssd-streaming-cache-bytes" \
+        "--ssd-streaming-cache-bytes BYTES" "$LOG"
+
+    if [ "$name" = "ds4-bench" ]; then
+        run_inference_option "$name" "$bin" \
+            --ctx-start 128 --ctx-max 128 --ctx-alloc 1024 \
+            --prefill-chunk 1 \
+            --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    else
+        run_inference_option "$name" "$bin" \
+            --ctx 1024 --prefill-chunk 1 \
+            --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    fi
+    rc=$?
+    assert_reaches_model_open "$name accepts canonical cache bytes" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --ssd-streaming --ssd-streaming-cache-experts 8GB
+    rc=$?
+    assert_reaches_model_open "$name retains legacy cache spelling" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --ssd-streaming --ssd-streaming-cache-bytes 08
+    rc=$?
+    assert_before_model_open "$name rejects non-canonical cache bytes" \
+        "--ssd-streaming-cache-bytes must be canonical" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592 \
+        --ssd-streaming-cache-experts 8GB
+    rc=$?
+    assert_before_model_open "$name rejects canonical/legacy cache mix" \
+        "--ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --ssd-streaming --ssd-streaming-cache-experts 8GB \
+        --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    assert_before_model_open "$name rejects legacy/canonical cache mix" \
+        "--ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --ssd-streaming --ssd-streaming-cache-bytes 18446744073709551615
+    rc=$?
+    assert_before_model_open "$name rejects impossible exact cache bytes" \
+        "--ssd-streaming-cache-bytes is impossible" "$rc"
+done
+
+# 9: diagnostic early exits must still pass the shared engine-option preflight.
+# /dev/null proves the typed configuration error happened before tokenizer/model
+# access; this exact reproduction previously returned the model-open class (1).
+if [ -x ./ds4 ]; then
+    ./ds4 --dump-tokens -p x -m /dev/null \
+        --ssd-streaming \
+        --ssd-streaming-cache-bytes 18446744073709551615 \
+        > "$LOG" 2>&1
+    rc=$?
+    assert_before_model_open \
+        "ds4 --dump-tokens rejects impossible exact cache before model access" \
+        "--ssd-streaming-cache-bytes is impossible" "$rc"
+fi
+
+# 10: exact graph-cache pricing requires a declared context, and this first
+# qualified compact profile is deliberately single-session until Task 5/14
+# account for concurrent graph/KV state.
+if [ -x ./ds4-eval ]; then
+    run_inference_option ds4-eval ./ds4-eval \
+        --cuda --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    assert_before_model_open \
+        "ds4-eval exact graph cache rejects auto context sizing" \
+        "--ctx" "$rc"
+fi
+
+if [ -x ./ds4 ]; then
+    run_inference_option ds4 ./ds4 \
+        --metal-graph-prompt-test --ctx 32768 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    assert_before_model_open \
+        "ds4 exact graph cache rejects direct-allocation diagnostics" \
+        "graph diagnostics" "$rc"
+fi
+
+if [ -x ./ds4-server ]; then
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --ctx 32768 --session-slots 1 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    if [ "$rc" -ne 0 ] &&
+       ! grep -q -- "shared prefill workspace" "$LOG" &&
+       ! grep -q -- "--session-slots 1" "$LOG" &&
+       grep -qE "model file is too small|failed to open model|another ds4 process|working-set limit is unavailable" "$LOG"; then
+        ok "ds4-server exact graph cache accepts one declared session"
+    else
+        fail "ds4-server exact one-session declaration was refused (got $rc)"
+        sed -n '1,12p' "$LOG" | sed 's/^/    /'
+    fi
+
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --session-slots 2 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    assert_before_model_open \
+        "ds4-server exact graph cache rejects multiple session slots" \
+        "--session-slots" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --batched-session 2 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    assert_before_model_open \
+        "ds4-server exact graph cache rejects legacy multi-session alias" \
+        "--session-slots" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --session-slots 2 \
+        --ssd-streaming --ssd-streaming-cache-experts 8GB
+    rc=$?
+    assert_reaches_model_open \
+        "ds4-server legacy cache preserves multiple session slots" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --ctx 32768 --session-slots 1 \
+        --gpu-vram 24,24 --gpu-devices 0,1 \
+        --ssd-streaming --ssd-streaming-cache-bytes 17179869184
+    rc=$?
+    assert_before_model_open \
+        "ds4-server exact graph cache rejects aggregate multi-GPU budgets" \
+        "one CUDA device" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --ctx 32768 --session-slots 1 \
+        --gpu-vram 128 --gpu-devices 3 \
+        --ssd-streaming --ssd-streaming-cache-bytes 17179869184
+    rc=$?
+    assert_before_model_open \
+        "ds4-server exact graph cache rejects nonzero single CUDA device" \
+        "CUDA device 0" "$rc"
+fi
+
+# 11: --session-slots is canonical; --batched-session is an equal-value alias.
+if [ -x ./ds4-server ]; then
+    ./ds4-server --help > "$LOG" 2>&1 || true
+    assert_grep "ds4-server --help mentions --session-slots" \
+        "--session-slots N" "$LOG"
+
+    run_inference_option ds4-server ./ds4-server --session-slots 1
+    rc=$?
+    assert_reaches_model_open "ds4-server accepts --session-slots" "$rc"
+
+    run_inference_option ds4-server ./ds4-server --batched-session 1
+    rc=$?
+    assert_reaches_model_open "ds4-server retains --batched-session alias" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --session-slots 1 --batched-session 1
+    rc=$?
+    assert_reaches_model_open "ds4-server accepts equal session-slot aliases" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --session-slots 1 --batched-session 2
+    rc=$?
+    assert_before_model_open "ds4-server rejects conflicting session-slot aliases" \
+        "--session-slots conflicts with --batched-session" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --batched-session 2 --session-slots 1
+    rc=$?
+    assert_before_model_open "ds4-server rejects reverse session-slot conflict" \
+        "--session-slots conflicts with --batched-session" "$rc"
+fi
+
 rm -f "$LOG"
 
 echo ""

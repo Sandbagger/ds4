@@ -27062,6 +27062,41 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b * (uint64_t)n;
 }
 
+extern "C" uint64_t ds4_gpu_default_device_working_set_size(
+        uint32_t *visible_devices_out) {
+    if (visible_devices_out) *visible_devices_out = 0;
+
+    int visible = 0;
+    if (cudaGetDeviceCount(&visible) != cudaSuccess || visible <= 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaSetDevice(0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    const cudaError_t query_rc = cudaMemGetInfo(&free_b, &total_b);
+    const cudaError_t restore_rc =
+        previous == 0 ? cudaSuccess : cudaSetDevice(previous);
+    if (query_rc != cudaSuccess || restore_rc != cudaSuccess || total_b == 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    (void)free_b;
+    if (visible_devices_out) *visible_devices_out = (uint32_t)visible;
+    return (uint64_t)total_b;
+}
+
 extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
     (void)selected;
     (void)n_selected;

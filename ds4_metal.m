@@ -3664,6 +3664,13 @@ uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)[g_device recommendedMaxWorkingSetSize];
 }
 
+uint64_t ds4_gpu_default_device_working_set_size(
+        uint32_t *visible_devices_out) {
+    const uint64_t bytes = ds4_gpu_recommended_working_set_size();
+    if (visible_devices_out) *visible_devices_out = bytes != 0 ? 1u : 0u;
+    return bytes;
+}
+
 static int ds4_gpu_model_map_log_enabled(void) {
     if (!g_ssd_streaming_mode) return 1;
     const char *trace = getenv("DS4_METAL_STREAMING_MAP_TRACE");

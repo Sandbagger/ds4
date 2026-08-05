@@ -4666,41 +4666,120 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
 }
 #endif
 
-static uint64_t ds4_streaming_manual_cache_safe_bytes(
+typedef struct {
+    bool ssd_streaming;
+    bool exact_cache_bytes_set;
+    bool legacy_cache_experts_set;
+    uint64_t configured_cache_bytes;
+    bool safe_cache_bytes_known;
+    uint64_t safe_cache_bytes;
+} ds4_exact_cache_option_state;
+
+typedef struct {
+    uint64_t configured_cache_bytes;
+    uint64_t effective_cache_bytes;
+    uint64_t slot_stride_bytes;
+    uint32_t slot_count;
+} ds4_exact_cache_plan;
+
+typedef enum {
+    DS4_GRAPH_FAMILY_FLASH,
+    DS4_GRAPH_FAMILY_PRO,
+    DS4_GRAPH_FAMILY_GLM,
+    DS4_GRAPH_FAMILY_LAGUNA,
+} ds4_graph_family;
+
+typedef struct {
+    uint64_t flash_bytes;
+    uint64_t pro_bytes;
+    uint64_t glm_bytes;
+    uint64_t laguna_bytes;
+    uint64_t max_bytes;
+    ds4_graph_family worst_family;
+} ds4_graph_context_bounds;
+
+static int ds4_exact_cache_options_preflight(
+        const ds4_exact_cache_option_state *state,
+        char *err,
+        size_t errcap);
+static uint64_t ds4_graph_cache_safe_bytes(
+        uint64_t recommended_working_set_bytes,
+        uint64_t graph_context_bytes);
+static bool ds4_graph_context_bounds_make(
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        ds4_graph_context_bounds *out);
+static bool ds4_exact_cache_plan_make(uint64_t configured_cache_bytes,
+                                      uint64_t slot_stride_bytes,
+                                      ds4_exact_cache_plan *out);
+static DS4_MAYBE_UNUSED bool ds4_post_prefill_cache_budget(
+        uint64_t current_cache_bytes,
+        uint64_t reclaimed_headroom_bytes,
+        bool exact_cache_bytes,
+        uint64_t *out);
+static bool ds4_laguna_graph_context_bound(
+        uint32_t context_tokens,
+        uint64_t *kv_bytes_out,
+        uint64_t *scratch_bytes_out,
+        uint64_t *total_bytes_out);
+static int ds4_engine_options_preflight_with_budget(
+        const ds4_engine_options *opt,
+        bool recommended_known,
+        uint64_t recommended_bytes,
+        char *err,
+        size_t errcap);
+static bool ds4_gpu_config_working_set_bytes(
+        const ds4_gpu_config *gpu_cfg,
+        uint64_t *out);
+static bool ds4_default_single_tier_working_set_bytes(
+        uint64_t default_device_bytes,
+        uint32_t visible_devices,
+        uint64_t *out);
+static int ds4_engine_reserve_exact_cache_session(
+        ds4_engine *e,
+        int ctx_size,
+        bool *reserved_out);
+static void ds4_engine_release_exact_cache_session(ds4_engine *e);
+
+static bool ds4_streaming_manual_cache_safe_bytes(
         ds4_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk,
-        bool        ssd_streaming) {
+        bool        ssd_streaming,
+        bool        preserve_legacy_floor,
+        uint64_t   *safe_bytes_out) {
+    if (safe_bytes_out) *safe_bytes_out = 0;
 #ifdef DS4_NO_GPU
     (void)backend;
     (void)ctx_size;
     (void)prefill_chunk;
     (void)ssd_streaming;
-    return 0;
+    (void)preserve_legacy_floor;
+    return false;
 #else
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    if (!safe_bytes_out) return false;
     const uint64_t recommended = ds4_gpu_recommended_working_set_size();
-    if (recommended == 0) return 0;
+    if (recommended == 0) return false;
 
     /*
-     * Explicit NGB budgets name only the routed expert cache. Keep that cache
+     * Explicit cache budgets name only the routed expert cache. Keep that cache
      * below the graph backend's working-set recommendation after accounting for
      * the graph context/KV buffers. This is intentionally not an mlock-derived
      * cap: crossing too close to the recommended working set makes short
      * token-major prefill spend most of its time in VM/driver synchronization.
      */
-    uint64_t target = recommended > UINT64_MAX / 7ull ?
-        UINT64_MAX : (recommended * 7ull) / 8ull;
     const ds4_context_memory ctx_mem =
         ds4_context_memory_estimate_with_prefill_mode(backend,
                                                       ctx_size,
                                                       prefill_chunk,
                                                       ssd_streaming);
-    uint64_t safe = 0;
-    if (target > ctx_mem.total_bytes) safe = target - ctx_mem.total_bytes;
-    safe = (safe / gib) * gib;
-    if (safe == 0) safe = gib;
-    return safe;
+    uint64_t safe = ds4_graph_cache_safe_bytes(recommended,
+                                               ctx_mem.total_bytes);
+    if (preserve_legacy_floor && safe == 0) {
+        safe = UINT64_C(1024) * 1024u * 1024u;
+    }
+    *safe_bytes_out = safe;
+    return true;
 #endif
 }
 
@@ -4711,6 +4790,284 @@ static uint64_t ds4_add_sat_u64(uint64_t a, uint64_t b) {
 static uint64_t ds4_mul_sat_u64(uint64_t a, uint64_t b) {
     if (a != 0 && b > UINT64_MAX / a) return UINT64_MAX;
     return a * b;
+}
+
+static int ds4_exact_cache_options_preflight(
+        const ds4_exact_cache_option_state *state,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    if (!state) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "invalid SSD streaming option state");
+        }
+        return 2;
+    }
+    if (!state->exact_cache_bytes_set) return 0;
+
+    if (state->legacy_cache_experts_set) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes cannot be combined with "
+                     "--ssd-streaming-cache-experts");
+        }
+        return 2;
+    }
+    if (!state->ssd_streaming || state->configured_cache_bytes == 0) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes requires --ssd-streaming "
+                     "and a positive byte count");
+        }
+        return 2;
+    }
+    if (state->configured_cache_bytes > (uint64_t)PTRDIFF_MAX) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes is impossible for one "
+                     "process allocation");
+        }
+        return 2;
+    }
+    if (state->safe_cache_bytes_known &&
+        state->configured_cache_bytes > state->safe_cache_bytes) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes is unsafe: requested "
+                     "%.2f GiB exceeds the %.2f GiB graph working-set "
+                     "pressure budget",
+                     (double)state->configured_cache_bytes / 1073741824.0,
+                     (double)state->safe_cache_bytes / 1073741824.0);
+        }
+        return 2;
+    }
+    return 0;
+}
+
+static int ds4_exact_cache_cuda_topology_preflight(
+        uint32_t device_count,
+        int device_index,
+        char *err,
+        size_t errcap) {
+    if (device_count > 1u) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes currently supports exactly "
+                     "one CUDA device; aggregate multi-GPU working-set budgets "
+                     "cannot price the single-device streaming execution path");
+        }
+        return 2;
+    }
+    if (device_count == 1u && device_index != 0) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes currently requires CUDA "
+                     "device 0 because the single-tier runtime initializes "
+                     "only CUDA device 0");
+        }
+        return 2;
+    }
+    return 0;
+}
+
+static uint64_t ds4_graph_cache_safe_bytes(
+        uint64_t recommended_working_set_bytes,
+        uint64_t graph_context_bytes) {
+    if (recommended_working_set_bytes == 0) return 0;
+    const uint64_t eighth = recommended_working_set_bytes / 8u;
+    const uint64_t remainder = recommended_working_set_bytes % 8u;
+    const uint64_t target = recommended_working_set_bytes - eighth -
+        (remainder != 0 ? 1u : 0u);
+    const uint64_t safe = target > graph_context_bytes ?
+        target - graph_context_bytes : 0;
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    return (safe / gib) * gib;
+}
+
+static uint64_t ds4_deepseek_graph_context_bound(
+        uint32_t context_tokens,
+        uint32_t prefill_tokens,
+        uint32_t layers,
+        bool pro) {
+    const uint64_t head_dim = 512u;
+    const uint64_t indexer_dim = 128u;
+    const uint32_t bounded_raw = context_tokens < 8192u ?
+        context_tokens : 8192u;
+    uint32_t raw_cap = (bounded_raw + 255u) & ~255u;
+    if (raw_cap > 8192u) raw_cap = 8192u;
+
+    uint64_t total = ds4_mul_sat_u64(
+        ds4_mul_sat_u64(layers, raw_cap),
+        head_dim * sizeof(float));
+
+    for (uint32_t il = 0; il < layers; il++) {
+        uint32_t ratio = 0;
+        if (pro) {
+            ratio = il < 2u ? 128u : ((il & 1u) == 0 ? 4u : 128u);
+        } else if (il >= 2u) {
+            ratio = (il & 1u) == 0 ? 4u : 128u;
+        }
+        if (ratio == 0) continue;
+
+        const uint64_t cap = context_tokens / ratio + 2u;
+        total = ds4_add_sat_u64(
+            total,
+            ds4_mul_sat_u64(cap, head_dim * sizeof(float)));
+        if (ratio == 4u) {
+            total = ds4_add_sat_u64(
+                total,
+                ds4_mul_sat_u64(cap,
+                                indexer_dim * sizeof(float)));
+        }
+    }
+
+    const uint64_t comp_cap = context_tokens / 4u + 2u;
+    uint64_t scratch = ds4_mul_sat_u64(comp_cap, prefill_tokens);
+    scratch = ds4_mul_sat_u64(scratch, 2u * sizeof(float));
+    const uint64_t staged_rows = prefill_tokens / 4u + 2u;
+    scratch = ds4_add_sat_u64(
+        scratch,
+        ds4_mul_sat_u64(staged_rows,
+                        head_dim * sizeof(float)));
+
+    /* Bound every prefill-cap-scaled allocation in
+     * metal_graph_alloc_raw_cap(), including the optional F16 Q staging
+     * buffer and lazy batch_ffn_out.  DeepSeek Pro's current upper envelope
+     * is 1,924,596 bytes/row; Flash plus the maximum eight-layer DSpark
+     * capture is 1,233,412 bytes/row.  Two MiB/row leaves explicit growth
+     * room.  The separate comp_cap*prefill score/mask slabs are already in
+     * scratch above; one fixed GiB dominates decode, MTP/speculative,
+     * steering, allocator-metadata, and non-row-scaled graph storage. */
+    const uint64_t prefill_workspace = ds4_mul_sat_u64(
+        prefill_tokens, UINT64_C(2) * 1024u * 1024u);
+    const uint64_t fixed_workspace = UINT64_C(1024) * 1024u * 1024u;
+    total = ds4_add_sat_u64(total, scratch);
+    total = ds4_add_sat_u64(total, prefill_workspace);
+    return ds4_add_sat_u64(total, fixed_workspace);
+}
+
+static bool ds4_laguna_graph_context_bound(
+        uint32_t context_tokens,
+        uint64_t *kv_bytes_out,
+        uint64_t *scratch_bytes_out,
+        uint64_t *total_bytes_out) {
+    if (kv_bytes_out) *kv_bytes_out = 0;
+    if (scratch_bytes_out) *scratch_bytes_out = 0;
+    if (total_bytes_out) *total_bytes_out = 0;
+    if (context_tokens == 0 || !total_bytes_out) return false;
+
+    /* Deliberately coarse and stable across Task 11's planned 16K -> 4K
+     * prefill-row reduction. Current Laguna row-shaped scratch is below
+     * 384 KiB/row and fixed scratch is below 1 GiB. Its twelve full-attention
+     * K/V layer pairs consume 48 KiB/context row, while all thirty-six 512-row
+     * SWA pairs consume 72 MiB; 64 KiB/context + 128 MiB dominates both. */
+    const uint64_t prefill_rows = context_tokens < 16384u ?
+        context_tokens : 16384u;
+    const uint64_t scratch = ds4_add_sat_u64(
+        ds4_mul_sat_u64(prefill_rows, 384u * 1024u),
+        UINT64_C(1024) * 1024u * 1024u);
+    const uint64_t kv = ds4_add_sat_u64(
+        ds4_mul_sat_u64(context_tokens, 64u * 1024u),
+        UINT64_C(128) * 1024u * 1024u);
+    const uint64_t total = ds4_add_sat_u64(kv, scratch);
+    if (kv_bytes_out) *kv_bytes_out = kv;
+    if (scratch_bytes_out) *scratch_bytes_out = scratch;
+    *total_bytes_out = total;
+    return total != 0;
+}
+
+static bool ds4_graph_context_bounds_make(
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        ds4_graph_context_bounds *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (context_tokens == 0) context_tokens = 1;
+
+    uint32_t prefill_tokens = prefill_chunk != 0 ?
+        prefill_chunk : context_tokens;
+    if (prefill_tokens > context_tokens) prefill_tokens = context_tokens;
+
+    out->flash_bytes = ds4_deepseek_graph_context_bound(
+        context_tokens, prefill_tokens, 43u, false);
+    out->pro_bytes = ds4_deepseek_graph_context_bound(
+        context_tokens, prefill_tokens, 61u, true);
+
+    /* CUDA GLM F32 compact KV is below 192 KiB/context row. Indexed prefill
+     * is capped at 4096 rows; 2 MiB/row leaves ample duplicate staging and
+     * alignment room, while the fixed GiB covers the 256-MiB score slab and
+     * all non-row-scaled decode tensors. */
+    const uint64_t glm_rows = context_tokens < 4096u ?
+        context_tokens : 4096u;
+    out->glm_bytes = ds4_add_sat_u64(
+        ds4_mul_sat_u64(context_tokens, 192u * 1024u),
+        ds4_add_sat_u64(
+            ds4_mul_sat_u64(glm_rows, 2u * 1024u * 1024u),
+            UINT64_C(1024) * 1024u * 1024u));
+
+    if (!ds4_laguna_graph_context_bound(context_tokens,
+                                        NULL,
+                                        NULL,
+                                        &out->laguna_bytes)) {
+        return false;
+    }
+
+    out->max_bytes = out->flash_bytes;
+    out->worst_family = DS4_GRAPH_FAMILY_FLASH;
+#define DS4_SELECT_WORST(field, family) do {                                  \
+    if (out->field > out->max_bytes) {                                        \
+        out->max_bytes = out->field;                                          \
+        out->worst_family = (family);                                         \
+    }                                                                         \
+} while (0)
+    DS4_SELECT_WORST(pro_bytes, DS4_GRAPH_FAMILY_PRO);
+    DS4_SELECT_WORST(glm_bytes, DS4_GRAPH_FAMILY_GLM);
+    DS4_SELECT_WORST(laguna_bytes, DS4_GRAPH_FAMILY_LAGUNA);
+#undef DS4_SELECT_WORST
+    return out->max_bytes != 0;
+}
+
+static bool ds4_exact_cache_plan_make(uint64_t configured_cache_bytes,
+                                      uint64_t slot_stride_bytes,
+                                      ds4_exact_cache_plan *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (configured_cache_bytes == 0 || slot_stride_bytes == 0) {
+        return false;
+    }
+
+    const uint64_t slot_count = configured_cache_bytes / slot_stride_bytes;
+    if (slot_count == 0 || slot_count > UINT32_MAX) return false;
+
+    out->configured_cache_bytes = configured_cache_bytes;
+    out->effective_cache_bytes = configured_cache_bytes;
+    out->slot_stride_bytes = slot_stride_bytes;
+    out->slot_count = (uint32_t)slot_count;
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool ds4_post_prefill_cache_budget(
+        uint64_t current_cache_bytes,
+        uint64_t reclaimed_headroom_bytes,
+        bool exact_cache_bytes,
+        uint64_t *out) {
+    if (!out) return false;
+    *out = 0;
+    if (exact_cache_bytes || reclaimed_headroom_bytes == 0) {
+        *out = current_cache_bytes;
+        return true;
+    }
+    if (current_cache_bytes > UINT64_MAX - reclaimed_headroom_bytes) {
+        return false;
+    }
+    *out = current_cache_bytes + reclaimed_headroom_bytes;
+    return true;
 }
 
 static double ds4_bytes_to_gib(uint64_t bytes) {
@@ -15226,7 +15583,9 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * than a semantic approximation: all Metal attention consumers already run the
  * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
  */
-#if defined(__APPLE__)
+#if defined(DS4_TEST_FORCE_GRAPH_CACHE_F32)
+#define DS4_GPU_ATTN_COMP_CACHE_F16 0
+#elif defined(__APPLE__)
 #define DS4_GPU_ATTN_COMP_CACHE_F16 1
 #else
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
@@ -35728,6 +36087,7 @@ struct ds4_engine {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    uint64_t ssd_streaming_cache_configured_bytes;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint32_t ssd_streaming_full_layers;
@@ -35743,12 +36103,23 @@ struct ds4_engine {
     bool glm_tp_token_prefill;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_cache_experts_set;
+    bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
     bool metal_ready;
     bool mtp_ready;
     bool share_session_prefill_workspace;
+    int exact_cache_context_limit;
+    uint32_t exact_cache_session_limit;
+    uint32_t exact_cache_active_sessions;
+    pthread_mutex_t exact_cache_session_mutex;
+    bool exact_cache_session_mutex_initialized;
+#ifdef DS4_TEST_HOOKS
+    bool test_session_create_no_alloc;
+    bool test_direct_graph_no_alloc;
+#endif
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -47068,6 +47439,7 @@ static int generate_glm_metal_argmax(
         bool                ssd_streaming_cold,
         uint32_t            ssd_streaming_preload_experts,
         uint64_t            ssd_streaming_cache_bytes,
+        bool                ssd_streaming_cache_bytes_exact,
         uint64_t            ssd_streaming_prefill_headroom_bytes,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
@@ -47154,20 +47526,23 @@ static int generate_glm_metal_argmax(
     const char *grow_cache_env =
         getenv("DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
     if (ssd_streaming &&
+        !ssd_streaming_cache_bytes_exact &&
         ssd_streaming_cache_bytes != 0 &&
         ssd_streaming_prefill_headroom_bytes != 0 &&
         (grow_cache_env == NULL || glm_graph_env_truthy(grow_cache_env))) {
         uint64_t budget_bytes = 0;
         uint64_t per_expert_bytes = 0;
-        if (ssd_streaming_cache_bytes <=
-            UINT64_MAX - ssd_streaming_prefill_headroom_bytes) {
-            budget_bytes =
-                ssd_streaming_cache_bytes + ssd_streaming_prefill_headroom_bytes;
-        }
+        const bool budget_ok = ds4_post_prefill_cache_budget(
+                ssd_streaming_cache_bytes,
+                ssd_streaming_prefill_headroom_bytes,
+                ssd_streaming_cache_bytes_exact,
+                &budget_bytes);
         const uint32_t grown_budget =
-            ds4_streaming_cache_experts_for_byte_budget(weights,
-                                                        budget_bytes,
-                                                        &per_expert_bytes);
+            budget_ok ?
+                ds4_streaming_cache_experts_for_byte_budget(
+                        weights,
+                        budget_bytes,
+                        &per_expert_bytes) : 0;
         const uint32_t current_budget =
             ds4_gpu_stream_expert_cache_configured_count();
         if (grown_budget > current_budget) {
@@ -47183,6 +47558,7 @@ static int generate_glm_metal_argmax(
     }
 #else
     (void)ssd_streaming_cache_bytes;
+    (void)ssd_streaming_cache_bytes_exact;
     (void)ssd_streaming_prefill_headroom_bytes;
 #endif
 
@@ -48345,6 +48721,7 @@ static int generate_metal_graph_raw_swa(
         bool                ssd_streaming_cold,
         uint32_t            ssd_streaming_preload_experts,
         uint64_t            ssd_streaming_cache_bytes,
+        bool                ssd_streaming_cache_bytes_exact,
         uint64_t            ssd_streaming_prefill_headroom_bytes,
         int                 power_percent,
         uint32_t            prefill_chunk,
@@ -48391,6 +48768,7 @@ static int generate_metal_graph_raw_swa(
                                          ssd_streaming_cold,
                                          ssd_streaming_preload_experts,
                                          ssd_streaming_cache_bytes,
+                                         ssd_streaming_cache_bytes_exact,
                                          ssd_streaming_prefill_headroom_bytes,
                                          emit,
                                          done,
@@ -49274,7 +49652,9 @@ struct ds4_session {
     bool logits_only_terminal;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    bool exact_cache_session_reserved;
 #ifdef DS4_TEST_HOOKS
+    bool test_no_alloc;
     uint64_t test_progress_dispatches;
     uint64_t test_warmup_dispatches;
     uint64_t test_layer_payload_dispatches;
@@ -52655,12 +53035,12 @@ static char *imatrix_trim_block(char *p, char *end) {
 }
 #endif
 
-int ds4_engine_collect_imatrix(ds4_engine *e,
-                               const char *dataset_path,
-                               const char *output_path,
-                               int ctx_size,
-                               int max_prompts,
-                               int max_tokens) {
+static int ds4_engine_collect_imatrix_unchecked(ds4_engine *e,
+                                                const char *dataset_path,
+                                                const char *output_path,
+                                                int ctx_size,
+                                                int max_prompts,
+                                                int max_tokens) {
 #ifdef DS4_NO_GPU
     (void)e;
     (void)dataset_path;
@@ -52807,6 +53187,24 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     free(dataset);
     return ok ? 0 : 1;
 #endif
+}
+
+int ds4_engine_collect_imatrix(ds4_engine *e,
+                               const char *dataset_path,
+                               const char *output_path,
+                               int ctx_size,
+                               int max_prompts,
+                               int max_tokens) {
+    const int safety_ctx = ctx_size > 0 ? ctx_size : 32768;
+    bool reserved = false;
+    const int reserve_rc =
+        ds4_engine_reserve_exact_cache_session(e, safety_ctx, &reserved);
+    if (reserve_rc != 0) return reserve_rc;
+
+    const int rc = ds4_engine_collect_imatrix_unchecked(
+        e, dataset_path, output_path, ctx_size, max_prompts, max_tokens);
+    if (reserved) ds4_engine_release_exact_cache_session(e);
+    return rc;
 }
 
 #ifndef DS4_NO_GPU
@@ -53480,9 +53878,10 @@ int ds4_engine_generate_argmax(
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
-            if (ds4_session_create(&s, e, ctx_size) != 0) {
+            const int session_rc = ds4_session_create(&s, e, ctx_size);
+            if (session_rc != 0) {
                 fprintf(stderr, "ds4: failed to create multi-tier graph session\n");
-                return 1;
+                return session_rc;
             }
             ds4_session_set_progress(s, progress, progress_ud);
             if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
@@ -53532,21 +53931,45 @@ int ds4_engine_generate_argmax(
             ds4_session_free(s);
             return rc;
         }
-        return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
-                                            n_predict, ctx_size, e->quality,
-                                            e->ssd_streaming,
-                                            e->ssd_streaming_cold,
-                                            e->ssd_streaming_preload_experts,
-                                            e->ssd_streaming_cache_bytes,
-                                            e->ssd_streaming_prefill_headroom_bytes,
-                                            e->power_percent,
-                                            e->prefill_chunk,
-                                            e->directional_steering_file,
-                                            e->directional_steering_attn_scale,
-                                            e->directional_steering_ffn_scale,
-                                            emit, done, emit_ud,
-                                            progress, progress_ud);
+        bool reserved = false;
+        const int reserve_rc =
+            ds4_engine_reserve_exact_cache_session(e, ctx_size, &reserved);
+        if (reserve_rc != 0) return reserve_rc;
+#ifdef DS4_TEST_HOOKS
+        if (e->test_direct_graph_no_alloc) {
+            if (reserved) ds4_engine_release_exact_cache_session(e);
+            return 0;
+        }
+#endif
+        const int rc = generate_metal_graph_raw_swa(
+            model, vocab, weights, prompt,
+            n_predict, ctx_size, e->quality,
+            e->ssd_streaming,
+            e->ssd_streaming_cold,
+            e->ssd_streaming_preload_experts,
+            e->ssd_streaming_cache_bytes,
+            e->ssd_streaming_cache_bytes_set,
+            e->ssd_streaming_prefill_headroom_bytes,
+            e->power_percent,
+            e->prefill_chunk,
+            e->directional_steering_file,
+            e->directional_steering_attn_scale,
+            e->directional_steering_ffn_scale,
+            emit, done, emit_ud,
+            progress, progress_ud);
+        if (reserved) ds4_engine_release_exact_cache_session(e);
+        return rc;
 #else
+#ifdef DS4_TEST_HOOKS
+        if (e->test_direct_graph_no_alloc) {
+            bool reserved = false;
+            const int reserve_rc =
+                ds4_engine_reserve_exact_cache_session(e, ctx_size, &reserved);
+            if (reserve_rc != 0) return reserve_rc;
+            if (reserved) ds4_engine_release_exact_cache_session(e);
+            return 0;
+        }
+#endif
         fprintf(stderr, "ds4: %s generation requested but this build has no graph backend support\n",
                 ds4_backend_name(e->backend));
         return 1;
@@ -55246,7 +55669,24 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 #endif
 
+static int ds4_exact_cache_graph_diagnostic_refusal(
+        const ds4_engine *e,
+        const char *diagnostic) {
+    if (!e || !e->ssd_streaming_cache_bytes_set ||
+        !ds4_backend_uses_graph(e->backend)) {
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: %s is not supported with --ssd-streaming-cache-bytes "
+            "because it allocates independent graph runtime state\n",
+            diagnostic);
+    return 2;
+}
+
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+    const int exact_rc =
+        ds4_exact_cache_graph_diagnostic_refusal(e, "graph test");
+    if (exact_rc != 0) return exact_rc;
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s graph test requested but backend is unavailable\n",
@@ -55266,6 +55706,9 @@ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
+    const int exact_rc =
+        ds4_exact_cache_graph_diagnostic_refusal(e, "full graph test");
+    if (exact_rc != 0) return exact_rc;
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s full graph test requested but backend is unavailable\n",
@@ -55282,6 +55725,9 @@ int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
+    const int exact_rc =
+        ds4_exact_cache_graph_diagnostic_refusal(e, "prompt graph test");
+    if (exact_rc != 0) return exact_rc;
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s prompt graph test requested but backend is unavailable\n",
@@ -55743,13 +56189,23 @@ static uint32_t ds4_glm_streaming_auto_full_layers(
     return best;
 }
 
-static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
+static int ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     g_glm_streaming_full_resident_layers = 0;
 #ifdef DS4_NO_GPU
     (void)e;
-    return true;
+    return 0;
 #else
-    if (!e || !e->ssd_streaming) return true;
+    if (!e || !e->ssd_streaming) return 0;
+
+    const bool exact_cache_bytes = e->ssd_streaming_cache_bytes_set;
+    if (exact_cache_bytes &&
+        e->ssd_streaming_cache_bytes !=
+            e->ssd_streaming_cache_configured_bytes) {
+        fprintf(stderr,
+                "ds4: exact SSD streaming cache bytes changed before "
+                "allocation planning\n");
+        return 2;
+    }
 
     const bool glm_full_layer_streaming =
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
@@ -55773,7 +56229,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                                            &per_expert_bytes)) {
         fprintf(stderr,
                 "ds4: SSD streaming could not measure routed expert size\n");
-        return false;
+        return 1;
     }
 
     uint32_t full_layers = 0;
@@ -55788,24 +56244,28 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                                                   &prefill_headroom_bytes)) {
             fprintf(stderr,
                     "ds4: SSD streaming prefill headroom byte accounting failed\n");
-            return false;
+            return 1;
         }
-        if (prefill_headroom_bytes >= total_cache_bytes) {
+        if (!exact_cache_bytes &&
+            prefill_headroom_bytes >= total_cache_bytes) {
             fprintf(stderr,
                     "ds4: --ssd-streaming-cache-experts byte budget %.2f GiB "
                     "is too small: two routed prefill layers need %.2f GiB\n",
                     (double)total_cache_bytes / 1073741824.0,
                     (double)prefill_headroom_bytes / 1073741824.0);
-            return false;
+            return 1;
         }
-        budget_after_prefill_headroom =
-            total_cache_bytes - prefill_headroom_bytes;
+        if (!exact_cache_bytes) {
+            budget_after_prefill_headroom =
+                total_cache_bytes - prefill_headroom_bytes;
+        }
     }
     e->ssd_streaming_prefill_headroom_bytes = prefill_headroom_bytes;
     if (glm_full_layer_streaming) {
         supported =
             ds4_glm_streaming_supported_resident_prefix_layers(&e->weights);
-        if (!e->ssd_streaming_full_layers_set &&
+        if (!exact_cache_bytes &&
+            !e->ssd_streaming_full_layers_set &&
             e->ssd_streaming_cache_bytes != 0) {
             /*
              * On ROCm/Strix, the dynamic selected-expert cache is a better use
@@ -55841,7 +56301,8 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                     full_layers);
         }
 
-        if (total_cache_bytes != 0 && per_expert_bytes != 0) {
+        if (!exact_cache_bytes &&
+            total_cache_bytes != 0 && per_expert_bytes != 0) {
             /*
              * The dynamic cache must be large enough for batch prefill too:
              * selected-address prefill can see many unique experts for a
@@ -55852,7 +56313,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             if (min_dynamic_experts > UINT64_MAX / per_expert_bytes) {
                 fprintf(stderr,
                         "ds4: SSD streaming full-layer budget overflow\n");
-                return false;
+                return 1;
             }
             const uint64_t min_dynamic_bytes =
                 min_dynamic_experts * per_expert_bytes;
@@ -55864,7 +56325,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                                                              &bytes)) {
                     fprintf(stderr,
                             "ds4: SSD streaming full-layer byte accounting failed\n");
-                    return false;
+                    return 1;
                 }
                 if (budget_after_prefill_headroom > min_dynamic_bytes &&
                     bytes <= budget_after_prefill_headroom - min_dynamic_bytes) {
@@ -55888,37 +56349,89 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                                                             &full_layers_bytes)) {
             fprintf(stderr,
                     "ds4: SSD streaming full-layer byte accounting failed\n");
-            return false;
+            return 1;
         }
     }
 
     if (total_cache_bytes != 0) {
         uint64_t dynamic_cache_bytes = budget_after_prefill_headroom;
-        if (full_layers_bytes != 0) {
+        if (!exact_cache_bytes && full_layers_bytes != 0) {
             if (full_layers_bytes >= dynamic_cache_bytes) {
                 fprintf(stderr,
                         "ds4: SSD streaming full-layer budget leaves no dynamic expert cache\n");
-                return false;
+                return 1;
             }
             dynamic_cache_bytes -= full_layers_bytes;
         }
 
-        uint64_t budget_expert_bytes = 0;
-        const uint32_t budget =
-            ds4_streaming_cache_experts_for_byte_budget(
+        uint64_t budget_expert_bytes = per_expert_bytes;
+        uint32_t budget = 0;
+        ds4_exact_cache_plan exact_plan;
+        memset(&exact_plan, 0, sizeof(exact_plan));
+        if (exact_cache_bytes) {
+            if (!ds4_exact_cache_plan_make(
+                        e->ssd_streaming_cache_configured_bytes,
+                        budget_expert_bytes,
+                        &exact_plan)) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes cannot hold one "
+                        "complete routed expert slot "
+                        "(configured=%" PRIu64 ", slot=%" PRIu64 ")\n",
+                        e->ssd_streaming_cache_configured_bytes,
+                        budget_expert_bytes);
+                return 2;
+            }
+            budget = exact_plan.slot_count;
+        } else {
+            budget = ds4_streaming_cache_experts_for_byte_budget(
                     &e->weights,
                     dynamic_cache_bytes,
                     &budget_expert_bytes);
-        if (budget == 0 || budget_expert_bytes == 0) {
-            fprintf(stderr,
-                    "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
-            return false;
+            if (budget == 0 || budget_expert_bytes == 0) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
+                return 1;
+            }
         }
         e->ssd_streaming_cache_experts = budget;
-        e->ssd_streaming_cache_bytes =
+        e->ssd_streaming_cache_bytes = exact_cache_bytes ?
+            exact_plan.effective_cache_bytes :
             (uint64_t)budget * budget_expert_bytes;
 
-        if (full_layers != 0) {
+        if (exact_cache_bytes &&
+            e->ssd_streaming_cache_bytes !=
+                e->ssd_streaming_cache_configured_bytes) {
+            fprintf(stderr,
+                    "ds4: exact SSD streaming cache plan changed the "
+                    "configured byte ceiling\n");
+            return 2;
+        }
+
+        if (exact_cache_bytes) {
+            if (full_layers != 0) {
+                fprintf(stderr,
+                        "ds4: GLM SSD streaming full resident layers: %u "
+                        "(%.2f GiB, explicit; outside exact expert cache)\n",
+                        full_layers,
+                        (double)full_layers_bytes / 1073741824.0);
+            } else if (glm_full_layer_streaming) {
+                fprintf(stderr,
+                        "ds4: GLM SSD streaming full resident layers: 0 "
+                        "(exact expert-cache bytes disable auto carving)\n");
+            }
+            fprintf(stderr,
+                    "ds4: %s SSD streaming exact expert cache %.2f GiB "
+                    "configured = %.2f GiB effective (%u experts, "
+                    "%.2f MiB each); %.2f GiB prefill headroom is reserved "
+                    "separately\n",
+                    ds4_backend_name(e->backend),
+                    (double)e->ssd_streaming_cache_configured_bytes /
+                        1073741824.0,
+                    (double)e->ssd_streaming_cache_bytes / 1073741824.0,
+                    budget,
+                    (double)budget_expert_bytes / 1048576.0,
+                    (double)prefill_headroom_bytes / 1073741824.0);
+        } else if (full_layers != 0) {
             fprintf(stderr,
                     "ds4: GLM SSD streaming full resident layers: %u "
                     "(%.2f GiB, %s)\n",
@@ -55978,7 +56491,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     e->ssd_streaming_full_layers = full_layers;
     e->ssd_streaming_full_layer_bytes = full_layers_bytes;
     g_glm_streaming_full_resident_layers = full_layers;
-    return true;
+    return 0;
 #endif
 }
 
@@ -57361,6 +57874,216 @@ size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size) {
     return bytes;
 }
 
+int ds4_test_exact_cache_options_preflight(
+        bool ssd_streaming,
+        bool exact_cache_bytes_set,
+        bool legacy_cache_experts_set,
+        uint64_t configured_cache_bytes,
+        bool safe_cache_bytes_known,
+        uint64_t safe_cache_bytes,
+        char *err,
+        size_t errcap) {
+    const ds4_exact_cache_option_state internal = {
+        .ssd_streaming = ssd_streaming,
+        .exact_cache_bytes_set = exact_cache_bytes_set,
+        .legacy_cache_experts_set = legacy_cache_experts_set,
+        .configured_cache_bytes = configured_cache_bytes,
+        .safe_cache_bytes_known = safe_cache_bytes_known,
+        .safe_cache_bytes = safe_cache_bytes,
+    };
+    return ds4_exact_cache_options_preflight(&internal, err, errcap);
+}
+
+uint64_t ds4_test_graph_cache_safe_bytes(
+        uint64_t recommended_working_set_bytes,
+        uint64_t graph_context_bytes) {
+    return ds4_graph_cache_safe_bytes(recommended_working_set_bytes,
+                                      graph_context_bytes);
+}
+
+uint64_t ds4_test_graph_context_bound(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk) {
+    ds4_graph_context_bounds internal;
+    if (!ds4_graph_context_bounds_make(context_tokens,
+                                       prefill_chunk,
+                                       &internal)) {
+        return 0;
+    }
+    switch (family) {
+    case DS4_TEST_GRAPH_FAMILY_FLASH: return internal.flash_bytes;
+    case DS4_TEST_GRAPH_FAMILY_PRO: return internal.pro_bytes;
+    case DS4_TEST_GRAPH_FAMILY_GLM: return internal.glm_bytes;
+    case DS4_TEST_GRAPH_FAMILY_LAGUNA: return internal.laguna_bytes;
+    default: return 0;
+    }
+}
+
+uint64_t ds4_test_graph_context_max_bound(
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        ds4_test_graph_family *worst_family_out) {
+    if (worst_family_out) *worst_family_out = DS4_TEST_GRAPH_FAMILY_FLASH;
+    ds4_graph_context_bounds internal;
+    if (!ds4_graph_context_bounds_make(context_tokens,
+                                       prefill_chunk,
+                                       &internal)) {
+        return 0;
+    }
+    if (worst_family_out) {
+        *worst_family_out = (ds4_test_graph_family)internal.worst_family;
+    }
+    return internal.max_bytes;
+}
+
+bool ds4_test_exact_cache_plan_make(uint64_t configured_cache_bytes,
+                                    uint64_t slot_stride_bytes,
+                                    uint64_t *effective_cache_bytes_out,
+                                    uint32_t *slot_count_out) {
+    if (effective_cache_bytes_out) *effective_cache_bytes_out = 0;
+    if (slot_count_out) *slot_count_out = 0;
+    if (!effective_cache_bytes_out || !slot_count_out) return false;
+    ds4_exact_cache_plan internal;
+    if (!ds4_exact_cache_plan_make(configured_cache_bytes,
+                                   slot_stride_bytes,
+                                   &internal)) {
+        return false;
+    }
+    *effective_cache_bytes_out = internal.effective_cache_bytes;
+    *slot_count_out = internal.slot_count;
+    return true;
+}
+
+bool ds4_test_post_prefill_cache_budget(uint64_t current_cache_bytes,
+                                        uint64_t reclaimed_headroom_bytes,
+                                        bool exact_cache_bytes,
+                                        uint64_t *out) {
+    return ds4_post_prefill_cache_budget(current_cache_bytes,
+                                         reclaimed_headroom_bytes,
+                                         exact_cache_bytes,
+                                         out);
+}
+
+int ds4_test_exact_cache_cuda_topology_preflight(
+        uint32_t device_count,
+        int device_index,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    return ds4_exact_cache_cuda_topology_preflight(
+        device_count, device_index, err, errcap);
+}
+
+int ds4_test_engine_exact_cache_preflight(
+        bool recommended_known,
+        uint64_t recommended_bytes,
+        uint64_t configured_cache_bytes,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        uint32_t session_slots,
+        bool share_session_prefill_workspace,
+        char *err,
+        size_t errcap) {
+    if (context_tokens > (uint32_t)INT_MAX) return 2;
+    const ds4_engine_options opt = {
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = (int)context_tokens,
+        .prefill_chunk = prefill_chunk,
+        .session_slots = session_slots,
+        .share_session_prefill_workspace = share_session_prefill_workspace,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = configured_cache_bytes,
+        .ssd_streaming_cache_bytes_set = true,
+    };
+    return ds4_engine_options_preflight_with_budget(
+        &opt, recommended_known, recommended_bytes, err, errcap);
+}
+
+bool ds4_test_gpu_config_working_set_bytes(
+        const uint64_t *budgets,
+        size_t count,
+        uint64_t *out) {
+    if (out) *out = 0;
+    if (!budgets || !out || count == 0 || count > DS4_MAX_GPUS) {
+        return false;
+    }
+    ds4_gpu_config gpu_cfg;
+    memset(&gpu_cfg, 0, sizeof(gpu_cfg));
+    gpu_cfg.n_gpus = (int)count;
+    for (size_t i = 0; i < count; i++) {
+        if (budgets[i] > SIZE_MAX) return false;
+        gpu_cfg.vram_bytes[i] = (size_t)budgets[i];
+    }
+    return ds4_gpu_config_working_set_bytes(&gpu_cfg, out);
+}
+
+bool ds4_test_default_single_tier_working_set_bytes(
+        uint64_t default_device_bytes,
+        uint32_t visible_devices,
+        uint64_t *out) {
+    return ds4_default_single_tier_working_set_bytes(
+        default_device_bytes, visible_devices, out);
+}
+
+uint64_t ds4_test_graph_context_memory_bytes(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk) {
+    if (context_tokens == 0 || context_tokens > (uint32_t)INT_MAX) return 0;
+
+    const ds4_shape saved_shape = g_ds4_shape;
+    uint32_t saved_ratios[DS4_MAX_LAYER];
+    uint32_t saved_heads[DS4_MAX_LAYER];
+    memcpy(saved_ratios, g_ds4_compress_ratios, sizeof(saved_ratios));
+    memcpy(saved_heads, g_ds4_head_counts, sizeof(saved_heads));
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
+
+    switch (family) {
+    case DS4_TEST_GRAPH_FAMILY_FLASH:
+        g_ds4_shape = DS4_SHAPE_FLASH;
+        break;
+    case DS4_TEST_GRAPH_FAMILY_PRO:
+        g_ds4_shape = DS4_SHAPE_PRO;
+        break;
+    case DS4_TEST_GRAPH_FAMILY_GLM:
+        g_ds4_shape = DS4_SHAPE_GLM52;
+        break;
+    case DS4_TEST_GRAPH_FAMILY_LAGUNA:
+        g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+        break;
+    default:
+        g_ds4_shape = saved_shape;
+        memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
+        memcpy(g_ds4_head_counts, saved_heads, sizeof(saved_heads));
+        return 0;
+    }
+
+    if (family == DS4_TEST_GRAPH_FAMILY_FLASH ||
+        family == DS4_TEST_GRAPH_FAMILY_PRO) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g_ds4_compress_ratios[il] =
+                ds4_expected_layer_compress_ratio(il);
+        }
+    } else if (family == DS4_TEST_GRAPH_FAMILY_LAGUNA) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g_ds4_head_counts[il] = (il % 4u) == 0 ? 48u : 72u;
+        }
+    }
+
+    const ds4_context_memory memory =
+        ds4_context_memory_estimate_with_prefill_mode(
+            DS4_BACKEND_CUDA,
+            (int)context_tokens,
+            prefill_chunk,
+            true);
+    g_ds4_shape = saved_shape;
+    memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
+    memcpy(g_ds4_head_counts, saved_heads, sizeof(saved_heads));
+    return memory.total_bytes;
+}
+
 int ds4_test_session_read_logits(ds4_session *s, float *out,
                                  uint64_t out_bytes) {
     if (!s || !out ||
@@ -57392,9 +58115,229 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+static int ds4_exact_graph_declaration_preflight(
+        const ds4_engine_options *opt,
+        char *err,
+        size_t errcap) {
+    if (!opt || !opt->ssd_streaming_cache_bytes_set ||
+        !ds4_backend_uses_graph(opt->backend)) {
+        return 0;
+    }
+    if (opt->context_size <= 0) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes on graph backends requires "
+                     "a positive declared --ctx safety context");
+        }
+        return 2;
+    }
+    const uint32_t session_slots =
+        opt->session_slots != 0 ? opt->session_slots : 1u;
+    if (session_slots != 1u) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes currently requires "
+                     "--session-slots 1 on graph backends; multi-session "
+                     "exact accounting is not yet available");
+        }
+        return 2;
+    }
+    if (opt->share_session_prefill_workspace) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "--ssd-streaming-cache-bytes does not support a shared "
+                     "prefill workspace on graph backends; exact one-session "
+                     "mode must not retain graph scratch between sessions");
+        }
+        return 2;
+    }
+    if (opt->metal_graph_test) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "graph diagnostics that allocate independent runtime "
+                     "state are not supported with "
+                     "--ssd-streaming-cache-bytes");
+        }
+        return 2;
+    }
+    return 0;
+}
+
+static int ds4_engine_options_preflight_with_budget(
+        const ds4_engine_options *opt,
+        bool recommended_known,
+        uint64_t recommended_bytes,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    if (!opt) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "invalid engine options");
+        }
+        return 2;
+    }
+    ds4_exact_cache_option_state cache = {
+        .ssd_streaming = opt->ssd_streaming,
+        .exact_cache_bytes_set = opt->ssd_streaming_cache_bytes_set,
+        .legacy_cache_experts_set = opt->ssd_streaming_cache_experts_set,
+        .configured_cache_bytes = opt->ssd_streaming_cache_bytes,
+    };
+    int rc = ds4_exact_cache_options_preflight(&cache, err, errcap);
+    if (rc != 0 || !cache.exact_cache_bytes_set ||
+        !ds4_backend_uses_graph(opt->backend)) {
+        return rc;
+    }
+
+    rc = ds4_exact_graph_declaration_preflight(opt, err, errcap);
+    if (rc != 0) return rc;
+
+    if (!recommended_known || recommended_bytes == 0) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "cannot validate --ssd-streaming-cache-bytes: device "
+                     "working-set limit is unavailable");
+        }
+        return 2;
+    }
+
+    ds4_graph_context_bounds bounds;
+    const uint32_t context_tokens = (uint32_t)opt->context_size;
+    if (!ds4_graph_context_bounds_make(context_tokens,
+                                       opt->prefill_chunk,
+                                       &bounds)) {
+        if (err && errcap != 0) {
+            snprintf(err,
+                     errcap,
+                     "cannot validate --ssd-streaming-cache-bytes: graph "
+                     "working-set bound is unavailable");
+        }
+        return 2;
+    }
+
+    cache.safe_cache_bytes_known = true;
+    cache.safe_cache_bytes =
+        ds4_graph_cache_safe_bytes(recommended_bytes, bounds.max_bytes);
+    return ds4_exact_cache_options_preflight(&cache, err, errcap);
+}
+
+static bool ds4_gpu_config_working_set_bytes(
+        const ds4_gpu_config *gpu_cfg,
+        uint64_t *out) {
+    if (out) *out = 0;
+    if (!gpu_cfg || !out || gpu_cfg->n_gpus <= 0 ||
+        gpu_cfg->n_gpus > DS4_MAX_GPUS) {
+        return false;
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < gpu_cfg->n_gpus; i++) {
+        const uint64_t budget = (uint64_t)gpu_cfg->vram_bytes[i];
+        if (budget > UINT64_MAX - total) return false;
+        total += budget;
+    }
+    if (total == 0) return false;
+    *out = total;
+    return true;
+}
+
+static bool ds4_default_single_tier_working_set_bytes(
+        uint64_t default_device_bytes,
+        uint32_t visible_devices,
+        uint64_t *out) {
+    if (out) *out = 0;
+    if (!out || visible_devices == 0 || default_device_bytes == 0) {
+        return false;
+    }
+
+    /* A NULL ds4_gpu_config takes ds4_gpu_init()'s device-0-only path.
+     * Other visible devices are not part of that execution topology. */
+    *out = default_device_bytes;
+    return true;
+}
+
+int ds4_engine_options_preflight_with_gpu_config(
+        const ds4_engine_options *opt,
+        const struct ds4_gpu_config *gpu_cfg,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    if (!opt) {
+        return ds4_engine_options_preflight_with_budget(
+            opt, false, 0, err, errcap);
+    }
+
+    ds4_exact_cache_option_state cache = {
+        .ssd_streaming = opt->ssd_streaming,
+        .exact_cache_bytes_set = opt->ssd_streaming_cache_bytes_set,
+        .legacy_cache_experts_set = opt->ssd_streaming_cache_experts_set,
+        .configured_cache_bytes = opt->ssd_streaming_cache_bytes,
+    };
+    const int structural_rc =
+        ds4_exact_cache_options_preflight(&cache, err, errcap);
+    if (structural_rc != 0 || !cache.exact_cache_bytes_set ||
+        !ds4_backend_uses_graph(opt->backend)) {
+        return structural_rc;
+    }
+    const int declaration_rc =
+        ds4_exact_graph_declaration_preflight(opt, err, errcap);
+    if (declaration_rc != 0) return declaration_rc;
+    if (gpu_cfg && opt->backend == DS4_BACKEND_CUDA) {
+        const int topology_rc = ds4_exact_cache_cuda_topology_preflight(
+            gpu_cfg->n_gpus > 0 ? (uint32_t)gpu_cfg->n_gpus : 0u,
+            gpu_cfg->n_gpus > 0 ? gpu_cfg->device_indices[0] : 0,
+            err,
+            errcap);
+        if (topology_rc != 0) return topology_rc;
+    }
+
+    uint64_t recommended = 0;
+    bool recommended_known = false;
+    if (gpu_cfg && opt->backend == DS4_BACKEND_CUDA) {
+        recommended_known =
+            ds4_gpu_config_working_set_bytes(gpu_cfg, &recommended);
+    }
+#ifndef DS4_NO_GPU
+    else if (opt->backend == DS4_BACKEND_CUDA) {
+        uint32_t visible_devices = 0;
+        const uint64_t default_device_bytes =
+            ds4_gpu_default_device_working_set_size(&visible_devices);
+        recommended_known = ds4_default_single_tier_working_set_bytes(
+            default_device_bytes, visible_devices, &recommended);
+    } else {
+        recommended = ds4_gpu_recommended_working_set_size();
+        recommended_known = recommended != 0;
+    }
+#endif
+    return ds4_engine_options_preflight_with_budget(
+        opt, recommended_known, recommended, err, errcap);
+}
+
+int ds4_engine_options_preflight(const ds4_engine_options *opt,
+                                 char *err,
+                                 size_t errcap) {
+    return ds4_engine_options_preflight_with_gpu_config(
+        opt, NULL, err, errcap);
+}
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
+    if (out) *out = NULL;
+    if (!out || !opt) return 1;
+    char preflight_err[256];
+    const int preflight_rc =
+        ds4_engine_options_preflight_with_gpu_config(
+            opt, gpu_cfg, preflight_err, sizeof(preflight_err));
+    if (preflight_rc != 0) {
+        fprintf(stderr, "ds4: %s\n", preflight_err);
+        return preflight_rc;
+    }
+
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -57408,6 +58351,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
+    e->ssd_streaming_cache_experts_set =
+        opt->ssd_streaming_cache_experts_set;
+    e->ssd_streaming_cache_bytes_set =
+        opt->ssd_streaming_cache_bytes_set;
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
@@ -57416,6 +58363,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     opt->prefill_chunk);
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+    e->ssd_streaming_cache_configured_bytes =
+        opt->ssd_streaming_cache_bytes_set ?
+            opt->ssd_streaming_cache_bytes : 0;
+    if (opt->ssd_streaming_cache_bytes_set &&
+        ds4_backend_uses_graph(opt->backend)) {
+        e->exact_cache_context_limit = opt->context_size;
+        e->exact_cache_session_limit =
+            opt->session_slots != 0 ? opt->session_slots : 1u;
+    }
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
@@ -57458,6 +58414,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    if (e->exact_cache_session_limit != 0) {
+        if (pthread_mutex_init(&e->exact_cache_session_mutex, NULL) != 0) {
+            fprintf(stderr,
+                    "ds4: failed to initialize exact-cache session safety gate\n");
+            free(e->directional_steering_file);
+            free(e);
+            return 1;
+        }
+        e->exact_cache_session_mutex_initialized = true;
+    }
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -57690,13 +58656,31 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ds4_streaming_manual_cache_safe_bytes(e->backend,
-                                                  opt->context_size,
-                                                  e->prefill_chunk,
-                                                  e->ssd_streaming);
-        if (safe_cache_bytes != 0 &&
+        uint64_t safe_cache_bytes = 0;
+        const bool safe_cache_bytes_known =
+            ds4_streaming_manual_cache_safe_bytes(
+                e->backend,
+                opt->context_size,
+                e->prefill_chunk,
+                e->ssd_streaming,
+                !e->ssd_streaming_cache_bytes_set,
+                &safe_cache_bytes);
+        if (safe_cache_bytes_known &&
             e->ssd_streaming_cache_bytes > safe_cache_bytes) {
+            if (e->ssd_streaming_cache_bytes_set) {
+                /* Defensive: the model-independent preflight bound is
+                 * designed to dominate every supported family. If a future
+                 * shape exceeds it, fail closed rather than rewriting the
+                 * canonical limit. */
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes is unsafe: "
+                        "requested %.2f GiB exceeds the %.2f GiB graph "
+                        "working-set pressure budget\n",
+                        (double)requested_cache_bytes / 1073741824.0,
+                        (double)safe_cache_bytes / 1073741824.0);
+                ds4_engine_close(e);
+                return 2;
+            }
             e->ssd_streaming_cache_bytes = safe_cache_bytes;
             fprintf(stderr,
                     "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
@@ -57950,10 +58934,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (!ds4_engine_configure_streaming_cache_budget(e)) {
+        const int cache_budget_rc =
+            ds4_engine_configure_streaming_cache_budget(e);
+        if (cache_budget_rc != 0) {
             ds4_engine_close(e);
             *out = NULL;
-            return 1;
+            return cache_budget_rc;
         }
         if (!ds4_engine_glm_streaming_memory_guard(
                     e,
@@ -58610,6 +59596,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
+    if (e->exact_cache_session_mutex_initialized) {
+        pthread_mutex_destroy(&e->exact_cache_session_mutex);
+    }
     free(e);
 }
 
@@ -58741,8 +59730,79 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
-int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+static bool ds4_engine_exact_cache_session_limit_enabled(
+        const ds4_engine *e) {
+    return e && e->ssd_streaming_cache_bytes_set &&
+           ds4_backend_uses_graph(e->backend);
+}
+
+static int ds4_engine_reserve_exact_cache_session(
+        ds4_engine *e,
+        int ctx_size,
+        bool *reserved_out) {
+    if (reserved_out) *reserved_out = false;
+    if (!ds4_engine_exact_cache_session_limit_enabled(e)) return 0;
+
+    if (e->exact_cache_context_limit <= 0 ||
+        ctx_size > e->exact_cache_context_limit) {
+        fprintf(stderr,
+                "ds4: requested session context %d exceeds the declared "
+                "--ctx safety context %d for --ssd-streaming-cache-bytes\n",
+                ctx_size,
+                e->exact_cache_context_limit);
+        return 2;
+    }
+    if (!e->exact_cache_session_mutex_initialized ||
+        e->exact_cache_session_limit != 1u) {
+        fprintf(stderr,
+                "ds4: exact-cache session safety gate is unavailable; "
+                "refusing session creation\n");
+        return 2;
+    }
+    if (pthread_mutex_lock(&e->exact_cache_session_mutex) != 0) {
+        fprintf(stderr,
+                "ds4: exact-cache session safety gate lock failed; "
+                "refusing session creation\n");
+        return 2;
+    }
+    if (e->exact_cache_active_sessions >= e->exact_cache_session_limit) {
+        pthread_mutex_unlock(&e->exact_cache_session_mutex);
+        fprintf(stderr,
+                "ds4: --ssd-streaming-cache-bytes currently permits one live "
+                "graph session; free it before creating another (temporary "
+                "safety while multi-session exact accounting is unavailable)\n");
+        return 2;
+    }
+    e->exact_cache_active_sessions++;
+    pthread_mutex_unlock(&e->exact_cache_session_mutex);
+    if (reserved_out) *reserved_out = true;
+    return 0;
+}
+
+static void ds4_engine_release_exact_cache_session(ds4_engine *e) {
+    if (!e || !e->exact_cache_session_mutex_initialized) return;
+    if (pthread_mutex_lock(&e->exact_cache_session_mutex) != 0) return;
+    if (e->exact_cache_active_sessions != 0) {
+        e->exact_cache_active_sessions--;
+    }
+    pthread_mutex_unlock(&e->exact_cache_session_mutex);
+}
+
+static int ds4_session_create_unchecked(
+        ds4_session **out,
+        ds4_engine *e,
+        int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+#ifdef DS4_TEST_HOOKS
+    if (e->test_session_create_no_alloc) {
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        s->test_no_alloc = true;
+        *out = s;
+        return 0;
+    }
+#endif
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -59053,8 +60113,35 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #endif
 }
 
+int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+    if (out) *out = NULL;
+    if (!out || !e || ctx_size <= 0) return 1;
+
+    bool reserved = false;
+    const int reserve_rc =
+        ds4_engine_reserve_exact_cache_session(e, ctx_size, &reserved);
+    if (reserve_rc != 0) return reserve_rc;
+
+    const int create_rc = ds4_session_create_unchecked(out, e, ctx_size);
+    if (create_rc != 0) {
+        if (reserved) ds4_engine_release_exact_cache_session(e);
+        return create_rc;
+    }
+    (*out)->exact_cache_session_reserved = reserved;
+    return 0;
+}
+
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+#ifdef DS4_TEST_HOOKS
+    if (s->test_no_alloc) {
+        if (s->exact_cache_session_reserved) {
+            ds4_engine_release_exact_cache_session(s->engine);
+        }
+        free(s);
+        return;
+    }
+#endif
     if (ds4_session_tp_leader(s) && s->tp_session_id != 0 &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         char err[256] = "";
@@ -59100,10 +60187,108 @@ void ds4_session_free(ds4_session *s) {
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
 #endif
+    if (s->exact_cache_session_reserved) {
+        ds4_engine_release_exact_cache_session(s->engine);
+    }
     free(s);
 }
 
 #ifdef DS4_TEST_HOOKS
+int ds4_test_session_limit_lifecycle(
+        bool exact_cache,
+        bool graph_backend,
+        int declared_context,
+        int requested_context,
+        int oversized_context,
+        int *oversized_rc,
+        int *first_rc,
+        int *second_rc,
+        int *reuse_rc) {
+    if (!oversized_rc || !first_rc || !second_rc || !reuse_rc) return 1;
+
+    ds4_engine engine;
+    memset(&engine, 0, sizeof(engine));
+    engine.backend = graph_backend ? DS4_BACKEND_CUDA : DS4_BACKEND_CPU;
+    engine.ssd_streaming_cache_bytes_set = exact_cache;
+    engine.test_session_create_no_alloc = true;
+    if (exact_cache && graph_backend) {
+        engine.exact_cache_context_limit = declared_context;
+        engine.exact_cache_session_limit = 1u;
+        if (pthread_mutex_init(&engine.exact_cache_session_mutex, NULL) != 0) {
+            return 1;
+        }
+        engine.exact_cache_session_mutex_initialized = true;
+    }
+
+    ds4_session *oversized = NULL;
+    *oversized_rc = ds4_session_create(
+        &oversized, &engine, oversized_context);
+    ds4_session_free(oversized);
+
+    ds4_session *first = NULL;
+    *first_rc = ds4_session_create(&first, &engine, requested_context);
+    ds4_session *second = NULL;
+    *second_rc = ds4_session_create(&second, &engine, requested_context);
+    ds4_session_free(first);
+    ds4_session_free(second);
+
+    ds4_session *reuse = NULL;
+    *reuse_rc = ds4_session_create(&reuse, &engine, requested_context);
+    ds4_session_free(reuse);
+
+    if (engine.exact_cache_session_mutex_initialized) {
+        pthread_mutex_destroy(&engine.exact_cache_session_mutex);
+    }
+    return 0;
+}
+
+int ds4_test_direct_graph_limit_lifecycle(
+        int *oversized_rc,
+        int *concurrent_rc,
+        int *reuse_rc,
+        int *diagnostic_rc) {
+    if (!oversized_rc || !concurrent_rc || !reuse_rc || !diagnostic_rc) {
+        return 1;
+    }
+
+    ds4_engine engine;
+    memset(&engine, 0, sizeof(engine));
+    engine.backend = DS4_BACKEND_CUDA;
+    engine.ssd_streaming_cache_bytes_set = true;
+    engine.exact_cache_context_limit = 32768;
+    engine.exact_cache_session_limit = 1u;
+    engine.metal_ready = true;
+    engine.test_session_create_no_alloc = true;
+    engine.test_direct_graph_no_alloc = true;
+    if (pthread_mutex_init(&engine.exact_cache_session_mutex, NULL) != 0) {
+        return 1;
+    }
+    engine.exact_cache_session_mutex_initialized = true;
+
+    ds4_tokens prompt = {0};
+    *oversized_rc = ds4_engine_generate_argmax(
+        &engine, &prompt, 0, 32769,
+        NULL, NULL, NULL, NULL, NULL);
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, &engine, 32768) != 0) {
+        pthread_mutex_destroy(&engine.exact_cache_session_mutex);
+        return 1;
+    }
+    *concurrent_rc = ds4_engine_generate_argmax(
+        &engine, &prompt, 0, 32768,
+        NULL, NULL, NULL, NULL, NULL);
+    ds4_session_free(session);
+
+    *reuse_rc = ds4_engine_generate_argmax(
+        &engine, &prompt, 0, 32768,
+        NULL, NULL, NULL, NULL, NULL);
+    *diagnostic_rc =
+        ds4_engine_metal_graph_prompt_test(&engine, &prompt, 32768);
+    pthread_mutex_destroy(&engine.exact_cache_session_mutex);
+    return 0;
+}
+
 int ds4_test_logits_only_sync_mode(
         bool native_cuda_build,
         bool laguna, ds4_backend backend,

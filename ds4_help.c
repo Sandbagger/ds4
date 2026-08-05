@@ -169,7 +169,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: N is an exact dynamic expert count; NGB is a routed memory budget that also reserves two full prefill layers. Auto: 80% working set minus non-routed weights; GLM Metal caps lower.");
+    opt(fp, c, "--ssd-streaming-cache-bytes BYTES", "SSD streaming: exact positive decimal expert-cache byte ceiling; never clamped or grown.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "Deprecated compatibility spelling: N is an expert count and NGB is a legacy routed-memory budget. Cannot be combined with the canonical byte option.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
@@ -332,7 +333,8 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
-    opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+    opt(fp, c, "--session-slots N", "Keep exactly N resident sessions and batch decode-ready requests.");
+    opt(fp, c, "--batched-session N", "Deprecated alias for --session-slots; values must agree if both are passed.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model aliases are available for DeepSeek V4, GLM-5.2, and Laguna-S-2.1; every alias serves the loaded GGUF.");
     fputc('\n', fp);

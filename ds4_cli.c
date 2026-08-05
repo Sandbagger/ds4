@@ -1886,7 +1886,33 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes must be canonical positive decimal bytes\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_experts_set) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_bytes_set &&
+                c.engine.ssd_streaming_cache_bytes != bytes) {
+                fprintf(stderr,
+                        "ds4: conflicting --ssd-streaming-cache-bytes values\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.engine.ssd_streaming_cache_bytes_set) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -1897,6 +1923,7 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssd_streaming_full_layers = (uint32_t)v;
@@ -2064,6 +2091,42 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    cfg.engine.inspect_only = cfg.inspect;
+    cfg.engine.first_token_test = cfg.gen.first_token_test;
+    cfg.engine.metal_graph_test = cfg.gen.metal_graph_test ||
+                                  cfg.gen.metal_graph_full_test ||
+                                  cfg.gen.metal_graph_prompt_test;
+    cfg.engine.context_size = cfg.gen.ctx_size;
+    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    ds4_gpu_config gpu_cfg = {0};
+    bool gpu_cfg_set = false;
+    bool skip_cuda = false;
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               errbuf, sizeof(errbuf)) != 0) {
+            fprintf(stderr, "ds4: %s\n", errbuf);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+        gpu_cfg_set = !skip_cuda;
+    }
+    char preflight_err[256];
+    const int preflight_rc =
+        ds4_engine_options_preflight_with_gpu_config(
+            &cfg.engine,
+            gpu_cfg_set ? &gpu_cfg : NULL,
+            preflight_err,
+            sizeof(preflight_err));
+    if (preflight_rc != 0) {
+        fprintf(stderr, "ds4: %s\n", preflight_err);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return preflight_rc;
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
@@ -2077,30 +2140,14 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    cfg.engine.inspect_only = cfg.inspect;
-    cfg.engine.first_token_test = cfg.gen.first_token_test;
-    cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
-    cfg.engine.context_size = cfg.gen.ctx_size;
-    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
-        ds4_gpu_config gpu_cfg = {0};
-        bool skip_cuda = false;
-        char errbuf[256];
-        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               errbuf, sizeof(errbuf)) != 0) {
-            fprintf(stderr, "ds4: %s\n", errbuf);
-            ds4_dist_options_free(cfg.dist);
-            free(cfg.prompt_owned);
-            return 2;
-        }
-        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+            const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+            if (open_rc != 0) {
                 ds4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
-                return 1;
+                return open_rc;
             }
         } else {
             const bool was_auto =
@@ -2112,17 +2159,21 @@ int main(int argc, char **argv) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
             }
-            if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
-                                                   &gpu_cfg) != 0) {
+            const int open_rc = ds4_engine_create_with_gpu_config(
+                    &engine, &cfg.engine, &gpu_cfg);
+            if (open_rc != 0) {
                 ds4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
-                return 1;
+                return open_rc;
             }
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        ds4_dist_options_free(cfg.dist);
-        free(cfg.prompt_owned);
-        return 1;
+    } else {
+        const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+        if (open_rc != 0) {
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return open_rc;
+        }
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
     if (!cfg.gen.system_set) {

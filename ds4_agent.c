@@ -688,7 +688,33 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-bytes must be canonical positive decimal bytes\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_experts_set) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_bytes_set &&
+                c.engine.ssd_streaming_cache_bytes != bytes) {
+                fprintf(stderr,
+                        "ds4-agent: conflicting --ssd-streaming-cache-bytes values\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.engine.ssd_streaming_cache_bytes_set) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -699,6 +725,7 @@ static agent_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssd_streaming_full_layers = (uint32_t)v;
@@ -11196,7 +11223,8 @@ int main(int argc, char **argv) {
         }
         if (skip_cuda) {
             cfg.engine.backend = DS4_BACKEND_CPU;
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+            if (open_rc != 0) return open_rc;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -11208,11 +11236,13 @@ int main(int argc, char **argv) {
                 fflush(stdout);
             }
             cfg.engine.backend = DS4_BACKEND_CUDA;
-            if (ds4_engine_create_with_gpu_config(
-                    &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
+            const int open_rc = ds4_engine_create_with_gpu_config(
+                    &engine, &cfg.engine, &gpu_cfg);
+            if (open_rc != 0) return open_rc;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        return 1;
+    } else {
+        const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+        if (open_rc != 0) return open_rc;
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 

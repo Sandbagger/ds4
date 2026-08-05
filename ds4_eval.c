@@ -1223,6 +1223,8 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_cache_experts_set;
+    bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool self_test_extractors;
 } eval_config;
@@ -1603,7 +1605,33 @@ static eval_config parse_options(int argc, char **argv) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --ssd-streaming-cache-bytes must be canonical positive decimal bytes\n");
+                exit(2);
+            }
+            if (c.ssd_streaming_cache_experts_set) {
+                fprintf(stderr,
+                        "ds4-eval: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
+            if (c.ssd_streaming_cache_bytes_set &&
+                c.ssd_streaming_cache_bytes != bytes) {
+                fprintf(stderr,
+                        "ds4-eval: conflicting --ssd-streaming-cache-bytes values\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_bytes = bytes;
+            c.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.ssd_streaming_cache_bytes_set) {
+                fprintf(stderr,
+                        "ds4-eval: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -1614,6 +1642,7 @@ static eval_config parse_options(int argc, char **argv) {
             }
             c.ssd_streaming_cache_experts = experts;
             c.ssd_streaming_cache_bytes = bytes;
+            c.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int_arg(need_arg(&i, argc, argv, arg), arg);
             c.ssd_streaming_full_layers = (uint32_t)v;
@@ -4170,6 +4199,9 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_cache_experts_set =
+            cfg.ssd_streaming_cache_experts_set,
+        .ssd_streaming_cache_bytes_set = cfg.ssd_streaming_cache_bytes_set,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .distributed = cfg.dist,
     };
@@ -4182,10 +4214,11 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) {
+    const int open_rc = ds4_engine_open(&engine, &opt);
+    if (open_rc != 0) {
         if (trace) fclose(trace);
         free(case_sequence);
-        return 1;
+        return open_rc;
     }
 
     int max_prompt_tokens = 0;

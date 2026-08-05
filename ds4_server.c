@@ -12771,6 +12771,8 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    bool batched_sessions_set;
+    bool session_slots_set;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12977,8 +12979,36 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--session-slots")) {
+            const int slots =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.batched_sessions_set && c.batched_sessions != slots) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --session-slots conflicts with --batched-session");
+                exit(2);
+            }
+            if (c.session_slots_set && c.batched_sessions != slots) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: conflicting --session-slots values");
+                exit(2);
+            }
+            c.batched_sessions = slots;
+            c.session_slots_set = true;
         } else if (!strcmp(arg, "--batched-session")) {
-            c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            const int slots =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.session_slots_set && c.batched_sessions != slots) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --session-slots conflicts with --batched-session");
+                exit(2);
+            }
+            if (c.batched_sessions_set && c.batched_sessions != slots) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: conflicting --batched-session values");
+                exit(2);
+            }
+            c.batched_sessions = slots;
+            c.batched_sessions_set = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -13005,7 +13035,33 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --ssd-streaming-cache-bytes must be canonical positive decimal bytes");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_experts_set) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_bytes_set &&
+                c.engine.ssd_streaming_cache_bytes != bytes) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: conflicting --ssd-streaming-cache-bytes values");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.engine.ssd_streaming_cache_bytes_set) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -13016,6 +13072,7 @@ static server_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssd_streaming_full_layers = (uint32_t)v;
@@ -13138,9 +13195,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
-    cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+    cfg.engine.share_session_prefill_workspace = slot_count > 1;
+    cfg.engine.session_slots = (uint32_t)slot_count;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -13154,7 +13213,8 @@ int main(int argc, char **argv) {
         }
         cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+            if (open_rc != 0) return open_rc;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -13165,11 +13225,13 @@ int main(int argc, char **argv) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
             }
-            if (ds4_engine_create_with_gpu_config(
-                    &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
+            const int open_rc = ds4_engine_create_with_gpu_config(
+                    &engine, &cfg.engine, &gpu_cfg);
+            if (open_rc != 0) return open_rc;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        return 1;
+    } else {
+        const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+        if (open_rc != 0) return open_rc;
     }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -13181,7 +13243,6 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
                        ds4_engine_prefill_chunk(engine),

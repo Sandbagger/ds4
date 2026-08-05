@@ -4,6 +4,7 @@
  * can enforce the same canonical configuration contract. */
 
 #include "ds4.h"
+#include "ds4_laguna_stream.h"
 
 #include <inttypes.h>
 #include <stdint.h>
@@ -369,18 +370,406 @@ static void test_options(void) {
           "legacy post-prefill growth fails closed on overflow");
 }
 
+enum {
+    FIXTURE_TENSOR_COUNT = 7,
+};
+
+typedef struct {
+    ds4_laguna_ledger_spec spec;
+    ds4_laguna_tensor_desc tensors[FIXTURE_TENSOR_COUNT];
+    char names[FIXTURE_TENSOR_COUNT][24];
+} ledger_fixture;
+
+static void fixture_tensor(
+        ledger_fixture *f,
+        size_t index,
+        const char *name,
+        uint64_t source_offset,
+        ds4_laguna_tensor_class tensor_class,
+        uint32_t routed_layer,
+        ds4_laguna_routed_projection projection) {
+    ds4_laguna_tensor_desc *t = &f->tensors[index];
+    memset(t, 0, sizeof(*t));
+    snprintf(f->names[index], sizeof(f->names[index]), "%s", name);
+    t->stable_index = (uint64_t)index + 10u;
+    t->name = f->names[index];
+    t->name_len = strlen(f->names[index]);
+    t->source_offset = source_offset;
+    t->gguf_type = 2;
+    t->block_elems = 32;
+    t->block_bytes = 18;
+    t->tensor_class = tensor_class;
+    t->routed_layer = routed_layer;
+    t->routed_projection = projection;
+
+    if (tensor_class == DS4_LAGUNA_TENSOR_STATIC) {
+        t->ndim = 1;
+        t->dim[0] = 33;
+        t->source_bytes = 36;
+    } else {
+        t->ndim = 3;
+        t->dim[0] = 32;
+        t->dim[1] = 2;
+        t->dim[2] = 2;
+        t->source_bytes = 72;
+    }
+}
+
+static void valid_ledger_fixture(ledger_fixture *f) {
+    memset(f, 0, sizeof(*f));
+    f->spec.file_size = 1024;
+    f->spec.header_end = 16;
+    f->spec.metadata_end = 32;
+    f->spec.tensor_directory_end = 65;
+    f->spec.tensor_data_start = 128;
+    f->spec.gguf_alignment = 64;
+    f->spec.device_alignment = 256;
+    f->spec.first_routed_layer = 1;
+    f->spec.layer_count = 3;
+    f->spec.expert_count = 2;
+
+    fixture_tensor(f, 0, "blk.0.ffn_shexp.weight", 128,
+                   DS4_LAGUNA_TENSOR_STATIC, UINT32_MAX,
+                   DS4_LAGUNA_ROUTED_PROJECTION_NONE);
+    fixture_tensor(f, 1, "blk.1.ffn_gate_exps.weight", 192,
+                   DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 1,
+                   DS4_LAGUNA_ROUTED_PROJECTION_GATE);
+    fixture_tensor(f, 2, "blk.1.ffn_up_exps.weight", 320,
+                   DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 1,
+                   DS4_LAGUNA_ROUTED_PROJECTION_UP);
+    fixture_tensor(f, 3, "blk.1.ffn_down_exps.weight", 448,
+                   DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 1,
+                   DS4_LAGUNA_ROUTED_PROJECTION_DOWN);
+    fixture_tensor(f, 4, "blk.2.ffn_gate_exps.weight", 576,
+                   DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 2,
+                   DS4_LAGUNA_ROUTED_PROJECTION_GATE);
+    fixture_tensor(f, 5, "blk.2.ffn_up_exps.weight", 704,
+                   DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 2,
+                   DS4_LAGUNA_ROUTED_PROJECTION_UP);
+    fixture_tensor(f, 6, "blk.2.ffn_down_exps.weight", 832,
+                   DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 2,
+                   DS4_LAGUNA_ROUTED_PROJECTION_DOWN);
+}
+
+static bool build_fixture(const ledger_fixture *f,
+                          ds4_laguna_ledger *ledger,
+                          char *err,
+                          size_t errlen) {
+    memset(ledger, 0, sizeof(*ledger));
+    memset(err, 0, errlen);
+    return ds4_laguna_ledger_build(ledger,
+                                   &f->spec,
+                                   f->tensors,
+                                   FIXTURE_TENSOR_COUNT,
+                                   err,
+                                   errlen);
+}
+
+static void check_fixture_rejected(ledger_fixture *f, const char *needle,
+                                   const char *message) {
+    ds4_laguna_ledger ledger;
+    char err[256];
+    const bool ok = build_fixture(f, &ledger, err, sizeof(err));
+    if (ok || (needle && !strstr(err, needle))) {
+        fprintf(stderr, "unexpected ledger result: ok=%d err=%s\n",
+                ok ? 1 : 0, err);
+    }
+    CHECK(!ok, message);
+    CHECK(needle == NULL || strstr(err, needle) != NULL,
+          "ledger rejection has a stable diagnostic");
+    ds4_laguna_ledger_free(&ledger);
+}
+
+static const ds4_laguna_source_range *find_source_range(
+        const ds4_laguna_ledger *ledger,
+        ds4_laguna_source_range_kind kind) {
+    for (size_t i = 0; i < ledger->source_range_count; i++) {
+        if (ledger->source_ranges[i].kind == kind) {
+            return &ledger->source_ranges[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_ledger_valid(void) {
+    ledger_fixture f;
+    valid_ledger_fixture(&f);
+    ds4_laguna_ledger ledger;
+    char err[256];
+    CHECK(build_fixture(&f, &ledger, err, sizeof(err)),
+          "valid synthetic Laguna tensor partition builds");
+    CHECK(err[0] == '\0', "successful ledger build leaves no error");
+    CHECK(ledger.file_size == 1024, "ledger preserves exact file size");
+    CHECK(ledger.tensor_count == 7 &&
+          ledger.static_parent_count == 1 &&
+          ledger.routed_parent_count == 6,
+          "ledger counts tensor parents by exact class");
+    CHECK(ledger.expert_entry_count == 4,
+          "expert entries count layer/expert pairs rather than projections");
+    CHECK(ledger.routed_source_bytes == 432 &&
+          ledger.static_source_bytes == 36 &&
+          ledger.static_aligned_device_bytes == 256,
+          "ledger reports exact routed, static, and device-aligned bytes");
+    CHECK(ledger.non_tensor_source_bytes == 556 &&
+          ledger.routed_source_bytes + ledger.static_source_bytes +
+              ledger.non_tensor_source_bytes == ledger.file_size,
+          "parent and non-tensor ranges reconcile the file exactly");
+    CHECK(ledger.routed_projection_expert_bytes == 36,
+          "ledger records the common routed projection/expert size");
+    CHECK(ledger.slot_stride_bytes == 768,
+          "slot stride includes gate/up/down device alignment");
+    CHECK(ledger.tensor_range_count == FIXTURE_TENSOR_COUNT,
+          "expert views do not become duplicate parent tensor ranges");
+
+    const ds4_laguna_source_range *header =
+        find_source_range(&ledger, DS4_LAGUNA_SOURCE_HEADER);
+    const ds4_laguna_source_range *metadata =
+        find_source_range(&ledger, DS4_LAGUNA_SOURCE_METADATA);
+    const ds4_laguna_source_range *directory =
+        find_source_range(&ledger, DS4_LAGUNA_SOURCE_TENSOR_DIRECTORY);
+    const ds4_laguna_source_range *alignment =
+        find_source_range(&ledger, DS4_LAGUNA_SOURCE_ALIGNMENT_PADDING);
+    CHECK(header && header->source_offset == 0 && header->source_bytes == 16,
+          "header source range is explicit");
+    CHECK(metadata && metadata->source_offset == 16 &&
+              metadata->source_bytes == 16,
+          "metadata source range is explicit");
+    CHECK(directory && directory->source_offset == 32 &&
+              directory->source_bytes == 33,
+          "tensor directory source range is explicit");
+    CHECK(alignment && alignment->source_offset == 65 &&
+              alignment->source_bytes == 63,
+          "pre-data alignment padding is explicit");
+
+    size_t tensor_padding_count = 0;
+    uint64_t tensor_padding_bytes = 0;
+    for (size_t i = 0; i < ledger.source_range_count; i++) {
+        if (ledger.source_ranges[i].kind ==
+            DS4_LAGUNA_SOURCE_TENSOR_PADDING) {
+            tensor_padding_count++;
+            tensor_padding_bytes += ledger.source_ranges[i].source_bytes;
+        }
+    }
+    CHECK(tensor_padding_count == 7 && tensor_padding_bytes == 428,
+          "tensor gaps and tail are synthesized as exact padding ranges");
+
+    const ds4_laguna_expert_entry *entry = &ledger.expert_entries[0];
+    CHECK(entry->layer == 1 && entry->expert == 0,
+          "expert entries are deterministically ordered by layer and expert");
+    CHECK(entry->gate.source_offset == 192 &&
+          entry->gate.source_bytes == 36 &&
+          entry->gate.device_offset == 0,
+          "gate view points into its parent and starts the slot");
+    CHECK(entry->up.source_offset == 320 &&
+          entry->up.source_bytes == 36 &&
+          entry->up.device_offset == 256,
+          "up view follows aligned gate storage");
+    CHECK(entry->down.source_offset == 448 &&
+          entry->down.source_bytes == 36 &&
+          entry->down.device_offset == 512 &&
+          entry->used_bytes == 768,
+          "down view and used bytes close the aligned slot");
+    entry = &ledger.expert_entries[3];
+    CHECK(entry->layer == 2 && entry->expert == 1 &&
+          entry->gate.source_offset == 612 &&
+          entry->up.source_offset == 740 &&
+          entry->down.source_offset == 868,
+          "last expert views use dim0-fastest parent arithmetic");
+
+    CHECK(ledger.tensor_ranges[0].tensor_class == DS4_LAGUNA_TENSOR_STATIC,
+          "quantized shared-expert tensor remains static");
+    CHECK(!ds4_laguna_ledger_build(&ledger, &f.spec, f.tensors,
+                                   FIXTURE_TENSOR_COUNT,
+                                   err, sizeof(err)) &&
+              strstr(err, "empty") != NULL,
+          "building into an owned ledger is rejected without leaking it");
+    ds4_laguna_ledger_free(&ledger);
+    CHECK(ledger.tensor_ranges == NULL && ledger.expert_entries == NULL &&
+          ledger.source_ranges == NULL,
+          "ledger free clears owned arrays");
+}
+
+static void test_ledger_identity_and_class_rejections(void) {
+    ledger_fixture f;
+    valid_ledger_fixture(&f);
+    f.tensors[0].tensor_class = DS4_LAGUNA_TENSOR_UNCLASSIFIED;
+    check_fixture_rejected(&f, "unclassified", "unclassified tensor rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].stable_index = f.tensors[0].stable_index;
+    check_fixture_rejected(&f, "stable index", "duplicate stable index rejected");
+
+    valid_ledger_fixture(&f);
+    static const char duplicate_name_storage[] =
+        "xxblk.0.ffn_shexp.weightyy";
+    f.tensors[1].name = duplicate_name_storage + 2;
+    f.tensors[1].name_len = strlen("blk.0.ffn_shexp.weight");
+    check_fixture_rejected(&f, "name", "duplicate length-delimited name rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[0].routed_projection = DS4_LAGUNA_ROUTED_PROJECTION_GATE;
+    check_fixture_rejected(&f, "static", "static tensor cannot claim routed identity");
+
+    valid_ledger_fixture(&f);
+    f.tensors[0].name = NULL;
+    check_fixture_rejected(&f, "name", "null length-delimited name rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[0].name_len = 0;
+    check_fixture_rejected(&f, "name", "empty length-delimited name rejected");
+}
+
+static void test_ledger_source_rejections(void) {
+    ledger_fixture f;
+    valid_ledger_fixture(&f);
+    f.tensors[2].source_offset = 256;
+    check_fixture_rejected(&f, "overlap", "overlapping parent ranges rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[6].source_offset = 960;
+    check_fixture_rejected(&f, "file", "truncated tensor range rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[0].source_offset = f.spec.tensor_data_start - 64;
+    check_fixture_rejected(&f, "tensor data", "tensor before data section rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[0].source_bytes++;
+    check_fixture_rejected(&f, "source size", "static source size mismatch rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].source_bytes++;
+    check_fixture_rejected(&f, "source size", "routed source size mismatch rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.gguf_alignment = 0;
+    check_fixture_rejected(&f, "alignment", "zero GGUF alignment rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.gguf_alignment = 48;
+    check_fixture_rejected(&f, "power of two", "non-power-of-two GGUF alignment rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.device_alignment = UINT64_MAX;
+    check_fixture_rejected(&f, "alignment", "unsafe device alignment rejected");
+}
+
+static void test_ledger_shape_rejections(void) {
+    ledger_fixture f;
+    valid_ledger_fixture(&f);
+    f.tensors[0].ndim = 0;
+    check_fixture_rejected(&f, "dimension", "zero-rank static tensor rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[0].ndim = DS4_LAGUNA_MAX_DIMS + 1u;
+    check_fixture_rejected(&f, "dimension", "over-rank static tensor rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].block_elems = 0;
+    check_fixture_rejected(&f, "block", "zero block geometry rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].dim[0] = 33;
+    check_fixture_rejected(&f, "dim0", "routed dim0 must divide block geometry exactly");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].dim[1] = 0;
+    check_fixture_rejected(&f, "zero dimension", "zero routed dimension rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].dim[2] = 3;
+    check_fixture_rejected(&f, "expert count", "routed dim2 must equal expert count");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].dim[1] = UINT64_MAX;
+    check_fixture_rejected(&f, "overflow", "routed dimension multiplication overflow rejected");
+}
+
+static void test_ledger_role_rejections(void) {
+    ledger_fixture f;
+    valid_ledger_fixture(&f);
+    f.tensors[1].routed_layer = 0;
+    check_fixture_rejected(&f, "layer", "routed layer below first routed layer rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].routed_layer = 3;
+    check_fixture_rejected(&f, "layer", "routed layer at layer count rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].routed_projection = (ds4_laguna_routed_projection)99;
+    check_fixture_rejected(&f, "projection", "unknown routed projection rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].routed_projection = DS4_LAGUNA_ROUTED_PROJECTION_UP;
+    check_fixture_rejected(&f, "duplicate", "duplicate routed projection rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].tensor_class = DS4_LAGUNA_TENSOR_STATIC;
+    f.tensors[1].routed_layer = UINT32_MAX;
+    f.tensors[1].routed_projection = DS4_LAGUNA_ROUTED_PROJECTION_NONE;
+    check_fixture_rejected(&f, "missing", "missing routed projection rejected");
+
+    valid_ledger_fixture(&f);
+    f.tensors[1].dim[1] = 4;
+    f.tensors[1].source_bytes = 144;
+    check_fixture_rejected(&f, "projection size", "inconsistent projection expert size rejected");
+}
+
+static void test_ledger_boundary_rejections(void) {
+    ledger_fixture f;
+    valid_ledger_fixture(&f);
+    f.spec.metadata_end = f.spec.header_end - 1;
+    check_fixture_rejected(&f, "boundaries", "reversed structural boundaries rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.tensor_data_start = 96;
+    check_fixture_rejected(&f, "alignment", "misaligned tensor data start rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.tensor_directory_end = f.spec.tensor_data_start + 1;
+    check_fixture_rejected(&f, "boundaries", "directory crossing data start rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.tensor_data_start = 192;
+    check_fixture_rejected(&f, "exact alignment", "noncanonical aligned data start rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.header_end = 0;
+    check_fixture_rejected(&f, "header", "empty GGUF header rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.tensor_directory_end = f.spec.metadata_end;
+    check_fixture_rejected(&f, "directory", "empty tensor directory rejected");
+
+    valid_ledger_fixture(&f);
+    f.spec.layer_count = UINT32_MAX;
+    f.spec.expert_count = UINT32_MAX;
+    check_fixture_rejected(&f, "allocation", "oversized expert table allocation rejected");
+}
+
+static void test_ledger(void) {
+    test_ledger_valid();
+    test_ledger_identity_and_class_rejections();
+    test_ledger_source_rejections();
+    test_ledger_shape_rejections();
+    test_ledger_role_rejections();
+    test_ledger_boundary_rejections();
+}
+
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s --case options\n", argv0);
+    fprintf(stderr, "Usage: %s --case options|ledger\n", argv0);
 }
 
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(argv[1], "--case") != 0 ||
-        strcmp(argv[2], "options") != 0) {
+        (strcmp(argv[2], "options") != 0 &&
+         strcmp(argv[2], "ledger") != 0)) {
         usage(argv[0]);
         return 2;
     }
 
-    test_options();
+    if (strcmp(argv[2], "options") == 0) test_options();
+    else test_ledger();
     if (g_failed != 0) {
         fprintf(stderr,
                 "test_laguna_stream: %d/%d assertion(s) failed\n",

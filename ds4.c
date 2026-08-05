@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_laguna_stream.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -2150,6 +2151,9 @@ typedef struct {
     uint64_t n_kv;
     uint64_t n_tensors;
     uint64_t alignment;
+    uint64_t header_end;
+    uint64_t metadata_end;
+    uint64_t tensor_directory_end;
     uint64_t tensor_data_pos;
     uint64_t max_tensor_bytes;
 
@@ -2475,6 +2479,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         }
     }
 
+    m->tensor_directory_end = c->pos;
     m->tensor_data_pos = align_up(c->pos, m->alignment);
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -2540,7 +2545,9 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     if (m->version != 3) ds4_die("only GGUF v3 is supported");
 
+    m->header_end = c.pos;
     parse_metadata(m, &c);
+    m->metadata_end = c.pos;
     parse_tensors(m, &c);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
@@ -6632,6 +6639,136 @@ static void weights_bind(
     }
 
     weights_validate_layout(w, start, end, require_token_embd, require_output);
+}
+
+static bool laguna_ledger_assign_routed_role(
+        ds4_laguna_tensor_desc       *descs,
+        size_t                        n_descs,
+        const ds4_model              *model,
+        const ds4_tensor             *role_tensor,
+        uint32_t                      layer,
+        ds4_laguna_routed_projection projection,
+        char                         *err,
+        size_t                        errlen) {
+    if (!role_tensor) {
+        snprintf(err, errlen,
+                 "missing bound routed tensor for layer %u projection %u",
+                 layer, (unsigned)projection);
+        return false;
+    }
+    for (size_t i = 0; i < n_descs; i++) {
+        if (&model->tensors[i] != role_tensor) continue;
+        if (descs[i].tensor_class != DS4_LAGUNA_TENSOR_STATIC) {
+            snprintf(err, errlen,
+                     "tensor %llu is bound to more than one routed role",
+                     (unsigned long long)descs[i].stable_index);
+            return false;
+        }
+        descs[i].tensor_class = DS4_LAGUNA_TENSOR_ROUTED_EXPERT;
+        descs[i].routed_layer = layer;
+        descs[i].routed_projection = projection;
+        return true;
+    }
+    snprintf(err, errlen,
+             "bound routed tensor for layer %u projection %u is not in the model directory",
+             layer, (unsigned)projection);
+    return false;
+}
+
+static bool laguna_ledger_build_from_bound_weights(
+        ds4_laguna_ledger *ledger,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        char              *err,
+        size_t             errlen) {
+    if (!ledger || !model || !weights) {
+        snprintf(err, errlen, "invalid Laguna ledger build inputs");
+        return false;
+    }
+    if (model->n_tensors == 0 ||
+        model->n_tensors > SIZE_MAX / sizeof(ds4_laguna_tensor_desc)) {
+        snprintf(err, errlen, "Laguna tensor descriptor allocation overflow");
+        return false;
+    }
+    const size_t n_tensors = (size_t)model->n_tensors;
+    ds4_laguna_tensor_desc *descs =
+        calloc(n_tensors, sizeof(descs[0]));
+    if (!descs) {
+        snprintf(err, errlen, "Laguna tensor descriptor allocation failed");
+        return false;
+    }
+
+    bool ok = true;
+    for (size_t i = 0; i < n_tensors; i++) {
+        const ds4_tensor *tensor = &model->tensors[i];
+        const gguf_type_info *type = tensor_type(tensor->type);
+        if (tensor->name.len > SIZE_MAX) {
+            snprintf(err, errlen,
+                     "Laguna tensor %zu name length exceeds address space", i);
+            ok = false;
+            break;
+        }
+        if (!type || type->block_elems == 0 || type->block_bytes == 0) {
+            snprintf(err, errlen,
+                     "Laguna tensor %zu has unsupported GGUF type %u",
+                     i, tensor->type);
+            ok = false;
+            break;
+        }
+        ds4_laguna_tensor_desc *desc = &descs[i];
+        desc->stable_index = i;
+        desc->name = tensor->name.ptr;
+        desc->name_len = (size_t)tensor->name.len;
+        desc->source_offset = tensor->abs_offset;
+        desc->source_bytes = tensor->bytes;
+        desc->ndim = tensor->ndim;
+        for (uint32_t d = 0; d < tensor->ndim; d++) {
+            desc->dim[d] = tensor->dim[d];
+        }
+        desc->gguf_type = tensor->type;
+        desc->block_elems = type->block_elems;
+        desc->block_bytes = type->block_bytes;
+        desc->tensor_class = DS4_LAGUNA_TENSOR_STATIC;
+        desc->routed_layer = UINT32_MAX;
+        desc->routed_projection = DS4_LAGUNA_ROUTED_PROJECTION_NONE;
+    }
+
+    for (uint32_t layer = DS4_N_LEADING_DENSE;
+         ok && layer < DS4_N_LAYER;
+         layer++) {
+        const ds4_layer_weights *bound = &weights->layer[layer];
+        ok = laguna_ledger_assign_routed_role(
+                 descs, n_tensors, model, bound->ffn_gate_exps,
+                 layer, DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+                 err, errlen) &&
+             laguna_ledger_assign_routed_role(
+                 descs, n_tensors, model, bound->ffn_up_exps,
+                 layer, DS4_LAGUNA_ROUTED_PROJECTION_UP,
+                 err, errlen) &&
+             laguna_ledger_assign_routed_role(
+                 descs, n_tensors, model, bound->ffn_down_exps,
+                 layer, DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
+                 err, errlen);
+    }
+
+    if (ok) {
+        const ds4_laguna_ledger_spec spec = {
+            .file_size = model->size,
+            .header_end = model->header_end,
+            .metadata_end = model->metadata_end,
+            .tensor_directory_end = model->tensor_directory_end,
+            .tensor_data_start = model->tensor_data_pos,
+            .gguf_alignment = model->alignment,
+            .device_alignment = 256,
+            .first_routed_layer = DS4_N_LEADING_DENSE,
+            .layer_count = DS4_N_LAYER,
+            .expert_count = DS4_N_EXPERT,
+        };
+        ok = ds4_laguna_ledger_build(ledger, &spec, descs, n_tensors,
+                                     err, errlen);
+    }
+    free(descs);
+    return ok;
 }
 
 typedef struct {
@@ -36070,6 +36207,7 @@ struct ds4_engine {
     ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
+    ds4_laguna_ledger laguna_ledger;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_backend backend;
@@ -58454,8 +58592,29 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            opt->tp.role != DS4_TP_NONE || e->cuda_tensor_parallel ||
+            gpu_cfg) {
+            fprintf(stderr,
+                    "ds4: Laguna S 2.1 does not yet support layer slicing, "
+                    "distributed inference, tensor parallelism, or multi-GPU placement\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming && e->ssd_streaming_cache_bytes_set &&
+            opt->warm_weights) {
+            fprintf(stderr,
+                    "ds4: exact compact Laguna does not support --warm-weights; "
+                    "the full-file scan would violate bounded startup\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 2;
+        }
+    }
+    if (opt->warm_weights) model_warm_weights(&e->model);
     if (e->cuda_tensor_parallel &&
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
@@ -58491,6 +58650,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_layer_start,
                  load_layer_end,
                  load_output);
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        char ledger_err[256] = {0};
+        if (!laguna_ledger_build_from_bound_weights(
+                &e->laguna_ledger, &e->model, &e->weights,
+                ledger_err, sizeof(ledger_err))) {
+            fprintf(stderr, "ds4: invalid Laguna tensor ledger: %s\n",
+                    ledger_err[0] ? ledger_err : "unknown validation error");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
@@ -58533,15 +58705,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (e->ssd_streaming) {
             fprintf(stderr,
                     "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
-            opt->tp.role != DS4_TP_NONE || gpu_cfg) {
-            fprintf(stderr,
-                    "ds4: Laguna S 2.1 does not yet support layer slicing, "
-                    "distributed inference, tensor parallelism, or multi-GPU placement\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -59270,6 +59433,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
 void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA &&
+        e->laguna_ledger.tensor_count != 0) {
+        const ds4_laguna_ledger *ledger = &e->laguna_ledger;
+        printf("laguna_ledger_tensor_count=%llu\n",
+               (unsigned long long)ledger->tensor_count);
+        printf("laguna_ledger_static_parent_count=%llu\n",
+               (unsigned long long)ledger->static_parent_count);
+        printf("laguna_ledger_routed_parent_count=%llu\n",
+               (unsigned long long)ledger->routed_parent_count);
+        printf("laguna_ledger_expert_entry_count=%llu\n",
+               (unsigned long long)ledger->expert_entry_count);
+        printf("laguna_ledger_routed_source_bytes=%llu\n",
+               (unsigned long long)ledger->routed_source_bytes);
+        printf("laguna_ledger_static_source_bytes=%llu\n",
+               (unsigned long long)ledger->static_source_bytes);
+        printf("laguna_ledger_static_aligned_device_bytes=%llu\n",
+               (unsigned long long)ledger->static_aligned_device_bytes);
+        printf("laguna_ledger_non_tensor_source_bytes=%llu\n",
+               (unsigned long long)ledger->non_tensor_source_bytes);
+        printf("laguna_ledger_routed_projection_expert_bytes=%llu\n",
+               (unsigned long long)ledger->routed_projection_expert_bytes);
+        printf("laguna_ledger_slot_stride_bytes=%llu\n",
+               (unsigned long long)ledger->slot_stride_bytes);
+        printf("laguna_ledger_file_size=%llu\n",
+               (unsigned long long)ledger->file_size);
+    }
     if (e->mtp_model.map) {
         printf("\nsupport model");
         if (e->support_kind != DS4_SUPPORT_NONE) {
@@ -59584,6 +59773,7 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
+    ds4_laguna_ledger_free(&e->laguna_ledger);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();

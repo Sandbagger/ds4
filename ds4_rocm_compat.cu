@@ -398,25 +398,6 @@ extern "C" int ds4_gpu_matmul_q6_K_tensor(
     return 0;
 }
 
-extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
-        ds4_gpu_tensor *routed_out, ds4_gpu_tensor *routed_mid,
-        ds4_gpu_tensor *shared_out, ds4_gpu_tensor *shared_mid,
-        const void *model_map, uint64_t model_size,
-        const ds4_gpu_laguna_moe_desc *routed,
-        const ds4_gpu_laguna_moe_desc *shared,
-        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-        uint32_t n_total_expert, uint32_t n_expert,
-        const ds4_gpu_tensor *shared_selected,
-        const ds4_gpu_tensor *shared_weight, const ds4_gpu_tensor *x) {
-    (void)routed_out; (void)routed_mid; (void)shared_out; (void)shared_mid;
-    (void)model_map; (void)model_size; (void)routed; (void)shared;
-    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
-    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
-    (void)shared_selected; (void)shared_weight; (void)x;
-    return 0;
-}
-
 extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
         ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
         ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,

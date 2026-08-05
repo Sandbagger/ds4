@@ -80,14 +80,33 @@ To inspect a local top-logprob dump manually:
 
 ## Laguna S 2.1 resident-CUDA oracle
 
-`laguna-resident/` defines a fail-closed, two-oracle model-parity contract for
-`poolside/Laguna-S-2.1-GGUF`. The admitted artifact is
-`laguna-s-2.1-Q4_K_M.gguf` at revision
-`706fa69799926b6afde1af9e24ca2a4923f110a1`, exactly `68248759648` bytes,
-with SHA-256
-`e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`.
-The independent Poolside reference is pinned to llama.cpp commit
-`04b2b72cb54048ead292884adbe11f284e3ec950`.
+`laguna-resident/` defines a fail-closed, one-full-model-oracle contract for
+`poolside/Laguna-S-2.1-GGUF` under policy `single-poolside-v1`. Poolside's
+Laguna-capable `llama.cpp` fork supplies the only full-model reference. The
+scalar CUDA kernel references and serialized-versus-batched and
+serialized-versus-mixed metamorphic session checks are complementary
+assurance; they are not second full-model oracles.
+
+The policy has an explicit limitation: it cannot detect a model-level error
+shared by Poolside and the captured GGUF conversion. If a genuinely
+independent runtime becomes available, introduce a new schema and policy and
+recapture rather than reinterpreting these fixtures as dual-oracle evidence.
+
+The exact pins are:
+
+- contract commit: `a250e43722945e293f6044bc7254c4806d5a7912`;
+- capture directory:
+  `/home/will/artifacts/ds4/laguna-resident/a250e43/poolside-04b2b72`;
+- capture manifest SHA-256:
+  `cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e`;
+- Poolside runtime commit: `04b2b72cb54048ead292884adbe11f284e3ec950`;
+- model repository and revision: `poolside/Laguna-S-2.1-GGUF` at
+  `706fa69799926b6afde1af9e24ca2a4923f110a1`;
+- model file: `laguna-s-2.1-Q4_K_M.gguf`, exactly `68248759648` bytes, with
+  SHA-256
+  `e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`;
+- promoted tokenizer runtime commit:
+  `15c9b92502fed6bc26842e98d11a6347caadb08e`.
 
 The checked-in inputs are `cases.json`, `short.txt`, the deterministic prompt
 generator, and its generated `benchmark-32768.txt` seed. Regenerate the seed
@@ -103,57 +122,64 @@ sha256sum tests/test-vectors/laguna-resident/generate_benchmark_prompt.py \
   tests/test-vectors/laguna-resident/benchmark-32768.txt
 ```
 
-Build the pinned Poolside capture helper and materialize the exact 513, 8193,
-and 32768-token raw prompts from the shared seed:
+The pinned capture has already been validated. Do not recapture it during an
+ordinary verification or admission run. A new full-model capture requires a
+failed provenance check or an explicit model/runtime change plus the external
+isolation attestation described by the design.
+
+Promotion consumes that capture and the pinned model through DS4's exact
+tokenizer. From the clean canonical DGX checkout used for promotion, run:
 
 ```sh
-make -C gguf-tools quality-laguna-logits \
-  LLAMA_CPP_DIR="$LLAMA_LAGUNA_DIR" \
-  LLAMA_CPP_BUILD="$LLAMA_LAGUNA_DIR/build"
-gguf-tools/quality-testing/dump_llama_logits \
-  --model "$LAGUNA_MODEL" \
-  --cases tests/test-vectors/laguna-resident/cases.json \
-  --seed-prompt tests/test-vectors/laguna-resident/benchmark-32768.txt \
-  --materialize-prompts tests/test-vectors/laguna-resident \
-  --out "$LAGUNA_LLAMA_OUT"
-```
-
-Capture the same four frontiers and eight teacher-forced continuation rows
-with DwarfStar Metal into `$LAGUNA_METAL_OUT`, then promote only when the two
-tokenizations, argmaxes, continuations, and fixed numeric gates agree:
-
-```sh
+LAGUNA_LLAMA_OUT=/home/will/artifacts/ds4/laguna-resident/a250e43/poolside-04b2b72
+LAGUNA_MODEL=/home/will/models/poolside/Laguna-S-2.1-GGUF/706fa69799926b6afde1af9e24ca2a4923f110a1/laguna-s-2.1-Q4_K_M.gguf
+LAGUNA_MODEL="$LAGUNA_MODEL" \
 python3 gguf-tools/quality-testing/compare_laguna_logits.py \
   --ds4 ./ds4 \
-  --metal "$LAGUNA_METAL_OUT" \
   --llama "$LAGUNA_LLAMA_OUT" \
   --promote tests/test-vectors/laguna-resident
 ```
 
-Promotion writes one Metal and one Poolside little-endian float32 vector for
-each of `short`, `swa-513`, `yarn-8193`, and `deep-32768`, plus the eight-ID
-little-endian continuation and `manifest.json`. It requires centered RMS
-`<= 0.02`, centered maximum absolute error `<= 0.10`, top-20 overlap `>= 18`,
-and exact argmax and continuation agreement. Materialized prompts and promoted
-vectors are intentionally absent until both independent captures pass.
+Promotion writes exactly four little-endian Poolside float32 vectors,
+`short.llama.f32`, `swa-513.llama.f32`, `yarn-8193.llama.f32`, and
+`deep-32768.llama.f32`, plus one eight-ID little-endian continuation file,
+`yarn-8193.continuation.i32`, and the `laguna-resident-promoted-v2` manifest.
+It does not overwrite existing promoted artifacts.
 
-Task 6 admission must run the non-mutating verifier with all runtime and GGUF
-pins supplied explicitly:
+Verification is non-mutating and supplies every provenance pin explicitly.
+Read the tokenizer runtime commit from the manifest, then run:
 
 ```sh
+export LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(
+  python3 -c 'import json; print(json.load(open("tests/test-vectors/laguna-resident/manifest.json", encoding="utf-8"))["provenance"]["tokenizer_runtime_commit"])'
+)"
+test "${#LAGUNA_TOKENIZER_RUNTIME_COMMIT}" -eq 40
 python3 gguf-tools/quality-testing/compare_laguna_logits.py \
   --verify-promoted tests/test-vectors/laguna-resident \
-  --dwarfstar-commit "$LAGUNA_CONTRACT_COMMIT" \
+  --contract-commit a250e43722945e293f6044bc7254c4806d5a7912 \
+  --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
   --llama-commit 04b2b72cb54048ead292884adbe11f284e3ec950 \
+  --capture-manifest-sha256 \
+    cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e \
   --gguf-size 68248759648 \
-  --gguf-sha256 e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
+  --gguf-sha256 \
+    e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
+```
+
+The aggregate target preserves the required gate order: promoted-fixture
+verification, unchanged scalar CUDA kernel tests, then the model-backed CUDA
+contract. It is deliberately excluded from ordinary `make test`. Run it with
+the verified local model:
+
+```sh
+export LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(
+  python3 -c 'import json; print(json.load(open("tests/test-vectors/laguna-resident/manifest.json", encoding="utf-8"))["provenance"]["tokenizer_runtime_commit"])'
+)"
+test "${#LAGUNA_TOKENIZER_RUNTIME_COMMIT}" -eq 40
+DS4_TEST_MODEL="$LAGUNA_MODEL" make test-cuda-laguna-resident
 ```
 
 Verification rejects missing or extra files, bad sizes or hashes, stale pins,
 token disagreement, or widened gates without modifying the fixture tree. The
-model-backed CUDA target is deliberately excluded from ordinary `make test`;
-run it explicitly with the verified local model:
-
-```sh
-DS4_TEST_MODEL="$LAGUNA_MODEL" make test-cuda-laguna-model
-```
+legacy dual-runtime CLI is intentionally unsupported: do not pass the removed
+Metal, DwarfStar-commit, or DS4-commit options.

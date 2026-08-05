@@ -377,6 +377,38 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+typedef struct {
+    int pos;
+    int first_token;
+    bool checkpoint_valid;
+    bool logits_only_terminal;
+    uint64_t token_hash;
+    uint64_t logit_hash;
+    bool progress_set;
+    bool progress_ud_set;
+    bool display_progress_set;
+    bool display_progress_ud_set;
+    bool cancel_set;
+    bool cancel_ud_set;
+    bool progress_is_test_probe;
+    bool display_progress_is_test_probe;
+    bool cancel_is_test_probe;
+    /* Hook-only boundary counters advance after the future terminal guard. */
+    uint64_t progress_dispatches;
+    uint64_t warmup_dispatches;
+    uint64_t layer_payload_dispatches;
+} ds4_test_session_state;
+
+int ds4_test_logits_only_sync_mode(
+        bool native_cuda_build,
+        bool laguna, ds4_backend backend,
+        bool session_distributed, bool engine_distributed,
+        bool transport_tensor_parallel, bool cuda_tensor_parallel,
+        int prompt_len, int ctx_size);
+int ds4_test_session_create_policy(
+        ds4_session **out, int ctx_size, bool terminal);
+int ds4_test_session_state_get(
+        const ds4_session *s, ds4_test_session_state *out);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,

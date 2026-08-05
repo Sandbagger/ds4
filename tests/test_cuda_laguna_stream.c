@@ -192,9 +192,7 @@ static void plan_prepare(
         ledger->expert_entry_count * sizeof(ledger->expert_entries[0]);
     plan->owned_category_bounds[
         DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] =
-            static_offset_bytes;
-    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] =
-        ledger_array_bytes;
+            static_offset_bytes + ledger_array_bytes;
     plan->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] =
         ledger->file_size;
     plan->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 0;
@@ -227,7 +225,7 @@ static void plan_prepare(
     plan->callsites[3] = (ds4_runtime_callsite){
         .id = DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
         .name = "laguna.ledger_arrays",
-        .category = DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        .category = DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
         .domain = DS4_RUNTIME_DOMAIN_HOST,
         .bound_bytes = ledger_array_bytes,
     };
@@ -318,14 +316,15 @@ static bool tracker_has_only_ledger(const ds4_runtime_tracker *tracker) {
         return false;
     }
     for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
-        if (i == DS4_RUNTIME_CATEGORY_OTHER_HOST) continue;
+        if (i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES) continue;
         if (tracker->category_current[i] != 0) return false;
     }
     for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
         if (tracker->report_current[i] != 0) return false;
     }
     return tracker->owned_total_current ==
-        tracker->category_current[DS4_RUNTIME_CATEGORY_OTHER_HOST];
+        tracker->category_current[
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES];
 }
 
 static ds4_laguna_ledger ledger_with_copied_ranges(
@@ -405,6 +404,11 @@ static int run_startup(void) {
               ledger.static_source_bytes == 72 &&
               ledger.static_aligned_device_bytes == 512,
           "synthetic ledger has the intended static/routed partition");
+    const uint64_t ledger_array_bytes =
+        ledger.tensor_range_count * sizeof(ledger.tensor_ranges[0]) +
+        (ledger.tensor_range_count * 2u + 5u) *
+            sizeof(ledger.source_ranges[0]) +
+        ledger.expert_entry_count * sizeof(ledger.expert_entries[0]);
 
     ds4_laguna_ledger bad = ledger_with_copied_ranges(&ledger);
     CHECK(bad.tensor_ranges != NULL, "overlap mutation has private ranges");
@@ -526,7 +530,8 @@ static int run_startup(void) {
               DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] == 0 &&
               runtime_snapshot.category_current[
               DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] ==
-                  FIXTURE_TENSOR_COUNT * sizeof(uint64_t) &&
+                  FIXTURE_TENSOR_COUNT * sizeof(uint64_t) +
+                  ledger_array_bytes &&
               runtime_snapshot.report_current[
               DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] ==
                   sizeof(model_bytes) &&
@@ -615,7 +620,10 @@ static int run_startup(void) {
               runtime_snapshot.active_record_count == 3 &&
               runtime_snapshot.owned_total_current ==
                   runtime_snapshot.category_current[
-                      DS4_RUNTIME_CATEGORY_OTHER_HOST] &&
+                      DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] &&
+              runtime_snapshot.category_current[
+                  DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] ==
+                  ledger_array_bytes &&
               runtime_snapshot.report_current[
               DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] == 0 &&
               runtime_snapshot.report_current[

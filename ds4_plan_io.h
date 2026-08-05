@@ -25,26 +25,30 @@ bool ds4_plan_io_sha256(const void *data,
                         char *error,
                         size_t error_size);
 
-/* Validate immutable output identity and its parent directory without
- * creating either artifact.  Plan-only frontends call this before opening the
- * model so an invalid destination cannot trigger a 68-GiB metadata walk. */
+/* Validate immutable output identity and probe both exact same-directory
+ * temporary names without leaving either final artifact or a probe file.
+ * Plan-only frontends call this before opening the model so an invalid
+ * destination cannot trigger a 68-GiB metadata walk. */
 bool ds4_plan_io_preflight_target(const char *path,
                                   char *error,
                                   size_t error_size);
 
-/* Durably publish exact plan bytes, followed by an external FILE.sha256 that
- * contains "<digest>\n".  Each artifact uses a same-directory mkstemp file,
- * write-all, file fsync, close, rename, and parent-directory fsync.
+/* Durably publish exact plan bytes and an external FILE.sha256 containing
+ * "<digest>\n".  Both artifacts are completely staged with same-directory
+ * mkstemp, write-all, file fsync, and close before either becomes visible.
+ * Publication uses atomic no-replace rename on Darwin/Linux and a same-device
+ * hard-link fallback; ordinary replacement rename is never used.  One parent
+ * directory fsync follows the pair.
  *
- * Existing plan and sidecar paths are rejected.  Portable C/POSIX has no
- * rename-without-replacement operation, so this is an explicit precheck and
- * assumes the publication directory is controlled by the caller.  A racing
- * creator could still be replaced between the precheck and rename.
+ * Existing or racing plan and sidecar paths are never replaced.  A returned
+ * failure removes temporary files and rolls back final artifacts whose inode
+ * identity proves that this call installed them.
  *
- * The two artifacts are intentionally not claimed to be pair-atomic.  If the
- * plan rename succeeds and sidecar publication later fails, the complete plan
- * remains at FILE as unauthenticated evidence and this function returns false.
- * It never removes or rewrites that published plan during failure cleanup. */
+ * No Darwin/Linux filesystem primitive makes two separate names crash-atomic.
+ * Power loss before the parent-directory fsync can therefore leave an
+ * incomplete pair.  Consumers must require both files and verify that the
+ * sidecar matches the exact plan bytes; an orphan is never qualification
+ * evidence. */
 bool ds4_plan_io_publish(const char *path,
                          const void *bytes,
                          size_t size,

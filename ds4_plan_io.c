@@ -1,3 +1,8 @@
+#if defined(__linux__)
+#define _GNU_SOURCE
+#elif defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include "ds4_plan_io.h"
@@ -330,6 +335,21 @@ static bool ds4_plan_write_all(int fd,
     return true;
 }
 
+static bool ds4_plan_fsync(int fd) {
+    for (;;) {
+        if (fsync(fd) == 0) return true;
+        if (errno != EINTR) return false;
+    }
+}
+
+static bool ds4_plan_unlink(const char *path) {
+    for (;;) {
+        if (unlink(path) == 0) return true;
+        if (errno == ENOENT) return true;
+        if (errno != EINTR) return false;
+    }
+}
+
 static char *ds4_plan_parent_directory(const char *path,
                                        char *error,
                                        size_t error_size) {
@@ -359,6 +379,46 @@ static char *ds4_plan_parent_directory(const char *path,
     return parent;
 }
 
+static bool ds4_plan_probe_temporary(const char *target,
+                                     char *temporary,
+                                     const char *kind,
+                                     char *error,
+                                     size_t error_size) {
+    const int fd = mkstemp(temporary);
+    if (fd < 0) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(error,
+                           error_size,
+                           "create temporary %s for '%s': %s",
+                           kind,
+                           target,
+                           strerror(saved_errno));
+        return false;
+    }
+    if (close(fd) != 0) {
+        const int saved_errno = errno;
+        (void)ds4_plan_unlink(temporary);
+        ds4_plan_set_error(error,
+                           error_size,
+                           "close temporary %s probe for '%s': %s",
+                           kind,
+                           target,
+                           strerror(saved_errno));
+        return false;
+    }
+    if (!ds4_plan_unlink(temporary)) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(error,
+                           error_size,
+                           "remove temporary %s probe for '%s': %s",
+                           kind,
+                           target,
+                           strerror(saved_errno));
+        return false;
+    }
+    return true;
+}
+
 bool ds4_plan_io_preflight_target(const char *path,
                                   char *error,
                                   size_t error_size) {
@@ -377,14 +437,42 @@ bool ds4_plan_io_preflight_target(const char *path,
         error_size);
     if (sidecar == NULL) return false;
 
+    const size_t temporary_suffix_length =
+        sizeof(DS4_PLAN_IO_TEMP_SUFFIX) - 1u;
+    char *plan_temporary = ds4_plan_append(
+        path,
+        path_length,
+        DS4_PLAN_IO_TEMP_SUFFIX,
+        temporary_suffix_length,
+        error,
+        error_size);
+    char *sidecar_temporary = NULL;
+    if (plan_temporary != NULL) {
+        sidecar_temporary = ds4_plan_append(
+            sidecar,
+            path_length + sizeof(DS4_PLAN_IO_SIDECAR_SUFFIX) - 1u,
+            DS4_PLAN_IO_TEMP_SUFFIX,
+            temporary_suffix_length,
+            error,
+            error_size);
+    }
+    if (plan_temporary == NULL || sidecar_temporary == NULL) {
+        free(sidecar_temporary);
+        free(plan_temporary);
+        free(sidecar);
+        return false;
+    }
+
     bool ok = ds4_plan_target_absent(path, "plan", error, error_size) &&
               ds4_plan_target_absent(
                   sidecar, "digest sidecar", error, error_size);
-    free(sidecar);
-    if (!ok) return false;
+    if (!ok) goto cleanup;
 
     char *parent = ds4_plan_parent_directory(path, error, error_size);
-    if (parent == NULL) return false;
+    if (parent == NULL) {
+        ok = false;
+        goto cleanup;
+    }
     struct stat status;
     if (stat(parent, &status) != 0) {
         const int saved_errno = errno;
@@ -394,7 +482,8 @@ bool ds4_plan_io_preflight_target(const char *path,
                            parent,
                            strerror(saved_errno));
         free(parent);
-        return false;
+        ok = false;
+        goto cleanup;
     }
     if (!S_ISDIR(status.st_mode)) {
         ds4_plan_set_error(error,
@@ -402,10 +491,24 @@ bool ds4_plan_io_preflight_target(const char *path,
                            "qualification-plan parent '%s' is not a directory",
                            parent);
         free(parent);
-        return false;
+        ok = false;
+        goto cleanup;
     }
     free(parent);
-    return true;
+
+    ok = ds4_plan_probe_temporary(
+             path, plan_temporary, "plan", error, error_size) &&
+         ds4_plan_probe_temporary(sidecar,
+                                  sidecar_temporary,
+                                  "digest sidecar",
+                                  error,
+                                  error_size);
+
+cleanup:
+    free(sidecar_temporary);
+    free(plan_temporary);
+    free(sidecar);
+    return ok;
 }
 
 static bool ds4_plan_sync_parent(const char *target,
@@ -426,7 +529,7 @@ static bool ds4_plan_sync_parent(const char *target,
         free(parent);
         return false;
     }
-    if (fsync(fd) != 0) {
+    if (!ds4_plan_fsync(fd)) {
         const int saved_errno = errno;
         (void)close(fd);
         ds4_plan_set_error(error,
@@ -453,13 +556,14 @@ static bool ds4_plan_sync_parent(const char *target,
     return true;
 }
 
-static bool ds4_plan_publish_one(const char *target,
-                                 char *temporary,
-                                 const unsigned char *bytes,
-                                 size_t size,
-                                 const char *kind,
-                                 char *error,
-                                 size_t error_size) {
+static bool ds4_plan_stage_one(const char *target,
+                               char *temporary,
+                               const unsigned char *bytes,
+                               size_t size,
+                               const char *kind,
+                               struct stat *identity,
+                               char *error,
+                               size_t error_size) {
     int fd = mkstemp(temporary);
     if (fd < 0) {
         const int saved_errno = errno;
@@ -475,7 +579,7 @@ static bool ds4_plan_publish_one(const char *target,
     if (!ds4_plan_write_all(fd, bytes, size)) {
         const int saved_errno = errno;
         (void)close(fd);
-        (void)unlink(temporary);
+        (void)ds4_plan_unlink(temporary);
         ds4_plan_set_error(error,
                            error_size,
                            "write temporary %s for '%s': %s",
@@ -484,10 +588,10 @@ static bool ds4_plan_publish_one(const char *target,
                            strerror(saved_errno));
         return false;
     }
-    if (fsync(fd) != 0) {
+    if (!ds4_plan_fsync(fd)) {
         const int saved_errno = errno;
         (void)close(fd);
-        (void)unlink(temporary);
+        (void)ds4_plan_unlink(temporary);
         ds4_plan_set_error(error,
                            error_size,
                            "synchronize temporary %s for '%s': %s",
@@ -496,9 +600,21 @@ static bool ds4_plan_publish_one(const char *target,
                            strerror(saved_errno));
         return false;
     }
+    if (fstat(fd, identity) != 0) {
+        const int saved_errno = errno;
+        (void)close(fd);
+        (void)ds4_plan_unlink(temporary);
+        ds4_plan_set_error(error,
+                           error_size,
+                           "inspect temporary %s for '%s': %s",
+                           kind,
+                           target,
+                           strerror(saved_errno));
+        return false;
+    }
     if (close(fd) != 0) {
         const int saved_errno = errno;
-        (void)unlink(temporary);
+        (void)ds4_plan_unlink(temporary);
         ds4_plan_set_error(error,
                            error_size,
                            "close temporary %s for '%s': %s",
@@ -507,18 +623,69 @@ static bool ds4_plan_publish_one(const char *target,
                            strerror(saved_errno));
         return false;
     }
-    if (rename(temporary, target) != 0) {
+    return true;
+}
+
+static int ds4_plan_rename_noreplace(const char *temporary,
+                                     const char *target) {
+#if defined(__APPLE__)
+    if (renamex_np(temporary, target, RENAME_EXCL) == 0) return 0;
+    if (errno != ENOTSUP && errno != EINVAL) return -1;
+#elif defined(__linux__)
+    if (renameat2(AT_FDCWD,
+                  temporary,
+                  AT_FDCWD,
+                  target,
+                  RENAME_NOREPLACE) == 0) {
+        return 0;
+    }
+    if (errno != ENOSYS && errno != ENOTSUP && errno != EOPNOTSUPP &&
+        errno != EINVAL) {
+        return -1;
+    }
+#endif
+
+    /* The mkstemp file and target are in the same directory, so hard-linking
+     * gives the fallback the same atomic no-clobber property.  The common
+     * cleanup path removes the now-redundant temporary link. */
+    return link(temporary, target);
+}
+
+static bool ds4_plan_commit_one(const char *target,
+                                const char *temporary,
+                                const char *kind,
+                                char *error,
+                                size_t error_size) {
+    if (ds4_plan_rename_noreplace(temporary, target) != 0) {
         const int saved_errno = errno;
-        (void)unlink(temporary);
-        ds4_plan_set_error(error,
-                           error_size,
-                           "publish %s '%s': %s",
-                           kind,
-                           target,
-                           strerror(saved_errno));
+        if (saved_errno == EEXIST) {
+            ds4_plan_set_error(error,
+                               error_size,
+                               "refusing to replace existing %s '%s'",
+                               kind,
+                               target);
+        } else {
+            ds4_plan_set_error(error,
+                               error_size,
+                               "publish %s '%s': %s",
+                               kind,
+                               target,
+                               strerror(saved_errno));
+        }
         return false;
     }
-    return ds4_plan_sync_parent(target, kind, error, error_size);
+    return true;
+}
+
+static bool ds4_plan_remove_if_identity(const char *path,
+                                        const struct stat *identity) {
+    struct stat current;
+    if (lstat(path, &current) != 0) return errno == ENOENT;
+    if (current.st_dev != identity->st_dev ||
+        current.st_ino != identity->st_ino) {
+        return false;
+    }
+    return ds4_plan_unlink(path);
 }
 
 bool ds4_plan_io_publish(const char *path,
@@ -597,31 +764,98 @@ bool ds4_plan_io_publish(const char *path,
     memcpy(sidecar_bytes, digest, DS4_PLAN_IO_SHA256_HEX_LENGTH);
     sidecar_bytes[DS4_PLAN_IO_SHA256_HEX_LENGTH] = '\n';
 
-    if (!ds4_plan_publish_one(path,
-                              plan_temporary,
-                              (const unsigned char *)bytes,
-                              size,
-                              "plan",
-                              error,
-                              error_size)) {
+    struct stat plan_identity;
+    struct stat sidecar_identity;
+    bool plan_committed = false;
+    bool sidecar_committed = false;
+    if (!ds4_plan_stage_one(path,
+                            plan_temporary,
+                            (const unsigned char *)bytes,
+                            size,
+                            "plan",
+                            &plan_identity,
+                            error,
+                            error_size)) {
         goto cleanup;
     }
+    if (!ds4_plan_stage_one(sidecar,
+                            sidecar_temporary,
+                            sidecar_bytes,
+                            sizeof(sidecar_bytes),
+                            "digest sidecar",
+                            &sidecar_identity,
+                            error,
+                            error_size)) {
+        goto rollback;
+    }
+    if (!ds4_plan_commit_one(path,
+                             plan_temporary,
+                             "plan",
+                             error,
+                             error_size)) {
+        goto rollback;
+    }
+    plan_committed = true;
+    if (!ds4_plan_commit_one(sidecar,
+                             sidecar_temporary,
+                             "digest sidecar",
+                             error,
+                             error_size)) {
+        goto rollback;
+    }
+    sidecar_committed = true;
 
-    /* Do not remove path if this second durable publication fails. */
-    if (!ds4_plan_publish_one(sidecar,
-                              sidecar_temporary,
-                              sidecar_bytes,
-                              sizeof(sidecar_bytes),
-                              "digest sidecar",
+    if (!ds4_plan_unlink(plan_temporary) ||
+        !ds4_plan_unlink(sidecar_temporary)) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(error,
+                           error_size,
+                           "remove qualification-plan temporary link: %s",
+                           strerror(saved_errno));
+        goto rollback;
+    }
+    if (!ds4_plan_sync_parent(path,
+                              "qualification plan pair",
                               error,
                               error_size)) {
-        goto cleanup;
+        goto rollback;
     }
 
     memcpy(digest_hex, digest, sizeof(digest));
     success = true;
+    goto cleanup;
+
+rollback: {
+        char ignored_error[1];
+        if (sidecar_temporary != NULL) {
+            (void)ds4_plan_unlink(sidecar_temporary);
+        }
+        if (plan_temporary != NULL) {
+            (void)ds4_plan_unlink(plan_temporary);
+        }
+        if (sidecar_committed) {
+            (void)ds4_plan_remove_if_identity(sidecar, &sidecar_identity);
+        }
+        if (plan_committed) {
+            (void)ds4_plan_remove_if_identity(path, &plan_identity);
+        }
+        if (sidecar_committed || plan_committed) {
+            (void)ds4_plan_sync_parent(path,
+                                       "qualification plan rollback",
+                                       ignored_error,
+                                       sizeof(ignored_error));
+        }
+    }
 
 cleanup:
+    if (!success) {
+        if (sidecar_temporary != NULL) {
+            (void)ds4_plan_unlink(sidecar_temporary);
+        }
+        if (plan_temporary != NULL) {
+            (void)ds4_plan_unlink(plan_temporary);
+        }
+    }
     free(sidecar_temporary);
     free(plan_temporary);
     free(sidecar);

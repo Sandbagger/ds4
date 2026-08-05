@@ -44,6 +44,32 @@ static bool write_fixture(const char *path, const void *bytes, size_t size) {
     return fclose(file) == 0 && wrote;
 }
 
+static bool write_exclusive_fixture(const char *path,
+                                    const void *bytes,
+                                    size_t size) {
+    const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return false;
+    size_t offset = 0;
+    while (offset != size) {
+        const ssize_t wrote = write(
+            fd, (const unsigned char *)bytes + offset, size - offset);
+        if (wrote > 0) {
+            offset += (size_t)wrote;
+        } else if (wrote < 0 && errno == EINTR) {
+            continue;
+        } else {
+            (void)close(fd);
+            (void)unlink(path);
+            return false;
+        }
+    }
+    const bool synced = fsync(fd) == 0;
+    const bool closed = close(fd) == 0;
+    const bool ok = synced && closed;
+    if (!ok) (void)unlink(path);
+    return ok;
+}
+
 static unsigned char *read_fixture(const char *path, size_t *size_out) {
     FILE *file = fopen(path, "rb");
     if (file == NULL) return NULL;
@@ -122,7 +148,8 @@ static pid_t spawn_target_racer(const char *dir,
     for (;;) {
         if (directory_has_prefix(dir, temporary_prefix)) {
             if (kill(publisher, SIGSTOP) != 0) _exit(21);
-            const bool wrote = write_fixture(target, sentinel, strlen(sentinel));
+            const bool wrote = write_exclusive_fixture(
+                target, sentinel, strlen(sentinel));
             const int resume_rc = kill(publisher, SIGCONT);
             _exit(wrote && resume_rc == 0 ? 0 : 22);
         }
@@ -424,7 +451,6 @@ static void test_racing_plan_target_is_not_replaced(const char *root) {
 
 static void test_second_commit_failure_rolls_back_plan(const char *root) {
     static const char sentinel[] = "racing creator owns this sidecar\n";
-    static const char payload[] = "qualification plan awaiting its digest\n";
     char plan[512];
     char sidecar[520];
     char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = "stale";
@@ -434,11 +460,17 @@ static void test_second_commit_failure_rolls_back_plan(const char *root) {
     CHECK(snprintf(sidecar, sizeof(sidecar), "%s.sha256", plan) > 0,
           "rollback sidecar path fits");
 
+    const size_t payload_size = 32u * 1024u * 1024u;
+    unsigned char *payload = malloc(payload_size);
+    CHECK(payload != NULL, "rollback race payload allocated");
+    if (payload == NULL) return;
+    memset(payload, 'q', payload_size);
+
     const pid_t racer = spawn_target_racer(
-        root, "rollback.json.sha256.tmp.", sidecar, sentinel);
+        root, "rollback.json.tmp.", sidecar, sentinel);
     CHECK(racer > 0, "sidecar-target racer started");
     const bool published = ds4_plan_io_publish(
-        plan, payload, sizeof(payload) - 1u, digest, error, sizeof(error));
+        plan, payload, payload_size, digest, error, sizeof(error));
     CHECK(wait_for_racer(racer), "sidecar-target racer completed");
     CHECK(!published, "racing sidecar target makes publication fail");
     CHECK(strstr(error, "existing digest sidecar") != NULL,
@@ -456,6 +488,7 @@ static void test_second_commit_failure_rolls_back_plan(const char *root) {
     free(bytes);
     CHECK(count_temporary_files(root) == 0,
           "second-commit rollback leaves no temporary files");
+    free(payload);
 }
 
 static void test_nested_directory(const char *root) {

@@ -441,6 +441,45 @@ assert_qualification_error_before_model_open() {
     fi
 }
 
+PLAN_DIR=$(mktemp -d)
+PLAN_PATH="$PLAN_DIR/plan.json"
+PLAN_LOCK="$PLAN_DIR/missing/plan.lock"
+
+run_reference_plan_option() {
+    local name=$1
+    local bin=$2
+    local path=$3
+    local cache_bytes=$4
+    shift 4
+    if [ "$name" = "ds4-bench" ]; then
+        DS4_LOCK_FILE="$PLAN_LOCK" "$bin" \
+            --cuda --ctx-start 1 --ctx-max 1 --ctx-alloc 32768 \
+            --gen-tokens 0 --prefill-chunk 4096 \
+            --ssd-streaming --ssd-streaming-cache-bytes "$cache_bytes" \
+            --qualification-plan "$path" "$@" \
+            -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+    else
+        DS4_LOCK_FILE="$PLAN_LOCK" "$bin" \
+            --cuda --ctx 32768 --prefill-chunk 4096 \
+            --ssd-streaming --ssd-streaming-cache-bytes "$cache_bytes" \
+            --qualification-plan "$path" "$@" \
+            -m /dev/null > "$LOG" 2>&1
+    fi
+}
+
+assert_plan_reaches_model_validation_without_runtime_side_effects() {
+    local name=$1
+    local rc=$2
+    if [ "$rc" -ne 0 ] &&
+       grep -qE "model file is too small|failed to open model" "$LOG" &&
+       ! grep -qE "working-set limit|another ds4 process|failed to open lock file|oom_score_adj|GPU config:|unknown option|not implemented" "$LOG"; then
+        ok "$name"
+    else
+        fail "$name (plan-only path did not reach model validation cleanly, got $rc)"
+        sed -n '1,12p' "$LOG" | sed 's/^/    /'
+    fi
+}
+
 for i in "${!INFERENCE_BINS[@]}"; do
     name=${INFERENCE_NAMES[$i]}; bin=${INFERENCE_BINS[$i]}
     [ -x "$bin" ] || continue
@@ -478,12 +517,43 @@ for i in "${!INFERENCE_BINS[@]}"; do
         "$name rejects conflicting qualification-plan paths" \
         "--qualification-plan may only be specified once" "$rc"
 
-    run_inference_option "$name" "$bin" \
-        --qualification-plan /tmp/ds4-qualification-plan.json
+    run_reference_plan_option "$name" "$bin" "$PLAN_PATH" 8589934592
     rc=$?
-    assert_reaches_model_open \
-        "$name accepts one qualification-plan path" "$rc"
+    assert_plan_reaches_model_validation_without_runtime_side_effects \
+        "$name reference qualification plan skips runtime startup" "$rc"
+
+    run_reference_plan_option "$name" "$bin" "$PLAN_PATH" 10737418240
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "$name rejects an unfrozen qualification cache profile" \
+        "8, 12, or 16 GiB|8/12/16" "$rc"
 done
+
+if [ -x ./ds4 ]; then
+    run_reference_plan_option ds4 ./ds4 "$PLAN_DIR/missing/plan.json" 8589934592
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4 rejects a missing qualification-plan parent before model access" \
+        "qualification-plan.*(parent|directory)|parent.*(missing|exist)" "$rc"
+
+    run_reference_plan_option ds4 ./ds4 "$PLAN_PATH" 8589934592 --warm-weights
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4 rejects warm scanning in qualification-plan mode" \
+        "qualification-plan.*warm|warm.*qualification-plan" "$rc"
+
+    DS4_LOCK_FILE="$PLAN_LOCK" ./ds4 \
+        --cuda --ctx 32768 --prefill-chunk 4096 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592 \
+        --qualification-plan "$PLAN_PATH" --gpu-vram auto \
+        -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4 rejects GPU-layout probes in qualification-plan mode" \
+        "qualification-plan.*gpu-vram|gpu-vram.*qualification-plan" "$rc"
+fi
+
+rmdir "$PLAN_DIR"
 
 rm -f "$LOG"
 

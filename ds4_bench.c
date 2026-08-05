@@ -605,20 +605,6 @@ int main(int argc, char **argv) {
     int placement_ctx_hint = cfg.ctx_max;
     if (cfg.ctx_alloc > placement_ctx_hint) placement_ctx_hint = cfg.ctx_alloc;
 
-    ds4_gpu_config gpu_cfg = {0};
-    bool skip_cuda = false;
-    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
-    if (have_gpu_config) {
-        char gpu_err[256];
-        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               gpu_err, sizeof(gpu_err)) != 0) {
-            fprintf(stderr, "ds4-bench: %s\n", gpu_err);
-            return 2;
-        }
-        cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
-    }
-
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .qualification_plan_path = cfg.qualification_plan_path,
@@ -645,6 +631,36 @@ int main(int argc, char **argv) {
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
+
+    ds4_gpu_config gpu_cfg = {0};
+    bool skip_cuda = false;
+    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
+    if (cfg.qualification_plan_path_set) {
+        if (have_gpu_config) {
+            fprintf(stderr,
+                    "ds4-bench: --qualification-plan cannot be combined "
+                    "with --gpu-vram or --gpu-devices\n");
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &opt, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", plan_err);
+        }
+        return plan_rc;
+    }
+    if (have_gpu_config) {
+        char gpu_err[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               gpu_err, sizeof(gpu_err)) != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", gpu_err);
+            return 2;
+        }
+        cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+        opt.backend = cfg.backend;
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);

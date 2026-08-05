@@ -11211,13 +11211,28 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    cfg.engine.context_size = cfg.gen.ctx_size;
+    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    if (cfg.engine.qualification_plan_path_set) {
+        if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+            fprintf(stderr,
+                    "ds4-agent: --qualification-plan cannot be combined "
+                    "with --gpu-vram or --gpu-devices\n");
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &cfg.engine, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) {
+            fprintf(stderr, "ds4-agent: %s\n", plan_err);
+        }
+        return plan_rc;
+    }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
-    cfg.engine.context_size = cfg.gen.ctx_size;
-    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         cfg.engine.backend = cfg.gpu_vram_arg &&
                              !strcmp(cfg.gpu_vram_arg, "0")

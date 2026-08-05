@@ -4163,6 +4163,42 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
 
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
+    ds4_engine_options opt = {
+        .model_path = cfg.model_path,
+        .qualification_plan_path = cfg.qualification_plan_path,
+        .mtp_path = cfg.mtp_path,
+        .backend = cfg.backend,
+        .n_threads = cfg.threads,
+        .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
+        .power_percent = cfg.power_percent,
+        .prefill_chunk = cfg.prefill_chunk,
+        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
+        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
+        .warm_weights = cfg.warm_weights,
+        .quality = cfg.quality,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_cache_experts_set =
+            cfg.ssd_streaming_cache_experts_set,
+        .ssd_streaming_cache_bytes_set = cfg.ssd_streaming_cache_bytes_set,
+        .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .qualification_plan_path_set = cfg.qualification_plan_path_set,
+        .distributed = cfg.dist,
+    };
+    if (cfg.qualification_plan_path_set) {
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &opt, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) {
+            fprintf(stderr, "ds4-eval: %s\n", plan_err);
+        }
+        return plan_rc;
+    }
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);
 
@@ -4196,33 +4232,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    ds4_engine_options opt = {
-        .model_path = cfg.model_path,
-        .qualification_plan_path = cfg.qualification_plan_path,
-        .mtp_path = cfg.mtp_path,
-        .backend = cfg.backend,
-        .n_threads = cfg.threads,
-        .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
-        .mtp_draft_tokens = 1,
-        .mtp_margin = 3.0f,
-        .power_percent = cfg.power_percent,
-        .prefill_chunk = cfg.prefill_chunk,
-        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
-        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
-        .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
-        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
-        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
-        .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
-        .ssd_streaming = cfg.ssd_streaming,
-        .ssd_streaming_cold = cfg.ssd_streaming_cold,
-        .ssd_streaming_cache_experts_set =
-            cfg.ssd_streaming_cache_experts_set,
-        .ssd_streaming_cache_bytes_set = cfg.ssd_streaming_cache_bytes_set,
-        .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
-        .qualification_plan_path_set = cfg.qualification_plan_path_set,
-        .distributed = cfg.dist,
-    };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);

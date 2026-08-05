@@ -13203,17 +13203,31 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
-    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
-                   cfg.chdir_path, strerror(errno));
-        return 1;
-    }
-
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.share_session_prefill_workspace = slot_count > 1;
     cfg.engine.session_slots = (uint32_t)slot_count;
+    if (cfg.engine.qualification_plan_path_set) {
+        if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+            fprintf(stderr,
+                    "ds4-server: --qualification-plan cannot be combined "
+                    "with --gpu-vram or --gpu-devices\n");
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &cfg.engine, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) {
+            fprintf(stderr, "ds4-server: %s\n", plan_err);
+        }
+        return plan_rc;
+    }
+    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
+                   cfg.chdir_path, strerror(errno));
+        return 1;
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};

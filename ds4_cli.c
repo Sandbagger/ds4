@@ -2112,6 +2112,23 @@ int main(int argc, char **argv) {
                                   cfg.gen.metal_graph_prompt_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    if (cfg.engine.qualification_plan_path_set) {
+        if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+            fprintf(stderr,
+                    "ds4: --qualification-plan cannot be combined with "
+                    "--gpu-vram or --gpu-devices\n");
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &cfg.engine, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) fprintf(stderr, "ds4: %s\n", plan_err);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return plan_rc;
+    }
     ds4_gpu_config gpu_cfg = {0};
     bool gpu_cfg_set = false;
     bool skip_cuda = false;

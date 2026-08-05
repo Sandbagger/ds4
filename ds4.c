@@ -4735,6 +4735,11 @@ static int ds4_engine_options_preflight_with_budget(
         uint64_t recommended_bytes,
         char *err,
         size_t errcap);
+static int ds4_qualification_plan_options_preflight(
+        const ds4_engine_options *opt,
+        bool gpu_config_requested,
+        char *err,
+        size_t errcap);
 static bool ds4_gpu_config_working_set_bytes(
         const ds4_gpu_config *gpu_cfg,
         uint64_t *out);
@@ -58113,6 +58118,15 @@ int ds4_test_exact_cache_cuda_topology_preflight(
         device_count, device_index, err, errcap);
 }
 
+int ds4_test_qualification_plan_preflight(
+        const ds4_engine_options *opt,
+        bool gpu_config_requested,
+        char *err,
+        size_t errcap) {
+    return ds4_qualification_plan_options_preflight(
+        opt, gpu_config_requested, err, errcap);
+}
+
 int ds4_test_engine_exact_cache_preflight(
         bool recommended_known,
         uint64_t recommended_bytes,
@@ -58305,6 +58319,117 @@ static int ds4_exact_graph_declaration_preflight(
     return 0;
 }
 
+static int ds4_qualification_plan_options_preflight(
+        const ds4_engine_options *opt,
+        bool gpu_config_requested,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    if (!opt || !opt->qualification_plan_path_set ||
+        !opt->qualification_plan_path || !opt->qualification_plan_path[0]) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan requires one non-empty output path");
+        }
+        return 2;
+    }
+    if (!opt->model_path || !opt->model_path[0]) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan requires a model path");
+        }
+        return 2;
+    }
+#ifdef DS4_ROCM_BUILD
+    if (err && errcap != 0) {
+        snprintf(err, errcap,
+                 "--qualification-plan requires a CUDA build, not ROCm");
+    }
+    return 2;
+#else
+    if (opt->backend != DS4_BACKEND_CUDA) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan requires the CUDA backend");
+        }
+        return 2;
+    }
+#endif
+    if (gpu_config_requested) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan cannot be combined with a GPU layout");
+        }
+        return 2;
+    }
+    if (!opt->ssd_streaming || !opt->ssd_streaming_cache_bytes_set ||
+        opt->ssd_streaming_cache_experts_set) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan requires canonical --ssd-streaming "
+                     "and --ssd-streaming-cache-bytes (the legacy alias is not allowed)");
+        }
+        return 2;
+    }
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    if (opt->ssd_streaming_cache_bytes != 8u * gib &&
+        opt->ssd_streaming_cache_bytes != 12u * gib &&
+        opt->ssd_streaming_cache_bytes != 16u * gib) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan cache must be exactly 8, 12, or 16 GiB");
+        }
+        return 2;
+    }
+    const uint32_t sessions = opt->session_slots != 0 ?
+        opt->session_slots : 1u;
+    if (opt->context_size != 32768 || opt->prefill_chunk != 4096u ||
+        sessions != 1u || opt->share_session_prefill_workspace) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan requires exactly --ctx 32768, "
+                     "--prefill-chunk 4096, and one session slot");
+        }
+        return 2;
+    }
+    if (opt->warm_weights) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan forbids --warm-weights");
+        }
+        return 2;
+    }
+    if (opt->simulate_used_memory_bytes != 0) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan forbids simulated memory pressure");
+        }
+        return 2;
+    }
+    if (opt->ssd_streaming_cold || opt->ssd_streaming_full_layers_set ||
+        opt->ssd_streaming_preload_experts != 0 || opt->quality ||
+        (opt->power_percent != 0 && opt->power_percent != 100) ||
+        opt->cuda_tensor_parallel || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+        opt->tp.requested || opt->tp.role != DS4_TP_NONE || opt->load_slice ||
+        opt->load_output || opt->inspect_only || opt->first_token_test ||
+        opt->metal_graph_test || opt->glm_mtp || opt->glm_mtp_timing ||
+        opt->dspark || opt->dspark_strict ||
+        (opt->mtp_path && opt->mtp_path[0]) ||
+        (opt->directional_steering_file &&
+         opt->directional_steering_file[0]) ||
+        opt->directional_steering_attn != 0.0f ||
+        opt->directional_steering_ffn != 0.0f ||
+        (opt->expert_profile_path && opt->expert_profile_path[0])) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "--qualification-plan is exclusive and rejects runtime, "
+                     "diagnostic, distributed, and support-model options");
+        }
+        return 2;
+    }
+    return 0;
+}
+
 static int ds4_engine_options_preflight_with_budget(
         const ds4_engine_options *opt,
         bool recommended_known,
@@ -58408,6 +58533,10 @@ int ds4_engine_options_preflight_with_gpu_config(
         return ds4_engine_options_preflight_with_budget(
             opt, false, 0, err, errcap);
     }
+    if (opt->qualification_plan_path_set) {
+        return ds4_qualification_plan_options_preflight(
+            opt, gpu_cfg != NULL, err, errcap);
+    }
 
     ds4_exact_cache_option_state cache = {
         .ssd_streaming = opt->ssd_streaming,
@@ -58467,6 +58596,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_gpu_config *gpu_cfg) {
     if (out) *out = NULL;
     if (!out || !opt) return 1;
+    if (opt->qualification_plan_path_set) {
+        fprintf(stderr,
+                "ds4: --qualification-plan must use the plan-only writer; "
+                "normal engine startup is disabled\n");
+        return 2;
+    }
     char preflight_err[256];
     const int preflight_rc =
         ds4_engine_options_preflight_with_gpu_config(

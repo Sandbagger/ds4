@@ -51,7 +51,86 @@ static void check_parse_rejected(const char *text) {
     CHECK(!ok && value == 0, "non-canonical uint64 rejected and output cleared");
 }
 
+static ds4_engine_options reference_qualification_options(uint64_t cache_bytes) {
+    ds4_engine_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.model_path = "/dev/null";
+    opt.qualification_plan_path = "/tmp/ds4-plan.json";
+    opt.qualification_plan_path_set = true;
+    opt.backend = DS4_BACKEND_CUDA;
+    opt.context_size = 32768;
+    opt.prefill_chunk = 4096u;
+    opt.session_slots = 1u;
+    opt.ssd_streaming = true;
+    opt.ssd_streaming_cache_bytes = cache_bytes;
+    opt.ssd_streaming_cache_bytes_set = true;
+    return opt;
+}
+
+static void test_qualification_option_preflight(void) {
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    char err[256];
+    ds4_engine_options opt = reference_qualification_options(8u * gib);
+    memset(err, 0, sizeof(err));
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 0 && err[0] == '\0',
+          "reference qualification options pass without hardware pricing");
+
+    opt.ssd_streaming_cache_bytes = 10u * gib;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2 &&
+              strstr(err, "8, 12, or 16 GiB") != NULL,
+          "qualification accepts only the frozen cache profiles");
+    opt = reference_qualification_options(8u * gib);
+    opt.backend = DS4_BACKEND_CPU;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification requires the declared CUDA backend");
+    opt = reference_qualification_options(8u * gib);
+    opt.context_size = 32767;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification requires exactly 32K context");
+    opt = reference_qualification_options(8u * gib);
+    opt.prefill_chunk = 8192u;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification requires exactly 4K prefill");
+    opt = reference_qualification_options(8u * gib);
+    opt.session_slots = 2u;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification prices exactly one live session");
+    opt = reference_qualification_options(8u * gib);
+    opt.warm_weights = true;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2 &&
+              strstr(err, "warm") != NULL,
+          "qualification forbids a whole-file warm scan");
+    opt = reference_qualification_options(8u * gib);
+    opt.simulate_used_memory_bytes = gib;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification forbids simulated external pressure");
+    opt = reference_qualification_options(8u * gib);
+    opt.ssd_streaming_cache_experts_set = true;
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification rejects the legacy cache alias");
+    opt = reference_qualification_options(8u * gib);
+    opt.mtp_path = "/dev/null";
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 2,
+          "qualification excludes support-model allocations");
+    opt = reference_qualification_options(8u * gib);
+    CHECK(ds4_test_qualification_plan_preflight(
+              &opt, true, err, sizeof(err)) == 2 &&
+              strstr(err, "GPU layout") != NULL,
+          "qualification rejects GPU-layout probing before hardware access");
+}
+
 static void test_options(void) {
+    test_qualification_option_preflight();
     check_parse_ok("1", UINT64_C(1));
     check_parse_ok("8589934592", UINT64_C(8589934592));
     check_parse_ok("18446744073709551615", UINT64_MAX);

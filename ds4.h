@@ -499,6 +499,11 @@ int ds4_test_exact_cache_cuda_topology_preflight(
         int device_index,
         char *err,
         size_t errcap);
+int ds4_test_qualification_plan_preflight(
+        const ds4_engine_options *opt,
+        bool gpu_config_requested,
+        char *err,
+        size_t errcap);
 bool ds4_test_gpu_config_working_set_bytes(
         const uint64_t *budgets,
         size_t count,

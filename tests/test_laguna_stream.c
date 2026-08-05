@@ -225,6 +225,17 @@ static void test_qualification_frontend_allowlist(void) {
               err, sizeof(err)) == 2 &&
               strstr(err, "--self-test-extractors") != NULL,
           "qualification allowlist rejects silently ignored frontend modes");
+
+    char *inline_plan[] = {
+        "ds4-eval", "--qualification-plan=/tmp/plan.json",
+        "--self-test-extractors",
+    };
+    CHECK(ds4_qualification_args_preflight(
+              (int)(sizeof(inline_plan) / sizeof(inline_plan[0])), inline_plan,
+              DS4_QUALIFICATION_FRONTEND_STANDARD,
+              err, sizeof(err)) == 2 &&
+              strstr(err, "--qualification-plan=") != NULL,
+          "inline qualification path is rejected by the plan-mode gate");
 }
 
 static void test_options(void) {

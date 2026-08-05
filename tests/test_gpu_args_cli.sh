@@ -571,6 +571,16 @@ if [ -x ./ds4-eval ]; then
     assert_qualification_error_before_model_open \
         "ds4-eval qualification planning rejects ignored eval modes" \
         "qualification-plan.*(cannot be combined|exclusive)" "$rc"
+
+    DS4_LOCK_FILE="$PLAN_LOCK" ./ds4-eval \
+        --cuda --ctx 32768 --prefill-chunk 4096 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592 \
+        --qualification-plan="$PLAN_PATH" --self-test-extractors \
+        -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "inline qualification path cannot bypass eval option isolation" \
+        "qualification-plan.*(cannot be combined|exclusive)" "$rc"
 fi
 
 if [ -x ./ds4 ]; then

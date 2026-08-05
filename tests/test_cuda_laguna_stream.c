@@ -389,20 +389,37 @@ static void restore_forbidden_environment(saved_environment *saved) {
 }
 
 static bool tracker_has_only_ledger(const ds4_runtime_tracker *tracker) {
-    if (!tracker || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
-        tracker->record_count != 3) {
+    ds4_runtime_snapshot snapshot;
+    ds4_runtime_allocation_record active[3];
+    if (!tracker || !ds4_runtime_tracker_snapshot_copy(
+            tracker, &snapshot, active, ARRAY_LEN(active)) ||
+        snapshot.violation != DS4_RUNTIME_VIOLATION_NONE ||
+        snapshot.active_record_count != ARRAY_LEN(active)) {
         return false;
+    }
+    for (size_t i = 0; i < ARRAY_LEN(active); i++) {
+        if (!active[i].live ||
+            active[i].callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS ||
+            active[i].category !=
+                DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ||
+            active[i].domain != DS4_RUNTIME_DOMAIN_HOST ||
+            active[i].relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+            active[i].requested_bytes == 0 ||
+            active[i].charged_bytes != active[i].requested_bytes) {
+            return false;
+        }
     }
     for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
         if (i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES) continue;
-        if (tracker->category_current[i] != 0) return false;
+        if (snapshot.category_current[i] != 0) return false;
     }
     for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
-        if (tracker->report_current[i] != 0) return false;
+        if (snapshot.report_current[i] != 0) return false;
     }
-    return tracker->owned_total_current ==
-        tracker->category_current[
-            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES];
+    const uint64_t ledger_bytes = snapshot.category_current[
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES];
+    return ledger_bytes != 0 && snapshot.owned_total_current == ledger_bytes &&
+        snapshot.qualification_total_current == ledger_bytes;
 }
 
 static ds4_laguna_ledger ledger_with_copied_ranges(

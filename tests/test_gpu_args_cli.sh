@@ -211,7 +211,16 @@ run_inference_option() {
     local bin=$2
     shift 2
     if [ "$name" = "ds4-bench" ]; then
-        "$bin" "$@" -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+        local planning=false
+        local arg
+        for arg in "$@"; do
+            [ "$arg" = "--qualification-plan" ] && planning=true
+        done
+        if [ "$planning" = true ]; then
+            "$bin" "$@" -m /dev/null > "$LOG" 2>&1
+        else
+            "$bin" "$@" -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+        fi
     else
         "$bin" "$@" -m /dev/null > "$LOG" 2>&1
     fi
@@ -453,11 +462,10 @@ run_reference_plan_option() {
     shift 4
     if [ "$name" = "ds4-bench" ]; then
         DS4_LOCK_FILE="$PLAN_LOCK" "$bin" \
-            --cuda --ctx-start 1 --ctx-max 1 --ctx-alloc 32768 \
-            --gen-tokens 0 --prefill-chunk 4096 \
+            --cuda --ctx-alloc 32768 --prefill-chunk 4096 \
             --ssd-streaming --ssd-streaming-cache-bytes "$cache_bytes" \
             --qualification-plan "$path" "$@" \
-            -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+            -m /dev/null > "$LOG" 2>&1
     else
         DS4_LOCK_FILE="$PLAN_LOCK" "$bin" \
             --cuda --ctx 32768 --prefill-chunk 4096 \
@@ -470,7 +478,7 @@ run_reference_plan_option() {
 assert_plan_reaches_model_validation_without_runtime_side_effects() {
     local name=$1
     local rc=$2
-    if [ "$rc" -ne 0 ] &&
+    if [ "$rc" -eq 2 ] &&
        grep -qE "model file is too small|failed to open model" "$LOG" &&
        ! grep -qE "working-set limit|another ds4 process|failed to open lock file|oom_score_adj|GPU config:|unknown option|not implemented" "$LOG"; then
         ok "$name"
@@ -528,6 +536,42 @@ for i in "${!INFERENCE_BINS[@]}"; do
         "$name rejects an unfrozen qualification cache profile" \
         "8, 12, or 16 GiB|8/12/16" "$rc"
 done
+
+if [ -x ./ds4 ]; then
+    run_reference_plan_option ds4 ./ds4 "$PLAN_PATH" 8589934592 --raw
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4 qualification planning rejects ignored CLI options" \
+        "qualification-plan.*(cannot be combined|exclusive)" "$rc"
+fi
+if [ -x ./ds4-server ]; then
+    run_reference_plan_option ds4-server ./ds4-server "$PLAN_PATH" 8589934592 --chdir /
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4-server qualification planning rejects ignored service options" \
+        "qualification-plan.*(cannot be combined|exclusive)" "$rc"
+fi
+if [ -x ./ds4-bench ]; then
+    run_reference_plan_option ds4-bench ./ds4-bench "$PLAN_PATH" 8589934592 --gen-tokens 1
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4-bench qualification planning rejects benchmark options" \
+        "qualification-plan.*(cannot be combined|exclusive)" "$rc"
+fi
+if [ -x ./ds4-agent ]; then
+    run_reference_plan_option ds4-agent ./ds4-agent "$PLAN_PATH" 8589934592 --chdir /
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4-agent qualification planning rejects ignored agent options" \
+        "qualification-plan.*(cannot be combined|exclusive)" "$rc"
+fi
+if [ -x ./ds4-eval ]; then
+    run_reference_plan_option ds4-eval ./ds4-eval "$PLAN_PATH" 8589934592 --self-test-extractors
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "ds4-eval qualification planning rejects ignored eval modes" \
+        "qualification-plan.*(cannot be combined|exclusive)" "$rc"
+fi
 
 if [ -x ./ds4 ]; then
     run_reference_plan_option ds4 ./ds4 "$PLAN_DIR/missing/plan.json" 8589934592

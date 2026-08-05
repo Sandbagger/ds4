@@ -176,9 +176,61 @@ static void test_qualification_model_identity(void) {
           "invalid model descriptor fails identity capture");
 }
 
+static void test_qualification_frontend_allowlist(void) {
+    char err[256] = "stale";
+    char *ordinary[] = { "ds4-agent", "--chdir", "/tmp" };
+    CHECK(ds4_qualification_args_preflight(
+              3, ordinary, DS4_QUALIFICATION_FRONTEND_STANDARD,
+              err, sizeof(err)) == 0 && err[0] == '\0',
+          "ordinary invocations bypass qualification allowlisting");
+
+    char *standard[] = {
+        "ds4", "--cuda", "--ctx", "32768", "--prefill-chunk", "4096",
+        "--ssd-streaming", "--ssd-streaming-cache-bytes", "8589934592",
+        "--qualification-plan", "/tmp/plan.json", "-m", "/tmp/model.gguf",
+    };
+    CHECK(ds4_qualification_args_preflight(
+              (int)(sizeof(standard) / sizeof(standard[0])), standard,
+              DS4_QUALIFICATION_FRONTEND_STANDARD,
+              err, sizeof(err)) == 0 && err[0] == '\0',
+          "standard qualification invocation accepts only planning inputs");
+
+    char *server[] = {
+        "ds4-server", "--qualification-plan", "/tmp/plan.json",
+        "--session-slots", "1", "--ctx", "32768",
+    };
+    CHECK(ds4_qualification_args_preflight(
+              (int)(sizeof(server) / sizeof(server[0])), server,
+              DS4_QUALIFICATION_FRONTEND_SERVER,
+              err, sizeof(err)) == 0 && err[0] == '\0',
+          "server qualification allowlist admits the exact session count");
+
+    char *bench[] = {
+        "ds4-bench", "--qualification-plan", "/tmp/plan.json",
+        "--ctx-alloc", "32768", "--cuda",
+    };
+    CHECK(ds4_qualification_args_preflight(
+              (int)(sizeof(bench) / sizeof(bench[0])), bench,
+              DS4_QUALIFICATION_FRONTEND_BENCH,
+              err, sizeof(err)) == 0 && err[0] == '\0',
+          "bench qualification allowlist admits allocation context only");
+
+    char *ignored[] = {
+        "ds4-eval", "--qualification-plan", "/tmp/plan.json",
+        "--self-test-extractors",
+    };
+    CHECK(ds4_qualification_args_preflight(
+              (int)(sizeof(ignored) / sizeof(ignored[0])), ignored,
+              DS4_QUALIFICATION_FRONTEND_STANDARD,
+              err, sizeof(err)) == 2 &&
+              strstr(err, "--self-test-extractors") != NULL,
+          "qualification allowlist rejects silently ignored frontend modes");
+}
+
 static void test_options(void) {
     test_qualification_option_preflight();
     test_qualification_model_identity();
+    test_qualification_frontend_allowlist();
     check_parse_ok("1", UINT64_C(1));
     check_parse_ok("8589934592", UINT64_C(8589934592));
     check_parse_ok("18446744073709551615", UINT64_MAX);

@@ -4,7 +4,9 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,6 +14,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_failed;
@@ -86,6 +90,52 @@ static int count_temporary_files(const char *dir) {
     }
     if (closedir(stream) != 0) return -1;
     return count;
+}
+
+static bool directory_has_prefix(const char *dir, const char *prefix) {
+    DIR *stream = opendir(dir);
+    if (stream == NULL) return false;
+    const size_t prefix_size = strlen(prefix);
+    bool found = false;
+    for (;;) {
+        struct dirent *entry = readdir(stream);
+        if (entry == NULL) break;
+        if (strncmp(entry->d_name, prefix, prefix_size) == 0) {
+            found = true;
+            break;
+        }
+    }
+    (void)closedir(stream);
+    return found;
+}
+
+static pid_t spawn_target_racer(const char *dir,
+                                const char *temporary_prefix,
+                                const char *target,
+                                const char *sentinel) {
+    const pid_t publisher = getpid();
+    const pid_t child = fork();
+    if (child != 0) return child;
+
+    struct timespec started;
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) _exit(20);
+    for (;;) {
+        if (directory_has_prefix(dir, temporary_prefix)) {
+            if (kill(publisher, SIGSTOP) != 0) _exit(21);
+            const bool wrote = write_fixture(target, sentinel, strlen(sentinel));
+            const int resume_rc = kill(publisher, SIGCONT);
+            _exit(wrote && resume_rc == 0 ? 0 : 22);
+        }
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) _exit(23);
+        if (now.tv_sec - started.tv_sec >= 5) _exit(24);
+    }
+}
+
+static bool wait_for_racer(pid_t child) {
+    int status = 0;
+    return child > 0 && waitpid(child, &status, 0) == child &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 static bool make_temporary_directory(char *path_template) {
@@ -188,6 +238,63 @@ static void test_target_preflight(const char *root) {
           "missing-parent preflight names the directory failure");
 }
 
+static char *make_name_max_plan(const char *root,
+                                size_t basename_size,
+                                char fill) {
+    const size_t root_size = strlen(root);
+    char *path = malloc(root_size + 1u + basename_size + 1u);
+    if (path == NULL) return NULL;
+    memcpy(path, root, root_size);
+    path[root_size] = '/';
+    memset(path + root_size + 1u, fill, basename_size);
+    path[root_size + 1u + basename_size] = '\0';
+    return path;
+}
+
+static void test_preflight_exact_temporary_names(const char *root) {
+    errno = 0;
+    const long name_max = pathconf(root, _PC_NAME_MAX);
+    if (name_max < 32 ||
+        (uintmax_t)name_max > DS4_PLAN_IO_PATH_LIMIT / 2u) {
+        return;
+    }
+
+    const size_t plan_temp_suffix = sizeof(".tmp.XXXXXX") - 1u;
+    const size_t sidecar_suffix = sizeof(".sha256") - 1u;
+    char *plan_temp_too_long = make_name_max_plan(
+        root, (size_t)name_max - sidecar_suffix, 'p');
+    char *sidecar_temp_too_long = make_name_max_plan(
+        root, (size_t)name_max - plan_temp_suffix, 's');
+    CHECK(plan_temp_too_long != NULL && sidecar_temp_too_long != NULL,
+          "exact-temp preflight paths allocated");
+    if (plan_temp_too_long == NULL || sidecar_temp_too_long == NULL) {
+        free(sidecar_temp_too_long);
+        free(plan_temp_too_long);
+        return;
+    }
+
+    char error[1024];
+    CHECK(!ds4_plan_io_preflight_target(
+              plan_temp_too_long, error, sizeof(error)),
+          "preflight rejects an uncreatable exact plan temp name");
+    CHECK(strstr(error, "temporary plan") != NULL,
+          "plan-temp preflight error identifies the failed artifact");
+    CHECK(!ds4_plan_io_preflight_target(
+              sidecar_temp_too_long, error, sizeof(error)),
+          "preflight rejects an uncreatable exact sidecar temp name");
+    CHECK(strstr(error, "temporary digest sidecar") != NULL,
+          "sidecar-temp preflight error identifies the failed artifact");
+    CHECK(access(plan_temp_too_long, F_OK) != 0 && errno == ENOENT,
+          "plan-temp preflight creates no final plan");
+    CHECK(access(sidecar_temp_too_long, F_OK) != 0 && errno == ENOENT,
+          "sidecar-temp preflight creates no final plan");
+    CHECK(count_temporary_files(root) == 0,
+          "exact-temp preflight cleans every probe file");
+
+    free(sidecar_temp_too_long);
+    free(plan_temp_too_long);
+}
+
 static void test_publish_and_immutability(const char *root) {
     static const unsigned char bytes_a[] = {
         '{', '"', 'x', '"', ':', 0x00, ',', 0xff, '}', '\n'
@@ -270,6 +377,85 @@ static void test_publish_and_immutability(const char *root) {
     free(file_bytes);
     CHECK(count_temporary_files(root) == 0,
           "refused overwrite leaves no temporary files");
+}
+
+static void test_racing_plan_target_is_not_replaced(const char *root) {
+    static const char sentinel[] = "racing creator owns this plan\n";
+    char plan[512];
+    char sidecar[520];
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = "stale";
+    char error[1024];
+    CHECK(make_path(plan, sizeof(plan), root, "race.json"),
+          "race target path fits");
+    CHECK(snprintf(sidecar, sizeof(sidecar), "%s.sha256", plan) > 0,
+          "race sidecar path fits");
+
+    const size_t payload_size = 32u * 1024u * 1024u;
+    unsigned char *payload = malloc(payload_size);
+    CHECK(payload != NULL, "race payload allocated");
+    if (payload == NULL) return;
+    memset(payload, 'r', payload_size);
+
+    const pid_t racer = spawn_target_racer(
+        root, "race.json.tmp.", plan, sentinel);
+    CHECK(racer > 0, "plan-target racer started");
+    const bool published = ds4_plan_io_publish(
+        plan, payload, payload_size, digest, error, sizeof(error));
+    CHECK(wait_for_racer(racer), "plan-target racer completed");
+    CHECK(!published, "racing plan target makes publication fail");
+    CHECK(strstr(error, "existing plan") != NULL,
+          "racing plan error reports immutable target conflict");
+    CHECK(digest[0] == '\0',
+          "racing plan failure returns no authenticated digest");
+
+    size_t size = 0;
+    unsigned char *bytes = read_fixture(plan, &size);
+    CHECK(bytes != NULL && size == sizeof(sentinel) - 1u &&
+              memcmp(bytes, sentinel, size) == 0,
+          "publisher never replaces a racing plan target");
+    free(bytes);
+    CHECK(access(sidecar, F_OK) != 0 && errno == ENOENT,
+          "plan-target race publishes no sidecar");
+    CHECK(count_temporary_files(root) == 0,
+          "plan-target race leaves no temporary files");
+
+    free(payload);
+}
+
+static void test_second_commit_failure_rolls_back_plan(const char *root) {
+    static const char sentinel[] = "racing creator owns this sidecar\n";
+    static const char payload[] = "qualification plan awaiting its digest\n";
+    char plan[512];
+    char sidecar[520];
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = "stale";
+    char error[1024];
+    CHECK(make_path(plan, sizeof(plan), root, "rollback.json"),
+          "rollback plan path fits");
+    CHECK(snprintf(sidecar, sizeof(sidecar), "%s.sha256", plan) > 0,
+          "rollback sidecar path fits");
+
+    const pid_t racer = spawn_target_racer(
+        root, "rollback.json.sha256.tmp.", sidecar, sentinel);
+    CHECK(racer > 0, "sidecar-target racer started");
+    const bool published = ds4_plan_io_publish(
+        plan, payload, sizeof(payload) - 1u, digest, error, sizeof(error));
+    CHECK(wait_for_racer(racer), "sidecar-target racer completed");
+    CHECK(!published, "racing sidecar target makes publication fail");
+    CHECK(strstr(error, "existing digest sidecar") != NULL,
+          "sidecar race reports immutable target conflict");
+    CHECK(digest[0] == '\0',
+          "second-commit failure returns no authenticated digest");
+    CHECK(access(plan, F_OK) != 0 && errno == ENOENT,
+          "second-commit failure rolls back this call's plan");
+
+    size_t size = 0;
+    unsigned char *bytes = read_fixture(sidecar, &size);
+    CHECK(bytes != NULL && size == sizeof(sentinel) - 1u &&
+              memcmp(bytes, sentinel, size) == 0,
+          "publisher never replaces a racing sidecar target");
+    free(bytes);
+    CHECK(count_temporary_files(root) == 0,
+          "second-commit rollback leaves no temporary files");
 }
 
 static void test_nested_directory(const char *root) {
@@ -374,7 +560,7 @@ static void test_post_plan_sidecar_failure(const char *root) {
                    plan) > 0,
           "sidecar-failure digest path built");
 
-    static const char bytes[] = "complete but unauthenticated\n";
+    static const char bytes[] = "must remain invisible without its digest\n";
     char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = "stale";
     char error[1024];
     CHECK(!ds4_plan_io_publish(plan,
@@ -390,12 +576,8 @@ static void test_post_plan_sidecar_failure(const char *root) {
     CHECK(digest[0] == '\0',
           "failed pair publication does not return an authenticated digest");
 
-    size_t published_size = 0;
-    unsigned char *published = read_fixture(plan, &published_size);
-    CHECK(published != NULL && published_size == sizeof(bytes) - 1u &&
-              memcmp(published, bytes, published_size) == 0,
-          "sidecar-stage failure leaves the complete published plan intact");
-    free(published);
+    CHECK(access(plan, F_OK) != 0 && errno == ENOENT,
+          "sidecar-stage failure publishes no unauthenticated plan");
     CHECK(access(sidecar, F_OK) != 0 && errno == ENOENT,
           "sidecar-stage failure leaves no digest sidecar");
     CHECK(count_temporary_files(root) == 0,
@@ -484,7 +666,8 @@ static void cleanup_tree(const char *root) {
     char path[512];
     char sidecar[520];
     static const char *const files[] = {
-        "plan-a.json", "plan-b.json", "blocked.json"
+        "plan-a.json", "plan-b.json", "blocked.json", "race.json",
+        "rollback.json"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         if (!make_path(path, sizeof(path), root, files[i])) continue;
@@ -509,7 +692,10 @@ int main(void) {
 
     test_sha256_vectors();
     test_target_preflight(root);
+    test_preflight_exact_temporary_names(root);
     test_publish_and_immutability(root);
+    test_racing_plan_target_is_not_replaced(root);
+    test_second_commit_failure_rolls_back_plan(root);
     test_nested_directory(root);
     test_preexisting_sidecar(root);
     test_post_plan_sidecar_failure(root);

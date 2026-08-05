@@ -3024,21 +3024,16 @@ extern "C" void ds4_gpu_cleanup(void) {
     const int compact_cleanup_required =
         g_laguna_compact_state.load(std::memory_order_acquire) !=
             DS4_LAGUNA_COMPACT_IDLE;
-    if (compact_cleanup_required &&
-        !cuda_laguna_compact_destroy_checked(&g_laguna_compact_storage)) {
-        fprintf(stderr,
-                "ds4: CUDA cleanup retained compact Laguna ownership after "
-                "teardown failure\n");
-        return;
-    }
-    if (!compact_cleanup_required) {
-        const cudaError_t cleanup_sync_error = cudaDeviceSynchronize();
-        if (cleanup_sync_error != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA cleanup synchronization failed: %s\n",
-                    cudaGetErrorString(cleanup_sync_error));
-            (void)cudaGetLastError();
+    if (compact_cleanup_required) {
+        if (!cuda_laguna_compact_destroy_checked(
+                &g_laguna_compact_storage)) {
+            fprintf(stderr,
+                    "ds4: CUDA cleanup retained compact Laguna ownership "
+                    "after teardown failure\n");
             return;
         }
+    } else {
+        (void)cudaDeviceSynchronize();
     }
     g_current_logical_tier = -1;
 

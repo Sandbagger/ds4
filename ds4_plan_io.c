@@ -688,12 +688,15 @@ static bool ds4_plan_remove_if_identity(const char *path,
     return ds4_plan_unlink(path);
 }
 
-bool ds4_plan_io_publish(const char *path,
-                         const void *bytes,
-                         size_t size,
-                         char digest_hex[DS4_PLAN_IO_SHA256_HEX_SIZE],
-                         char *error,
-                         size_t error_size) {
+bool ds4_plan_io_publish_checked(
+        const char *path,
+        const void *bytes,
+        size_t size,
+        ds4_plan_io_validation_callback validate,
+        void *validation_context,
+        char digest_hex[DS4_PLAN_IO_SHA256_HEX_SIZE],
+        char *error,
+        size_t error_size) {
     ds4_plan_clear_error(error, error_size);
     if (digest_hex != NULL) digest_hex[0] = '\0';
 
@@ -788,6 +791,17 @@ bool ds4_plan_io_publish(const char *path,
                             error_size)) {
         goto rollback;
     }
+    if (validate != NULL) {
+        if (!validate(validation_context, error, error_size)) {
+            if (error != NULL && error_size != 0 && error[0] == '\0') {
+                ds4_plan_set_error(error,
+                                   error_size,
+                                   "qualification-plan validation rejected publication");
+            }
+            goto rollback;
+        }
+        ds4_plan_clear_error(error, error_size);
+    }
     if (!ds4_plan_commit_one(path,
                              plan_temporary,
                              "plan",
@@ -860,4 +874,20 @@ cleanup:
     free(plan_temporary);
     free(sidecar);
     return success;
+}
+
+bool ds4_plan_io_publish(const char *path,
+                         const void *bytes,
+                         size_t size,
+                         char digest_hex[DS4_PLAN_IO_SHA256_HEX_SIZE],
+                         char *error,
+                         size_t error_size) {
+    return ds4_plan_io_publish_checked(path,
+                                       bytes,
+                                       size,
+                                       NULL,
+                                       NULL,
+                                       digest_hex,
+                                       error,
+                                       error_size);
 }

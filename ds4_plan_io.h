@@ -33,9 +33,19 @@ bool ds4_plan_io_preflight_target(const char *path,
                                   char *error,
                                   size_t error_size);
 
+/* Return true to allow the staged pair to become visible.  Return false to
+ * reject it and optionally place the exact rejection diagnostic in error. */
+typedef bool (*ds4_plan_io_validation_callback)(void *context,
+                                                char *error,
+                                                size_t error_size);
+
 /* Durably publish exact plan bytes and an external FILE.sha256 containing
  * "<digest>\n".  Both artifacts are completely staged with same-directory
  * mkstemp, write-all, file fsync, and close before either becomes visible.
+ * If validate is non-NULL, it runs exactly once after both stages are durable
+ * and immediately before the first no-replace commit.  Rejection preserves
+ * its diagnostic and exposes neither final artifact.
+ *
  * Publication uses atomic no-replace rename on Darwin/Linux and a same-device
  * hard-link fallback; ordinary replacement rename is never used.  One parent
  * directory fsync follows the pair.
@@ -49,6 +59,17 @@ bool ds4_plan_io_preflight_target(const char *path,
  * incomplete pair.  Consumers must require both files and verify that the
  * sidecar matches the exact plan bytes; an orphan is never qualification
  * evidence. */
+bool ds4_plan_io_publish_checked(
+    const char *path,
+    const void *bytes,
+    size_t size,
+    ds4_plan_io_validation_callback validate,
+    void *validation_context,
+    char digest_hex[DS4_PLAN_IO_SHA256_HEX_SIZE],
+    char *error,
+    size_t error_size);
+
+/* Publish without a caller validation boundary. */
 bool ds4_plan_io_publish(const char *path,
                          const void *bytes,
                          size_t size,

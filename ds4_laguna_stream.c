@@ -562,3 +562,366 @@ bool ds4_laguna_ledger_build(ds4_laguna_ledger *out,
     if (!ok) ds4_laguna_ledger_free(out);
     return ok;
 }
+
+static void allocation_callsite(ds4_laguna_allocation_plan *plan,
+                                size_t index,
+                                uint32_t id,
+                                const char *name,
+                                ds4_runtime_category category,
+                                ds4_runtime_physical_domain domain,
+                                uint64_t bound_bytes) {
+    ds4_runtime_callsite *site = &plan->callsites[index];
+    site->id = id;
+    site->name = name;
+    site->category = category;
+    site->domain = domain;
+    site->bound_bytes = bound_bytes;
+}
+
+bool ds4_laguna_allocation_plan_make(
+        ds4_laguna_allocation_plan *out,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan_spec *spec,
+        char *err,
+        size_t errlen) {
+    if (err && errlen != 0) err[0] = '\0';
+    if (!out || !ledger || !spec) {
+        return set_error(err, errlen, "allocation plan argument is null");
+    }
+    memset(out, 0, sizeof(*out));
+
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    const uint64_t mib = UINT64_C(1024) * 1024u;
+    const uint64_t expected_file_size = UINT64_C(68248759648);
+    const uint64_t expected_static_bytes = UINT64_C(4374164480);
+    const uint64_t expected_slot_stride = UINT64_C(5308416);
+    const uint64_t expected_expert_entries = UINT64_C(12032);
+    if (spec->context_tokens != 32768u || spec->prefill_rows != 4096u ||
+        spec->session_count != 1u) {
+        return set_error(err, errlen,
+                         "allocation plan requires the 32K/4K/one-session profile");
+    }
+    if (spec->configured_cache_bytes != 8u * gib &&
+        spec->configured_cache_bytes != 12u * gib &&
+        spec->configured_cache_bytes != 16u * gib) {
+        return set_error(err, errlen,
+                         "allocation plan cache must be exactly 8, 12, or 16 GiB");
+    }
+    if (ledger->slot_stride_bytes == 0 ||
+        spec->configured_cache_bytes / ledger->slot_stride_bytes == 0) {
+        return set_error(err, errlen,
+                         "allocation plan cache contains no complete slot");
+    }
+    if (ledger->file_size != expected_file_size ||
+        ledger->tensor_count != UINT64_C(814) ||
+        ledger->static_parent_count != UINT64_C(673) ||
+        ledger->routed_parent_count != UINT64_C(141) ||
+        ledger->static_aligned_device_bytes != expected_static_bytes ||
+        ledger->expert_entry_count != expected_expert_entries ||
+        ledger->slot_stride_bytes != expected_slot_stride) {
+        return set_error(err, errlen,
+                         "allocation plan requires the exact Laguna ledger");
+    }
+
+    const uint64_t slots = spec->configured_cache_bytes /
+                           ledger->slot_stride_bytes;
+    if (slots == 0 || slots > UINT32_MAX) {
+        return set_error(err, errlen,
+                         "allocation plan cache contains no valid slot count");
+    }
+    uint64_t cache_payload = 0;
+    if (!mul_u64(slots, ledger->slot_stride_bytes, &cache_payload) ||
+        cache_payload > spec->configured_cache_bytes) {
+        return set_error(err, errlen, "allocation plan cache payload overflow");
+    }
+
+    const uint64_t ledger_arrays = UINT64_C(1412824);
+    const uint64_t route_hotness = UINT64_C(96256);
+    const uint64_t host_entry_to_slot = UINT64_C(48128);
+    const uint64_t device_entry_to_slot = UINT64_C(48128);
+    const uint64_t static_offsets = UINT64_C(6512);
+    uint64_t slot_state = 0;
+    uint64_t metadata = 0;
+    if (!mul_u64(slots, UINT64_C(32), &slot_state) ||
+        !add_u64(ledger_arrays, route_hotness, &metadata) ||
+        !add_u64(metadata, host_entry_to_slot, &metadata) ||
+        !add_u64(metadata, device_entry_to_slot, &metadata) ||
+        !add_u64(metadata, static_offsets, &metadata) ||
+        !add_u64(metadata, slot_state, &metadata)) {
+        return set_error(err, errlen,
+                         "allocation plan metadata arithmetic overflow");
+    }
+
+    uint64_t kv_tokens = 0;
+    uint64_t kv_bytes = 0;
+    if (!mul_u64(UINT64_C(12), spec->context_tokens, &kv_tokens) ||
+        !add_u64(kv_tokens, UINT64_C(36) * 512u, &kv_tokens) ||
+        !mul_u64(kv_tokens, UINT64_C(4096), &kv_bytes)) {
+        return set_error(err, errlen, "allocation plan KV arithmetic overflow");
+    }
+    uint64_t graph_bytes = 0;
+    if (!mul_u64(spec->prefill_rows, UINT64_C(375156), &graph_bytes) ||
+        !add_u64(graph_bytes, UINT64_C(413704), &graph_bytes)) {
+        return set_error(err, errlen,
+                         "allocation plan graph arithmetic overflow");
+    }
+    uint64_t staging_bytes = 0;
+    if (!mul_u64(UINT64_C(4), ledger->slot_stride_bytes, &staging_bytes)) {
+        return set_error(err, errlen,
+                         "allocation plan staging arithmetic overflow");
+    }
+
+    out->configured_cache_bytes = spec->configured_cache_bytes;
+    out->effective_cache_limit_bytes = spec->configured_cache_bytes;
+    out->slot_stride_bytes = ledger->slot_stride_bytes;
+    out->cache_payload_bytes = cache_payload;
+    out->cache_tail_uncharged_bytes =
+        spec->configured_cache_bytes - cache_payload;
+    out->slot_count = (uint32_t)slots;
+    out->staging_buffer_count = 4u;
+    out->staging_buffer_bytes = ledger->slot_stride_bytes;
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] =
+        ledger->static_aligned_device_bytes;
+    out->owned_category_bounds[
+        DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = cache_payload;
+    out->owned_category_bounds[
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = metadata;
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] = kv_bytes;
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] =
+        graph_bytes;
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_PINNED_STAGING] =
+        staging_bytes;
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = gib;
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 2u * gib;
+
+    out->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] =
+        ledger->file_size;
+    out->report_bounds[
+        DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 0;
+    out->report_bounds[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 2u * gib;
+    out->report_bounds[
+        DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = gib / 2u;
+    out->report_bounds[
+        DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = gib / 2u;
+
+    uint64_t owned_total = 0;
+    uint64_t owned_non_cache = 0;
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        if (!add_u64(owned_total, out->owned_category_bounds[i],
+                     &owned_total)) {
+            return set_error(err, errlen,
+                             "allocation plan owned total overflow");
+        }
+        if (i != DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD &&
+            !add_u64(owned_non_cache, out->owned_category_bounds[i],
+                     &owned_non_cache)) {
+            return set_error(err, errlen,
+                             "allocation plan non-cache total overflow");
+        }
+    }
+    uint64_t external = 0;
+    if (!add_u64(out->report_bounds[
+                     DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT],
+                 out->report_bounds[
+                     DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED],
+                 &external) ||
+        !add_u64(external,
+                 out->report_bounds[
+                     DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED],
+                 &external) ||
+        !add_u64(owned_non_cache, external,
+                 &out->qualification_non_cache_bound_bytes) ||
+        !add_u64(owned_total, external,
+                 &out->planned_qualification_bytes) ||
+        !add_u64(spec->configured_cache_bytes, 16u * gib,
+                 &out->qualification_total_bound_bytes)) {
+        return set_error(err, errlen,
+                         "allocation plan qualification arithmetic overflow");
+    }
+    out->owned_non_cache_bound_bytes = owned_non_cache;
+    out->owned_total_bound_bytes = owned_total;
+    if (out->qualification_non_cache_bound_bytes > 16u * gib ||
+        out->planned_qualification_bytes >
+            out->qualification_total_bound_bytes) {
+        return set_error(err, errlen,
+                         "allocation plan exceeds qualification total bound");
+    }
+
+    allocation_callsite(out, 0, DS4_LAGUNA_CALLSITE_STATIC_SLAB,
+        "laguna.static_slab", DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, expected_static_bytes);
+    allocation_callsite(out, 1, DS4_LAGUNA_CALLSITE_EXPERT_CACHE_PAYLOAD,
+        "laguna.expert_cache_payload",
+        DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, cache_payload);
+    allocation_callsite(out, 2, DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+        "laguna.ledger_arrays",
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+        DS4_RUNTIME_DOMAIN_HOST, ledger_arrays);
+    allocation_callsite(out, 3, DS4_LAGUNA_CALLSITE_ROUTE_HOTNESS,
+        "laguna.route_hotness",
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+        DS4_RUNTIME_DOMAIN_HOST, route_hotness);
+    allocation_callsite(out, 4, DS4_LAGUNA_CALLSITE_HOST_ENTRY_TO_SLOT,
+        "laguna.host_entry_to_slot",
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+        DS4_RUNTIME_DOMAIN_HOST, host_entry_to_slot);
+    allocation_callsite(out, 5, DS4_LAGUNA_CALLSITE_DEVICE_ENTRY_TO_SLOT,
+        "laguna.device_entry_to_slot",
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, device_entry_to_slot);
+    allocation_callsite(out, 6, DS4_LAGUNA_CALLSITE_STATIC_OFFSETS,
+        "laguna.static_offsets",
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+        DS4_RUNTIME_DOMAIN_HOST, static_offsets);
+    allocation_callsite(out, 7, DS4_LAGUNA_CALLSITE_SLOT_STATE,
+        "laguna.slot_state",
+        DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+        DS4_RUNTIME_DOMAIN_HOST, slot_state);
+    allocation_callsite(out, 8, DS4_LAGUNA_CALLSITE_KV_STATE,
+        "laguna.kv_state", DS4_RUNTIME_CATEGORY_KV_STATE,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, kv_bytes);
+    allocation_callsite(out, 9, DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH,
+        "laguna.graph_scratch", DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, graph_bytes);
+    allocation_callsite(out, 10, DS4_LAGUNA_CALLSITE_PINNED_STAGING_0,
+        "laguna.pinned_staging.0", DS4_RUNTIME_CATEGORY_PINNED_STAGING,
+        DS4_RUNTIME_DOMAIN_HOST, ledger->slot_stride_bytes);
+    allocation_callsite(out, 11, DS4_LAGUNA_CALLSITE_PINNED_STAGING_1,
+        "laguna.pinned_staging.1", DS4_RUNTIME_CATEGORY_PINNED_STAGING,
+        DS4_RUNTIME_DOMAIN_HOST, ledger->slot_stride_bytes);
+    allocation_callsite(out, 12, DS4_LAGUNA_CALLSITE_PINNED_STAGING_2,
+        "laguna.pinned_staging.2", DS4_RUNTIME_CATEGORY_PINNED_STAGING,
+        DS4_RUNTIME_DOMAIN_HOST, ledger->slot_stride_bytes);
+    allocation_callsite(out, 13, DS4_LAGUNA_CALLSITE_PINNED_STAGING_3,
+        "laguna.pinned_staging.3", DS4_RUNTIME_CATEGORY_PINNED_STAGING,
+        DS4_RUNTIME_DOMAIN_HOST, ledger->slot_stride_bytes);
+    allocation_callsite(out, 14, DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE,
+        "laguna.other_host.engine", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 64u * mib);
+    allocation_callsite(out, 15, DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL,
+        "laguna.other_host.model", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 192u * mib);
+    allocation_callsite(out, 16, DS4_LAGUNA_CALLSITE_OTHER_HOST_BOOTSTRAP,
+        "laguna.other_host.bootstrap", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 128u * mib);
+    allocation_callsite(out, 17, DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB,
+        "laguna.other_host.vocab", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 256u * mib);
+    allocation_callsite(out, 18, DS4_LAGUNA_CALLSITE_OTHER_HOST_SESSION,
+        "laguna.other_host.session", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 128u * mib);
+    allocation_callsite(out, 19, DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
+        "laguna.other_host.tracker", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 128u * mib);
+    allocation_callsite(out, 20, DS4_LAGUNA_CALLSITE_OTHER_HOST_SERIALIZER,
+        "laguna.other_host.serializer", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        DS4_RUNTIME_DOMAIN_HOST, 128u * mib);
+    allocation_callsite(out, 21,
+        DS4_LAGUNA_CALLSITE_OTHER_CUDA_KERNEL_TMP,
+        "laguna.other_cuda.kernel_tmp", DS4_RUNTIME_CATEGORY_OTHER_CUDA,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 512u * mib);
+    allocation_callsite(out, 22,
+        DS4_LAGUNA_CALLSITE_OTHER_CUDA_ROUTED_WORKSPACE,
+        "laguna.other_cuda.routed_workspace",
+        DS4_RUNTIME_CATEGORY_OTHER_CUDA,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 768u * mib);
+    allocation_callsite(out, 23,
+        DS4_LAGUNA_CALLSITE_OTHER_CUDA_DESCRIPTOR_UPLOAD,
+        "laguna.other_cuda.descriptor_upload",
+        DS4_RUNTIME_CATEGORY_OTHER_CUDA,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 256u * mib);
+    allocation_callsite(out, 24,
+        DS4_LAGUNA_CALLSITE_OTHER_CUDA_TRANSIENT,
+        "laguna.other_cuda.transient", DS4_RUNTIME_CATEGORY_OTHER_CUDA,
+        DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 512u * mib);
+    out->callsite_count = DS4_LAGUNA_ALLOCATION_CALLSITE_COUNT;
+    return true;
+}
+
+static int compare_page_range(const void *lhs, const void *rhs) {
+    const ds4_laguna_page_range *a = lhs;
+    const ds4_laguna_page_range *b = rhs;
+    if (a->offset < b->offset) return -1;
+    if (a->offset > b->offset) return 1;
+    if (a->bytes < b->bytes) return -1;
+    if (a->bytes > b->bytes) return 1;
+    return 0;
+}
+
+bool ds4_laguna_full_page_union(
+        const ds4_laguna_page_range *input,
+        size_t input_count,
+        uint64_t page_size,
+        ds4_laguna_page_range *output,
+        size_t output_capacity,
+        size_t *output_count,
+        uint64_t *output_bytes) {
+    if (output_count) *output_count = 0;
+    if (output_bytes) *output_bytes = 0;
+    if (!output_count || !output_bytes || !is_power_of_two(page_size) ||
+        (input_count != 0 && !input) ||
+        (output_capacity != 0 && !output)) {
+        return false;
+    }
+
+    size_t rounded_count = 0;
+    for (size_t i = 0; i < input_count; i++) {
+        if (input[i].bytes == 0) continue;
+        uint64_t raw_end = 0;
+        if (!add_u64(input[i].offset, input[i].bytes, &raw_end)) {
+            return false;
+        }
+        uint64_t start_pages = input[i].offset / page_size;
+        if (input[i].offset % page_size != 0) {
+            if (start_pages == UINT64_MAX) return false;
+            start_pages++;
+        }
+        if (start_pages > UINT64_MAX / page_size) return false;
+        const uint64_t safe_start = start_pages * page_size;
+        const uint64_t safe_end = (raw_end / page_size) * page_size;
+        if (safe_start >= safe_end) continue;
+        if (rounded_count >= output_capacity) {
+            *output_count = 0;
+            *output_bytes = 0;
+            return false;
+        }
+        output[rounded_count].offset = safe_start;
+        output[rounded_count].bytes = safe_end - safe_start;
+        rounded_count++;
+    }
+    if (rounded_count == 0) return true;
+
+    qsort(output, rounded_count, sizeof(output[0]), compare_page_range);
+    size_t merged_count = 1;
+    for (size_t i = 1; i < rounded_count; i++) {
+        ds4_laguna_page_range *previous = &output[merged_count - 1u];
+        uint64_t previous_end = 0;
+        uint64_t current_end = 0;
+        if (!add_u64(previous->offset, previous->bytes, &previous_end) ||
+            !add_u64(output[i].offset, output[i].bytes, &current_end)) {
+            *output_count = 0;
+            *output_bytes = 0;
+            return false;
+        }
+        if (output[i].offset <= previous_end) {
+            if (current_end > previous_end) {
+                previous->bytes = current_end - previous->offset;
+            }
+        } else {
+            output[merged_count++] = output[i];
+        }
+    }
+
+    uint64_t total = 0;
+    for (size_t i = 0; i < merged_count; i++) {
+        if (!add_u64(total, output[i].bytes, &total)) {
+            *output_count = 0;
+            *output_bytes = 0;
+            return false;
+        }
+    }
+    *output_count = merged_count;
+    *output_bytes = total;
+    return true;
+}

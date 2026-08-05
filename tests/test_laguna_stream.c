@@ -5,6 +5,7 @@
 
 #include "ds4.h"
 #include "ds4_laguna_stream.h"
+#include "ds4_runtime.h"
 
 #include <inttypes.h>
 #include <stdint.h>
@@ -756,20 +757,616 @@ static void test_ledger(void) {
     test_ledger_boundary_rejections();
 }
 
+static uint64_t sum_u64(const uint64_t *values, size_t count) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < count; i++) sum += values[i];
+    return sum;
+}
+
+static void test_allocation_profiles(void) {
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    const uint64_t cache_bytes[] = { 8u * gib, 12u * gib, 16u * gib };
+    const uint32_t slot_counts[] = { 1618u, 2427u, 3236u };
+    const uint64_t payload_bytes[] = {
+        UINT64_C(8589017088),
+        UINT64_C(12883525632),
+        UINT64_C(17178034176),
+    };
+    const uint64_t tail_bytes[] = {
+        UINT64_C(917504),
+        UINT64_C(1376256),
+        UINT64_C(1835008),
+    };
+    const uint64_t metadata_bytes[] = {
+        UINT64_C(1663624),
+        UINT64_C(1689512),
+        UINT64_C(1715400),
+    };
+    const uint64_t qualification_non_cache[] = {
+        UINT64_C(14062675600),
+        UINT64_C(14062701488),
+        UINT64_C(14062727376),
+    };
+    const uint64_t profile_bounds[] = {
+        UINT64_C(25769803776),
+        UINT64_C(30064771072),
+        UINT64_C(34359738368),
+    };
+    ds4_laguna_ledger ledger;
+    memset(&ledger, 0, sizeof(ledger));
+    ledger.file_size = UINT64_C(68248759648);
+    ledger.tensor_count = UINT64_C(814);
+    ledger.static_parent_count = UINT64_C(673);
+    ledger.routed_parent_count = UINT64_C(141);
+    ledger.static_aligned_device_bytes = UINT64_C(4374164480);
+    ledger.expert_entry_count = UINT64_C(12032);
+    ledger.slot_stride_bytes = UINT64_C(5308416);
+
+    for (size_t i = 0; i < sizeof(cache_bytes) / sizeof(cache_bytes[0]); i++) {
+        ds4_laguna_allocation_plan_spec spec;
+        memset(&spec, 0, sizeof(spec));
+        spec.configured_cache_bytes = cache_bytes[i];
+        spec.context_tokens = 32768u;
+        spec.prefill_rows = 4096u;
+        spec.session_count = 1u;
+        ds4_laguna_allocation_plan plan;
+        char err[256];
+        memset(&plan, 0, sizeof(plan));
+        memset(err, 0, sizeof(err));
+        CHECK(ds4_laguna_allocation_plan_make(
+                  &plan, &ledger, &spec, err, sizeof(err)),
+              "reference allocation profile builds");
+        CHECK(err[0] == '\0', "successful allocation plan leaves no error");
+        CHECK(plan.configured_cache_bytes == cache_bytes[i] &&
+                  plan.effective_cache_limit_bytes == cache_bytes[i],
+              "effective cache limit preserves the configured byte ceiling");
+        CHECK(plan.slot_stride_bytes == UINT64_C(5308416) &&
+                  plan.slot_count == slot_counts[i],
+              "reference profile floors exact cache slots from ledger stride");
+        CHECK(plan.cache_payload_bytes == payload_bytes[i] &&
+                  plan.cache_tail_uncharged_bytes == tail_bytes[i] &&
+                  plan.cache_payload_bytes +
+                      plan.cache_tail_uncharged_bytes == cache_bytes[i],
+              "physical cache payload charges slot padding and leaves only tail slack");
+        CHECK(plan.owned_category_bounds[
+                  DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] ==
+                      UINT64_C(4374164480),
+              "static category uses the exact aligned tensor ledger bytes");
+        CHECK(plan.owned_category_bounds[
+                  DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] ==
+                      metadata_bytes[i],
+              "cache metadata freezes exact ledger, table, and slot-state arithmetic");
+        CHECK(plan.owned_category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] ==
+                  UINT64_C(1686110208),
+              "32K one-session KV allocation is exact");
+        CHECK(plan.owned_category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
+                  UINT64_C(1537052680),
+              "4K Laguna graph and scratch allocation is exact");
+        CHECK(plan.owned_category_bounds[DS4_RUNTIME_CATEGORY_PINNED_STAGING] ==
+                  UINT64_C(21233664) &&
+                  plan.staging_buffer_count == 4u &&
+                  plan.staging_buffer_bytes == UINT64_C(5308416),
+              "four fixed pinned staging buffers are charged exactly");
+        CHECK(plan.owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] ==
+                  gib &&
+                  plan.owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] ==
+                      2u * gib,
+              "provisional named other-host and other-CUDA envelopes are explicit");
+        CHECK(plan.report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] ==
+                  ledger.file_size &&
+                  plan.report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] ==
+                      0 &&
+                  plan.report_bounds[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ==
+                      2u * gib &&
+                  plan.report_bounds[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] ==
+                      gib / 2u &&
+                  plan.report_bounds[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] ==
+                      gib / 2u,
+              "report-only model and unattributed ceilings are distinct from owned bytes");
+        CHECK(plan.qualification_non_cache_bound_bytes ==
+                  qualification_non_cache[i] &&
+                  plan.qualification_non_cache_bound_bytes <= 16u * gib,
+              "owned non-cache plus all external charges stays inside 16GiB");
+        CHECK(plan.qualification_total_bound_bytes == profile_bounds[i] &&
+                  plan.planned_qualification_bytes <= profile_bounds[i],
+              "reference profile fits its configured-cache-plus-16GiB ceiling");
+        CHECK(sum_u64(plan.owned_category_bounds,
+                      DS4_RUNTIME_OWNED_CATEGORY_COUNT) ==
+                  plan.owned_total_bound_bytes,
+              "owned category bounds reconcile byte-exactly");
+        uint64_t callsite_sum[DS4_RUNTIME_OWNED_CATEGORY_COUNT] = {0};
+        size_t other_host_callsites = 0;
+        size_t other_cuda_callsites = 0;
+        bool static_offsets_are_host = false;
+        CHECK(plan.callsite_count == DS4_LAGUNA_ALLOCATION_CALLSITE_COUNT,
+              "allocation plan exposes the complete stable callsite registry");
+        for (size_t j = 0; j < plan.callsite_count; j++) {
+            const ds4_runtime_callsite *site = &plan.callsites[j];
+            CHECK(site->id != 0 && site->name && site->name[0] != '\0',
+                  "every planned allocation callsite has stable identity");
+            callsite_sum[site->category] += site->bound_bytes;
+            if (site->category == DS4_RUNTIME_CATEGORY_OTHER_HOST) {
+                other_host_callsites++;
+            }
+            if (site->category == DS4_RUNTIME_CATEGORY_OTHER_CUDA) {
+                other_cuda_callsites++;
+            }
+            if (site->id == DS4_LAGUNA_CALLSITE_STATIC_OFFSETS &&
+                site->domain == DS4_RUNTIME_DOMAIN_HOST) {
+                static_offsets_are_host = true;
+            }
+        }
+        CHECK(other_host_callsites == 7u && other_cuda_callsites == 4u,
+              "other envelopes decompose into explicit stable allocation callsites");
+        CHECK(static_offsets_are_host,
+              "static offset metadata is attributed to its host physical domain");
+        for (size_t j = 0; j < DS4_RUNTIME_OWNED_CATEGORY_COUNT; j++) {
+            CHECK(callsite_sum[j] == plan.owned_category_bounds[j],
+                  "callsite bounds reconcile exactly to their owned category");
+        }
+    }
+
+    ds4_laguna_allocation_plan_spec invalid = {
+        8u * gib, 32768u, 4096u, 1u,
+    };
+    ds4_laguna_allocation_plan plan;
+    char err[256];
+    ledger.slot_stride_bytes = 8u * gib + 1u;
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)) &&
+              strstr(err, "slot") != NULL,
+          "cache smaller than one complete slot is rejected");
+    ledger.slot_stride_bytes = UINT64_C(5308416);
+
+    invalid.context_tokens = 32767u;
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)),
+          "non-reference context is rejected");
+    invalid.context_tokens = 32768u;
+    invalid.prefill_rows = 8192u;
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)),
+          "non-reference prefill shape is rejected");
+    invalid.prefill_rows = 4096u;
+    invalid.session_count = 2u;
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)),
+          "non-reference session count is rejected");
+    invalid.session_count = 1u;
+    invalid.configured_cache_bytes = 10u * gib;
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)),
+          "unqualified cache profile is rejected");
+    invalid.configured_cache_bytes = 8u * gib;
+    ledger.static_aligned_device_bytes = UINT64_MAX;
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)) &&
+              strstr(err, "ledger") != NULL,
+          "non-reference or overflowing ledger input fails closed");
+}
+
+typedef struct {
+    ds4_runtime_callsite callsites[9];
+    ds4_runtime_allocation_record records[32];
+    ds4_runtime_tracker_config config;
+    ds4_runtime_tracker tracker;
+} tracker_fixture;
+
+static void tracker_fixture_prepare(tracker_fixture *f) {
+    memset(f, 0, sizeof(*f));
+    const ds4_runtime_callsite sites[] = {
+        { 1u, "static", DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS,
+          DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 100u },
+        { 2u, "cache", DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD,
+          DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 200u },
+        { 3u, "metadata-host", DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+          DS4_RUNTIME_DOMAIN_HOST, 40u },
+        { 4u, "metadata-device", DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+          DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 60u },
+        { 5u, "kv", DS4_RUNTIME_CATEGORY_KV_STATE,
+          DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 60u },
+        { 6u, "graph", DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH,
+          DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 70u },
+        { 7u, "staging", DS4_RUNTIME_CATEGORY_PINNED_STAGING,
+          DS4_RUNTIME_DOMAIN_HOST, 80u },
+        { 8u, "other-host", DS4_RUNTIME_CATEGORY_OTHER_HOST,
+          DS4_RUNTIME_DOMAIN_HOST, 50u },
+        { 9u, "managed", DS4_RUNTIME_CATEGORY_OTHER_CUDA,
+          DS4_RUNTIME_DOMAIN_CUDA_MANAGED, 90u },
+    };
+    memcpy(f->callsites, sites, sizeof(sites));
+    f->config.callsites = f->callsites;
+    f->config.callsite_count = sizeof(f->callsites) / sizeof(f->callsites[0]);
+    f->config.records = f->records;
+    f->config.record_capacity = sizeof(f->records) / sizeof(f->records[0]);
+    const uint64_t category_bounds[] = {
+        100u, 200u, 100u, 60u, 70u, 80u, 50u, 90u,
+    };
+    memcpy(f->config.category_bounds, category_bounds,
+           sizeof(category_bounds));
+    f->config.report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] = 1000u;
+    f->config.report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 1000u;
+    f->config.report_bounds[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 100u;
+    f->config.report_bounds[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = 100u;
+    f->config.report_bounds[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 100u;
+    f->config.owned_total_bound_bytes = 750u;
+    f->config.qualification_total_bound_bytes = 1050u;
+}
+
+static bool tracker_fixture_init(tracker_fixture *f) {
+    tracker_fixture_prepare(f);
+    return ds4_runtime_tracker_init(&f->tracker, &f->config) ==
+           DS4_RUNTIME_STATUS_OK;
+}
+
+static void test_tracker_reconciliation_and_peaks(void) {
+    tracker_fixture f;
+    CHECK(tracker_fixture_init(&f), "valid predeclared tracker registry initializes");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 101u, 1u,
+                                       UINT64_C(0x1000), 100u, 100u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "tracked static allocation succeeds");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 102u, 8u,
+                                       UINT64_C(0x1000), 50u, 50u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "equal numeric address in a distinct physical domain is allowed");
+    CHECK(f.tracker.category_current[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] ==
+              100u &&
+              f.tracker.category_current[DS4_RUNTIME_CATEGORY_OTHER_HOST] ==
+                  50u &&
+              f.tracker.owned_total_current == 150u &&
+              f.tracker.owned_total_peak == 150u,
+          "owned current and simultaneous peak reconcile after every event");
+    CHECK(ds4_runtime_tracker_release(&f.tracker, 101u) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(&f.tracker, 103u, 2u,
+                                            UINT64_C(0x2000), 200u, 200u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "free followed by a disjoint category allocation succeeds");
+    CHECK(f.tracker.category_peak[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] == 100u &&
+              f.tracker.category_peak[
+                  DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] == 200u &&
+              f.tracker.owned_total_peak == 250u,
+          "owned peak is simultaneous rather than sum of category peaks");
+
+    CHECK(ds4_runtime_tracker_map_model(&f.tracker, 200u,
+                                        UINT64_C(0x5000), 1000u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "model mapping is recorded without a physical charge");
+    CHECK(f.tracker.report_current[
+              DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] == 1000u &&
+              f.tracker.owned_total_current == 250u,
+          "mapped virtual bytes are report-only");
+    CHECK(ds4_runtime_tracker_report_set(
+              &f.tracker, DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT, 80u) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_report_set(
+                  &f.tracker, DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED,
+                  30u) == DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_report_set(
+                  &f.tracker, DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED,
+                  20u) == DS4_RUNTIME_STATUS_OK,
+          "external physical observations update through bounded reports");
+    CHECK(f.tracker.qualification_total_current == 380u &&
+              f.tracker.qualification_total_peak == 380u,
+          "qualification total adds source and unattributed bytes exactly once");
+
+    ds4_runtime_snapshot snapshot;
+    ds4_runtime_allocation_record active_records[8];
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &f.tracker, &snapshot, active_records,
+              sizeof(active_records) / sizeof(active_records[0])) &&
+              snapshot.active_record_count == 3u &&
+              snapshot.owned_total_current == 250u &&
+              snapshot.qualification_total_current == 380u,
+          "snapshot copies simultaneous scalar state and active records");
+    CHECK(active_records[0].id == 102u && active_records[0].live &&
+              active_records[0].base == UINT64_C(0x1000) &&
+              active_records[0].requested_bytes == 50u &&
+              active_records[0].charged_bytes == 50u &&
+              active_records[0].category == DS4_RUNTIME_CATEGORY_OTHER_HOST &&
+              active_records[0].domain == DS4_RUNTIME_DOMAIN_HOST &&
+              active_records[0].callsite_id == 8u &&
+              active_records[0].relation ==
+                  DS4_RUNTIME_RELATION_OWNED_ALLOCATION,
+          "snapshot attribution records preserve every required field");
+    active_records[0].live = false;
+    CHECK(f.tracker.records[1].live,
+          "snapshot records are copies rather than tracker-owned pointers");
+    CHECK(!ds4_runtime_tracker_snapshot_copy(
+              &f.tracker, &snapshot, active_records, 2u) &&
+              snapshot.active_record_count == 3u,
+          "snapshot reports required active capacity without reallocating");
+
+    CHECK(ds4_runtime_tracker_register(&f.tracker, 201u,
+                                        UINT64_C(0x5000), 1000u, 200u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "exact model mapping registration is accepted as a zero-charge relation");
+    CHECK(f.tracker.report_current[
+              DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] == 1000u &&
+              f.tracker.owned_total_current == 250u &&
+              f.tracker.qualification_total_current == 380u,
+          "registration metadata never double-charges mapped pages");
+    CHECK(ds4_runtime_tracker_unmap_model(&f.tracker, 200u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_LIVE_RELATION,
+          "model mapping cannot be removed while registration is live");
+    CHECK(ds4_runtime_tracker_unregister(&f.tracker, 201u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              ds4_runtime_tracker_unmap_model(&f.tracker, 200u) ==
+                  DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_LIVE_RELATION,
+          "cleanup events do not clear a latched unsafe status");
+}
+
+static void test_tracker_relations(void) {
+    tracker_fixture f;
+    CHECK(tracker_fixture_init(&f), "relation tracker initializes");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 1u, 8u,
+                                       UINT64_C(0x10000), 50u, 50u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "host owner allocation succeeds");
+    CHECK(ds4_runtime_tracker_register(&f.tracker, 2u,
+                                        UINT64_C(0x10010), 20u, 1u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "registration contained in exactly one host allocation succeeds");
+    CHECK(ds4_runtime_tracker_release(&f.tracker, 1u) ==
+              DS4_RUNTIME_STATUS_UNSAFE,
+          "host allocation cannot be freed with live registration");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(&f.tracker, 3u, 8u,
+                                            UINT64_C(0x18000), 50u, 50u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_register(&f.tracker, 4u,
+                                             UINT64_C(0x18008), 24u, 3u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "first contained host registration succeeds");
+    CHECK(ds4_runtime_tracker_register(&f.tracker, 5u,
+                                        UINT64_C(0x18010), 16u, 3u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_OVERLAP,
+          "overlapping registration identity is rejected without a second charge");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "fresh tracker for managed relation initializes");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 10u, 9u,
+                                       UINT64_C(0x30000), 90u, 90u) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_managed_host_relation(
+                  &f.tracker, 11u, UINT64_C(0x30000), 90u, 10u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "managed allocation gains an exact zero-charge host-visible relation");
+    CHECK(f.tracker.category_current[DS4_RUNTIME_CATEGORY_OTHER_CUDA] == 90u &&
+              f.tracker.owned_total_current == 90u,
+          "managed requested bytes are charged once to other CUDA");
+    CHECK(ds4_runtime_tracker_unregister(&f.tracker, 11u) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(&f.tracker, 10u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "managed host relation is removed before its owner");
+    CHECK(ds4_runtime_tracker_unregister(&f.tracker, 11u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_NOT_LIVE,
+          "double unregister latches unsafe");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(&f.tracker, 20u, 8u,
+                                            UINT64_C(0x40000), 50u, 50u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(&f.tracker, 20u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "fresh owner can be allocated and freed exactly once");
+    CHECK(ds4_runtime_tracker_release(&f.tracker, 20u) ==
+              DS4_RUNTIME_STATUS_UNSAFE,
+          "double free latches unsafe");
+}
+
+static void test_tracker_rejections(void) {
+    tracker_fixture f;
+    CHECK(tracker_fixture_init(&f), "rejection tracker initializes");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 1u, 999u,
+                                       UINT64_C(0x1000), 1u, 1u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE,
+          "unknown allocation callsite latches unsafe");
+    const ds4_runtime_violation first = f.tracker.violation;
+    CHECK(ds4_runtime_tracker_report_set(
+              &f.tracker, DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT, 1u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == first,
+          "first violation remains permanently latched");
+
+    tracker_fixture_prepare(&f);
+    f.callsites[1].id = f.callsites[0].id;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_DUPLICATE_CALLSITE,
+          "duplicate predeclared callsite is rejected");
+    tracker_fixture_prepare(&f);
+    f.callsites[0].category = (ds4_runtime_category)99;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE,
+          "unclassified callsite is rejected");
+
+    tracker_fixture_prepare(&f);
+    f.config.qualification_total_bound_bytes = 1049u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation ==
+                  DS4_RUNTIME_VIOLATION_QUALIFICATION_TOTAL_BOUND,
+          "plan whose owned and external maxima exceed total is rejected");
+    tracker_fixture_prepare(&f);
+    f.config.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = UINT64_MAX;
+    f.callsites[8].bound_bytes = UINT64_MAX;
+    f.config.owned_total_bound_bytes = UINT64_MAX;
+    f.config.qualification_total_bound_bytes = UINT64_MAX;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_OVERFLOW,
+          "uint64 plan reconciliation overflow fails closed");
+    tracker_fixture_prepare(&f);
+    f.config.record_capacity =
+        SIZE_MAX / sizeof(ds4_runtime_allocation_record) + 1u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_OVERFLOW,
+          "record storage size overflow is rejected before initialization");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(&f.tracker, 30u, 1u,
+                                            UINT64_C(0x1000), 80u, 80u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "overlap fixture first allocation succeeds");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 31u, 2u,
+                                       UINT64_C(0x1040), 20u, 20u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_OVERLAP,
+          "overlapping charged ranges in one physical domain are rejected");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "category-overrun tracker initializes");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 40u, 1u,
+                                       UINT64_C(0x2000), 101u, 101u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              (f.tracker.violation == DS4_RUNTIME_VIOLATION_CALLSITE_BOUND ||
+               f.tracker.violation == DS4_RUNTIME_VIOLATION_CATEGORY_BOUND),
+          "category or callsite bound crossing latches unsafe");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "undercharge tracker initializes");
+    CHECK(ds4_runtime_tracker_allocate(&f.tracker, 41u, 8u,
+                                       UINT64_C(0x3000), 50u, 49u) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_UNDERCHARGE,
+          "charged bytes may never be smaller than requested bytes");
+}
+
+static void test_reduction_floor(void) {
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    uint64_t reduction = 0;
+    CHECK(ds4_runtime_reduction_qualified(80u * gib, 44u * gib,
+                                          &reduction) &&
+              reduction == 36u * gib,
+          "exact 45-percent reduction above 32GiB passes");
+    CHECK(!ds4_runtime_reduction_qualified(80u * gib, 44u * gib + 1u,
+                                           &reduction),
+          "one byte below the exact 45-percent ratio fails");
+    CHECK(ds4_runtime_reduction_qualified(64u * gib, 32u * gib,
+                                          &reduction) &&
+              reduction == 32u * gib,
+          "exact 32GiB reduction at a sufficient ratio passes");
+    CHECK(!ds4_runtime_reduction_qualified(80u * gib, 48u * gib,
+                                           &reduction),
+          "32GiB reduction below 45 percent fails");
+    CHECK(!ds4_runtime_reduction_qualified(31u * gib, 0, &reduction),
+          "ratio cannot compensate for a sub-32GiB reduction");
+    CHECK(!ds4_runtime_reduction_qualified(0, 0, &reduction) &&
+              !ds4_runtime_reduction_qualified(1u, 2u, &reduction),
+          "zero resident or inverted peaks fail safely");
+    CHECK(ds4_runtime_reduction_qualified(UINT64_MAX, 0, &reduction) &&
+              reduction == UINT64_MAX,
+          "ratio comparison remains exact at uint64 boundary");
+}
+
+static void test_inward_page_union(void) {
+    const ds4_laguna_page_range input[] = {
+        { 1u, 8192u },
+        { 4096u, 8192u },
+        { 12288u, 4096u },
+        { 0u, 2048u },
+        { 2048u, 2048u },
+    };
+    ds4_laguna_page_range output[5];
+    size_t output_count = 0;
+    uint64_t output_bytes = 0;
+    CHECK(ds4_laguna_full_page_union(input,
+                                      sizeof(input) / sizeof(input[0]),
+                                      4096u, output,
+                                      sizeof(output) / sizeof(output[0]),
+                                      &output_count, &output_bytes),
+          "safe full-page union succeeds");
+    CHECK(output_count == 1u && output[0].offset == 4096u &&
+              output[0].bytes == 12288u && output_bytes == 12288u,
+          "inward-rounded ranges sort, deduplicate, and merge adjacent pages");
+
+    const ds4_laguna_page_range split_page[] = {
+        { 0u, 2048u }, { 2048u, 2048u },
+    };
+    CHECK(ds4_laguna_full_page_union(split_page, 2u, 4096u,
+                                      output, 5u, &output_count,
+                                      &output_bytes) &&
+              output_count == 0 && output_bytes == 0,
+          "raw ranges are never merged before each is rounded inward");
+    const ds4_laguna_page_range exact_page[] = {
+        { 4096u, 4096u },
+    };
+    CHECK(ds4_laguna_full_page_union(exact_page, 1u, 4096u,
+                                      output, 5u, &output_count,
+                                      &output_bytes) &&
+              output_count == 1u && output[0].offset == 4096u &&
+              output[0].bytes == 4096u,
+          "an exact full page remains eligible");
+    const ds4_laguna_page_range overflow[] = {
+        { UINT64_MAX - 1u, 4u },
+    };
+    CHECK(!ds4_laguna_full_page_union(overflow, 1u, 4096u,
+                                       output, 5u, &output_count,
+                                       &output_bytes) &&
+              output_count == 0 && output_bytes == 0,
+          "overflowing source interval fails closed and clears outputs");
+    CHECK(!ds4_laguna_full_page_union(exact_page, 1u, 0,
+                                       output, 5u, &output_count,
+                                       &output_bytes),
+          "zero page size is rejected");
+    CHECK(!ds4_laguna_full_page_union(exact_page, 1u, 3000u,
+                                       output, 5u, &output_count,
+                                       &output_bytes),
+          "non-power-of-two page size is rejected");
+    CHECK(!ds4_laguna_full_page_union(input, 3u, 4096u,
+                                       output, 1u, &output_count,
+                                       &output_bytes),
+          "insufficient fixed output capacity fails without allocation");
+}
+
+static void test_allocation(void) {
+    test_allocation_profiles();
+    test_tracker_reconciliation_and_peaks();
+    test_tracker_relations();
+    test_tracker_rejections();
+    test_reduction_floor();
+    test_inward_page_union();
+}
+
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s --case options|ledger\n", argv0);
+    fprintf(stderr, "Usage: %s --case options|ledger|allocation\n", argv0);
 }
 
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(argv[1], "--case") != 0 ||
         (strcmp(argv[2], "options") != 0 &&
-         strcmp(argv[2], "ledger") != 0)) {
+         strcmp(argv[2], "ledger") != 0 &&
+         strcmp(argv[2], "allocation") != 0)) {
         usage(argv[0]);
         return 2;
     }
 
     if (strcmp(argv[2], "options") == 0) test_options();
-    else test_ledger();
+    else if (strcmp(argv[2], "ledger") == 0) test_ledger();
+    else test_allocation();
     if (g_failed != 0) {
         fprintf(stderr,
                 "test_laguna_stream: %d/%d assertion(s) failed\n",

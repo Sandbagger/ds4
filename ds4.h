@@ -231,7 +231,9 @@ int ds4_engine_options_preflight_with_gpu_config(
         size_t errcap);
 /* Build and publish the harness-only compact Laguna qualification plan.
  * This path parses the opened GGUF but never initializes an accelerator,
- * acquires the process lock, warms model pages, or creates an engine. */
+ * acquires the process lock, warms model pages, or creates an engine. Calls
+ * are serialized and restore fixed-shape state before returning. Invoke this
+ * plan-only API before engine creation, never concurrently with a live engine. */
 int ds4_engine_write_qualification_plan(
         const ds4_engine_options *opt,
         char *err,

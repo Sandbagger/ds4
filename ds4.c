@@ -748,6 +748,42 @@ static ds4_shape g_ds4_shape = {
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 static uint32_t g_ds4_head_counts[DS4_MAX_LAYER] = {0};
 
+typedef struct {
+    ds4_shape shape;
+    uint32_t compress_ratios[DS4_MAX_LAYER];
+    uint32_t head_counts[DS4_MAX_LAYER];
+} ds4_qualification_shape_state;
+
+/* The fixed-shape runtime is process-global. Qualification writers therefore
+ * serialize their temporary Laguna selection and restore it before returning.
+ * Frontends invoke the writer before any engine is created. */
+static pthread_mutex_t g_ds4_qualification_plan_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef DS4_TEST_HOOKS
+static bool g_ds4_test_force_qualification_shape_failure;
+#endif
+
+static void ds4_qualification_shape_state_capture(
+        ds4_qualification_shape_state *state) {
+    if (!state) return;
+    state->shape = g_ds4_shape;
+    memcpy(state->compress_ratios, g_ds4_compress_ratios,
+           sizeof(state->compress_ratios));
+    memcpy(state->head_counts, g_ds4_head_counts,
+           sizeof(state->head_counts));
+}
+
+static void ds4_qualification_shape_state_restore(
+        const ds4_qualification_shape_state *state) {
+    if (!state) return;
+    g_ds4_shape = state->shape;
+    memcpy(g_ds4_compress_ratios, state->compress_ratios,
+           sizeof(state->compress_ratios));
+    memcpy(g_ds4_head_counts, state->head_counts,
+           sizeof(state->head_counts));
+}
+
 #define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
 #define DS4_MODEL_FAMILY              (g_ds4_shape.family)
 #define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
@@ -1115,17 +1151,42 @@ typedef struct {
     char message[512];
 } ds4_failure_trap;
 
-/* Qualification planning is single-threaded and runs before engine startup.
- * Its narrow failure scope converts legacy fatal GGUF validation into the
- * public writer's return/error contract; ordinary runtime callers still exit. */
-static ds4_failure_trap *g_ds4_failure_trap;
+/* A qualification writer converts legacy fatal GGUF validation into its
+ * public error contract. Keep the active trap in pthread TLS: an unrelated
+ * runtime thread must never longjmp into the writer thread's stack. */
+static pthread_key_t g_ds4_failure_trap_key;
+static pthread_once_t g_ds4_failure_trap_key_once = PTHREAD_ONCE_INIT;
+static int g_ds4_failure_trap_key_error;
+
+static void ds4_failure_trap_key_create(void) {
+    g_ds4_failure_trap_key_error =
+        pthread_key_create(&g_ds4_failure_trap_key, NULL);
+}
+
+static int ds4_failure_trap_key_prepare(void) {
+    const int once_error = pthread_once(
+        &g_ds4_failure_trap_key_once, ds4_failure_trap_key_create);
+    return once_error != 0 ? once_error : g_ds4_failure_trap_key_error;
+}
+
+static ds4_failure_trap *ds4_failure_trap_get(void) {
+    if (ds4_failure_trap_key_prepare() != 0) return NULL;
+    return pthread_getspecific(g_ds4_failure_trap_key);
+}
+
+static int ds4_failure_trap_set(ds4_failure_trap *trap) {
+    const int prepare_error = ds4_failure_trap_key_prepare();
+    if (prepare_error != 0) return prepare_error;
+    return pthread_setspecific(g_ds4_failure_trap_key, trap);
+}
 
 static void ds4_die(const char *msg) {
-    if (g_ds4_failure_trap) {
-        snprintf(g_ds4_failure_trap->message,
-                 sizeof(g_ds4_failure_trap->message),
+    ds4_failure_trap *const trap = ds4_failure_trap_get();
+    if (trap) {
+        snprintf(trap->message,
+                 sizeof(trap->message),
                  "%s", msg ? msg : "unknown failure");
-        longjmp(g_ds4_failure_trap->environment, 1);
+        longjmp(trap->environment, 1);
     }
     fprintf(stderr, "ds4: %s\n", msg);
     exit(1);
@@ -58206,6 +58267,45 @@ int ds4_test_qualification_plan_preflight(
         opt, gpu_config_requested, err, errcap);
 }
 
+bool ds4_test_failure_trap_thread_probe(
+        ds4_test_thread_sync_fn synchronize,
+        void *context) {
+    ds4_failure_trap *const trap = calloc(1, sizeof(*trap));
+    if (!trap) {
+        if (synchronize) synchronize(context);
+        return false;
+    }
+    ds4_failure_trap *const previous_trap = ds4_failure_trap_get();
+    if (ds4_failure_trap_set(trap) != 0) {
+        if (synchronize) synchronize(context);
+        free(trap);
+        return false;
+    }
+    if (synchronize) synchronize(context);
+    const bool isolated = ds4_failure_trap_get() == trap;
+    const int restore_error = ds4_failure_trap_set(previous_trap);
+    if (restore_error == 0) free(trap);
+    return isolated && restore_error == 0;
+}
+
+void ds4_test_model_shape_state_get(ds4_test_model_shape_state *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->family = (int)g_ds4_shape.family;
+    out->variant = (int)g_ds4_shape.variant;
+    out->layer_count = g_ds4_shape.n_layer;
+    out->compress_ratios_hash = hash_bytes(
+        g_ds4_compress_ratios, sizeof(g_ds4_compress_ratios));
+    out->head_counts_hash = hash_bytes(
+        g_ds4_head_counts, sizeof(g_ds4_head_counts));
+}
+
+void ds4_test_force_qualification_shape_failure(bool enabled) {
+    if (pthread_mutex_lock(&g_ds4_qualification_plan_mutex) != 0) return;
+    g_ds4_test_force_qualification_shape_failure = enabled;
+    pthread_mutex_unlock(&g_ds4_qualification_plan_mutex);
+}
+
 bool ds4_test_laguna_file_identity_capture(
         int fd,
         uint64_t *device,
@@ -58842,9 +58942,15 @@ static bool qualification_plan_load_laguna(
         return false;
     }
 
-    ds4_failure_trap *const previous_trap = g_ds4_failure_trap;
+    ds4_failure_trap *const previous_trap = ds4_failure_trap_get();
     if (setjmp(trap->environment) != 0) {
-        g_ds4_failure_trap = previous_trap;
+        const int restore_error = ds4_failure_trap_set(previous_trap);
+        if (restore_error != 0) {
+            fprintf(stderr,
+                    "ds4: cannot restore model validation trap: %s\n",
+                    strerror(restore_error));
+            _Exit(EXIT_FAILURE);
+        }
         if (err && errcap != 0) {
             snprintf(err, errcap, "%s",
                      trap->message[0] ? trap->message :
@@ -58854,7 +58960,17 @@ static bool qualification_plan_load_laguna(
         return false;
     }
 
-    g_ds4_failure_trap = trap;
+    const int install_error = ds4_failure_trap_set(trap);
+    if (install_error != 0) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "cannot install model validation trap: %s",
+                     strerror(install_error));
+        }
+        free(trap);
+        return false;
+    }
+
     model_open(model, model_path, false, false);
 
     ds4_str architecture = {0};
@@ -58865,7 +58981,13 @@ static bool qualification_plan_load_laguna(
     config_validate_model(model);
     weights_bind(weights, model, false, 0, 0, true);
 
-    g_ds4_failure_trap = previous_trap;
+    const int restore_error = ds4_failure_trap_set(previous_trap);
+    if (restore_error != 0) {
+        fprintf(stderr,
+                "ds4: cannot restore model validation trap: %s\n",
+                strerror(restore_error));
+        _Exit(EXIT_FAILURE);
+    }
     free(trap);
     return true;
 }
@@ -58888,6 +59010,18 @@ int ds4_engine_write_qualification_plan(
         return 2;
     }
 
+    const int plan_lock_error =
+        pthread_mutex_lock(&g_ds4_qualification_plan_mutex);
+    if (plan_lock_error != 0) {
+        snprintf(detail, sizeof(detail),
+                 "cannot serialize qualification planning: %s",
+                 strerror(plan_lock_error));
+        qualification_plan_error(err, errcap, "state", detail);
+        return 2;
+    }
+    ds4_qualification_shape_state saved_shape_state;
+    ds4_qualification_shape_state_capture(&saved_shape_state);
+
     ds4_model model;
     memset(&model, 0, sizeof(model));
     model.fd = -1;
@@ -58900,6 +59034,19 @@ int ds4_engine_write_qualification_plan(
     char *plan_bytes = NULL;
     size_t plan_size = 0;
     int rc = 2;
+
+#ifdef DS4_TEST_HOOKS
+    if (g_ds4_test_force_qualification_shape_failure) {
+        g_ds4_test_force_qualification_shape_failure = false;
+        g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+        g_ds4_compress_ratios[0] = UINT32_MAX;
+        g_ds4_head_counts[0] = 48u;
+        g_ds4_head_counts[1] = 72u;
+        qualification_plan_error(
+            err, errcap, "model", "injected shape failure");
+        goto cleanup;
+    }
+#endif
 
     if (!qualification_plan_load_laguna(
             &model, &weights, opt->model_path,
@@ -58985,6 +59132,16 @@ cleanup:
     ds4_laguna_ledger_free(&ledger);
     weights_free(&weights);
     model_close(&model);
+    ds4_qualification_shape_state_restore(&saved_shape_state);
+    const int unlock_error =
+        pthread_mutex_unlock(&g_ds4_qualification_plan_mutex);
+    if (unlock_error != 0 && rc == 0) {
+        snprintf(detail, sizeof(detail),
+                 "cannot release qualification planning state: %s",
+                 strerror(unlock_error));
+        qualification_plan_error(err, errcap, "state", detail);
+        rc = 2;
+    }
     return rc;
 }
 

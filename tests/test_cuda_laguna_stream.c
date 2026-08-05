@@ -92,13 +92,20 @@ typedef struct {
     unsigned arrived;
     unsigned target;
     unsigned generation;
+    bool cancelled;
 } test_barrier;
 
 static bool test_barrier_init(test_barrier *barrier, unsigned target) {
     memset(barrier, 0, sizeof(*barrier));
     barrier->target = target;
-    return target != 0 && pthread_mutex_init(&barrier->mutex, NULL) == 0 &&
-        pthread_cond_init(&barrier->condition, NULL) == 0;
+    if (target == 0 || pthread_mutex_init(&barrier->mutex, NULL) != 0) {
+        return false;
+    }
+    if (pthread_cond_init(&barrier->condition, NULL) != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return false;
+    }
+    return true;
 }
 
 static bool test_barrier_wait(test_barrier *barrier) {
@@ -110,7 +117,7 @@ static bool test_barrier_wait(test_barrier *barrier) {
         barrier->generation++;
         pthread_cond_broadcast(&barrier->condition);
     } else {
-        while (generation == barrier->generation) {
+        while (generation == barrier->generation && !barrier->cancelled) {
             if (pthread_cond_wait(
                     &barrier->condition, &barrier->mutex) != 0) {
                 pthread_mutex_unlock(&barrier->mutex);
@@ -118,7 +125,16 @@ static bool test_barrier_wait(test_barrier *barrier) {
             }
         }
     }
-    return pthread_mutex_unlock(&barrier->mutex) == 0;
+    const bool passed = !barrier->cancelled;
+    return pthread_mutex_unlock(&barrier->mutex) == 0 && passed;
+}
+
+static void test_barrier_cancel(test_barrier *barrier) {
+    if (pthread_mutex_lock(&barrier->mutex) != 0) return;
+    barrier->cancelled = true;
+    barrier->generation++;
+    pthread_cond_broadcast(&barrier->condition);
+    pthread_mutex_unlock(&barrier->mutex);
 }
 
 static void test_barrier_destroy(test_barrier *barrier) {
@@ -194,28 +210,28 @@ static void ledger_fixture_prepare(ledger_fixture *fixture) {
     fixture->spec.layer_count = 3;
     fixture->spec.expert_count = 2;
 
-    fixture_tensor(fixture, 0, "token_embd.weight", 128,
+    fixture_tensor(fixture, 0, "token_embd.weight", 192,
                    DS4_LAGUNA_TENSOR_STATIC, UINT32_MAX,
                    DS4_LAGUNA_ROUTED_PROJECTION_NONE);
-    fixture_tensor(fixture, 1, "output_norm.weight", 192,
+    fixture_tensor(fixture, 1, "output_norm.weight", 128,
                    DS4_LAGUNA_TENSOR_STATIC, UINT32_MAX,
                    DS4_LAGUNA_ROUTED_PROJECTION_NONE);
-    fixture_tensor(fixture, 2, "blk.1.ffn_gate_exps.weight", 320,
+    fixture_tensor(fixture, 2, "blk.1.ffn_gate_exps.weight", 832,
                    DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 1,
                    DS4_LAGUNA_ROUTED_PROJECTION_GATE);
-    fixture_tensor(fixture, 3, "blk.1.ffn_up_exps.weight", 448,
+    fixture_tensor(fixture, 3, "blk.1.ffn_up_exps.weight", 320,
                    DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 1,
                    DS4_LAGUNA_ROUTED_PROJECTION_UP);
-    fixture_tensor(fixture, 4, "blk.1.ffn_down_exps.weight", 576,
+    fixture_tensor(fixture, 4, "blk.1.ffn_down_exps.weight", 704,
                    DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 1,
                    DS4_LAGUNA_ROUTED_PROJECTION_DOWN);
-    fixture_tensor(fixture, 5, "blk.2.ffn_gate_exps.weight", 704,
+    fixture_tensor(fixture, 5, "blk.2.ffn_gate_exps.weight", 448,
                    DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 2,
                    DS4_LAGUNA_ROUTED_PROJECTION_GATE);
-    fixture_tensor(fixture, 6, "blk.2.ffn_up_exps.weight", 832,
+    fixture_tensor(fixture, 6, "blk.2.ffn_up_exps.weight", 960,
                    DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 2,
                    DS4_LAGUNA_ROUTED_PROJECTION_UP);
-    fixture_tensor(fixture, 7, "blk.2.ffn_down_exps.weight", 960,
+    fixture_tensor(fixture, 7, "blk.2.ffn_down_exps.weight", 576,
                    DS4_LAGUNA_TENSOR_ROUTED_EXPERT, 2,
                    DS4_LAGUNA_ROUTED_PROJECTION_DOWN);
 }
@@ -604,6 +620,34 @@ static int run_startup(void) {
               DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] == 0,
           "mapped bytes are metadata-only and static bytes reconcile exactly");
 
+    const ds4_runtime_allocation_record *offset_record = NULL;
+    for (size_t i = 0; i < runtime_snapshot.active_record_count; i++) {
+        if (active[i].callsite_id == DS4_LAGUNA_CALLSITE_STATIC_OFFSETS) {
+            offset_record = &active[i];
+            break;
+        }
+    }
+    CHECK(offset_record && offset_record->live &&
+              offset_record->domain == DS4_RUNTIME_DOMAIN_HOST &&
+              offset_record->requested_bytes ==
+                  FIXTURE_TENSOR_COUNT * sizeof(uint64_t) &&
+              offset_record->charged_bytes ==
+                  FIXTURE_TENSOR_COUNT * sizeof(uint64_t) &&
+              offset_record->base != 0,
+          "static-offset record names the exact live host table");
+    const uint64_t *static_offsets = offset_record ?
+        (const uint64_t *)(uintptr_t)offset_record->base : NULL;
+    CHECK(static_offsets && static_offsets[0] == 0 &&
+              static_offsets[1] == 256 &&
+              static_offsets[2] == UINT64_MAX &&
+              static_offsets[3] == UINT64_MAX &&
+              static_offsets[4] == UINT64_MAX &&
+              static_offsets[5] == UINT64_MAX &&
+              static_offsets[6] == UINT64_MAX &&
+              static_offsets[7] == UINT64_MAX,
+          "offset table follows ledger order and marks every routed tensor");
+
+    void *first_static_ptr = NULL;
     for (size_t i = 0; i < 2; i++) {
         const uint64_t offset = ledger.tensor_ranges[i].source_offset;
         const uint64_t bytes = ledger.tensor_ranges[i].source_bytes;
@@ -612,6 +656,12 @@ static int run_startup(void) {
                   context, offset, bytes, 0, &device_ptr) &&
                   device_ptr != NULL,
               "strict lookup hits a complete static range");
+        if (i == 0) first_static_ptr = device_ptr;
+        if (i == 1) {
+            CHECK((uintptr_t)device_ptr ==
+                      (uintptr_t)first_static_ptr + 256u,
+                  "static destinations advance by exact 256-byte alignment");
+        }
         unsigned char copied[64] = {0};
         CHECK(bytes <= sizeof(copied) &&
                   cudaMemcpy(copied, device_ptr, (size_t)bytes,
@@ -622,6 +672,10 @@ static int run_startup(void) {
             model_map, offset, bytes, 0, "startup-static");
         CHECK(resolved == device_ptr,
               "single-GPU kernel resolver uses the strict static lookup");
+        const void *subrange = ds4_gpu_test_laguna_compact_resolve_weight_ptr(
+            model_map, offset + 5u, bytes - 5u, 0, "startup-subrange");
+        CHECK((uintptr_t)subrange == (uintptr_t)device_ptr + 5u,
+              "strict resolver preserves subrange pointer arithmetic");
     }
     void *crossing = NULL;
     CHECK(!ds4_gpu_test_laguna_compact_lookup(
@@ -675,6 +729,14 @@ static int run_startup(void) {
               tracker_has_only_ledger(&second_runtime.tracker),
           "second-context refusal preserves only its ledger records");
 
+    ds4_gpu_laguna_compact *destroyed_context = context;
+    ds4_gpu_test_laguna_compact_fail_destroy_once();
+    ds4_gpu_laguna_compact_destroy(context);
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &runtime.tracker, &runtime_snapshot,
+              active, ARRAY_LEN(active)) &&
+              runtime_snapshot.active_record_count == 6,
+          "failed teardown remains observable and retains every ownership record");
     ds4_gpu_laguna_compact_destroy(context);
     context = NULL;
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
@@ -697,7 +759,7 @@ static int run_startup(void) {
           "compact teardown preserves only the three live ledger records");
     void *after_destroy = NULL;
     CHECK(!ds4_gpu_test_laguna_compact_lookup(
-              context,
+              destroyed_context,
               ledger.tensor_ranges[0].source_offset,
               ledger.tensor_ranges[0].source_bytes,
               0, &after_destroy),
@@ -717,24 +779,42 @@ static int run_startup(void) {
          .model_size = sizeof(model_bytes), .ledger = &ledger, .plan = &plan,
          .runtime = &race_runtime[1]},
     };
-    CHECK(test_barrier_init(&barrier, 3) &&
-              pthread_create(&creators[0], NULL, creator_race_run, &race[0]) == 0 &&
-              pthread_create(&creators[1], NULL, creator_race_run, &race[1]) == 0,
+    const bool barrier_ready = test_barrier_init(&barrier, 3);
+    int creator_count = 0;
+    if (barrier_ready &&
+        pthread_create(&creators[0], NULL, creator_race_run, &race[0]) == 0) {
+        creator_count++;
+        if (pthread_create(
+                &creators[1], NULL, creator_race_run, &race[1]) == 0) {
+            creator_count++;
+        }
+    }
+    CHECK(barrier_ready && creator_count == 2,
           "two concurrent compact creators reach one barrier");
-    const uint64_t attempts_before_race =
-        ds4_gpu_test_laguna_compact_static_allocation_attempts();
-    (void)test_barrier_wait(&barrier);
-    CHECK(pthread_join(creators[0], NULL) == 0 &&
-              pthread_join(creators[1], NULL) == 0,
-          "concurrent compact creators finish");
-    test_barrier_destroy(&barrier);
-    const int race_successes = race[0].created + race[1].created;
-    CHECK(race_successes == 1 &&
-              ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
-                  attempts_before_race + 1u,
-          "creator race publishes one context with one slab attempt");
-    ds4_gpu_laguna_compact_destroy(
-        race[0].created ? race[0].context : race[1].context);
+    if (barrier_ready && creator_count == 2) {
+        const uint64_t attempts_before_race =
+            ds4_gpu_test_laguna_compact_static_allocation_attempts();
+        const bool main_released = test_barrier_wait(&barrier);
+        CHECK(main_released,
+              "main thread releases the concurrent creator barrier");
+        if (!main_released) test_barrier_cancel(&barrier);
+        CHECK(pthread_join(creators[0], NULL) == 0 &&
+                  pthread_join(creators[1], NULL) == 0,
+              "concurrent compact creators finish");
+        const int race_successes = race[0].created + race[1].created;
+        CHECK(race_successes == 1 &&
+                  ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+                      attempts_before_race + 1u,
+              "creator race publishes one context with one slab attempt");
+        ds4_gpu_laguna_compact_destroy(
+            race[0].created ? race[0].context : race[1].context);
+    } else if (barrier_ready) {
+        test_barrier_cancel(&barrier);
+        for (int i = 0; i < creator_count; i++) {
+            (void)pthread_join(creators[i], NULL);
+        }
+    }
+    if (barrier_ready) test_barrier_destroy(&barrier);
 
     tracker_fixture reusable_runtime;
     ds4_gpu_laguna_compact *reusable = NULL;
@@ -744,11 +824,22 @@ static int run_startup(void) {
                   &ledger, &plan, &reusable_runtime.tracker) &&
               reusable != NULL,
           "singleton is reusable after raced attachment teardown");
+    ds4_gpu_test_laguna_compact_fail_destroy_once();
     ds4_gpu_laguna_compact_destroy(reusable);
+    CHECK(!tracker_has_only_ledger(&reusable_runtime.tracker),
+          "void teardown keeps failed ownership visible to its tracker");
+    ds4_gpu_cleanup();
+    CHECK(tracker_has_only_ledger(&reusable_runtime.tracker),
+          "global CUDA cleanup retries and reconciles compact ownership");
+    reusable = NULL;
 
     ds4_laguna_ledger_free(&ledger);
-    CHECK(tracker_fixture_release_ledger(&runtime),
-          "ledger records release after their physical arrays are freed");
+    CHECK(tracker_fixture_release_ledger(&runtime) &&
+              tracker_fixture_release_ledger(&second_runtime) &&
+              tracker_fixture_release_ledger(&race_runtime[0]) &&
+              tracker_fixture_release_ledger(&race_runtime[1]) &&
+              tracker_fixture_release_ledger(&reusable_runtime),
+          "all surviving ledger records release after physical arrays are freed");
     CHECK(ds4_runtime_tracker_snapshot_copy(
               &runtime.tracker, &runtime_snapshot,
               active, ARRAY_LEN(active)) &&

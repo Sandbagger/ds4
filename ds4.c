@@ -762,7 +762,52 @@ static pthread_mutex_t g_ds4_qualification_plan_mutex =
 
 #ifdef DS4_TEST_HOOKS
 static bool g_ds4_test_force_qualification_shape_failure;
+static ds4_test_laguna_compact_bypass_snapshot
+    g_ds4_test_laguna_compact_bypass;
 #endif
+
+typedef enum {
+    DS4_LAGUNA_BYPASS_MODEL_FD,
+    DS4_LAGUNA_BYPASS_MODEL_MAP,
+    DS4_LAGUNA_BYPASS_MODEL_RANGE,
+    DS4_LAGUNA_BYPASS_MODEL_SPAN,
+    DS4_LAGUNA_BYPASS_MODEL_CACHE,
+    DS4_LAGUNA_BYPASS_MODEL_WARM,
+} ds4_laguna_bypass_entry;
+
+static void ds4_laguna_bypass_reset(void) {
+#ifdef DS4_TEST_HOOKS
+    memset(&g_ds4_test_laguna_compact_bypass, 0,
+           sizeof(g_ds4_test_laguna_compact_bypass));
+#endif
+}
+
+static void ds4_laguna_bypass_note(ds4_laguna_bypass_entry entry) {
+#ifdef DS4_TEST_HOOKS
+    switch (entry) {
+    case DS4_LAGUNA_BYPASS_MODEL_FD:
+        g_ds4_test_laguna_compact_bypass.model_fd_entries++;
+        break;
+    case DS4_LAGUNA_BYPASS_MODEL_MAP:
+        g_ds4_test_laguna_compact_bypass.model_map_entries++;
+        break;
+    case DS4_LAGUNA_BYPASS_MODEL_RANGE:
+        g_ds4_test_laguna_compact_bypass.model_range_entries++;
+        break;
+    case DS4_LAGUNA_BYPASS_MODEL_SPAN:
+        g_ds4_test_laguna_compact_bypass.model_span_entries++;
+        break;
+    case DS4_LAGUNA_BYPASS_MODEL_CACHE:
+        g_ds4_test_laguna_compact_bypass.model_cache_entries++;
+        break;
+    case DS4_LAGUNA_BYPASS_MODEL_WARM:
+        g_ds4_test_laguna_compact_bypass.model_warm_entries++;
+        break;
+    }
+#else
+    (void)entry;
+#endif
+}
 
 static void ds4_qualification_shape_state_capture(
         ds4_qualification_shape_state *state) {
@@ -36347,12 +36392,26 @@ typedef struct {
     bool active;
 } ds4_engine_tp_state;
 
+enum { DS4_LAGUNA_RUNTIME_RECORD_CAPACITY = 64 };
+
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_laguna_ledger laguna_ledger;
+    ds4_laguna_allocation_plan laguna_allocation_plan;
+    ds4_runtime_tracker laguna_runtime_tracker;
+    ds4_runtime_allocation_record
+        laguna_runtime_records[DS4_LAGUNA_RUNTIME_RECORD_CAPACITY];
+    uint64_t laguna_ledger_record_ids[3];
+    bool laguna_ledger_records_live[3];
+#ifndef DS4_NO_GPU
+    ds4_gpu_laguna_compact *laguna_compact;
+#endif
+    bool laguna_compact_runtime;
+    bool laguna_compact_create_attempted;
+    bool laguna_runtime_tracker_ready;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_backend backend;
@@ -58306,6 +58365,13 @@ void ds4_test_force_qualification_shape_failure(bool enabled) {
     pthread_mutex_unlock(&g_ds4_qualification_plan_mutex);
 }
 
+bool ds4_test_laguna_compact_bypass_snapshot_get(
+        ds4_test_laguna_compact_bypass_snapshot *out) {
+    if (!out) return false;
+    *out = g_ds4_test_laguna_compact_bypass;
+    return true;
+}
+
 bool ds4_test_laguna_file_identity_capture(
         int fd,
         uint64_t *device,
@@ -58476,6 +58542,303 @@ static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
+
+static const char *const ds4_laguna_compact_forbidden_cuda_env[] = {
+    "DS4_CUDA_COPY_MODEL",
+    "DS4_CUDA_COPY_MODEL_CHUNKED",
+    "DS4_CUDA_WEIGHT_CACHE",
+    "DS4_CUDA_WEIGHT_PRELOAD",
+    "DS4_CUDA_DIRECT_MODEL",
+    "DS4_CUDA_WEIGHT_CACHE_LIMIT_GB",
+    "DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB",
+    "DS4_CUDA_WEIGHT_ARENA_CHUNK_MB",
+    "DS4_CUDA_Q8_F32_PRELOAD",
+    "DS4_CUDA_KEEP_MODEL_PAGES",
+    "DS4_CUDA_MODEL_PREFETCH_SYNC",
+    "DS4_CUDA_Q8_F16_ALL",
+    "DS4_CUDA_Q8_F32_ALL",
+    "DS4_CUDA_Q8_F32_LARGE",
+    "DS4_CUDA_ATTN_Q_B_F32_CACHE",
+    "DS4_CUDA_ATTENTION_OUTPUT_PRELOAD",
+    "DS4_CUDA_MODEL_COPY_CHUNK_MB",
+    "DS4_CUDA_Q8_F16_CACHE_MB",
+    "DS4_CUDA_Q8_F16_CACHE_RESERVE_MB",
+    "DS4_CUDA_STRICT_WEIGHT_CACHE",
+};
+
+static const char *ds4_laguna_compact_forbidden_environment(void) {
+    for (size_t i = 0;
+         i < sizeof(ds4_laguna_compact_forbidden_cuda_env) /
+                 sizeof(ds4_laguna_compact_forbidden_cuda_env[0]);
+         i++) {
+        if (getenv(ds4_laguna_compact_forbidden_cuda_env[i]) != NULL) {
+            return ds4_laguna_compact_forbidden_cuda_env[i];
+        }
+    }
+    return NULL;
+}
+
+static bool ds4_engine_laguna_compact_requested(
+        const ds4_engine *e,
+        const ds4_engine_options *opt) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+    return e && opt && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA &&
+        e->backend == DS4_BACKEND_CUDA && e->ssd_streaming &&
+        e->ssd_streaming_cache_bytes_set;
+#else
+    (void)e;
+    (void)opt;
+    return false;
+#endif
+}
+
+static int ds4_engine_laguna_compact_profile_preflight(
+        const ds4_engine_options *opt,
+        bool gpu_config_requested,
+        char *err,
+        size_t errcap) {
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    const uint32_t sessions = opt->session_slots != 0 ?
+        opt->session_slots : 1u;
+    if (opt->context_size != 32768 || opt->prefill_chunk != 4096u ||
+        sessions != 1u || opt->share_session_prefill_workspace ||
+        (opt->ssd_streaming_cache_bytes != 8u * gib &&
+         opt->ssd_streaming_cache_bytes != 12u * gib &&
+         opt->ssd_streaming_cache_bytes != 16u * gib)) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "compact Laguna CUDA requires exactly --ctx 32768, "
+                     "--prefill-chunk 4096, one session, and an exact "
+                     "8, 12, or 16 GiB streaming cache");
+        }
+        return 2;
+    }
+    if (opt->warm_weights) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "compact Laguna CUDA forbids --warm-weights");
+        }
+        return 2;
+    }
+    if (opt->ssd_streaming_cold ||
+        opt->ssd_streaming_cache_experts_set ||
+        opt->ssd_streaming_cache_experts != 0 ||
+        opt->ssd_streaming_full_layers_set ||
+        opt->ssd_streaming_full_layers != 0 ||
+        opt->ssd_streaming_preload_experts != 0) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "compact Laguna CUDA forbids legacy cold, "
+                     "cache-expert, full-layer, and preload-expert "
+                     "streaming controls");
+        }
+        return 2;
+    }
+    if (opt->simulate_used_memory_bytes != 0 || opt->quality ||
+        (opt->power_percent != 0 && opt->power_percent != 100) ||
+        opt->inspect_only || opt->first_token_test ||
+        opt->metal_graph_test || opt->glm_mtp || opt->glm_mtp_timing ||
+        opt->dspark || opt->dspark_strict || opt->cuda_tensor_parallel ||
+        opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+        opt->tp.requested || opt->tp.role != DS4_TP_NONE ||
+        opt->load_slice || opt->load_output || gpu_config_requested ||
+        (opt->mtp_path && opt->mtp_path[0]) ||
+        (opt->directional_steering_file &&
+         opt->directional_steering_file[0]) ||
+        opt->directional_steering_attn != 0.0f ||
+        opt->directional_steering_ffn != 0.0f ||
+        (opt->expert_profile_path && opt->expert_profile_path[0])) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "compact Laguna CUDA is exclusive and rejects "
+                     "diagnostic, simulated-pressure, multi-GPU, support-"
+                     "model, steering, quality, and profiling options");
+        }
+        return 2;
+    }
+    if (getenv("DS4_EXPERT_PROFILE") != NULL ||
+        getenv("DS4_EXPERT_HOTLIST") != NULL) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "compact Laguna CUDA forbids expert profile/hotlist "
+                     "environment controls");
+        }
+        return 2;
+    }
+    const char *forbidden =
+        ds4_laguna_compact_forbidden_environment();
+    if (forbidden) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "compact Laguna CUDA forbids present environment "
+                     "variable %s", forbidden);
+        }
+        return 2;
+    }
+    return 0;
+}
+
+static bool ds4_engine_laguna_ledger_array_layout(
+        const ds4_laguna_ledger *ledger,
+        const void *bases[3],
+        uint64_t bytes[3]) {
+    if (!ledger || !bases || !bytes ||
+        ledger->tensor_range_count > (SIZE_MAX - 5u) / 2u ||
+        ledger->tensor_range_count > UINT64_MAX /
+            sizeof(ledger->tensor_ranges[0]) ||
+        ledger->expert_entry_count > UINT64_MAX /
+            sizeof(ledger->expert_entries[0])) {
+        return false;
+    }
+    const uint64_t source_capacity =
+        (uint64_t)ledger->tensor_range_count * 2u + 5u;
+    if (source_capacity > UINT64_MAX /
+            sizeof(ledger->source_ranges[0])) {
+        return false;
+    }
+    bases[0] = ledger->tensor_ranges;
+    bases[1] = ledger->source_ranges;
+    bases[2] = ledger->expert_entries;
+    bytes[0] = (uint64_t)ledger->tensor_range_count *
+        sizeof(ledger->tensor_ranges[0]);
+    bytes[1] = source_capacity * sizeof(ledger->source_ranges[0]);
+    bytes[2] = ledger->expert_entry_count *
+        sizeof(ledger->expert_entries[0]);
+    return bases[0] && bases[1] && bases[2] &&
+        bytes[0] != 0 && bytes[1] != 0 && bytes[2] != 0;
+}
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+static bool ds4_engine_laguna_compact_ownership_released(
+        const ds4_engine *e) {
+    if (!e || !e->laguna_runtime_tracker_ready ||
+        e->laguna_runtime_tracker.violation !=
+            DS4_RUNTIME_VIOLATION_NONE) {
+        return false;
+    }
+    const void *bases[3] = {0};
+    uint64_t bytes[3] = {0};
+    if (!ds4_engine_laguna_ledger_array_layout(
+            &e->laguna_ledger, bases, bytes)) {
+        return false;
+    }
+    if (bytes[0] > UINT64_MAX - bytes[1] ||
+        bytes[0] + bytes[1] > UINT64_MAX - bytes[2]) {
+        return false;
+    }
+    const uint64_t ledger_bytes = bytes[0] + bytes[1] + bytes[2];
+    bool seen[3] = {false, false, false};
+    size_t live_count = 0;
+    for (size_t i = 0; i < e->laguna_runtime_tracker.record_count; i++) {
+        const ds4_runtime_allocation_record *record =
+            &e->laguna_runtime_tracker.records[i];
+        if (!record->live) continue;
+        live_count++;
+        size_t ledger_index = 3;
+        for (size_t j = 0; j < 3; j++) {
+            if (record->id == e->laguna_ledger_record_ids[j]) {
+                ledger_index = j;
+                break;
+            }
+        }
+        if (ledger_index == 3 || seen[ledger_index] ||
+            !e->laguna_ledger_records_live[ledger_index] ||
+            record->callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS ||
+            record->category !=
+                DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ||
+            record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+            record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+            record->base != (uint64_t)(uintptr_t)bases[ledger_index] ||
+            record->requested_bytes != bytes[ledger_index] ||
+            record->charged_bytes != bytes[ledger_index]) {
+            return false;
+        }
+        seen[ledger_index] = true;
+    }
+    if (live_count != 3 || !seen[0] || !seen[1] || !seen[2]) {
+        return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        const uint64_t expected =
+            i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ?
+                ledger_bytes : 0;
+        if (e->laguna_runtime_tracker.category_current[i] != expected) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (e->laguna_runtime_tracker.report_current[i] != 0) return false;
+    }
+    return true;
+}
+#endif
+
+static bool ds4_engine_prepare_laguna_compact_runtime(
+        ds4_engine *e,
+        const ds4_engine_options *opt,
+        char *err,
+        size_t errcap) {
+    const ds4_laguna_allocation_plan_spec allocation_spec = {
+        .configured_cache_bytes = opt->ssd_streaming_cache_bytes,
+        .context_tokens = (uint32_t)opt->context_size,
+        .prefill_rows = opt->prefill_chunk,
+        .session_count = opt->session_slots != 0 ? opt->session_slots : 1u,
+    };
+    if (!ds4_laguna_allocation_plan_make(
+            &e->laguna_allocation_plan, &e->laguna_ledger,
+            &allocation_spec, err, errcap)) {
+        return false;
+    }
+    ds4_runtime_tracker_config tracker_config = {
+        .callsites = e->laguna_allocation_plan.callsites,
+        .callsite_count = e->laguna_allocation_plan.callsite_count,
+        .records = e->laguna_runtime_records,
+        .record_capacity = DS4_LAGUNA_RUNTIME_RECORD_CAPACITY,
+        .owned_total_bound_bytes =
+            e->laguna_allocation_plan.owned_total_bound_bytes,
+        .qualification_total_bound_bytes =
+            e->laguna_allocation_plan.qualification_total_bound_bytes,
+    };
+    memcpy(tracker_config.category_bounds,
+           e->laguna_allocation_plan.owned_category_bounds,
+           sizeof(tracker_config.category_bounds));
+    memcpy(tracker_config.report_bounds,
+           e->laguna_allocation_plan.report_bounds,
+           sizeof(tracker_config.report_bounds));
+    if (ds4_runtime_tracker_init(
+            &e->laguna_runtime_tracker, &tracker_config) !=
+        DS4_RUNTIME_STATUS_OK) {
+        snprintf(err, errcap, "runtime tracker initialization failed");
+        return false;
+    }
+    e->laguna_runtime_tracker_ready = true;
+
+    const void *bases[3] = {0};
+    uint64_t bytes[3] = {0};
+    if (!ds4_engine_laguna_ledger_array_layout(
+            &e->laguna_ledger, bases, bytes)) {
+        snprintf(err, errcap, "ledger array accounting overflow");
+        return false;
+    }
+    for (size_t i = 0; i < 3; i++) {
+        e->laguna_ledger_record_ids[i] =
+            UINT64_C(0x4c45444745520001) + i;
+        if (ds4_runtime_tracker_allocate(
+                &e->laguna_runtime_tracker,
+                e->laguna_ledger_record_ids[i],
+                DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+                (uint64_t)(uintptr_t)bases[i], bytes[i], bytes[i]) !=
+            DS4_RUNTIME_STATUS_OK) {
+            snprintf(err, errcap,
+                     "ledger array %zu runtime accounting failed", i);
+            return false;
+        }
+        e->laguna_ledger_records_live[i] = true;
+    }
+    return true;
+}
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
@@ -59282,6 +59645,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     config_validate_model(&e->model);
+    e->laguna_compact_runtime =
+        ds4_engine_laguna_compact_requested(e, opt);
+    if (e->laguna_compact_runtime) {
+        ds4_laguna_bypass_reset();
+        char compact_err[256] = {0};
+        const int compact_rc = ds4_engine_laguna_compact_profile_preflight(
+            opt, gpu_cfg != NULL, compact_err, sizeof(compact_err));
+        if (compact_rc != 0) {
+            fprintf(stderr, "ds4: %s\n", compact_err);
+            ds4_engine_close(e);
+            *out = NULL;
+            return compact_rc;
+        }
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
             opt->tp.role != DS4_TP_NONE || e->cuda_tensor_parallel ||
@@ -59303,7 +59680,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 2;
         }
     }
-    if (opt->warm_weights) model_warm_weights(&e->model);
+    if (opt->warm_weights) {
+        if (e->laguna_compact_runtime) {
+            ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_WARM);
+        }
+        model_warm_weights(&e->model);
+    }
     if (e->cuda_tensor_parallel &&
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
@@ -59351,6 +59733,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (e->laguna_compact_runtime &&
+            !ds4_engine_prepare_laguna_compact_runtime(
+                e, opt, ledger_err, sizeof(ledger_err))) {
+            fprintf(stderr,
+                    "ds4: compact Laguna configuration rejected: %s\n",
+                    ledger_err[0] ? ledger_err :
+                        "runtime allocation plan is unavailable");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 2;
+        }
     }
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
@@ -59391,7 +59784,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->ssd_streaming) {
+        if (e->ssd_streaming && !e->laguna_compact_runtime) {
             fprintf(stderr,
                     "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
             ds4_engine_close(e);
@@ -59403,7 +59796,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->directional_steering_attn != 0.0f ||
             opt->directional_steering_ffn != 0.0f ||
             e->power_percent < 100 ||
-            opt->prefill_chunk != 0 ||
+            (!e->laguna_compact_runtime && opt->prefill_chunk != 0) ||
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
@@ -59781,6 +60174,33 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->laguna_compact_runtime) {
+            e->laguna_compact_create_attempted = true;
+            if (!ds4_gpu_laguna_compact_create(
+                    &e->laguna_compact,
+                    e->model.fd,
+                    e->model.map,
+                    e->model.size,
+                    &e->laguna_ledger,
+                    &e->laguna_allocation_plan,
+                    &e->laguna_runtime_tracker)) {
+                fprintf(stderr,
+                        "ds4: compact Laguna CUDA attachment failed before "
+                        "legacy model mapping\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->startup_model_span_bytes =
+                e->laguna_ledger.static_source_bytes;
+            fprintf(stderr,
+                    "ds4: CUDA backend initialized with compact Laguna "
+                    "static attachment (%.2f GiB source bytes)\n",
+                    (double)e->startup_model_span_bytes / 1073741824.0);
+            goto graph_backend_ready;
+        }
+#endif
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -59864,6 +60284,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 }
             }
         }
+        if (e->laguna_compact_runtime) {
+            ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_FD);
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
@@ -59926,6 +60349,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         spans.len,
                         (double)span_bytes / 1073741824.0);
             }
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_MAP);
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_SPAN);
+            }
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
                                                         load_offsets,
@@ -59977,6 +60404,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     load_end,
                     spans.len,
                     (double)span_bytes / 1073741824.0);
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_MAP);
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_SPAN);
+            }
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
                                                         load_offsets,
@@ -60011,6 +60442,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     spans.len,
                     (double)span_bytes / 1073741824.0,
                     (double)(e->model.size - e->model.tensor_data_pos) / 1073741824.0);
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_MAP);
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_SPAN);
+            }
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
                                                         load_offsets,
@@ -60021,6 +60456,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_MAP);
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_RANGE);
+            }
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
@@ -60039,28 +60478,36 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         if (tp_shard) {
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_WARM);
+            }
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
         }
         const bool support_model_runtime_ready =
             e->mtp_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
-        if (support_model_runtime_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
-        {
-            fprintf(stderr,
-                    "ds4: %s failed to map support model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-                    ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (support_model_runtime_ready) {
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_MAP);
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_RANGE);
+            }
+            if (!ds4_gpu_set_model_map_range(
+                    e->mtp_model.map,
+                    e->mtp_model.size,
+                    e->mtp_model.tensor_data_pos,
+                    e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                    e->mtp_model.max_tensor_bytes)) {
+                fprintf(stderr,
+                        "ds4: %s failed to map support model views; aborting startup. "
+                        "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                        ds4_backend_name(e->backend));
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         if (!ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,
@@ -60072,7 +60519,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (e->laguna_compact_runtime) {
+            ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_FD);
+        }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        if (e->laguna_compact_runtime) {
+            ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_CACHE);
+        }
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -60089,7 +60542,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
         /* Also apply explicit optional Q8 preload settings to the runtime
          * support model when loaded. */
         if (support_model_runtime_ready) {
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_FD);
+            }
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_CACHE);
+            }
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                  NULL, NULL, 0)) {
                 fprintf(stderr, "ds4: %s failed to prepare optional support model cache\n",
@@ -60098,10 +60557,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+            if (e->laguna_compact_runtime) {
+                ds4_laguna_bypass_note(DS4_LAGUNA_BYPASS_MODEL_FD);
+            }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+graph_backend_ready:
+#endif
+        ;
     }
 #else
     if (graph_backend) {
@@ -60440,6 +60906,9 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#ifndef DS4_NO_GPU
+    bool gpu_cleanup_complete = false;
+#endif
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
@@ -60462,14 +60931,46 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+    if (e->laguna_compact) {
+        ds4_gpu_laguna_compact_destroy(e->laguna_compact);
+    }
+    if (e->laguna_compact_create_attempted &&
+        !ds4_engine_laguna_compact_ownership_released(e)) {
+        ds4_gpu_cleanup();
+        gpu_cleanup_complete = true;
+    }
+    if (e->laguna_compact_create_attempted &&
+        !ds4_engine_laguna_compact_ownership_released(e)) {
+        fprintf(stderr,
+                "ds4: compact Laguna teardown remains unreconciled after "
+                "cleanup retry; retaining engine owners until restart\n");
+        return;
+    }
+    e->laguna_compact = NULL;
+#endif
     ds4_laguna_ledger_free(&e->laguna_ledger);
+    if (e->laguna_runtime_tracker_ready) {
+        for (size_t i = 0; i < 3; i++) {
+            if (!e->laguna_ledger_records_live[i]) continue;
+            if (ds4_runtime_tracker_release(
+                    &e->laguna_runtime_tracker,
+                    e->laguna_ledger_record_ids[i]) !=
+                DS4_RUNTIME_STATUS_OK) {
+                fprintf(stderr,
+                        "ds4: Laguna ledger tracker release %zu failed\n", i);
+            }
+            e->laguna_ledger_records_live[i] = false;
+        }
+    }
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
-    ds4_gpu_cleanup();
+    if (!gpu_cleanup_complete) ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();

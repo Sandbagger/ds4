@@ -166,9 +166,10 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_laguna_kernels
+cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_laguna_kernels tests/test_cuda_laguna_stream
 	./tests/cuda_long_context_smoke
 	env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
+	./tests/test_cuda_laguna_stream --case startup
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h
@@ -249,7 +250,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kv
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
@@ -324,7 +325,7 @@ test-laguna-plan: tests/test_plan_io tests/test_laguna_plan
 	./tests/test_plan_io
 	./tests/test_laguna_plan
 
-tests/test_runtime_cpp_link.o: tests/test_runtime_cpp_link.cc ds4_laguna_stream.h ds4_runtime.h
+tests/test_runtime_cpp_link.o: tests/test_runtime_cpp_link.cc ds4_gpu.h ds4_laguna_stream.h ds4_runtime.h
 	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
 
 tests/test_runtime_cpp_link: tests/test_runtime_cpp_link.o ds4_laguna_stream.o ds4_runtime.o

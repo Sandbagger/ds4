@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4_laguna_stream.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -97,6 +99,60 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+
+/* One process may own one compact Laguna attachment at a time.  The context
+ * records the existing file mapping without registering it, owns the exact
+ * ledger-approved static CUDA slab, and resolves compact weights strictly. */
+typedef struct ds4_gpu_laguna_compact ds4_gpu_laguna_compact;
+int ds4_gpu_laguna_compact_create(
+        ds4_gpu_laguna_compact **out,
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        ds4_runtime_tracker *tracker);
+void ds4_gpu_laguna_compact_destroy(ds4_gpu_laguna_compact *ctx);
+
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    int model_fd;
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t static_slab_bytes;
+    uint64_t static_source_copied_bytes;
+    uint64_t static_range_count;
+    uint64_t static_offset_count;
+    uint64_t static_offset_bytes;
+    uint64_t model_mapping_registered_bytes;
+    uint64_t whole_model_copied_bytes;
+    uint64_t routed_payload_bytes;
+    uint64_t opportunistic_range_allocated_bytes;
+    uint64_t legacy_model_range_count;
+    uint64_t legacy_model_arena_count;
+} ds4_gpu_laguna_compact_test_snapshot;
+
+int ds4_gpu_test_laguna_compact_snapshot(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_laguna_compact_test_snapshot *out);
+int ds4_gpu_test_laguna_compact_active_snapshot(
+        ds4_gpu_laguna_compact_test_snapshot *out);
+uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);
+void ds4_gpu_test_laguna_compact_fail_destroy_once(void);
+int ds4_gpu_test_laguna_compact_lookup(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t source_offset,
+        uint64_t bytes,
+        int expected_device,
+        void **out_device_ptr);
+const void *ds4_gpu_test_laguna_compact_resolve_weight_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const char *label);
+#endif
+
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);

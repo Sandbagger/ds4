@@ -457,6 +457,15 @@ typedef struct {
     uint64_t head_counts_hash;
 } ds4_test_model_shape_state;
 
+typedef struct {
+    uint64_t model_fd_entries;
+    uint64_t model_map_entries;
+    uint64_t model_range_entries;
+    uint64_t model_span_entries;
+    uint64_t model_cache_entries;
+    uint64_t model_warm_entries;
+} ds4_test_laguna_compact_bypass_snapshot;
+
 typedef void (*ds4_test_thread_sync_fn)(void *context);
 
 int ds4_test_logits_only_sync_mode(
@@ -514,6 +523,8 @@ int ds4_test_engine_exact_cache_preflight(
         bool share_session_prefill_workspace,
         char *err,
         size_t errcap);
+bool ds4_test_laguna_compact_bypass_snapshot_get(
+        ds4_test_laguna_compact_bypass_snapshot *out);
 int ds4_test_session_limit_lifecycle(
         bool exact_cache,
         bool graph_backend,

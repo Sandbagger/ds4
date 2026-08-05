@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /* Pure-C policy tests for the Laguna compact runtime.
  *
  * Keep option parsing here independent of CUDA and model files so every host
@@ -8,9 +10,11 @@
 #include "ds4_runtime.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static int g_failed;
 static int g_total;
@@ -129,8 +133,52 @@ static void test_qualification_option_preflight(void) {
           "qualification rejects GPU-layout probing before hardware access");
 }
 
+static void test_qualification_model_identity(void) {
+    char path[] = "/tmp/ds4-laguna-identity.XXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0, "model identity fixture opens one stable descriptor");
+    if (fd < 0) return;
+
+    static const char initial[] = "GGUF identity";
+    CHECK(write(fd, initial, sizeof(initial)) == (ssize_t)sizeof(initial),
+          "model identity fixture has stable initial bytes");
+
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    uint64_t size_bytes = 0;
+    uint64_t mtime_ns = 0;
+    char err[256] = "stale";
+    CHECK(ds4_test_laguna_file_identity_capture(
+              fd, &device, &inode, &size_bytes, &mtime_ns,
+              err, sizeof(err)) && err[0] == '\0',
+          "model identity captures the opened descriptor exactly");
+    CHECK(device != 0 && inode != 0 &&
+              size_bytes == sizeof(initial) && mtime_ns != 0,
+          "captured model identity contains stat provenance");
+    CHECK(ds4_test_laguna_file_identity_matches(
+              fd, device, inode, size_bytes, mtime_ns,
+              err, sizeof(err)) && err[0] == '\0',
+          "unchanged opened descriptor preserves model identity");
+
+    static const char changed[] = "changed";
+    CHECK(write(fd, changed, sizeof(changed)) == (ssize_t)sizeof(changed),
+          "model identity fixture can change through the same descriptor");
+    CHECK(!ds4_test_laguna_file_identity_matches(
+              fd, device, inode, size_bytes, mtime_ns,
+              err, sizeof(err)) && strstr(err, "changed") != NULL,
+          "same-fd identity check rejects a changed source");
+
+    CHECK(close(fd) == 0, "model identity fixture descriptor closes");
+    CHECK(unlink(path) == 0, "model identity fixture path is removed");
+    CHECK(!ds4_test_laguna_file_identity_capture(
+              -1, &device, &inode, &size_bytes, &mtime_ns,
+              err, sizeof(err)),
+          "invalid model descriptor fails identity capture");
+}
+
 static void test_options(void) {
     test_qualification_option_preflight();
+    test_qualification_model_identity();
     check_parse_ok("1", UINT64_C(1));
     check_parse_ok("8589934592", UINT64_C(8589934592));
     check_parse_ok("18446744073709551615", UINT64_MAX);

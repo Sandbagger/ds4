@@ -213,6 +213,13 @@ int ds4_engine_options_preflight_with_gpu_config(
         const struct ds4_gpu_config *gpu_cfg,
         char *err,
         size_t errcap);
+/* Build and publish the harness-only compact Laguna qualification plan.
+ * This path parses the opened GGUF but never initializes an accelerator,
+ * acquires the process lock, warms model pages, or creates an engine. */
+int ds4_engine_write_qualification_plan(
+        const ds4_engine_options *opt,
+        char *err,
+        size_t errcap);
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 
 /* Multi-GPU pipeline-parallel entry point (wave 2).
@@ -502,6 +509,22 @@ int ds4_test_exact_cache_cuda_topology_preflight(
 int ds4_test_qualification_plan_preflight(
         const ds4_engine_options *opt,
         bool gpu_config_requested,
+        char *err,
+        size_t errcap);
+bool ds4_test_laguna_file_identity_capture(
+        int fd,
+        uint64_t *device,
+        uint64_t *inode,
+        uint64_t *size_bytes,
+        uint64_t *mtime_ns,
+        char *err,
+        size_t errcap);
+bool ds4_test_laguna_file_identity_matches(
+        int fd,
+        uint64_t device,
+        uint64_t inode,
+        uint64_t size_bytes,
+        uint64_t mtime_ns,
         char *err,
         size_t errcap);
 bool ds4_test_gpu_config_working_set_bytes(

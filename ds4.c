@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_laguna_plan.h"
 #include "ds4_laguna_stream.h"
 #include "ds4_tp.h"
 
@@ -2146,6 +2147,7 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    ds4_laguna_file_identity identity;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2160,6 +2162,94 @@ typedef struct {
     ds4_kv *kv;
     ds4_tensor *tensors;
 } ds4_model;
+
+static bool laguna_file_identity_capture(
+        int fd,
+        ds4_laguna_file_identity *identity,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    if (!identity) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "model identity output is null");
+        }
+        return false;
+    }
+    memset(identity, 0, sizeof(*identity));
+
+    struct stat status;
+    if (fd < 0 || fstat(fd, &status) != 0) {
+        const int saved_errno = fd < 0 ? EBADF : errno;
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "cannot stat opened model: %s",
+                     strerror(saved_errno));
+        }
+        return false;
+    }
+    if (status.st_size < 0) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "opened model has a negative size");
+        }
+        return false;
+    }
+
+#if defined(__APPLE__)
+    const time_t mtime_seconds = status.st_mtimespec.tv_sec;
+    const long mtime_nanoseconds = status.st_mtimespec.tv_nsec;
+#else
+    const time_t mtime_seconds = status.st_mtim.tv_sec;
+    const long mtime_nanoseconds = status.st_mtim.tv_nsec;
+#endif
+    const uintmax_t device = (uintmax_t)status.st_dev;
+    const uintmax_t inode = (uintmax_t)status.st_ino;
+    const uintmax_t size_bytes = (uintmax_t)status.st_size;
+    if (device > UINT64_MAX || inode > UINT64_MAX ||
+        size_bytes > UINT64_MAX || mtime_seconds < 0 ||
+        mtime_nanoseconds < 0 || mtime_nanoseconds >= 1000000000L) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "opened model stat identity is out of range");
+        }
+        return false;
+    }
+    const uintmax_t seconds = (uintmax_t)mtime_seconds;
+    const uint64_t nanoseconds = (uint64_t)mtime_nanoseconds;
+    if (seconds > (UINT64_MAX - nanoseconds) / UINT64_C(1000000000)) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "opened model mtime identity overflows");
+        }
+        return false;
+    }
+
+    identity->device = (uint64_t)device;
+    identity->inode = (uint64_t)inode;
+    identity->size_bytes = (uint64_t)size_bytes;
+    identity->mtime_ns =
+        (uint64_t)seconds * UINT64_C(1000000000) + nanoseconds;
+    return true;
+}
+
+static bool laguna_file_identity_matches(
+        int fd,
+        const ds4_laguna_file_identity *expected,
+        char *err,
+        size_t errcap) {
+    ds4_laguna_file_identity actual;
+    if (!expected ||
+        !laguna_file_identity_capture(fd, &actual, err, errcap)) {
+        return false;
+    }
+    if (actual.device != expected->device ||
+        actual.inode != expected->inode ||
+        actual.size_bytes != expected->size_bytes ||
+        actual.mtime_ns != expected->mtime_ns) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "opened model file identity changed during qualification planning");
+        }
+        return false;
+    }
+    return true;
+}
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -2514,6 +2604,12 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     struct stat st;
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
     if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
+    char identity_err[192];
+    if (!laguna_file_identity_capture(
+            fd, &m->identity, identity_err, sizeof(identity_err))) {
+        ds4_die(identity_err[0] ? identity_err :
+                "cannot capture opened model identity");
+    }
 
     /*
      * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
@@ -58127,6 +58223,47 @@ int ds4_test_qualification_plan_preflight(
         opt, gpu_config_requested, err, errcap);
 }
 
+bool ds4_test_laguna_file_identity_capture(
+        int fd,
+        uint64_t *device,
+        uint64_t *inode,
+        uint64_t *size_bytes,
+        uint64_t *mtime_ns,
+        char *err,
+        size_t errcap) {
+    if (device) *device = 0;
+    if (inode) *inode = 0;
+    if (size_bytes) *size_bytes = 0;
+    if (mtime_ns) *mtime_ns = 0;
+    if (!device || !inode || !size_bytes || !mtime_ns) return false;
+    ds4_laguna_file_identity identity;
+    if (!laguna_file_identity_capture(fd, &identity, err, errcap)) {
+        return false;
+    }
+    *device = identity.device;
+    *inode = identity.inode;
+    *size_bytes = identity.size_bytes;
+    *mtime_ns = identity.mtime_ns;
+    return true;
+}
+
+bool ds4_test_laguna_file_identity_matches(
+        int fd,
+        uint64_t device,
+        uint64_t inode,
+        uint64_t size_bytes,
+        uint64_t mtime_ns,
+        char *err,
+        size_t errcap) {
+    const ds4_laguna_file_identity expected = {
+        .device = device,
+        .inode = inode,
+        .size_bytes = size_bytes,
+        .mtime_ns = mtime_ns,
+    };
+    return laguna_file_identity_matches(fd, &expected, err, errcap);
+}
+
 int ds4_test_engine_exact_cache_preflight(
         bool recommended_known,
         uint64_t recommended_bytes,
@@ -58589,6 +58726,135 @@ int ds4_engine_options_preflight(const ds4_engine_options *opt,
                                  size_t errcap) {
     return ds4_engine_options_preflight_with_gpu_config(
         opt, NULL, err, errcap);
+}
+
+static void qualification_plan_error(char *err,
+                                     size_t errcap,
+                                     const char *stage,
+                                     const char *detail) {
+    if (!err || errcap == 0) return;
+    snprintf(err, errcap, "qualification-plan %s: %s",
+             stage, detail && detail[0] ? detail : "unknown error");
+}
+
+int ds4_engine_write_qualification_plan(
+        const ds4_engine_options *opt,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    char detail[512];
+    const int preflight_rc = ds4_qualification_plan_options_preflight(
+        opt, false, detail, sizeof(detail));
+    if (preflight_rc != 0) {
+        qualification_plan_error(err, errcap, "options", detail);
+        return preflight_rc;
+    }
+    if (!ds4_plan_io_preflight_target(
+            opt->qualification_plan_path, detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "output", detail);
+        return 2;
+    }
+
+    ds4_model model;
+    memset(&model, 0, sizeof(model));
+    model.fd = -1;
+    ds4_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    ds4_laguna_ledger ledger;
+    memset(&ledger, 0, sizeof(ledger));
+    ds4_laguna_page_plan page_plan;
+    memset(&page_plan, 0, sizeof(page_plan));
+    char *plan_bytes = NULL;
+    size_t plan_size = 0;
+    int rc = 2;
+
+    model_open(&model, opt->model_path, false, false);
+    config_validate_model(&model);
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
+        qualification_plan_error(
+            err, errcap, "model", "the opened GGUF is not Laguna S 2.1");
+        goto cleanup;
+    }
+    weights_bind(&weights, &model, false, 0, 0, true);
+    if (!laguna_ledger_build_from_bound_weights(
+            &ledger, &model, &weights, detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "ledger", detail);
+        goto cleanup;
+    }
+
+    const ds4_laguna_allocation_plan_spec allocation_spec = {
+        .configured_cache_bytes = opt->ssd_streaming_cache_bytes,
+        .context_tokens = (uint32_t)opt->context_size,
+        .prefill_rows = opt->prefill_chunk,
+        .session_count = opt->session_slots != 0 ? opt->session_slots : 1u,
+    };
+    ds4_laguna_allocation_plan allocation_plan;
+    memset(&allocation_plan, 0, sizeof(allocation_plan));
+    if (!ds4_laguna_allocation_plan_make(
+            &allocation_plan, &ledger, &allocation_spec,
+            detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "allocation", detail);
+        goto cleanup;
+    }
+
+    const long host_page_size = sysconf(_SC_PAGESIZE);
+    if (host_page_size <= 0 ||
+        !ds4_laguna_page_plan_make(
+            &page_plan, &ledger, (uint64_t)host_page_size,
+            detail, sizeof(detail))) {
+        if (host_page_size <= 0) {
+            snprintf(detail, sizeof(detail),
+                     "host page size is unavailable");
+        }
+        qualification_plan_error(err, errcap, "page cache", detail);
+        goto cleanup;
+    }
+    if (!laguna_file_identity_matches(
+            model.fd, &model.identity, detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "model identity", detail);
+        goto cleanup;
+    }
+
+    const ds4_laguna_qualification_plan_input input = {
+        .model_identity = model.identity,
+        .ledger = &ledger,
+        .allocation = &allocation_plan,
+        .page_cache = &page_plan,
+    };
+    char ledger_sha256[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    if (!ds4_laguna_qualification_plan_serialize(
+            &input, &plan_bytes, &plan_size, ledger_sha256,
+            detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "serialization", detail);
+        goto cleanup;
+    }
+    if (!laguna_file_identity_matches(
+            model.fd, &model.identity, detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "model identity", detail);
+        goto cleanup;
+    }
+
+    char plan_sha256[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    if (!ds4_plan_io_publish(
+            opt->qualification_plan_path, plan_bytes, plan_size,
+            plan_sha256, detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "publication", detail);
+        goto cleanup;
+    }
+    if (!laguna_file_identity_matches(
+            model.fd, &model.identity, detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "model identity", detail);
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_laguna_qualification_plan_bytes_free(plan_bytes);
+    ds4_laguna_page_plan_free(&page_plan);
+    ds4_laguna_ledger_free(&ledger);
+    weights_free(&weights);
+    model_close(&model);
+    return rc;
 }
 
 static int ds4_engine_open_internal(ds4_engine **out,

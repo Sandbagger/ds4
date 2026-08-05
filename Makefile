@@ -335,6 +335,8 @@ test-laguna-stream: tests/test_laguna_stream tests/test_runtime_cpp_link
 	./tests/test_laguna_stream --case options
 	./tests/test_laguna_stream --case ledger
 	./tests/test_laguna_stream --case allocation
+	./tests/test_laguna_stream --case cache-policy
+	./tests/test_laguna_stream --case grouping
 	./tests/test_runtime_cpp_link
 
 ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -486,6 +488,8 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract tes
 	./tests/test_laguna_stream --case options
 	./tests/test_laguna_stream --case ledger
 	./tests/test_laguna_stream --case allocation
+	./tests/test_laguna_stream --case cache-policy
+	./tests/test_laguna_stream --case grouping
 	./tests/test_runtime_cpp_link
 	./tests/test_plan_io
 	./tests/test_laguna_plan

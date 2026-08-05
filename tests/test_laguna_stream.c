@@ -17,6 +17,17 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Review-gap RED declarations. Production exposes these pure policy helpers
+ * in the GREEN commit; keeping the wished-for signatures here makes their
+ * absence an explicit link failure instead of an implicit C declaration. */
+ds4_laguna_cache_status ds4_laguna_cache_policy_note_routes(
+    ds4_laguna_cache_policy *policy,
+    const ds4_laguna_expert_key *keys,
+    size_t key_count);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_audit(
+    const ds4_laguna_cache_policy *policy);
+
 static int g_failed;
 static int g_total;
 
@@ -1226,6 +1237,169 @@ static void test_cache_lifecycle_and_hits(void) {
           "final unpin returns the slot to ready with monotonic last-used state");
 }
 
+static void test_cache_acquire_reserves_current_group(void) {
+    cache_fixture f;
+    CHECK(cache_fixture_init(&f, 2u, 2u),
+          "current-group reservation fixture initializes");
+    ds4_laguna_cache_handle first = {0};
+    ds4_laguna_cache_handle second = {0};
+    ds4_laguna_cache_handle pressure = {0};
+    bool hit = true;
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(0), &first, &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              !hit && f.entry_to_slot[0] == first.slot_index,
+          "load ownership reserves the key-to-slot mapping before publication");
+    CHECK(ds4_laguna_cache_policy_publish(
+              &f.policy, first) == DS4_LAGUNA_CACHE_OK &&
+              f.slots[first.slot_index].state ==
+                  DS4_LAGUNA_CACHE_SLOT_IN_USE &&
+              f.slots[first.slot_index].refs == 1u,
+          "publishing a miss atomically reserves its initial group reference");
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(1), &second, &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              ds4_laguna_cache_policy_publish(
+                  &f.policy, second) == DS4_LAGUNA_CACHE_OK &&
+              f.slots[second.slot_index].state ==
+                  DS4_LAGUNA_CACHE_SLOT_IN_USE &&
+              f.slots[second.slot_index].refs == 1u,
+          "a later group member receives its own atomic reservation");
+    f.route_hotness[0] = 0;
+    f.route_hotness[1] = 10u;
+    hit = true;
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(2), &pressure, &hit) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              pressure.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE && !hit &&
+              f.entry_to_slot[0] == first.slot_index,
+          "a full reserved group refuses pressure instead of evicting its low-hotness first member");
+
+    cache_fixture hit_fixture;
+    CHECK(cache_fixture_init(&hit_fixture, 1u, 1u),
+          "hit reservation fixture initializes");
+    ds4_laguna_cache_handle owner = {0};
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &hit_fixture.policy, fixture_key(0), &owner, &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              ds4_laguna_cache_policy_publish(
+                  &hit_fixture.policy, owner) == DS4_LAGUNA_CACHE_OK,
+          "hit reservation fixture publishes one owner");
+    CHECK(ds4_laguna_cache_policy_unpin(
+              &hit_fixture.policy, owner) == DS4_LAGUNA_CACHE_OK &&
+              hit_fixture.slots[0].state == DS4_LAGUNA_CACHE_SLOT_READY,
+          "owner releases its initial reservation before the hit probe");
+    ds4_laguna_cache_handle reused = {0};
+    hit = false;
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &hit_fixture.policy, fixture_key(0), &reused, &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              hit && hit_fixture.slots[0].state ==
+                  DS4_LAGUNA_CACHE_SLOT_IN_USE &&
+              hit_fixture.slots[0].refs == 1u,
+          "a ready hit atomically reserves its initial group reference");
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &hit_fixture.policy, fixture_key(1), &pressure, &hit) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              pressure.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "an acquired hit cannot be evicted before the owner releases it");
+}
+
+static void test_cache_observers_have_no_owner_capability(void) {
+    cache_fixture f;
+    CHECK(cache_fixture_init(&f, 2u, 2u),
+          "observer capability fixture initializes");
+    ds4_laguna_cache_handle owner = {0};
+    ds4_laguna_cache_handle observer = {0};
+    bool hit = true;
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(0), &owner, &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              !hit && f.entry_to_slot[0] == owner.slot_index,
+          "load owner receives the only mutation-capable handle");
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(0), &observer, &hit) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              observer.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "duplicate loading observer receives busy without an owner handle");
+    const ds4_laguna_cache_slot loading = f.slots[owner.slot_index];
+    CHECK(ds4_laguna_cache_policy_publish(
+              &f.policy, observer) == DS4_LAGUNA_CACHE_UNSAFE &&
+              memcmp(&loading, &f.slots[owner.slot_index],
+                     sizeof(loading)) == 0 &&
+              ds4_laguna_cache_policy_publish(
+                  &f.policy, owner) == DS4_LAGUNA_CACHE_OK,
+          "loading observer cannot publish the owner's completion");
+    observer.slot_index = 0u;
+    observer.generation = 99u;
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(0), &observer, &hit) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              observer.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "in-use observer receives busy without a reusable owner handle");
+
+    cache_fixture fail_fixture;
+    CHECK(cache_fixture_init(&fail_fixture, 1u, 1u),
+          "observer failure fixture initializes");
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &fail_fixture.policy, fixture_key(1), &owner, &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              ds4_laguna_cache_policy_acquire(
+                  &fail_fixture.policy, fixture_key(1), &observer, &hit) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              observer.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "duplicate failure observer receives no load capability");
+    const ds4_laguna_cache_slot before_fail =
+        fail_fixture.slots[owner.slot_index];
+    CHECK(ds4_laguna_cache_policy_fail(
+              &fail_fixture.policy, observer) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              memcmp(&before_fail,
+                     &fail_fixture.slots[owner.slot_index],
+                     sizeof(before_fail)) == 0 &&
+              ds4_laguna_cache_policy_fail(
+                  &fail_fixture.policy, owner) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE,
+          "loading observer cannot fail or roll back the owner's slot");
+}
+
+static void test_cache_hot_path_ignores_unrelated_corruption(void) {
+    cache_fixture f;
+    CHECK(cache_fixture_init(&f, 2u, 2u),
+          "hot-path locality fixture initializes");
+    f.entry_to_slot[7] = 0u;
+    CHECK(ds4_laguna_cache_policy_note_route(
+              &f.policy, fixture_key(0)) == DS4_LAGUNA_CACHE_OK &&
+              f.route_hotness[0] == 1u,
+          "route accounting validates only its touched key rather than globally scanning cache state");
+    f.entry_to_slot[7] = DS4_LAGUNA_CACHE_SLOT_NONE;
+}
+
+static void test_cache_batched_route_note_and_explicit_audit(void) {
+    cache_fixture f;
+    CHECK(cache_fixture_init(&f, 2u, 2u),
+          "batched route-note fixture initializes");
+    const ds4_laguna_expert_key selected[] = {
+        fixture_key(0), fixture_key(0), fixture_key(1), fixture_key(2),
+    };
+    CHECK(ds4_laguna_cache_policy_note_routes(
+              &f.policy, selected,
+              sizeof(selected) / sizeof(selected[0])) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              f.route_hotness[0] == 2u &&
+              f.route_hotness[1] == 1u &&
+              f.route_hotness[2] == 1u,
+          "one batched route-note call accounts every admitted selection including duplicates");
+    f.entry_to_slot[7] = 0u;
+    CHECK(ds4_laguna_cache_policy_audit(
+              &f.policy) == DS4_LAGUNA_CACHE_UNSAFE,
+          "explicit full audit detects corruption outside the hot path's touched key");
+    f.entry_to_slot[7] = DS4_LAGUNA_CACHE_SLOT_NONE;
+    CHECK(ds4_laguna_cache_policy_audit(
+              &f.policy) == DS4_LAGUNA_CACHE_OK,
+          "explicit full audit accepts restored policy invariants");
+}
+
 static void test_cache_hotness_saturates(void) {
     cache_fixture f;
     CHECK(cache_fixture_init(&f, 1u, 1u),
@@ -1369,6 +1543,23 @@ static void test_cache_victim_ordering(void) {
               f.entry_to_slot[0] == DS4_LAGUNA_CACHE_SLOT_NONE,
           "equal-hotness victim selection evicts the oldest last-used entry");
 
+    CHECK(cache_fixture_init(&f, 2u, 2u) &&
+              cache_load(&f, fixture_key(0), &handles[0]) &&
+              cache_load(&f, fixture_key(1), &handles[1]),
+          "strict age fixture fills lower-key slot zero before slot one");
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(0), &handles[2], &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              hit && f.slots[0].last_used > f.slots[1].last_used,
+          "strict age fixture makes lower-key slot zero newer than slot one");
+    CHECK(ds4_laguna_cache_policy_acquire(
+              &f.policy, fixture_key(2), &handles[3], &hit) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              handles[3].slot_index == handles[1].slot_index &&
+              f.entry_to_slot[1] == DS4_LAGUNA_CACHE_SLOT_NONE &&
+              f.entry_to_slot[0] == handles[0].slot_index,
+          "equal-hotness victim selection evicts older slot one before newer lower key");
+
     CHECK(cache_fixture_init(&f, 3u, 3u) &&
               cache_load(&f, fixture_key(6), &handles[0]) &&
               cache_load(&f, fixture_key(1), &handles[1]) &&
@@ -1493,6 +1684,10 @@ static void test_cache_unsafe_boundaries(void) {
 static void test_cache_policy(void) {
     test_cache_initialization_and_keys();
     test_cache_lifecycle_and_hits();
+    test_cache_acquire_reserves_current_group();
+    test_cache_observers_have_no_owner_capability();
+    test_cache_hot_path_ignores_unrelated_corruption();
+    test_cache_batched_route_note_and_explicit_audit();
     test_cache_hotness_saturates();
     test_cache_failed_load_and_stale_completion();
     test_cache_cancellation_states();
@@ -1601,9 +1796,60 @@ static void test_grouping_rejections_and_capacity(void) {
           "insufficient caller-owned output capacity is recoverable and publishes no groups");
 }
 
+static void test_grouping_overlap_contract(void) {
+    cache_fixture f;
+    CHECK(cache_fixture_init(&f, 3u, 3u),
+          "grouping overlap fixture initializes");
+    ds4_laguna_expert_key in_place[8] = {
+        fixture_key(0), fixture_key(0), fixture_key(1),
+        fixture_key(2), fixture_key(1), fixture_key(3),
+        { UINT32_MAX, UINT32_MAX }, { UINT32_MAX, UINT32_MAX },
+    };
+    ds4_laguna_expert_group groups[4];
+    memset(groups, 0xa5, sizeof(groups));
+    size_t key_count = 99u;
+    size_t group_count = 99u;
+    CHECK(ds4_laguna_cache_policy_group(
+              &f.policy, in_place, 2u, 3u,
+              in_place, 8u, groups, 4u,
+              &key_count, &group_count) == DS4_LAGUNA_CACHE_OK &&
+              key_count == 4u && group_count == 2u,
+          "grouping supports exact in-place stable compaction");
+    for (size_t i = 0; i < key_count; i++) {
+        CHECK(key_equal(in_place[i], fixture_key(i)),
+              "in-place grouping preserves stable first occurrence");
+    }
+    const ds4_laguna_expert_key zero_key = {0};
+    CHECK(memcmp(&in_place[4], &zero_key, sizeof(zero_key)) == 0 &&
+              memcmp(&in_place[5], &zero_key, sizeof(zero_key)) == 0 &&
+              memcmp(&in_place[6], &zero_key, sizeof(zero_key)) == 0 &&
+              memcmp(&in_place[7], &zero_key, sizeof(zero_key)) == 0 &&
+              groups[0].first_key == 0u && groups[0].key_count == 3u &&
+              groups[1].first_key == 3u && groups[1].key_count == 1u,
+          "in-place grouping deterministically zero-fills unused output capacity");
+
+    ds4_laguna_expert_key partial[8] = {
+        fixture_key(0), fixture_key(0), fixture_key(1),
+        fixture_key(2), fixture_key(1), fixture_key(3),
+        { 77u, 77u }, { 88u, 88u },
+    };
+    ds4_laguna_expert_key before[8];
+    memcpy(before, partial, sizeof(before));
+    key_count = 99u;
+    group_count = 99u;
+    CHECK(ds4_laguna_cache_policy_group(
+              &f.policy, partial, 2u, 3u,
+              &partial[1], 6u, groups, 4u,
+              &key_count, &group_count) == DS4_LAGUNA_CACHE_UNSAFE &&
+              key_count == 0 && group_count == 0 &&
+              memcmp(partial, before, sizeof(before)) == 0,
+          "grouping rejects partial overlap before mutating input or logical outputs");
+}
+
 static void test_grouping(void) {
     test_grouping_stable_first_occurrence();
     test_grouping_rejections_and_capacity();
+    test_grouping_overlap_contract();
 }
 
 static uint64_t sum_u64(const uint64_t *values, size_t count) {

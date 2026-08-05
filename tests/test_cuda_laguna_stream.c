@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -84,6 +85,67 @@ typedef struct {
 typedef struct {
     char *values[ARRAY_LEN(forbidden_cuda_env)];
 } saved_environment;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    unsigned arrived;
+    unsigned target;
+    unsigned generation;
+} test_barrier;
+
+static bool test_barrier_init(test_barrier *barrier, unsigned target) {
+    memset(barrier, 0, sizeof(*barrier));
+    barrier->target = target;
+    return target != 0 && pthread_mutex_init(&barrier->mutex, NULL) == 0 &&
+        pthread_cond_init(&barrier->condition, NULL) == 0;
+}
+
+static bool test_barrier_wait(test_barrier *barrier) {
+    if (pthread_mutex_lock(&barrier->mutex) != 0) return false;
+    const unsigned generation = barrier->generation;
+    barrier->arrived++;
+    if (barrier->arrived == barrier->target) {
+        barrier->arrived = 0;
+        barrier->generation++;
+        pthread_cond_broadcast(&barrier->condition);
+    } else {
+        while (generation == barrier->generation) {
+            if (pthread_cond_wait(
+                    &barrier->condition, &barrier->mutex) != 0) {
+                pthread_mutex_unlock(&barrier->mutex);
+                return false;
+            }
+        }
+    }
+    return pthread_mutex_unlock(&barrier->mutex) == 0;
+}
+
+static void test_barrier_destroy(test_barrier *barrier) {
+    pthread_cond_destroy(&barrier->condition);
+    pthread_mutex_destroy(&barrier->mutex);
+}
+
+typedef struct {
+    test_barrier *barrier;
+    int model_fd;
+    const void *model_map;
+    uint64_t model_size;
+    const ds4_laguna_ledger *ledger;
+    const ds4_laguna_allocation_plan *plan;
+    tracker_fixture *runtime;
+    ds4_gpu_laguna_compact *context;
+    int created;
+} creator_race;
+
+static void *creator_race_run(void *opaque) {
+    creator_race *race = opaque;
+    if (!test_barrier_wait(race->barrier)) return NULL;
+    race->created = ds4_gpu_laguna_compact_create(
+        &race->context, race->model_fd, race->model_map, race->model_size,
+        race->ledger, race->plan, &race->runtime->tracker);
+    return NULL;
+}
 
 static void fixture_tensor(
         ledger_fixture *fixture,
@@ -451,31 +513,34 @@ static int run_startup(void) {
         fd, model_map, sizeof(model_bytes), &ledger, &bad_plan,
         "truncated static allocation plan fails closed");
 
+    const char *const present_values[] = {"", "0", "1"};
     for (size_t i = 0; i < ARRAY_LEN(forbidden_cuda_env); i++) {
-        tracker_fixture runtime;
-        CHECK(tracker_fixture_init(&runtime, &plan, &ledger),
-              "forbidden-environment tracker initializes");
-        const uint64_t attempts_before =
-            ds4_gpu_test_laguna_compact_static_allocation_attempts();
-        CHECK(setenv(forbidden_cuda_env[i], "1", 1) == 0,
-              "forbidden CUDA environment can be injected");
-        ds4_gpu_laguna_compact *rejected = NULL;
-        const int created = ds4_gpu_laguna_compact_create(
-            &rejected, fd, model_map, sizeof(model_bytes),
-            &ledger, &plan, &runtime.tracker);
-        if (created || rejected) {
-            fprintf(stderr, "unexpected acceptance: %s\n",
-                    forbidden_cuda_env[i]);
+        for (size_t j = 0; j < ARRAY_LEN(present_values); j++) {
+            tracker_fixture runtime;
+            CHECK(tracker_fixture_init(&runtime, &plan, &ledger),
+                  "forbidden-environment tracker initializes");
+            const uint64_t attempts_before =
+                ds4_gpu_test_laguna_compact_static_allocation_attempts();
+            CHECK(setenv(forbidden_cuda_env[i], present_values[j], 1) == 0,
+                  "forbidden CUDA environment can be injected by presence");
+            ds4_gpu_laguna_compact *rejected = NULL;
+            const int created = ds4_gpu_laguna_compact_create(
+                &rejected, fd, model_map, sizeof(model_bytes),
+                &ledger, &plan, &runtime.tracker);
+            if (created || rejected) {
+                fprintf(stderr, "unexpected acceptance: %s=%s\n",
+                        forbidden_cuda_env[i], present_values[j]);
+            }
+            CHECK(!created && rejected == NULL,
+                  "unsafe present CUDA model/cache option is rejected");
+            CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+                      attempts_before,
+                  "unsafe CUDA option fails before static CUDA allocation");
+            CHECK(tracker_has_only_ledger(&runtime.tracker),
+                  "unsafe CUDA option leaves only live ledger records");
+            ds4_gpu_laguna_compact_destroy(rejected);
+            unsetenv(forbidden_cuda_env[i]);
         }
-        CHECK(!created && rejected == NULL,
-              "unsafe positive CUDA model/cache option is rejected");
-        CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
-                  attempts_before,
-              "unsafe CUDA option fails before static CUDA allocation");
-        CHECK(tracker_has_only_ledger(&runtime.tracker),
-              "unsafe CUDA option leaves only live ledger records");
-        ds4_gpu_laguna_compact_destroy(rejected);
-        unsetenv(forbidden_cuda_env[i]);
     }
 
     CHECK(setenv("DS4_CUDA_NO_MODEL_COPY", "1", 1) == 0 &&
@@ -637,6 +702,50 @@ static int run_startup(void) {
               ledger.tensor_ranges[0].source_bytes,
               0, &after_destroy),
           "teardown removes compact static lookup entries before freeing slab");
+
+    tracker_fixture race_runtime[2];
+    CHECK(tracker_fixture_init(&race_runtime[0], &plan, &ledger) &&
+              tracker_fixture_init(&race_runtime[1], &plan, &ledger),
+          "creator-race trackers initialize with ledger ownership");
+    test_barrier barrier;
+    pthread_t creators[2];
+    creator_race race[2] = {
+        {.barrier = &barrier, .model_fd = fd, .model_map = model_map,
+         .model_size = sizeof(model_bytes), .ledger = &ledger, .plan = &plan,
+         .runtime = &race_runtime[0]},
+        {.barrier = &barrier, .model_fd = fd, .model_map = model_map,
+         .model_size = sizeof(model_bytes), .ledger = &ledger, .plan = &plan,
+         .runtime = &race_runtime[1]},
+    };
+    CHECK(test_barrier_init(&barrier, 3) &&
+              pthread_create(&creators[0], NULL, creator_race_run, &race[0]) == 0 &&
+              pthread_create(&creators[1], NULL, creator_race_run, &race[1]) == 0,
+          "two concurrent compact creators reach one barrier");
+    const uint64_t attempts_before_race =
+        ds4_gpu_test_laguna_compact_static_allocation_attempts();
+    (void)test_barrier_wait(&barrier);
+    CHECK(pthread_join(creators[0], NULL) == 0 &&
+              pthread_join(creators[1], NULL) == 0,
+          "concurrent compact creators finish");
+    test_barrier_destroy(&barrier);
+    const int race_successes = race[0].created + race[1].created;
+    CHECK(race_successes == 1 &&
+              ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+                  attempts_before_race + 1u,
+          "creator race publishes one context with one slab attempt");
+    ds4_gpu_laguna_compact_destroy(
+        race[0].created ? race[0].context : race[1].context);
+
+    tracker_fixture reusable_runtime;
+    ds4_gpu_laguna_compact *reusable = NULL;
+    CHECK(tracker_fixture_init(&reusable_runtime, &plan, &ledger) &&
+              ds4_gpu_laguna_compact_create(
+                  &reusable, fd, model_map, sizeof(model_bytes),
+                  &ledger, &plan, &reusable_runtime.tracker) &&
+              reusable != NULL,
+          "singleton is reusable after raced attachment teardown");
+    ds4_gpu_laguna_compact_destroy(reusable);
+
     ds4_laguna_ledger_free(&ledger);
     CHECK(tracker_fixture_release_ledger(&runtime),
           "ledger records release after their physical arrays are freed");
@@ -691,11 +800,25 @@ static int run_model_startup(void) {
     CHECK(engine && ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "pinned engine owns one active compact attachment");
     CHECK(compact.model_map != NULL && compact.model_size != 0 &&
+              compact.static_offset_count == 814 &&
+              compact.static_offset_bytes == 6512 &&
+              compact.static_range_count == 673 &&
+              compact.static_slab_bytes == UINT64_C(4374164480) &&
               compact.model_mapping_registered_bytes == 0 &&
               compact.whole_model_copied_bytes == 0 &&
               compact.routed_payload_bytes == 0 &&
               compact.opportunistic_range_allocated_bytes == 0,
           "pinned startup remains static-only and never registers the model map");
+    ds4_test_laguna_compact_bypass_snapshot bypass;
+    memset(&bypass, 0, sizeof(bypass));
+    CHECK(ds4_test_laguna_compact_bypass_snapshot_get(&bypass) &&
+              bypass.model_fd_entries == 0 &&
+              bypass.model_map_entries == 0 &&
+              bypass.model_range_entries == 0 &&
+              bypass.model_span_entries == 0 &&
+              bypass.model_cache_entries == 0 &&
+              bypass.model_warm_entries == 0,
+          "pinned compact startup bypasses every legacy model entrypoint");
     ds4_engine_close(engine);
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "pinned engine teardown destroys compact attachment");

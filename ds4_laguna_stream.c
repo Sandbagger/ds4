@@ -588,6 +588,9 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_unpin(
 ds4_laguna_cache_status ds4_laguna_cache_policy_fail(
         ds4_laguna_cache_policy *policy,
         ds4_laguna_cache_handle handle) {
+    if (ds4_laguna_cache_policy_audit(policy) != DS4_LAGUNA_CACHE_OK) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
     ds4_laguna_cache_slot *slot = NULL;
     size_t entry_index = SIZE_MAX;
     const ds4_laguna_cache_status resolved =
@@ -601,14 +604,18 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_fail(
     }
     policy->entry_to_slot[entry_index] = DS4_LAGUNA_CACHE_SLOT_NONE;
     cache_slot_clear(slot);
-    return DS4_LAGUNA_CACHE_RECOVERABLE;
+    return ds4_laguna_cache_policy_audit(policy) == DS4_LAGUNA_CACHE_OK
+               ? DS4_LAGUNA_CACHE_RECOVERABLE
+               : DS4_LAGUNA_CACHE_UNSAFE;
 }
 
 ds4_laguna_cache_status ds4_laguna_cache_policy_cancel(
         ds4_laguna_cache_policy *policy,
         ds4_laguna_cache_handle handle) {
-    if (!cache_policy_core_valid(policy) ||
-        handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+    if (ds4_laguna_cache_policy_audit(policy) != DS4_LAGUNA_CACHE_OK) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
         (size_t)handle.slot_index >= policy->slot_count) {
         return DS4_LAGUNA_CACHE_UNSAFE;
     }
@@ -636,12 +643,16 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_cancel(
     }
     policy->entry_to_slot[entry_index] = DS4_LAGUNA_CACHE_SLOT_NONE;
     cache_slot_clear(slot);
-    return DS4_LAGUNA_CACHE_RECOVERABLE;
+    return ds4_laguna_cache_policy_audit(policy) == DS4_LAGUNA_CACHE_OK
+               ? DS4_LAGUNA_CACHE_RECOVERABLE
+               : DS4_LAGUNA_CACHE_UNSAFE;
 }
 
 ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
         ds4_laguna_cache_policy *policy) {
-    if (!cache_policy_core_valid(policy)) return DS4_LAGUNA_CACHE_UNSAFE;
+    if (ds4_laguna_cache_policy_audit(policy) != DS4_LAGUNA_CACHE_OK) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
     bool in_use = false;
     for (size_t i = 0; i < policy->slot_count; i++) {
         if (!cache_slot_state_valid(policy, i, NULL)) {
@@ -665,7 +676,7 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
             cache_slot_clear(slot);
         }
     }
-    return DS4_LAGUNA_CACHE_OK;
+    return ds4_laguna_cache_policy_audit(policy);
 }
 
 static void cache_group_outputs_clear(

@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /* CUDA startup contract for the compact Laguna attachment.
  *
  * The synthetic case is model-independent and safe to run beside an existing
@@ -61,6 +63,10 @@ static const char *const forbidden_cuda_env[] = {
     "DS4_CUDA_Q8_F32_LARGE",
     "DS4_CUDA_ATTN_Q_B_F32_CACHE",
     "DS4_CUDA_ATTENTION_OUTPUT_PRELOAD",
+    "DS4_CUDA_MODEL_COPY_CHUNK_MB",
+    "DS4_CUDA_Q8_F16_CACHE_MB",
+    "DS4_CUDA_Q8_F16_CACHE_RESERVE_MB",
+    "DS4_CUDA_STRICT_WEIGHT_CACHE",
 };
 
 typedef struct {
@@ -72,6 +78,7 @@ typedef struct {
 typedef struct {
     ds4_runtime_allocation_record records[TRACKER_RECORD_CAPACITY];
     ds4_runtime_tracker tracker;
+    uint64_t ledger_ids[3];
 } tracker_fixture;
 
 typedef struct {
@@ -178,16 +185,24 @@ static void plan_prepare(
         ledger->static_aligned_device_bytes;
     const uint64_t static_offset_bytes =
         ledger->tensor_range_count * sizeof(uint64_t);
+    const uint64_t ledger_array_bytes =
+        ledger->tensor_range_count * sizeof(ledger->tensor_ranges[0]) +
+        (ledger->tensor_range_count * 2u + 5u) *
+            sizeof(ledger->source_ranges[0]) +
+        ledger->expert_entry_count * sizeof(ledger->expert_entries[0]);
     plan->owned_category_bounds[
         DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] =
             static_offset_bytes;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] =
+        ledger_array_bytes;
     plan->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] =
         ledger->file_size;
     plan->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 0;
     plan->owned_total_bound_bytes =
-        ledger->static_aligned_device_bytes + static_offset_bytes;
+        ledger->static_aligned_device_bytes + static_offset_bytes +
+        ledger_array_bytes;
     plan->qualification_total_bound_bytes = plan->owned_total_bound_bytes;
-    plan->callsite_count = 3;
+    plan->callsite_count = 4;
     plan->callsites[0] = (ds4_runtime_callsite){
         .id = DS4_LAGUNA_CALLSITE_STATIC_SLAB,
         .name = "laguna.static_slab",
@@ -209,11 +224,19 @@ static void plan_prepare(
         .domain = DS4_RUNTIME_DOMAIN_HOST,
         .bound_bytes = static_offset_bytes,
     };
+    plan->callsites[3] = (ds4_runtime_callsite){
+        .id = DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+        .name = "laguna.ledger_arrays",
+        .category = DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        .domain = DS4_RUNTIME_DOMAIN_HOST,
+        .bound_bytes = ledger_array_bytes,
+    };
 }
 
 static bool tracker_fixture_init(
         tracker_fixture *fixture,
-        const ds4_laguna_allocation_plan *plan) {
+        const ds4_laguna_allocation_plan *plan,
+        const ds4_laguna_ledger *ledger) {
     memset(fixture, 0, sizeof(*fixture));
     ds4_runtime_tracker_config config = {
         .callsites = plan->callsites,
@@ -228,8 +251,45 @@ static bool tracker_fixture_init(
            sizeof(config.category_bounds));
     memcpy(config.report_bounds, plan->report_bounds,
            sizeof(config.report_bounds));
-    return ds4_runtime_tracker_init(&fixture->tracker, &config) ==
-           DS4_RUNTIME_STATUS_OK;
+    if (ds4_runtime_tracker_init(&fixture->tracker, &config) !=
+        DS4_RUNTIME_STATUS_OK) {
+        return false;
+    }
+    const uint64_t source_capacity = ledger->tensor_range_count * 2u + 5u;
+    const uint64_t requested[3] = {
+        ledger->tensor_range_count * sizeof(ledger->tensor_ranges[0]),
+        source_capacity * sizeof(ledger->source_ranges[0]),
+        ledger->expert_entry_count * sizeof(ledger->expert_entries[0]),
+    };
+    const void *base[3] = {
+        ledger->tensor_ranges,
+        ledger->source_ranges,
+        ledger->expert_entries,
+    };
+    for (size_t i = 0; i < ARRAY_LEN(fixture->ledger_ids); i++) {
+        fixture->ledger_ids[i] = UINT64_C(0x4c45444745520001) + i;
+        if (!base[i] || requested[i] == 0 ||
+            ds4_runtime_tracker_allocate(
+                &fixture->tracker, fixture->ledger_ids[i],
+                DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+                (uint64_t)(uintptr_t)base[i], requested[i], requested[i]) !=
+                DS4_RUNTIME_STATUS_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tracker_fixture_release_ledger(tracker_fixture *fixture) {
+    bool ok = true;
+    for (size_t i = 0; i < ARRAY_LEN(fixture->ledger_ids); i++) {
+        if (ds4_runtime_tracker_release(
+                &fixture->tracker, fixture->ledger_ids[i]) !=
+            DS4_RUNTIME_STATUS_OK) {
+            ok = false;
+        }
+    }
+    return ok;
 }
 
 static void save_and_clear_forbidden_environment(saved_environment *saved) {
@@ -252,20 +312,20 @@ static void restore_forbidden_environment(saved_environment *saved) {
     }
 }
 
-static bool tracker_is_pristine(const ds4_runtime_tracker *tracker) {
+static bool tracker_has_only_ledger(const ds4_runtime_tracker *tracker) {
     if (!tracker || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
-        tracker->record_count != 0 || tracker->owned_total_current != 0) {
+        tracker->record_count != 3) {
         return false;
     }
     for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
-        if (tracker->category_current[i] != 0 ||
-            tracker->category_peak[i] != 0) return false;
+        if (i == DS4_RUNTIME_CATEGORY_OTHER_HOST) continue;
+        if (tracker->category_current[i] != 0) return false;
     }
     for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
-        if (tracker->report_current[i] != 0 ||
-            tracker->report_peak[i] != 0) return false;
+        if (tracker->report_current[i] != 0) return false;
     }
-    return true;
+    return tracker->owned_total_current ==
+        tracker->category_current[DS4_RUNTIME_CATEGORY_OTHER_HOST];
 }
 
 static ds4_laguna_ledger ledger_with_copied_ranges(
@@ -288,7 +348,7 @@ static void expect_invalid_ledger_before_allocation(
         const ds4_laguna_allocation_plan *plan,
         const char *message) {
     tracker_fixture runtime;
-    CHECK(tracker_fixture_init(&runtime, plan),
+    CHECK(tracker_fixture_init(&runtime, plan, ledger),
           "invalid-ledger tracker initializes");
     const uint64_t attempts_before =
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
@@ -300,8 +360,8 @@ static void expect_invalid_ledger_before_allocation(
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before,
           "invalid ledger is rejected before a static CUDA allocation attempt");
-    CHECK(tracker_is_pristine(&runtime.tracker),
-          "invalid ledger leaves the runtime tracker pristine");
+    CHECK(tracker_has_only_ledger(&runtime.tracker),
+          "invalid ledger leaves only its live ledger records");
     ds4_gpu_laguna_compact_destroy(context);
 }
 
@@ -389,7 +449,7 @@ static int run_startup(void) {
 
     for (size_t i = 0; i < ARRAY_LEN(forbidden_cuda_env); i++) {
         tracker_fixture runtime;
-        CHECK(tracker_fixture_init(&runtime, &plan),
+        CHECK(tracker_fixture_init(&runtime, &plan, &ledger),
               "forbidden-environment tracker initializes");
         const uint64_t attempts_before =
             ds4_gpu_test_laguna_compact_static_allocation_attempts();
@@ -408,8 +468,8 @@ static int run_startup(void) {
         CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
                   attempts_before,
               "unsafe CUDA option fails before static CUDA allocation");
-        CHECK(tracker_is_pristine(&runtime.tracker),
-              "unsafe CUDA option leaves tracker pristine");
+        CHECK(tracker_has_only_ledger(&runtime.tracker),
+              "unsafe CUDA option leaves only live ledger records");
         ds4_gpu_laguna_compact_destroy(rejected);
         unsetenv(forbidden_cuda_env[i]);
     }
@@ -418,7 +478,7 @@ static int run_startup(void) {
               setenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE", "1", 1) == 0,
           "harmless disabling and verbose CUDA knobs can be injected");
     tracker_fixture runtime;
-    CHECK(tracker_fixture_init(&runtime, &plan),
+    CHECK(tracker_fixture_init(&runtime, &plan, &ledger),
           "startup runtime tracker initializes");
     const uint64_t attempts_before_create =
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
@@ -454,12 +514,12 @@ static int run_startup(void) {
           "startup creates no opportunistic range allocation or arena");
 
     ds4_runtime_snapshot runtime_snapshot;
-    ds4_runtime_allocation_record active[4];
+    ds4_runtime_allocation_record active[8];
     CHECK(ds4_runtime_tracker_snapshot_copy(
               &runtime.tracker, &runtime_snapshot,
               active, ARRAY_LEN(active)) &&
-              runtime_snapshot.active_record_count == 3,
-          "tracker records static slab/offsets and mapped virtual identity");
+              runtime_snapshot.active_record_count == 6,
+          "tracker preserves ledger records and adds compact attachment records");
     CHECK(runtime_snapshot.category_current[
               DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] == 512 &&
               runtime_snapshot.category_current[
@@ -478,7 +538,8 @@ static int run_startup(void) {
         const uint64_t offset = ledger.tensor_ranges[i].source_offset;
         const uint64_t bytes = ledger.tensor_ranges[i].source_bytes;
         void *device_ptr = NULL;
-        CHECK(ds4_gpu_lookup_cache_strict(offset, bytes, 0, &device_ptr) &&
+        CHECK(ds4_gpu_test_laguna_compact_lookup(
+                  context, offset, bytes, 0, &device_ptr) &&
                   device_ptr != NULL,
               "strict lookup hits a complete static range");
         unsigned char copied[64] = {0};
@@ -493,16 +554,23 @@ static int run_startup(void) {
               "single-GPU kernel resolver uses the strict static lookup");
     }
     void *crossing = NULL;
-    CHECK(!ds4_gpu_lookup_cache_strict(
+    CHECK(!ds4_gpu_test_laguna_compact_lookup(
+              context,
               ledger.tensor_ranges[0].source_offset,
               ledger.tensor_ranges[0].source_bytes + 1u,
               0, &crossing),
           "strict lookup rejects a static-range overrun");
+    CHECK(!ds4_gpu_test_laguna_compact_lookup(
+              context,
+              ledger.tensor_ranges[0].source_offset,
+              0, 0, &crossing),
+          "strict lookup rejects a zero-byte request");
 
     const uint64_t routed_offset = ledger.tensor_ranges[2].source_offset;
     const uint64_t routed_bytes = ledger.tensor_ranges[2].source_bytes;
     void *routed = NULL;
-    CHECK(!ds4_gpu_lookup_cache_strict(
+    CHECK(!ds4_gpu_test_laguna_compact_lookup(
+              context,
               routed_offset, routed_bytes, 0, &routed),
           "strict lookup misses routed payload at startup");
     CHECK(setenv("DS4_CUDA_DIRECT_MODEL", "1", 1) == 0 &&
@@ -523,7 +591,7 @@ static int run_startup(void) {
           "strict routed miss allocates, registers, and copies nothing");
 
     tracker_fixture second_runtime;
-    CHECK(tracker_fixture_init(&second_runtime, &plan),
+    CHECK(tracker_fixture_init(&second_runtime, &plan, &ledger),
           "second-context tracker initializes");
     ds4_gpu_laguna_compact *second = NULL;
     const uint64_t attempts_before_second =
@@ -534,8 +602,8 @@ static int run_startup(void) {
           "only one compact context may be active per process");
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before_second &&
-              tracker_is_pristine(&second_runtime.tracker),
-          "second-context refusal happens before allocation or tracking");
+              tracker_has_only_ledger(&second_runtime.tracker),
+          "second-context refusal preserves only its ledger records");
 
     ds4_gpu_laguna_compact_destroy(context);
     context = NULL;
@@ -544,20 +612,33 @@ static int run_startup(void) {
     CHECK(ds4_runtime_tracker_snapshot_copy(
               &runtime.tracker, &runtime_snapshot,
               active, ARRAY_LEN(active)) &&
-              runtime_snapshot.active_record_count == 0 &&
-              runtime_snapshot.owned_total_current == 0 &&
+              runtime_snapshot.active_record_count == 3 &&
+              runtime_snapshot.owned_total_current ==
+                  runtime_snapshot.category_current[
+                      DS4_RUNTIME_CATEGORY_OTHER_HOST] &&
               runtime_snapshot.report_current[
               DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] == 0 &&
               runtime_snapshot.report_current[
               DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] == 0 &&
               runtime_snapshot.violation == DS4_RUNTIME_VIOLATION_NONE,
-          "teardown releases and reconciles every compact runtime record");
+          "compact teardown preserves only the three live ledger records");
     void *after_destroy = NULL;
-    CHECK(!ds4_gpu_lookup_cache_strict(
+    CHECK(!ds4_gpu_test_laguna_compact_lookup(
+              context,
               ledger.tensor_ranges[0].source_offset,
               ledger.tensor_ranges[0].source_bytes,
               0, &after_destroy),
-          "teardown removes strict static lookup entries before freeing slab");
+          "teardown removes compact static lookup entries before freeing slab");
+    ds4_laguna_ledger_free(&ledger);
+    CHECK(tracker_fixture_release_ledger(&runtime),
+          "ledger records release after their physical arrays are freed");
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &runtime.tracker, &runtime_snapshot,
+              active, ARRAY_LEN(active)) &&
+              runtime_snapshot.active_record_count == 0 &&
+              runtime_snapshot.owned_total_current == 0 &&
+              runtime_snapshot.violation == DS4_RUNTIME_VIOLATION_NONE,
+          "full startup teardown reconciles every runtime record");
     result = g_failures == 0 ? 0 : 1;
 
 cleanup_map:

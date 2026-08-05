@@ -57550,9 +57550,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
-        if (e->backend != DS4_BACKEND_METAL) {
+        bool laguna_backend_supported =
+            e->backend == DS4_BACKEND_METAL;
+#ifndef DS4_ROCM_BUILD
+        laguna_backend_supported =
+            laguna_backend_supported || e->backend == DS4_BACKEND_CUDA;
+#endif
+        if (!laguna_backend_supported) {
             fprintf(stderr,
-                    "ds4: Laguna S 2.1 inference currently requires --metal\n");
+                    "ds4: Laguna S 2.1 inference currently requires the "
+                    "Metal or CUDA graph backend\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -57582,7 +57589,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
-                    "ds4: Laguna S 2.1 currently supports the standard Metal "
+                    "ds4: Laguna S 2.1 currently supports the standard graph backend "
                     "generation path only (no steering, power cap, custom "
                     "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
             ds4_engine_close(e);
@@ -58740,7 +58747,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
             fprintf(stderr,
-                    "ds4: %s sessions currently require the Metal graph backend\n",
+                    "ds4: %s sessions currently require a graph backend\n",
                     DS4_MODEL_SHAPE_NAME);
             return 1;
         }
@@ -66163,6 +66170,14 @@ static bool metal_graph_eval_mixed_prefill_decode(
 }
 #endif
 
+#ifdef DS4_TEST_HOOKS
+static uint64_t ds4_test_laguna_decode_fallback_evals = 0;
+
+uint64_t ds4_test_laguna_decode_fallback_count(void) {
+    return ds4_test_laguna_decode_fallback_evals;
+}
+#endif
+
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -66214,11 +66229,13 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * while preserving the exact one-token kernels and per-session KV order. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_session_is_laguna(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
             ds4_session *s = items[i].session;
             if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) ||
+                ds4_session_is_laguna(s) ||
                 !s->checkpoint_valid || s->engine->support_kind != DS4_SUPPORT_NONE) {
                 ok = false;
             }
@@ -66279,6 +66296,11 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
     /* Correctness fallback.  If a later item fails, invalidate every member:
      * earlier sessions may already have advanced and must be rebuilt rather
      * than exposing a partially committed logical batch. */
+#ifdef DS4_TEST_HOOKS
+    if (ds4_session_is_laguna(first)) {
+        ds4_test_laguna_decode_fallback_evals++;
+    }
+#endif
     for (int i = 0; i < count; i++) {
         if (ds4_session_eval(items[i].session, items[i].token,
                              err, errlen) != 0) {
@@ -66291,9 +66313,14 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
 
 #ifdef DS4_TEST_HOOKS
 static uint64_t ds4_test_mixed_native_evals = 0;
+static uint64_t ds4_test_laguna_mixed_fallback_evals = 0;
 
 uint64_t ds4_test_mixed_native_count(void) {
     return ds4_test_mixed_native_evals;
+}
+
+uint64_t ds4_test_laguna_mixed_fallback_count(void) {
+    return ds4_test_laguna_mixed_fallback_evals;
 }
 #endif
 
@@ -66351,6 +66378,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         native_requested &&
         e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(prefill_session) &&
+        !ds4_session_is_laguna(prefill_session) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prefill_prompt, start, prefill_rows,
@@ -66394,6 +66422,11 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
     }
 #endif
 
+#ifdef DS4_TEST_HOOKS
+    if (ds4_session_is_laguna(prefill_session)) {
+        ds4_test_laguna_mixed_fallback_evals++;
+    }
+#endif
     int rc = ds4_session_sync(
             prefill_session, prefill_prompt, err, errlen);
     if (rc != 0) return rc;

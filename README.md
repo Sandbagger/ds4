@@ -176,10 +176,10 @@ file are not supported for GLM yet.
 Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
 The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
 weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
-attention and mixed Q4_K/Q6_K experts. Laguna currently requires Metal and full
-model residency; SSD streaming, distributed inference, CUDA, ROCm, and the
-DFlash draft model are rejected explicitly. Both files fit comfortably on a
-96 or 128 GiB Mac. CLI, agent, and server use Laguna's native chat, interleaved
+attention and mixed Q4_K/Q6_K experts. Laguna runs on Metal or one-device CUDA
+with full model residency. SSD streaming, distributed inference, tensor
+parallelism, multi-GPU placement, ROCm, and the DFlash draft model are rejected
+explicitly. CLI, agent, and server use Laguna's native chat, interleaved
 reasoning, and tagged tool-call formats:
 
 ```sh

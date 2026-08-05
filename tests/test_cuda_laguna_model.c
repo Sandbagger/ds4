@@ -684,6 +684,8 @@ static bool load_decode_prompts(
 }
 
 static bool run_decode_batch(ds4_engine *engine) {
+    const uint64_t fallback_before =
+        ds4_test_laguna_decode_fallback_count();
     ds4_tokens prompts[2] = {{0}};
     ds4_session *batched[2] = {0};
     ds4_session *controls[2] = {0};
@@ -708,6 +710,12 @@ static bool run_decode_batch(ds4_engine *engine) {
     if (ok && ds4_sessions_eval_batch(items, 2, err, sizeof(err)) != 0) {
         ok = fail_message("two-session batch eval", err);
     }
+    if (ok && ds4_test_laguna_decode_fallback_count() !=
+                  fallback_before + 1u) {
+        ok = fail_message(
+                "two-session batch did not use the Laguna correctness fallback",
+                NULL);
+    }
     for (int i = 0; ok && i < 2; i++) {
         if (ds4_session_eval(controls[i], tokens[i], err, sizeof(err)) != 0) {
             ok = fail_message("serialized decode control", err);
@@ -726,6 +734,8 @@ static bool run_decode_batch(ds4_engine *engine) {
 }
 
 static bool run_mixed_batch(ds4_engine *engine) {
+    const uint64_t fallback_before =
+        ds4_test_laguna_mixed_fallback_count();
     ds4_tokens target = {0};
     if (!tokenize_raw_fixture(
             engine, "swa-513.prompt", 513, &target)) return false;
@@ -764,6 +774,12 @@ static bool run_mixed_batch(ds4_engine *engine) {
                       items, 2, prefill_mixed, &target,
                       err, sizeof(err)) != 0) {
         ok = fail_message("mixed prefill/decode batch", err);
+    }
+    if (ok && ds4_test_laguna_mixed_fallback_count() !=
+                  fallback_before + 1u) {
+        ok = fail_message(
+                "mixed prefill/decode did not use the Laguna correctness fallback",
+                NULL);
     }
     if (ok && ds4_session_sync(
                       prefill_control, &target, err, sizeof(err)) != 0) {

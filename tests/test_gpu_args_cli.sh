@@ -424,6 +424,67 @@ if [ -x ./ds4-server ]; then
         "--session-slots conflicts with --batched-session" "$rc"
 fi
 
+# 12: --qualification-plan is a harness-only option shared by all five
+# inference frontends. It is intentionally absent from public help, accepts
+# exactly one non-empty path, and rejects malformed provenance before opening
+# the model.
+assert_qualification_error_before_model_open() {
+    local name=$1
+    local expected=$2
+    local rc=$3
+    if [ "$rc" -eq 2 ] && grep -qE -- "$expected" "$LOG" &&
+       ! grep -qE "unknown option|model file is too small|failed to open model|another ds4 process" "$LOG"; then
+        ok "$name"
+    else
+        fail "$name (expected qualification-plan exit 2 before model open, got $rc)"
+        sed -n '1,12p' "$LOG" | sed 's/^/    /'
+    fi
+}
+
+for i in "${!INFERENCE_BINS[@]}"; do
+    name=${INFERENCE_NAMES[$i]}; bin=${INFERENCE_BINS[$i]}
+    [ -x "$bin" ] || continue
+
+    "$bin" --help > "$LOG" 2>&1 || true
+    assert_not_grep "$name --help hides --qualification-plan" \
+        "--qualification-plan" "$LOG"
+
+    "$bin" --qualification-plan > "$LOG" 2>&1
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "$name rejects missing qualification-plan path" \
+        "missing value for --qualification-plan|--qualification-plan requires an argument" \
+        "$rc"
+
+    run_inference_option "$name" "$bin" --qualification-plan ""
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "$name rejects empty qualification-plan path" \
+        "--qualification-plan requires a non-empty path" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --qualification-plan /tmp/ds4-qualification-plan.json \
+        --qualification-plan /tmp/ds4-qualification-plan.json
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "$name rejects identical duplicate qualification-plan paths" \
+        "--qualification-plan may only be specified once" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --qualification-plan /tmp/ds4-qualification-plan-a.json \
+        --qualification-plan /tmp/ds4-qualification-plan-b.json
+    rc=$?
+    assert_qualification_error_before_model_open \
+        "$name rejects conflicting qualification-plan paths" \
+        "--qualification-plan may only be specified once" "$rc"
+
+    run_inference_option "$name" "$bin" \
+        --qualification-plan /tmp/ds4-qualification-plan.json
+    rc=$?
+    assert_reaches_model_open \
+        "$name accepts one qualification-plan path" "$rc"
+done
+
 rm -f "$LOG"
 
 echo ""

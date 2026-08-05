@@ -1841,6 +1841,20 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.engine.qualification_plan_path_set) {
+                fprintf(stderr,
+                        "ds4: --qualification-plan may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4: --qualification-plan requires a non-empty path\n");
+                exit(2);
+            }
+            c.engine.qualification_plan_path = path;
+            c.engine.qualification_plan_path_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {

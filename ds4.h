@@ -126,6 +126,7 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
+    const char *qualification_plan_path;
     const char *mtp_path;
     ds4_backend backend;
     int n_threads;
@@ -151,6 +152,7 @@ typedef struct {
     bool dspark;
     bool dspark_strict;
     bool dspark_confidence_threshold_set;
+    bool qualification_plan_path_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;

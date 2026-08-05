@@ -1192,6 +1192,7 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
+    const char *qualification_plan_path;
     const char *mtp_path;
     const char *trace_path;
     const char *regrade_trace_path;
@@ -1226,6 +1227,7 @@ typedef struct {
     bool ssd_streaming_cache_experts_set;
     bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
+    bool qualification_plan_path_set;
     bool self_test_extractors;
 } eval_config;
 
@@ -1554,6 +1556,20 @@ static eval_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.qualification_plan_path_set) {
+                fprintf(stderr,
+                        "ds4-eval: --qualification-plan may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-eval: --qualification-plan requires a non-empty path\n");
+                exit(2);
+            }
+            c.qualification_plan_path = path;
+            c.qualification_plan_path_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -4182,6 +4198,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .qualification_plan_path = cfg.qualification_plan_path,
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
@@ -4203,6 +4220,7 @@ int main(int argc, char **argv) {
             cfg.ssd_streaming_cache_experts_set,
         .ssd_streaming_cache_bytes_set = cfg.ssd_streaming_cache_bytes_set,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .qualification_plan_path_set = cfg.qualification_plan_path_set,
         .distributed = cfg.dist,
     };
     char dist_err[256];

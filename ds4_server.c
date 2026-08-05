@@ -12942,6 +12942,20 @@ static server_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.engine.qualification_plan_path_set) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --qualification-plan may only be specified once");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --qualification-plan requires a non-empty path");
+                exit(2);
+            }
+            c.engine.qualification_plan_path = path;
+            c.engine.qualification_plan_path_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {

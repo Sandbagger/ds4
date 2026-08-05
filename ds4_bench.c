@@ -27,6 +27,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *qualification_plan_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -58,6 +59,7 @@ typedef struct {
     bool ssd_streaming_cache_experts_set;
     bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
+    bool qualification_plan_path_set;
     bool cuda_tensor_parallel;
     bool show_output;
 } bench_config;
@@ -238,6 +240,20 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.qualification_plan_path_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-plan may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-plan requires a non-empty path\n");
+                exit(2);
+            }
+            c.qualification_plan_path = path;
+            c.qualification_plan_path_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -605,6 +621,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .qualification_plan_path = cfg.qualification_plan_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -624,6 +641,7 @@ int main(int argc, char **argv) {
             cfg.ssd_streaming_cache_experts_set,
         .ssd_streaming_cache_bytes_set = cfg.ssd_streaming_cache_bytes_set,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .qualification_plan_path_set = cfg.qualification_plan_path_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };

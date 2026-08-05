@@ -25,6 +25,13 @@ bool ds4_plan_io_sha256(const void *data,
                         char *error,
                         size_t error_size);
 
+/* Validate immutable output identity and its parent directory without
+ * creating either artifact.  Plan-only frontends call this before opening the
+ * model so an invalid destination cannot trigger a 68-GiB metadata walk. */
+bool ds4_plan_io_preflight_target(const char *path,
+                                  char *error,
+                                  size_t error_size);
+
 /* Durably publish exact plan bytes, followed by an external FILE.sha256 that
  * contains "<digest>\n".  Each artifact uses a same-directory mkstemp file,
  * write-all, file fsync, close, rename, and parent-directory fsync.

@@ -359,6 +359,55 @@ static char *ds4_plan_parent_directory(const char *path,
     return parent;
 }
 
+bool ds4_plan_io_preflight_target(const char *path,
+                                  char *error,
+                                  size_t error_size) {
+    ds4_plan_clear_error(error, error_size);
+
+    size_t path_length = 0;
+    if (!ds4_plan_path_length(path, &path_length, error, error_size)) {
+        return false;
+    }
+    char *sidecar = ds4_plan_append(
+        path,
+        path_length,
+        DS4_PLAN_IO_SIDECAR_SUFFIX,
+        sizeof(DS4_PLAN_IO_SIDECAR_SUFFIX) - 1u,
+        error,
+        error_size);
+    if (sidecar == NULL) return false;
+
+    bool ok = ds4_plan_target_absent(path, "plan", error, error_size) &&
+              ds4_plan_target_absent(
+                  sidecar, "digest sidecar", error, error_size);
+    free(sidecar);
+    if (!ok) return false;
+
+    char *parent = ds4_plan_parent_directory(path, error, error_size);
+    if (parent == NULL) return false;
+    struct stat status;
+    if (stat(parent, &status) != 0) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(error,
+                           error_size,
+                           "inspect parent directory '%s': %s",
+                           parent,
+                           strerror(saved_errno));
+        free(parent);
+        return false;
+    }
+    if (!S_ISDIR(status.st_mode)) {
+        ds4_plan_set_error(error,
+                           error_size,
+                           "qualification-plan parent '%s' is not a directory",
+                           parent);
+        free(parent);
+        return false;
+    }
+    free(parent);
+    return true;
+}
+
 static bool ds4_plan_sync_parent(const char *target,
                                  const char *kind,
                                  char *error,

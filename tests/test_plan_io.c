@@ -151,6 +151,43 @@ static void test_sha256_vectors(void) {
     }
 }
 
+static void test_target_preflight(const char *root) {
+    char valid[512];
+    char existing[512];
+    char missing_parent[512];
+    char error[512] = "stale";
+
+    CHECK(make_path(valid, sizeof(valid), root, "preflight.json"),
+          "preflight target path fits");
+    CHECK(ds4_plan_io_preflight_target(valid, error, sizeof(error)),
+          "preflight accepts an absent target in an existing parent");
+    CHECK(error[0] == '\0', "successful target preflight clears stale error");
+    CHECK(access(valid, F_OK) != 0 && errno == ENOENT,
+          "target preflight does not create the plan");
+
+    CHECK(make_path(existing, sizeof(existing), root, "preflight-existing.json"),
+          "existing preflight target path fits");
+    CHECK(write_fixture(existing, "occupied", 8),
+          "existing preflight target fixture written");
+    CHECK(!ds4_plan_io_preflight_target(existing, error, sizeof(error)),
+          "preflight rejects an existing immutable target");
+    CHECK(strstr(error, "refusing to replace existing plan") == error,
+          "existing target preflight explains immutability");
+    CHECK(unlink(existing) == 0, "existing preflight fixture removed");
+
+    CHECK(make_path(missing_parent,
+                    sizeof(missing_parent),
+                    root,
+                    "missing/preflight.json"),
+          "missing-parent preflight path fits");
+    CHECK(!ds4_plan_io_preflight_target(
+              missing_parent, error, sizeof(error)),
+          "preflight rejects a missing parent before model access");
+    CHECK(strstr(error, "parent directory") != NULL &&
+              strstr(error, "No such file or directory") != NULL,
+          "missing-parent preflight names the directory failure");
+}
+
 static void test_publish_and_immutability(const char *root) {
     static const unsigned char bytes_a[] = {
         '{', '"', 'x', '"', ':', 0x00, ',', 0xff, '}', '\n'
@@ -471,6 +508,7 @@ int main(void) {
     if (g_failed != 0) return 1;
 
     test_sha256_vectors();
+    test_target_preflight(root);
     test_publish_and_immutability(root);
     test_nested_directory(root);
     test_preexisting_sidecar(root);

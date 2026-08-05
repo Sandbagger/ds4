@@ -1,4 +1,5 @@
 CC ?= cc
+CXX ?= c++
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
@@ -13,6 +14,7 @@ endif
 
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+CXXFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c++11
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
@@ -300,10 +302,17 @@ ds4_bound_test_hooks.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_distribute
 tests/test_laguna_stream: tests/test_laguna_stream.o ds4_bound_test_hooks.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o
 	$(CC) $(CFLAGS) $(TEST_GC_LDFLAGS) -o $@ $^ $(LDLIBS)
 
-test-laguna-stream: tests/test_laguna_stream
+tests/test_runtime_cpp_link.o: tests/test_runtime_cpp_link.cc ds4_laguna_stream.h ds4_runtime.h
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+tests/test_runtime_cpp_link: tests/test_runtime_cpp_link.o ds4_laguna_stream.o ds4_runtime.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
+
+test-laguna-stream: tests/test_laguna_stream tests/test_runtime_cpp_link
 	./tests/test_laguna_stream --case options
 	./tests/test_laguna_stream --case ledger
 	./tests/test_laguna_stream --case allocation
+	./tests/test_runtime_cpp_link
 
 ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
@@ -430,7 +439,7 @@ test-laguna-compact-python:
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-laguna-compact-python \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_session_logits_only tests/test_laguna_stream $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_session_logits_only tests/test_laguna_stream tests/test_runtime_cpp_link $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -441,6 +450,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-laguna-compact-python \
 	./tests/test_laguna_stream --case options
 	./tests/test_laguna_stream --case ledger
 	./tests/test_laguna_stream --case allocation
+	./tests/test_runtime_cpp_link
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling
@@ -476,4 +486,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime_cpp_link tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

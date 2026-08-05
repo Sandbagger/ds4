@@ -1125,16 +1125,9 @@ static void test_tracker_reconciliation_and_peaks(void) {
               DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] == 1000u &&
               f.tracker.owned_total_current == 250u,
           "mapped virtual bytes are report-only");
-    CHECK(ds4_runtime_tracker_report_set(
-              &f.tracker, DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT, 80u) ==
-              DS4_RUNTIME_STATUS_OK &&
-              ds4_runtime_tracker_report_set(
-                  &f.tracker, DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED,
-                  30u) == DS4_RUNTIME_STATUS_OK &&
-              ds4_runtime_tracker_report_set(
-                  &f.tracker, DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED,
-                  20u) == DS4_RUNTIME_STATUS_OK,
-          "external physical observations update through bounded reports");
+    CHECK(ds4_runtime_tracker_checkpoint_external(
+              &f.tracker, 80u, 30u, 20u) == DS4_RUNTIME_STATUS_OK,
+          "external physical observations update as one synchronized checkpoint");
     CHECK(f.tracker.qualification_total_current == 380u &&
               f.tracker.qualification_total_peak == 380u,
           "qualification total adds source and unattributed bytes exactly once");
@@ -1185,6 +1178,18 @@ static void test_tracker_reconciliation_and_peaks(void) {
                   DS4_RUNTIME_STATUS_UNSAFE &&
               f.tracker.violation == DS4_RUNTIME_VIOLATION_LIVE_RELATION,
           "cleanup events do not clear a latched unsafe status");
+
+    tracker_fixture_prepare(&f);
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_checkpoint_external(
+                  &f.tracker, 100u, 0, 0) == DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_checkpoint_external(
+                  &f.tracker, 0, 100u, 0) == DS4_RUNTIME_STATUS_OK,
+          "crossing external samples commit atomically");
+    CHECK(f.tracker.qualification_total_current == 100u &&
+              f.tracker.qualification_total_peak == 100u,
+          "crossing samples never manufacture a non-simultaneous peak");
 }
 
 static void test_tracker_relations(void) {
@@ -1265,8 +1270,8 @@ static void test_tracker_rejections(void) {
               f.tracker.violation == DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE,
           "unknown allocation callsite latches unsafe");
     const ds4_runtime_violation first = f.tracker.violation;
-    CHECK(ds4_runtime_tracker_report_set(
-              &f.tracker, DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT, 1u) ==
+    CHECK(ds4_runtime_tracker_checkpoint_external(
+              &f.tracker, 1u, 0, 0) ==
               DS4_RUNTIME_STATUS_UNSAFE &&
               f.tracker.violation == first,
           "first violation remains permanently latched");

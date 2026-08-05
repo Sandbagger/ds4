@@ -575,19 +575,20 @@ ds4_runtime_status ds4_runtime_tracker_unregister(
     return status(tracker);
 }
 
-ds4_runtime_status ds4_runtime_tracker_report_set(
-        ds4_runtime_tracker *tracker, ds4_runtime_report report,
-        uint64_t bytes) {
+ds4_runtime_status ds4_runtime_tracker_checkpoint_external(
+        ds4_runtime_tracker *tracker,
+        uint64_t model_source_resident_bytes,
+        uint64_t host_library_unattributed_bytes,
+        uint64_t cuda_library_unattributed_bytes) {
     if (!tracker || status(tracker) != DS4_RUNTIME_STATUS_OK) {
         return DS4_RUNTIME_STATUS_UNSAFE;
     }
-    if (report != DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT &&
-        report != DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED &&
-        report != DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED) {
-        latch(tracker, DS4_RUNTIME_VIOLATION_RELATION);
-        return status(tracker);
-    }
-    tracker->report_current[report] = bytes;
+    tracker->report_current[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] =
+        model_source_resident_bytes;
+    tracker->report_current[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] =
+        host_library_unattributed_bytes;
+    tracker->report_current[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] =
+        cuda_library_unattributed_bytes;
     recompute(tracker);
     return status(tracker);
 }

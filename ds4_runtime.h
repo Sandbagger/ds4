@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS = 0,
     DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD = 1,
@@ -185,10 +189,11 @@ ds4_runtime_status ds4_runtime_tracker_unregister(
     ds4_runtime_tracker *tracker,
     uint64_t relation_id);
 
-ds4_runtime_status ds4_runtime_tracker_report_set(
+ds4_runtime_status ds4_runtime_tracker_checkpoint_external(
     ds4_runtime_tracker *tracker,
-    ds4_runtime_report report,
-    uint64_t bytes);
+    uint64_t model_source_resident_bytes,
+    uint64_t host_library_unattributed_bytes,
+    uint64_t cuda_library_unattributed_bytes);
 
 bool ds4_runtime_tracker_snapshot_copy(
     const ds4_runtime_tracker *tracker,
@@ -200,5 +205,9 @@ bool ds4_runtime_reduction_qualified(
     uint64_t resident_qualification_total_peak,
     uint64_t streamed_qualification_total_peak,
     uint64_t *reduction_bytes_out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -7,6 +7,10 @@
 
 #include "ds4_runtime.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define DS4_LAGUNA_MAX_DIMS 8u
 #define DS4_LAGUNA_ALLOCATION_CALLSITE_COUNT 25u
 
@@ -202,5 +206,9 @@ bool ds4_laguna_full_page_union(
     size_t output_capacity,
     size_t *output_count,
     uint64_t *output_bytes);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -179,6 +179,63 @@ typedef struct {
     uint64_t bytes;
 } ds4_laguna_page_range;
 
+#define DS4_LAGUNA_CACHE_SLOT_NONE UINT32_MAX
+
+typedef enum {
+    DS4_LAGUNA_CACHE_OK = 0,
+    DS4_LAGUNA_CACHE_RECOVERABLE = 1,
+    DS4_LAGUNA_CACHE_UNSAFE = 2,
+} ds4_laguna_cache_status;
+
+typedef enum {
+    DS4_LAGUNA_CACHE_SLOT_EMPTY = 0,
+    DS4_LAGUNA_CACHE_SLOT_LOADING = 1,
+    DS4_LAGUNA_CACHE_SLOT_READY = 2,
+    DS4_LAGUNA_CACHE_SLOT_IN_USE = 3,
+} ds4_laguna_cache_slot_state;
+
+typedef struct {
+    uint32_t layer_id;
+    uint32_t expert_id;
+} ds4_laguna_expert_key;
+
+/* This layout is part of the allocation-plan contract: slot metadata is
+ * charged at exactly 32 bytes per cache slot. */
+typedef struct {
+    uint64_t generation;
+    uint64_t last_used;
+    uint32_t layer;
+    uint32_t expert;
+    uint32_t refs;
+    uint32_t state;
+} ds4_laguna_cache_slot;
+
+typedef char ds4_laguna_cache_slot_must_be_32_bytes[
+    sizeof(ds4_laguna_cache_slot) == 32u ? 1 : -1];
+
+typedef struct {
+    uint32_t slot_index;
+    uint64_t generation;
+} ds4_laguna_cache_handle;
+
+typedef struct {
+    uint32_t first_key;
+    uint32_t key_count;
+} ds4_laguna_expert_group;
+
+/* Pure borrowed state. The caller owns every referenced array for the engine
+ * lifetime; this policy never allocates, frees, performs I/O, or submits work. */
+typedef struct {
+    const ds4_laguna_expert_entry *entries;
+    size_t entry_count;
+    ds4_laguna_cache_slot *slots;
+    size_t slot_count;
+    uint64_t *route_hotness;
+    uint32_t *entry_to_slot;
+    size_t max_selected_per_token;
+    uint64_t sequence;
+} ds4_laguna_cache_policy;
+
 bool ds4_laguna_ledger_build(ds4_laguna_ledger *out,
                              const ds4_laguna_ledger_spec *spec,
                              const ds4_laguna_tensor_desc *tensors,
@@ -206,6 +263,65 @@ bool ds4_laguna_full_page_union(
     size_t output_capacity,
     size_t *output_count,
     uint64_t *output_bytes);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_init(
+    ds4_laguna_cache_policy *policy,
+    const ds4_laguna_expert_entry *entries,
+    size_t entry_count,
+    ds4_laguna_cache_slot *slots,
+    size_t slot_count,
+    uint64_t *route_hotness,
+    uint32_t *entry_to_slot,
+    size_t max_selected_per_token);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_note_route(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_expert_key key);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_acquire(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_expert_key key,
+    ds4_laguna_cache_handle *handle,
+    bool *hit);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_publish(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_cache_handle handle);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_pin(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_cache_handle handle);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_unpin(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_cache_handle handle);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_fail(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_cache_handle handle);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_cancel(
+    ds4_laguna_cache_policy *policy,
+    ds4_laguna_cache_handle handle);
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
+    ds4_laguna_cache_policy *policy);
+
+/* `selected` is flattened token-major input for one routed layer. The helper
+ * emits unique keys in stable first-occurrence order and slot-sized group
+ * descriptors into caller-owned buffers. All output capacity is zero-filled
+ * so repeated inputs produce byte-identical output, including padding. */
+ds4_laguna_cache_status ds4_laguna_cache_policy_group(
+    const ds4_laguna_cache_policy *policy,
+    const ds4_laguna_expert_key *selected,
+    size_t token_count,
+    size_t selected_per_token,
+    ds4_laguna_expert_key *grouped_keys,
+    size_t grouped_key_capacity,
+    ds4_laguna_expert_group *groups,
+    size_t group_capacity,
+    size_t *grouped_key_count,
+    size_t *group_count);
 
 #ifdef __cplusplus
 }

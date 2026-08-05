@@ -1353,8 +1353,9 @@ static void test_cache_victim_ordering(void) {
                   DS4_LAGUNA_CACHE_OK &&
               !hit &&
               handles[3].slot_index == handles[2].slot_index &&
-              f.entry_to_slot[1] == DS4_LAGUNA_CACHE_SLOT_NONE,
-          "victim selection evicts the lowest persistent route hotness first");
+              f.entry_to_slot[1] == DS4_LAGUNA_CACHE_SLOT_NONE &&
+              f.route_hotness[1] == 1u,
+          "victim selection evicts the lowest persistent route hotness without clearing it");
 
     CHECK(cache_fixture_init(&f, 3u, 3u) &&
               cache_load(&f, fixture_key(0), &handles[0]) &&
@@ -1369,18 +1370,19 @@ static void test_cache_victim_ordering(void) {
           "equal-hotness victim selection evicts the oldest last-used entry");
 
     CHECK(cache_fixture_init(&f, 3u, 3u) &&
-              cache_load(&f, fixture_key(2), &handles[0]) &&
-              cache_load(&f, fixture_key(0), &handles[1]) &&
-              cache_load(&f, fixture_key(1), &handles[2]),
-          "key victim fixture decouples slot order from key order");
+              cache_load(&f, fixture_key(6), &handles[0]) &&
+              cache_load(&f, fixture_key(1), &handles[1]) &&
+              cache_load(&f, fixture_key(2), &handles[2]),
+          "key victim fixture decouples layer/expert order from slot order");
     f.policy.sequence = 77u;
     for (size_t i = 0; i < 3u; i++) f.slots[i].last_used = 77u;
     CHECK(ds4_laguna_cache_policy_acquire(
               &f.policy, fixture_key(3), &handles[3], &hit) ==
                   DS4_LAGUNA_CACHE_OK &&
               handles[3].slot_index == handles[1].slot_index &&
-              f.entry_to_slot[0] == DS4_LAGUNA_CACHE_SLOT_NONE,
-          "equal-hotness equal-age victim selection evicts the lowest key");
+              f.entry_to_slot[1] == DS4_LAGUNA_CACHE_SLOT_NONE &&
+              f.entry_to_slot[6] == handles[0].slot_index,
+          "equal-hotness equal-age victim selection evicts the lowest layer/expert key");
 }
 
 static void test_cache_pins_and_drain(void) {

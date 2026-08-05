@@ -140,6 +140,632 @@ void ds4_laguna_ledger_free(ds4_laguna_ledger *ledger) {
     memset(ledger, 0, sizeof(*ledger));
 }
 
+static int cache_key_compare(ds4_laguna_expert_key a,
+                             ds4_laguna_expert_key b) {
+    if (a.layer_id < b.layer_id) return -1;
+    if (a.layer_id > b.layer_id) return 1;
+    if (a.expert_id < b.expert_id) return -1;
+    if (a.expert_id > b.expert_id) return 1;
+    return 0;
+}
+
+static bool cache_key_equal(ds4_laguna_expert_key a,
+                            ds4_laguna_expert_key b) {
+    return cache_key_compare(a, b) == 0;
+}
+
+static ds4_laguna_expert_key cache_entry_key(
+        const ds4_laguna_expert_entry *entry) {
+    const ds4_laguna_expert_key key = {
+        .layer_id = entry->layer,
+        .expert_id = entry->expert,
+    };
+    return key;
+}
+
+static ds4_laguna_expert_key cache_slot_key(
+        const ds4_laguna_cache_slot *slot) {
+    const ds4_laguna_expert_key key = {
+        .layer_id = slot->layer,
+        .expert_id = slot->expert,
+    };
+    return key;
+}
+
+static bool cache_entry_index(const ds4_laguna_cache_policy *policy,
+                              ds4_laguna_expert_key key,
+                              size_t *entry_index) {
+    size_t lo = 0;
+    size_t hi = policy->entry_count;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2u;
+        const int order = cache_key_compare(
+            cache_entry_key(&policy->entries[mid]), key);
+        if (order < 0) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo >= policy->entry_count ||
+        !cache_key_equal(cache_entry_key(&policy->entries[lo]), key)) {
+        return false;
+    }
+    if (entry_index) *entry_index = lo;
+    return true;
+}
+
+static bool cache_policy_shape_valid(
+        const ds4_laguna_cache_policy *policy) {
+    if (!policy || !policy->entries || policy->entry_count == 0 ||
+        !policy->slots || policy->slot_count == 0 ||
+        policy->slot_count > UINT32_MAX ||
+        !policy->route_hotness || !policy->entry_to_slot ||
+        policy->max_selected_per_token == 0 ||
+        policy->max_selected_per_token > policy->slot_count) {
+        return false;
+    }
+    for (size_t i = 1; i < policy->entry_count; i++) {
+        if (cache_key_compare(cache_entry_key(&policy->entries[i - 1u]),
+                              cache_entry_key(&policy->entries[i])) >= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cache_policy_valid(const ds4_laguna_cache_policy *policy) {
+    if (!cache_policy_shape_valid(policy)) return false;
+
+    for (size_t i = 0; i < policy->entry_count; i++) {
+        const uint32_t slot_index = policy->entry_to_slot[i];
+        if (slot_index == DS4_LAGUNA_CACHE_SLOT_NONE) continue;
+        if ((size_t)slot_index >= policy->slot_count) return false;
+        const ds4_laguna_cache_slot *slot = &policy->slots[slot_index];
+        if (slot->state != DS4_LAGUNA_CACHE_SLOT_READY &&
+            slot->state != DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            return false;
+        }
+        if (!cache_key_equal(cache_slot_key(slot),
+                             cache_entry_key(&policy->entries[i]))) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < policy->slot_count; i++) {
+        const ds4_laguna_cache_slot *slot = &policy->slots[i];
+        if (slot->last_used > policy->sequence) return false;
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+            if (slot->refs != 0 || slot->layer != UINT32_MAX ||
+                slot->expert != UINT32_MAX) {
+                return false;
+            }
+            continue;
+        }
+        if (slot->generation == 0) return false;
+
+        size_t entry_index = 0;
+        if (!cache_entry_index(policy, cache_slot_key(slot), &entry_index)) {
+            return false;
+        }
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_LOADING) {
+            if (slot->refs != 0 ||
+                policy->entry_to_slot[entry_index] !=
+                    DS4_LAGUNA_CACHE_SLOT_NONE) {
+                return false;
+            }
+        } else if (slot->state == DS4_LAGUNA_CACHE_SLOT_READY) {
+            if (slot->refs != 0 ||
+                policy->entry_to_slot[entry_index] != (uint32_t)i) {
+                return false;
+            }
+        } else if (slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            if (slot->refs == 0 ||
+                policy->entry_to_slot[entry_index] != (uint32_t)i) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_LOADING) {
+            for (size_t earlier = 0; earlier < i; earlier++) {
+                const ds4_laguna_cache_slot *other =
+                    &policy->slots[earlier];
+                if (other->state == DS4_LAGUNA_CACHE_SLOT_LOADING &&
+                    cache_key_equal(cache_slot_key(other),
+                                    cache_slot_key(slot))) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static void cache_slot_clear(ds4_laguna_cache_slot *slot) {
+    slot->last_used = 0;
+    slot->layer = UINT32_MAX;
+    slot->expert = UINT32_MAX;
+    slot->refs = 0;
+    slot->state = DS4_LAGUNA_CACHE_SLOT_EMPTY;
+}
+
+static ds4_laguna_cache_handle cache_handle_for_slot(
+        const ds4_laguna_cache_slot *slot,
+        size_t slot_index) {
+    const ds4_laguna_cache_handle handle = {
+        .slot_index = (uint32_t)slot_index,
+        .generation = slot->generation,
+    };
+    return handle;
+}
+
+static void cache_handle_clear(ds4_laguna_cache_handle *handle) {
+    if (!handle) return;
+    handle->slot_index = DS4_LAGUNA_CACHE_SLOT_NONE;
+    handle->generation = 0;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_init(
+        ds4_laguna_cache_policy *policy,
+        const ds4_laguna_expert_entry *entries,
+        size_t entry_count,
+        ds4_laguna_cache_slot *slots,
+        size_t slot_count,
+        uint64_t *route_hotness,
+        uint32_t *entry_to_slot,
+        size_t max_selected_per_token) {
+    if (!policy) return DS4_LAGUNA_CACHE_UNSAFE;
+    memset(policy, 0, sizeof(*policy));
+    if (!entries || entry_count == 0 || !slots || slot_count == 0 ||
+        slot_count > UINT32_MAX || !route_hotness || !entry_to_slot ||
+        max_selected_per_token == 0 ||
+        max_selected_per_token > slot_count) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    for (size_t i = 1; i < entry_count; i++) {
+        if (cache_key_compare(cache_entry_key(&entries[i - 1u]),
+                              cache_entry_key(&entries[i])) >= 0) {
+            return DS4_LAGUNA_CACHE_UNSAFE;
+        }
+    }
+
+    policy->entries = entries;
+    policy->entry_count = entry_count;
+    policy->slots = slots;
+    policy->slot_count = slot_count;
+    policy->route_hotness = route_hotness;
+    policy->entry_to_slot = entry_to_slot;
+    policy->max_selected_per_token = max_selected_per_token;
+    for (size_t i = 0; i < entry_count; i++) {
+        route_hotness[i] = 0;
+        entry_to_slot[i] = DS4_LAGUNA_CACHE_SLOT_NONE;
+    }
+    for (size_t i = 0; i < slot_count; i++) {
+        memset(&slots[i], 0, sizeof(slots[i]));
+        slots[i].layer = UINT32_MAX;
+        slots[i].expert = UINT32_MAX;
+        slots[i].state = DS4_LAGUNA_CACHE_SLOT_EMPTY;
+    }
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_note_route(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_expert_key key) {
+    if (!cache_policy_valid(policy)) return DS4_LAGUNA_CACHE_UNSAFE;
+    size_t entry_index = 0;
+    if (!cache_entry_index(policy, key, &entry_index)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (policy->route_hotness[entry_index] != UINT64_MAX) {
+        policy->route_hotness[entry_index]++;
+    }
+    return DS4_LAGUNA_CACHE_OK;
+}
+
+static bool cache_victim_precedes(const ds4_laguna_cache_policy *policy,
+                                  size_t candidate,
+                                  size_t current) {
+    const ds4_laguna_cache_slot *a = &policy->slots[candidate];
+    const ds4_laguna_cache_slot *b = &policy->slots[current];
+    size_t a_entry = 0;
+    size_t b_entry = 0;
+    if (!cache_entry_index(policy, cache_slot_key(a), &a_entry) ||
+        !cache_entry_index(policy, cache_slot_key(b), &b_entry)) {
+        return false;
+    }
+    if (policy->route_hotness[a_entry] !=
+        policy->route_hotness[b_entry]) {
+        return policy->route_hotness[a_entry] <
+               policy->route_hotness[b_entry];
+    }
+    if (a->last_used != b->last_used) {
+        return a->last_used < b->last_used;
+    }
+    return cache_key_compare(cache_slot_key(a), cache_slot_key(b)) < 0;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_acquire(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        bool *hit) {
+    cache_handle_clear(handle);
+    if (hit) *hit = false;
+    if (!handle || !hit || !cache_policy_valid(policy)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+
+    size_t entry_index = 0;
+    if (!cache_entry_index(policy, key, &entry_index)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const uint32_t published = policy->entry_to_slot[entry_index];
+    if (published != DS4_LAGUNA_CACHE_SLOT_NONE) {
+        ds4_laguna_cache_slot *slot = &policy->slots[published];
+        *handle = cache_handle_for_slot(slot, published);
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
+        if (slot->state != DS4_LAGUNA_CACHE_SLOT_READY ||
+            policy->sequence == UINT64_MAX) {
+            return DS4_LAGUNA_CACHE_UNSAFE;
+        }
+        policy->sequence++;
+        slot->last_used = policy->sequence;
+        *hit = true;
+        return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                          : DS4_LAGUNA_CACHE_UNSAFE;
+    }
+
+    for (size_t i = 0; i < policy->slot_count; i++) {
+        ds4_laguna_cache_slot *slot = &policy->slots[i];
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_LOADING &&
+            cache_key_equal(cache_slot_key(slot), key)) {
+            *handle = cache_handle_for_slot(slot, i);
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
+    }
+
+    size_t selected_slot = SIZE_MAX;
+    for (size_t i = 0; i < policy->slot_count; i++) {
+        if (policy->slots[i].state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+            selected_slot = i;
+            break;
+        }
+    }
+    if (selected_slot == SIZE_MAX) {
+        for (size_t i = 0; i < policy->slot_count; i++) {
+            if (policy->slots[i].state != DS4_LAGUNA_CACHE_SLOT_READY) {
+                continue;
+            }
+            if (selected_slot == SIZE_MAX ||
+                cache_victim_precedes(policy, i, selected_slot)) {
+                selected_slot = i;
+            }
+        }
+    }
+    if (selected_slot == SIZE_MAX) return DS4_LAGUNA_CACHE_RECOVERABLE;
+
+    ds4_laguna_cache_slot *slot = &policy->slots[selected_slot];
+    if (slot->generation == UINT64_MAX ||
+        policy->sequence == UINT64_MAX) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (slot->state == DS4_LAGUNA_CACHE_SLOT_READY) {
+        size_t victim_entry = 0;
+        if (!cache_entry_index(policy, cache_slot_key(slot),
+                               &victim_entry) ||
+            policy->entry_to_slot[victim_entry] !=
+                (uint32_t)selected_slot) {
+            return DS4_LAGUNA_CACHE_UNSAFE;
+        }
+        policy->entry_to_slot[victim_entry] =
+            DS4_LAGUNA_CACHE_SLOT_NONE;
+    }
+
+    policy->sequence++;
+    slot->generation++;
+    slot->last_used = policy->sequence;
+    slot->layer = key.layer_id;
+    slot->expert = key.expert_id;
+    slot->refs = 0;
+    slot->state = DS4_LAGUNA_CACHE_SLOT_LOADING;
+    *handle = cache_handle_for_slot(slot, selected_slot);
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_publish(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_cache_handle handle) {
+    if (!cache_policy_valid(policy) ||
+        handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+        (size_t)handle.slot_index >= policy->slot_count) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    ds4_laguna_cache_slot *slot = &policy->slots[handle.slot_index];
+    if (slot->generation != handle.generation) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (slot->state != DS4_LAGUNA_CACHE_SLOT_LOADING) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    size_t entry_index = 0;
+    if (!cache_entry_index(policy, cache_slot_key(slot), &entry_index) ||
+        policy->entry_to_slot[entry_index] !=
+            DS4_LAGUNA_CACHE_SLOT_NONE) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    policy->entry_to_slot[entry_index] = handle.slot_index;
+    slot->state = DS4_LAGUNA_CACHE_SLOT_READY;
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_pin(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_cache_handle handle) {
+    if (!cache_policy_valid(policy) ||
+        handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+        (size_t)handle.slot_index >= policy->slot_count) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    ds4_laguna_cache_slot *slot = &policy->slots[handle.slot_index];
+    if (slot->generation != handle.generation) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if ((slot->state != DS4_LAGUNA_CACHE_SLOT_READY &&
+         slot->state != DS4_LAGUNA_CACHE_SLOT_IN_USE) ||
+        slot->refs == UINT32_MAX) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    slot->refs++;
+    slot->state = DS4_LAGUNA_CACHE_SLOT_IN_USE;
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_unpin(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_cache_handle handle) {
+    if (!cache_policy_valid(policy) ||
+        handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+        (size_t)handle.slot_index >= policy->slot_count) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    ds4_laguna_cache_slot *slot = &policy->slots[handle.slot_index];
+    if (slot->generation != handle.generation ||
+        slot->state != DS4_LAGUNA_CACHE_SLOT_IN_USE || slot->refs == 0) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (slot->refs == 1u && policy->sequence == UINT64_MAX) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    slot->refs--;
+    if (slot->refs == 0) {
+        policy->sequence++;
+        slot->last_used = policy->sequence;
+        slot->state = DS4_LAGUNA_CACHE_SLOT_READY;
+    }
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_fail(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_cache_handle handle) {
+    if (!cache_policy_valid(policy) ||
+        handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+        (size_t)handle.slot_index >= policy->slot_count) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    ds4_laguna_cache_slot *slot = &policy->slots[handle.slot_index];
+    if (slot->generation != handle.generation) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (slot->state != DS4_LAGUNA_CACHE_SLOT_LOADING) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    cache_slot_clear(slot);
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_RECOVERABLE
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_cancel(
+        ds4_laguna_cache_policy *policy,
+        ds4_laguna_cache_handle handle) {
+    if (!cache_policy_valid(policy) ||
+        handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+        (size_t)handle.slot_index >= policy->slot_count) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    ds4_laguna_cache_slot *slot = &policy->slots[handle.slot_index];
+    if (slot->generation != handle.generation) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY ||
+        slot->state == DS4_LAGUNA_CACHE_SLOT_READY) {
+        return DS4_LAGUNA_CACHE_OK;
+    }
+    if (slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (slot->state != DS4_LAGUNA_CACHE_SLOT_LOADING) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    cache_slot_clear(slot);
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_RECOVERABLE
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
+        ds4_laguna_cache_policy *policy) {
+    if (!cache_policy_valid(policy)) return DS4_LAGUNA_CACHE_UNSAFE;
+    for (size_t i = 0; i < policy->slot_count; i++) {
+        if (policy->slots[i].state == DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
+    }
+    for (size_t i = 0; i < policy->slot_count; i++) {
+        ds4_laguna_cache_slot *slot = &policy->slots[i];
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_READY) {
+            size_t entry_index = 0;
+            if (!cache_entry_index(policy, cache_slot_key(slot),
+                                   &entry_index) ||
+                policy->entry_to_slot[entry_index] != (uint32_t)i) {
+                return DS4_LAGUNA_CACHE_UNSAFE;
+            }
+            policy->entry_to_slot[entry_index] =
+                DS4_LAGUNA_CACHE_SLOT_NONE;
+        }
+        if (slot->state != DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+            cache_slot_clear(slot);
+        }
+    }
+    return cache_policy_valid(policy) ? DS4_LAGUNA_CACHE_OK
+                                      : DS4_LAGUNA_CACHE_UNSAFE;
+}
+
+static void cache_group_outputs_clear(
+        ds4_laguna_expert_key *grouped_keys,
+        size_t grouped_key_capacity,
+        ds4_laguna_expert_group *groups,
+        size_t group_capacity,
+        size_t *grouped_key_count,
+        size_t *group_count) {
+    if (grouped_key_count) *grouped_key_count = 0;
+    if (group_count) *group_count = 0;
+    if (grouped_keys && grouped_key_capacity != 0) {
+        memset(grouped_keys, 0,
+               grouped_key_capacity * sizeof(grouped_keys[0]));
+    }
+    if (groups && group_capacity != 0) {
+        memset(groups, 0, group_capacity * sizeof(groups[0]));
+    }
+}
+
+ds4_laguna_cache_status ds4_laguna_cache_policy_group(
+        const ds4_laguna_cache_policy *policy,
+        const ds4_laguna_expert_key *selected,
+        size_t token_count,
+        size_t selected_per_token,
+        ds4_laguna_expert_key *grouped_keys,
+        size_t grouped_key_capacity,
+        ds4_laguna_expert_group *groups,
+        size_t group_capacity,
+        size_t *grouped_key_count,
+        size_t *group_count) {
+    if (grouped_key_count) *grouped_key_count = 0;
+    if (group_count) *group_count = 0;
+    if (!grouped_key_count || !group_count ||
+        grouped_key_capacity > SIZE_MAX / sizeof(grouped_keys[0]) ||
+        group_capacity > SIZE_MAX / sizeof(groups[0]) ||
+        (grouped_key_capacity != 0 && !grouped_keys) ||
+        (group_capacity != 0 && !groups)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    cache_group_outputs_clear(grouped_keys, grouped_key_capacity,
+                              groups, group_capacity,
+                              grouped_key_count, group_count);
+    if (!cache_policy_valid(policy) || selected_per_token == 0 ||
+        token_count > SIZE_MAX / selected_per_token) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const size_t selected_count = token_count * selected_per_token;
+    if (selected_count != 0 && !selected) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (selected_count == 0) return DS4_LAGUNA_CACHE_OK;
+
+    const uint32_t layer_id = selected[0].layer_id;
+    for (size_t row = 0; row < token_count; row++) {
+        size_t row_unique = 0;
+        const size_t row_start = row * selected_per_token;
+        for (size_t column = 0; column < selected_per_token; column++) {
+            const ds4_laguna_expert_key key =
+                selected[row_start + column];
+            if (key.layer_id != layer_id ||
+                !cache_entry_index(policy, key, NULL)) {
+                cache_group_outputs_clear(
+                    grouped_keys, grouped_key_capacity,
+                    groups, group_capacity,
+                    grouped_key_count, group_count);
+                return DS4_LAGUNA_CACHE_UNSAFE;
+            }
+
+            bool seen_in_row = false;
+            for (size_t earlier = 0; earlier < column; earlier++) {
+                if (cache_key_equal(key,
+                        selected[row_start + earlier])) {
+                    seen_in_row = true;
+                    break;
+                }
+            }
+            if (!seen_in_row) row_unique++;
+            if (row_unique > policy->slot_count ||
+                row_unique > policy->max_selected_per_token) {
+                cache_group_outputs_clear(
+                    grouped_keys, grouped_key_capacity,
+                    groups, group_capacity,
+                    grouped_key_count, group_count);
+                return DS4_LAGUNA_CACHE_UNSAFE;
+            }
+        }
+    }
+
+    size_t unique_count = 0;
+    for (size_t i = 0; i < selected_count; i++) {
+        bool seen = false;
+        for (size_t earlier = 0; earlier < unique_count; earlier++) {
+            if (cache_key_equal(selected[i], grouped_keys[earlier])) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (unique_count >= grouped_key_capacity) {
+            cache_group_outputs_clear(grouped_keys, grouped_key_capacity,
+                                      groups, group_capacity,
+                                      grouped_key_count, group_count);
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
+        grouped_keys[unique_count++] = selected[i];
+    }
+
+    if (unique_count > UINT32_MAX) {
+        cache_group_outputs_clear(grouped_keys, grouped_key_capacity,
+                                  groups, group_capacity,
+                                  grouped_key_count, group_count);
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const size_t required_groups =
+        unique_count / policy->slot_count +
+        (unique_count % policy->slot_count != 0 ? 1u : 0u);
+    if (required_groups > group_capacity) {
+        cache_group_outputs_clear(grouped_keys, grouped_key_capacity,
+                                  groups, group_capacity,
+                                  grouped_key_count, group_count);
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    for (size_t i = 0; i < required_groups; i++) {
+        const size_t first = i * policy->slot_count;
+        size_t count = unique_count - first;
+        if (count > policy->slot_count) count = policy->slot_count;
+        groups[i].first_key = (uint32_t)first;
+        groups[i].key_count = (uint32_t)count;
+    }
+    *grouped_key_count = unique_count;
+    *group_count = required_groups;
+    return DS4_LAGUNA_CACHE_OK;
+}
+
 bool ds4_laguna_ledger_build(ds4_laguna_ledger *out,
                              const ds4_laguna_ledger_spec *spec,
                              const ds4_laguna_tensor_desc *tensors,

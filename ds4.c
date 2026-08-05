@@ -49271,8 +49271,14 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    bool logits_only_terminal;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+#ifdef DS4_TEST_HOOKS
+    uint64_t test_progress_dispatches;
+    uint64_t test_warmup_dispatches;
+    uint64_t test_layer_payload_dispatches;
+#endif
 };
 
 #ifndef DS4_NO_GPU
@@ -50134,6 +50140,99 @@ static bool ds4_session_is_laguna(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA;
 }
 
+enum {
+    DS4_LOGITS_ONLY_SYNC_INVALID = -1,
+    DS4_LOGITS_ONLY_SYNC_ORDINARY = 0,
+    DS4_LOGITS_ONLY_SYNC_EXACT = 1,
+};
+
+static bool ds4_session_is_logits_only_terminal(const ds4_session *s) {
+    return s && s->logits_only_terminal;
+}
+
+static int ds4_session_terminal_error(char *err, size_t errlen) {
+    if (err && errlen) snprintf(err, errlen, "session is logits-only terminal");
+    return 1;
+}
+
+static int ds4_logits_only_sync_mode(
+        bool native_cuda_build,
+        bool laguna,
+        ds4_backend backend,
+        bool session_distributed,
+        bool engine_distributed,
+        bool transport_tensor_parallel,
+        bool cuda_tensor_parallel,
+        int prompt_len,
+        int ctx_size) {
+    if (prompt_len != ctx_size) return DS4_LOGITS_ONLY_SYNC_ORDINARY;
+    if (!native_cuda_build || !laguna || backend != DS4_BACKEND_CUDA ||
+        session_distributed || engine_distributed ||
+        transport_tensor_parallel || cuda_tensor_parallel) {
+        return DS4_LOGITS_ONLY_SYNC_INVALID;
+    }
+    return DS4_LOGITS_ONLY_SYNC_EXACT;
+}
+
+static bool ds4_native_cuda_build(void) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool ds4_session_exact_logits_only_eligible(const ds4_session *s) {
+    if (!s || !s->engine) return false;
+    const ds4_engine *e = s->engine;
+    return ds4_logits_only_sync_mode(
+               ds4_native_cuda_build(),
+               ds4_session_is_laguna(s),
+               e->backend,
+               s->distributed != NULL,
+               e->distributed.role != DS4_DISTRIBUTED_NONE,
+               e->tp.active,
+               e->cuda_tensor_parallel,
+               s->ctx_size,
+               s->ctx_size) == DS4_LOGITS_ONLY_SYNC_EXACT;
+}
+
+static int ds4_session_exact_context_error(
+        const ds4_session *s, const ds4_tokens *prompt,
+        char *err, size_t errlen) {
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "exact-context logits-only sync requires local non-TP Laguna CUDA "
+                 "(prompt=%d context=%d)",
+                 prompt ? prompt->len : -1, s ? s->ctx_size : -1);
+    }
+    return 1;
+}
+
+#ifdef DS4_TEST_HOOKS
+static void ds4_test_session_progress_probe(void *ud, const char *event,
+                                            int current, int total) {
+    ds4_session *s = ud;
+    (void)event;
+    (void)current;
+    (void)total;
+    if (s) s->test_progress_dispatches++;
+}
+
+static void ds4_test_session_display_progress_probe(
+        void *ud, const char *event, int current, int total) {
+    (void)ud;
+    (void)event;
+    (void)current;
+    (void)total;
+}
+
+static bool ds4_test_session_cancel_probe(void *ud) {
+    (void)ud;
+    return false;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     if (s) s->glm_dense_cache_len = 0;
@@ -50227,6 +50326,10 @@ static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_e
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end) {
+    if (ds4_session_is_logits_only_terminal(s)) return 0;
+#ifdef DS4_TEST_HOOKS
+    if (s) s->test_layer_payload_dispatches++;
+#endif
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
@@ -50299,6 +50402,9 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
@@ -50541,6 +50647,9 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -51034,6 +51143,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return NULL;
     return s ? &s->checkpoint : NULL;
 }
 
@@ -51163,6 +51273,7 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return 0;
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
     if (ds4_session_is_laguna(s)) {
@@ -51253,6 +51364,9 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -51306,6 +51420,9 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -51698,6 +51815,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -52387,6 +52507,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -52430,6 +52553,9 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -52866,6 +52992,10 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 #endif
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        (void)ds4_session_terminal_error(err, errlen);
+        return -1;
+    }
     if (!s) return -1;
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
@@ -58966,7 +59096,116 @@ void ds4_session_free(ds4_session *s) {
     free(s);
 }
 
+#ifdef DS4_TEST_HOOKS
+int ds4_test_logits_only_sync_mode(
+        bool native_cuda_build,
+        bool laguna, ds4_backend backend,
+        bool session_distributed, bool engine_distributed,
+        bool transport_tensor_parallel, bool cuda_tensor_parallel,
+        int prompt_len, int ctx_size) {
+    return ds4_logits_only_sync_mode(
+            native_cuda_build, laguna, backend,
+            session_distributed, engine_distributed,
+            transport_tensor_parallel, cuda_tensor_parallel,
+            prompt_len, ctx_size);
+}
+
+int ds4_test_session_create_policy(
+        ds4_session **out, int ctx_size, bool terminal) {
+    if (!out || ctx_size <= 1) return 1;
+    *out = NULL;
+
+    static ds4_engine engine;
+    static bool engine_initialized;
+    if (!engine_initialized) {
+        memset(&engine, 0, sizeof(engine));
+        engine.backend = DS4_BACKEND_CPU;
+        engine.power_percent = 73;
+        engine.distributed.role = DS4_DISTRIBUTED_NONE;
+        engine.model.fd = -1;
+        engine.mtp_model.fd = -1;
+        engine_initialized = true;
+    }
+
+    ds4_session *s = calloc(1, sizeof(*s));
+    if (!s) return 1;
+    s->engine = &engine;
+    s->ctx_size = ctx_size;
+    s->prefill_cap = (uint32_t)ctx_size;
+    s->logits = malloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->sample_probs = calloc((size_t)DS4_N_VOCAB,
+                             sizeof(s->sample_probs[0]));
+    if (!s->logits || !s->sample_probs) {
+        ds4_session_free(s);
+        return 1;
+    }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        s->logits[i] = -(float)i / (float)DS4_N_VOCAB;
+    }
+
+    static const int checkpoint_tokens[] = {7, 11, 13};
+    const int checkpoint_len =
+        ctx_size - 1 < (int)(sizeof(checkpoint_tokens) /
+                             sizeof(checkpoint_tokens[0]))
+            ? ctx_size - 1
+            : (int)(sizeof(checkpoint_tokens) /
+                    sizeof(checkpoint_tokens[0]));
+    for (int i = 0; i < checkpoint_len; i++) {
+        token_vec_push(&s->checkpoint, checkpoint_tokens[i]);
+    }
+    s->checkpoint_valid = true;
+    s->logits_only_terminal = terminal;
+    if (terminal) {
+        s->progress = ds4_test_session_progress_probe;
+        s->progress_ud = s;
+        s->display_progress = ds4_test_session_display_progress_probe;
+        s->display_progress_ud = s;
+        s->cancel = ds4_test_session_cancel_probe;
+        s->cancel_ud = s;
+    }
+    *out = s;
+    return 0;
+}
+
+int ds4_test_session_state_get(
+        const ds4_session *s, ds4_test_session_state *out) {
+    if (!s || !out) return 1;
+    memset(out, 0, sizeof(*out));
+    out->pos = s->checkpoint.len;
+    out->first_token =
+        s->checkpoint.len > 0 && s->checkpoint.v ? s->checkpoint.v[0] : -1;
+    out->checkpoint_valid = s->checkpoint_valid;
+    out->logits_only_terminal = s->logits_only_terminal;
+    out->token_hash = hash_bytes(
+            s->checkpoint.v,
+            (uint64_t)s->checkpoint.len * sizeof(s->checkpoint.v[0]));
+    out->logit_hash = s->logits
+        ? hash_bytes(s->logits,
+                     (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0]))
+        : 0;
+    out->progress_set = s->progress != NULL;
+    out->progress_ud_set = s->progress_ud != NULL;
+    out->display_progress_set = s->display_progress != NULL;
+    out->display_progress_ud_set = s->display_progress_ud != NULL;
+    out->cancel_set = s->cancel != NULL;
+    out->cancel_ud_set = s->cancel_ud != NULL;
+    out->progress_is_test_probe =
+        s->progress == ds4_test_session_progress_probe;
+    out->display_progress_is_test_probe =
+        s->display_progress == ds4_test_session_display_progress_probe;
+    out->cancel_is_test_probe = s->cancel == ds4_test_session_cancel_probe;
+    out->progress_dispatches = s->test_progress_dispatches;
+    out->warmup_dispatches = s->test_warmup_dispatches;
+    out->layer_payload_dispatches = s->test_layer_payload_dispatches;
+    return 0;
+}
+#endif
+
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        (void)ds4_session_terminal_error(err, errlen);
+        return -1;
+    }
     if (!s || !s->distributed) {
         if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");
         return -1;
@@ -58975,15 +59214,18 @@ int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen
 }
 
 int ds4_session_power(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return 100;
     if (!s || !s->engine) return 100;
     return s->engine->power_percent;
 }
 
 bool ds4_session_is_distributed(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return false;
     return s && s->distributed != NULL;
 }
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
+    if (ds4_session_is_logits_only_terminal(s)) return 1;
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
 #ifndef DS4_NO_GPU
     if ((ds4_session_is_glm(s) || ds4_session_is_laguna(s)) &&
@@ -59005,18 +59247,21 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
 }
 
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
     if (!s) return;
     s->progress = fn;
     s->progress_ud = ud;
 }
 
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
     if (!s) return;
     s->display_progress = fn;
     s->display_progress_ud = ud;
 }
 
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
     if (!s) return;
     s->cancel = fn;
     s->cancel_ud = ud;
@@ -59031,11 +59276,15 @@ static bool ds4_session_cancelled_cb(void *ud) {
 }
 
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
 }
 
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -59078,6 +59327,9 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !s->engine || !hidden_hc || n_tokens == 0 || !logits) {
         if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
         return 1;
@@ -59376,6 +59628,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -59885,7 +60140,11 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+static int ds4_session_sync_internal(ds4_session *s,
+                                     const ds4_tokens *prompt,
+                                     bool allow_exact_context,
+                                     char *err,
+                                     size_t errlen);
 
 /* Under tensor parallelism the leader mirrors every public sync/eval to the
  * worker before doing the work itself, so both engines execute the same
@@ -59893,6 +60152,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     const bool mirror = ds4_session_tp_leader(s);
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
@@ -59901,7 +60163,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return 1;
         }
     }
-    int rc = ds4_session_sync_internal(s, prompt, err, errlen);
+    int rc = ds4_session_sync_internal(s, prompt, false, err, errlen);
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
@@ -59950,7 +60212,31 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return rc;
 }
 
-static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+int ds4_session_sync_logits_only(
+        ds4_session *s, const ds4_tokens *prompt,
+        char *err, size_t errlen) {
+    if (!s || !prompt || prompt->len != s->ctx_size) {
+        return ds4_session_sync(s, prompt, err, errlen);
+    }
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
+    if (!ds4_session_exact_logits_only_eligible(s)) {
+        return ds4_session_exact_context_error(s, prompt, err, errlen);
+    }
+    int rc = ds4_session_sync_internal(s, prompt, true, err, errlen);
+    if (rc == 0) s->logits_only_terminal = true;
+    return rc;
+}
+
+static int ds4_session_sync_internal(ds4_session *s,
+                                     const ds4_tokens *prompt,
+                                     bool allow_exact_context,
+                                     char *err,
+                                     size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -59959,7 +60245,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "empty prompt");
         return 1;
     }
-    if (prompt->len >= s->ctx_size) {
+    if (prompt->len > s->ctx_size ||
+        (!allow_exact_context && prompt->len == s->ctx_size)) {
         snprintf(err, errlen,
                  "prompt length %d exceeds context %d (one token of generation room is required)",
                  prompt->len, s->ctx_size);
@@ -60856,6 +61143,10 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        (void)ds4_session_terminal_error(err, errlen);
+        return DS4_SESSION_REWRITE_ERROR;
+    }
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return DS4_SESSION_REWRITE_ERROR;
@@ -60901,6 +61192,7 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 }
 
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
+    if (ds4_session_is_logits_only_terminal(s)) return 0;
     if (!s->checkpoint_valid) return 0;
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
     int i = 0;
@@ -60939,6 +61231,7 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (ds4_session_is_logits_only_terminal(s)) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -61009,6 +61302,7 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+    if (ds4_session_is_logits_only_terminal(s)) return 1;
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
@@ -61022,6 +61316,10 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
  * on the M5 Max pair -- the whole first-run TP deficit vs single
  * node, which pays the same cost before its timing window starts). */
 void ds4_session_gpu_warmup(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
+#ifdef DS4_TEST_HOOKS
+    if (s) s->test_warmup_dispatches++;
+#endif
 #ifndef DS4_NO_GPU
     if (!s || ds4_session_is_cpu(s)) return;
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return;
@@ -61647,6 +61945,9 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (!s) return 1;
     if (s->distributed) {
         if (!s->checkpoint_valid) {
@@ -61843,6 +62144,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  * the leader/worker lockstep survives every eval entry point. */
 static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     if (ds4_session_tp_leader(s)) {
         ds4_engine *e = s->engine;
         if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
@@ -61883,6 +62187,9 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -62657,6 +62964,13 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
+    if (items && count > 0) {
+        for (int i = 0; i < count; i++) {
+            if (ds4_session_is_logits_only_terminal(items[i].session)) {
+                return ds4_session_terminal_error(err, errlen);
+            }
+        }
+    }
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
@@ -62736,6 +63050,16 @@ int ds4_sessions_eval_batch_with_prefill(
         const ds4_tokens *prefill_prompt,
         char *err,
         size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(prefill_session)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
+    if (items && count > 0) {
+        for (int i = 0; i < count; i++) {
+            if (ds4_session_is_logits_only_terminal(items[i].session)) {
+                return ds4_session_terminal_error(err, errlen);
+            }
+        }
+    }
     if (!items || count <= 0 || !prefill_session || !prefill_prompt ||
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
@@ -63168,6 +63492,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
  * through the gated single-token decode in lockstep with the leader. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        return ds4_session_terminal_error(err, errlen);
+    }
 #ifdef DS4_NO_GPU
     (void)s; (void)drafts; (void)draft_n;
     snprintf(err, errlen, "GPU support is not compiled in");
@@ -66079,6 +66406,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    if (ds4_session_is_logits_only_terminal(s)) {
+        (void)ds4_session_terminal_error(err, errlen);
+        return -1;
+    }
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
         if (!accepted) return 0;
@@ -66798,6 +67129,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -66813,6 +67145,7 @@ void ds4_session_invalidate(ds4_session *s) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (ds4_session_is_logits_only_terminal(s)) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos);
@@ -66836,5 +67169,6 @@ int ds4_session_ctx(ds4_session *s) {
 }
 
 int ds4_session_prefill_cap(ds4_session *s) {
+    if (ds4_session_is_logits_only_terminal(s)) return 0;
     return s ? (int)s->prefill_cap : 0;
 }

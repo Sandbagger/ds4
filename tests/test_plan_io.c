@@ -491,6 +491,115 @@ static void test_second_commit_failure_rolls_back_plan(const char *root) {
     free(payload);
 }
 
+typedef struct {
+    const char *directory;
+    const char *plan;
+    const char *sidecar;
+    const char *rejection;
+    int calls;
+    bool saw_staged_pair_before_visibility;
+} checked_publication_fixture;
+
+static bool validate_checked_publication(void *context,
+                                         char *error,
+                                         size_t error_size) {
+    checked_publication_fixture *fixture = context;
+    fixture->calls++;
+    errno = 0;
+    const bool plan_absent = access(fixture->plan, F_OK) != 0 && errno == ENOENT;
+    errno = 0;
+    const bool sidecar_absent =
+        access(fixture->sidecar, F_OK) != 0 && errno == ENOENT;
+    fixture->saw_staged_pair_before_visibility =
+        plan_absent && sidecar_absent &&
+        count_temporary_files(fixture->directory) == 2;
+    if (fixture->rejection == NULL) return true;
+    (void)snprintf(error, error_size, "%s", fixture->rejection);
+    return false;
+}
+
+static void test_checked_publication_validation(const char *root) {
+    static const char payload[] = "identity-bound qualification plan\n";
+    static const char rejection[] = "opened model identity changed before commit";
+    char rejected_plan[512];
+    char rejected_sidecar[520];
+    char accepted_plan[512];
+    char accepted_sidecar[520];
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = "stale";
+    char error[512] = "stale";
+    CHECK(make_path(rejected_plan, sizeof(rejected_plan), root, "checked-reject.json"),
+          "checked rejection plan path fits");
+    CHECK(snprintf(rejected_sidecar,
+                   sizeof(rejected_sidecar),
+                   "%s.sha256",
+                   rejected_plan) > 0,
+          "checked rejection sidecar path fits");
+    CHECK(make_path(accepted_plan, sizeof(accepted_plan), root, "checked-accept.json"),
+          "checked acceptance plan path fits");
+    CHECK(snprintf(accepted_sidecar,
+                   sizeof(accepted_sidecar),
+                   "%s.sha256",
+                   accepted_plan) > 0,
+          "checked acceptance sidecar path fits");
+
+    checked_publication_fixture rejected = {
+        .directory = root,
+        .plan = rejected_plan,
+        .sidecar = rejected_sidecar,
+        .rejection = rejection,
+    };
+    CHECK(!ds4_plan_io_publish_checked(rejected_plan,
+                                       payload,
+                                       sizeof(payload) - 1u,
+                                       validate_checked_publication,
+                                       &rejected,
+                                       digest,
+                                       error,
+                                       sizeof(error)),
+          "checked publisher rejects a changed caller identity");
+    CHECK(rejected.calls == 1,
+          "checked publisher invokes validation exactly once");
+    CHECK(rejected.saw_staged_pair_before_visibility,
+          "validation runs after both stages and before final visibility");
+    CHECK(strcmp(error, rejection) == 0,
+          "checked publisher preserves the callback error exactly");
+    CHECK(digest[0] == '\0',
+          "checked rejection returns no authenticated digest");
+    CHECK(access(rejected_plan, F_OK) != 0 && errno == ENOENT,
+          "checked rejection exposes no plan");
+    CHECK(access(rejected_sidecar, F_OK) != 0 && errno == ENOENT,
+          "checked rejection exposes no sidecar");
+    CHECK(count_temporary_files(root) == 0,
+          "checked rejection removes both staged temporary files");
+
+    checked_publication_fixture accepted = {
+        .directory = root,
+        .plan = accepted_plan,
+        .sidecar = accepted_sidecar,
+    };
+    CHECK(ds4_plan_io_publish_checked(accepted_plan,
+                                      payload,
+                                      sizeof(payload) - 1u,
+                                      validate_checked_publication,
+                                      &accepted,
+                                      digest,
+                                      error,
+                                      sizeof(error)),
+          "checked publisher commits after callback acceptance");
+    CHECK(accepted.calls == 1,
+          "accepted checked publisher invokes validation exactly once");
+    CHECK(accepted.saw_staged_pair_before_visibility,
+          "accepted validation sees both durable stages before visibility");
+    CHECK(error[0] == '\0',
+          "successful checked publication leaves no error text");
+    CHECK(access(accepted_plan, F_OK) == 0,
+          "accepted checked publication exposes the plan");
+    CHECK(access(accepted_sidecar, F_OK) == 0,
+          "accepted checked publication exposes the sidecar");
+    CHECK(count_temporary_files(root) == 0,
+          "accepted checked publication leaves no temporary files");
+}
+
 static void test_nested_directory(const char *root) {
     char nested[512];
     char deeper[512];
@@ -700,7 +809,7 @@ static void cleanup_tree(const char *root) {
     char sidecar[520];
     static const char *const files[] = {
         "plan-a.json", "plan-b.json", "blocked.json", "race.json",
-        "rollback.json"
+        "rollback.json", "checked-accept.json"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         if (!make_path(path, sizeof(path), root, files[i])) continue;
@@ -729,6 +838,7 @@ int main(void) {
     test_publish_and_immutability(root);
     test_racing_plan_target_is_not_replaced(root);
     test_second_commit_failure_rolls_back_plan(root);
+    test_checked_publication_validation(root);
     test_nested_directory(root);
     test_preexisting_sidecar(root);
     test_post_plan_sidecar_failure(root);

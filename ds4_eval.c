@@ -4162,6 +4162,14 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
 }
 
 int main(int argc, char **argv) {
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     eval_config cfg = parse_options(argc, argv);
     ds4_engine_options opt = {
         .model_path = cfg.model_path,

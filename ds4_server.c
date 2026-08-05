@@ -13194,6 +13194,14 @@ static void server_request_decode_stop(server *s) {
 }
 
 int main(int argc, char **argv) {
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_SERVER,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4-server: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

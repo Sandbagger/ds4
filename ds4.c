@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -1109,9 +1110,35 @@ typedef struct {
     char error[256];
 } ds4_cursor;
 
+typedef struct {
+    jmp_buf environment;
+    char message[512];
+} ds4_failure_trap;
+
+/* Qualification planning is single-threaded and runs before engine startup.
+ * Its narrow failure scope converts legacy fatal GGUF validation into the
+ * public writer's return/error contract; ordinary runtime callers still exit. */
+static ds4_failure_trap *g_ds4_failure_trap;
+
 static void ds4_die(const char *msg) {
+    if (g_ds4_failure_trap) {
+        snprintf(g_ds4_failure_trap->message,
+                 sizeof(g_ds4_failure_trap->message),
+                 "%s", msg ? msg : "unknown failure");
+        longjmp(g_ds4_failure_trap->environment, 1);
+    }
     fprintf(stderr, "ds4: %s\n", msg);
     exit(1);
+}
+
+static void ds4_dief(const char *format, ...) {
+    char message[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    message[sizeof(message) - 1u] = '\0';
+    ds4_die(message);
 }
 
 /* Attention compression is read from GGUF metadata after validating that it
@@ -1154,8 +1181,8 @@ static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
 }
 
 static void ds4_die_errno(const char *what, const char *path) {
-    fprintf(stderr, "ds4: %s '%s': %s\n", what, path, strerror(errno));
-    exit(1);
+    const int saved_errno = errno;
+    ds4_dief("%s '%s': %s", what, path, strerror(saved_errno));
 }
 
 static bool ds4_streq(ds4_str s, const char *z) {
@@ -2600,6 +2627,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
+    m->fd = fd;
 
     struct stat st;
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
@@ -2627,7 +2655,6 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
-    m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
 
@@ -4341,8 +4368,7 @@ typedef struct {
 static uint32_t required_u32(const ds4_model *m, const char *key) {
     uint32_t v = 0;
     if (!model_get_u32(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_dief("required metadata key is missing: %s", key);
     }
     return v;
 }
@@ -4350,8 +4376,7 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
 static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
     uint64_t v = 0;
     if (!model_get_u64_compat(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_dief("required metadata key is missing: %s", key);
     }
     return v;
 }
@@ -4359,8 +4384,7 @@ static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
 static float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_dief("required metadata key is missing: %s", key);
     }
     return v;
 }
@@ -4368,8 +4392,7 @@ static float required_f32(const ds4_model *m, const char *key) {
 static bool required_bool(const ds4_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_dief("required metadata key is missing: %s", key);
     }
     return v;
 }
@@ -4377,8 +4400,7 @@ static bool required_bool(const ds4_model *m, const char *key) {
 static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
     ds4_tensor *t = model_find_tensor(m, name);
     if (!t) {
-        fprintf(stderr, "ds4: required tensor is missing: %s\n", name);
-        exit(1);
+        ds4_dief("required tensor is missing: %s", name);
     }
     return t;
 }
@@ -4416,35 +4438,22 @@ static void tensor_expect_layout(
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (t->type != type) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected %s\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type),
-                tensor_type_name(type));
-        exit(1);
+        ds4_dief("tensor %.*s has type %s, expected %s",
+                 (int)t->name.len,
+                 t->name.ptr,
+                 tensor_type_name(t->type),
+                 tensor_type_name(type));
     }
     if (t->ndim != ndim) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has %u dimensions, expected %u\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->ndim,
-                ndim);
-        exit(1);
+        ds4_dief("tensor %.*s has %u dimensions, expected %u",
+                 (int)t->name.len, t->name.ptr, t->ndim, ndim);
     }
 
     const uint64_t want[3] = { d0, d1, d2 };
     for (uint32_t i = 0; i < ndim; i++) {
         if (t->dim[i] == want[i]) continue;
-        fprintf(stderr,
-                "ds4: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
-                (int)t->name.len,
-                t->name.ptr,
-                i,
-                t->dim[i],
-                want[i]);
-        exit(1);
+        ds4_dief("tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64,
+                 (int)t->name.len, t->name.ptr, i, t->dim[i], want[i]);
     }
 }
 
@@ -4468,12 +4477,8 @@ static void tensor_expect_glm_dense_quant_layout(
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating GLM dense layout");
     if (!tensor_type_is_glm_dense_quant(t->type)) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
+        ds4_dief("tensor %.*s has type %s, expected q8_0, q4_K, or q4_0",
+                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4486,12 +4491,8 @@ static void tensor_expect_dense_quant_layout(
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating dense quant layout");
     if (!tensor_type_is_dense_quant(t->type)) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
+        ds4_dief("tensor %.*s has type %s, expected q8_0, q4_K, or q4_0",
+                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4514,12 +4515,8 @@ static void tensor_expect_plain_layout(
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected F16 or F32\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
+        ds4_dief("tensor %.*s has type %s, expected F16 or F32",
+                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4536,12 +4533,8 @@ static void tensor_expect_f16_or_q8_0_layout(
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_f16_or_q8_0(t->type)) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected f16 or q8_0\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
+        ds4_dief("tensor %.*s has type %s, expected f16 or q8_0",
+                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -5513,11 +5506,9 @@ static void weights_validate_laguna_layout(
         (w->token_embd && layout_marker->type == DS4_TENSOR_Q4_K) ||
         (!w->token_embd && layout_marker->type == DS4_TENSOR_F16);
     if (!signal_q8 && !legacy_layout) {
-        fprintf(stderr,
-                "ds4: unsupported Laguna quantization layout marker %s; "
-                "expected legacy Q4_K/F16 or Q8_0 signal weights\n",
-                tensor_type_name(layout_marker->type));
-        exit(1);
+        ds4_dief("unsupported Laguna quantization layout marker %s; "
+                 "expected legacy Q4_K/F16 or Q8_0 signal weights",
+                 tensor_type_name(layout_marker->type));
     }
 
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
@@ -5541,8 +5532,7 @@ static void weights_validate_laguna_layout(
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_laguna_layer_has_required(l, il)) {
-            fprintf(stderr, "ds4: required Laguna tensors for layer %u are missing\n", il);
-            exit(1);
+            ds4_dief("required Laguna tensors for layer %u are missing", il);
         }
         const uint32_t n_head = ds4_layer_head_count(il);
         const uint64_t q_dim = (uint64_t)n_head * DS4_N_HEAD_DIM;
@@ -5592,10 +5582,9 @@ static void weights_validate_laguna_layout(
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         if (l->ffn_down_exps->type != DS4_TENSOR_Q4_K &&
             (signal_q8 || l->ffn_down_exps->type != DS4_TENSOR_Q6_K)) {
-            fprintf(stderr,
-                    "ds4: Laguna routed down tensor for layer %u has unsupported type %s\n",
-                    il, tensor_type_name(l->ffn_down_exps->type));
-            exit(1);
+            ds4_dief("Laguna routed down tensor for layer %u has "
+                     "unsupported type %s",
+                     il, tensor_type_name(l->ffn_down_exps->type));
         }
         tensor_expect_layout(l->ffn_down_exps, l->ffn_down_exps->type,
                              3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
@@ -5610,10 +5599,9 @@ static void weights_validate_laguna_layout(
         if (!signal_q8 &&
             shared_down_type != DS4_TENSOR_Q4_K &&
             shared_down_type != DS4_TENSOR_Q6_K) {
-            fprintf(stderr,
-                    "ds4: Laguna shared down tensor for layer %u has unsupported type %s\n",
-                    il, tensor_type_name(shared_down_type));
-            exit(1);
+            ds4_dief("Laguna shared down tensor for layer %u has "
+                     "unsupported type %s",
+                     il, tensor_type_name(shared_down_type));
         }
         tensor_expect_layout(l->ffn_down_shexp, shared_down_type,
                              2, DS4_N_FF_SHARED, DS4_N_EMBD, 0);
@@ -6212,31 +6200,28 @@ static void validate_swiglu_clamp_metadata(const ds4_model *m) {
 
 static void config_expect_u32(const char *name, uint32_t got, uint32_t expected) {
     if (got == expected) return;
-    fprintf(stderr, "ds4: expected %s=%u for %s, got %u\n",
-            name, expected, DS4_MODEL_SHAPE_NAME, got);
-    exit(1);
+    ds4_dief("expected %s=%u for %s, got %u",
+             name, expected, DS4_MODEL_SHAPE_NAME, got);
 }
 
 static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
     if (got == expected) return;
-    fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
-            name, expected, DS4_MODEL_SHAPE_NAME, got);
-    exit(1);
+    ds4_dief("expected %s=%" PRIu64 " for %s, got %" PRIu64,
+             name, expected, DS4_MODEL_SHAPE_NAME, got);
 }
 
 static void config_expect_f32(const char *name, float got, float expected) {
     const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
     if (fabsf(got - expected) <= scale * 1.0e-6f) return;
-    fprintf(stderr, "ds4: expected %s=%.9g for %s, got %.9g\n",
-            name, (double)expected, DS4_MODEL_SHAPE_NAME, (double)got);
-    exit(1);
+    ds4_dief("expected %s=%.9g for %s, got %.9g",
+             name, (double)expected, DS4_MODEL_SHAPE_NAME, (double)got);
 }
 
 static void config_expect_bool(const char *name, bool got, bool expected) {
     if (got == expected) return;
-    fprintf(stderr, "ds4: expected %s=%s for %s, got %s\n",
-            name, expected ? "true" : "false", DS4_MODEL_SHAPE_NAME, got ? "true" : "false");
-    exit(1);
+    ds4_dief("expected %s=%s for %s, got %s",
+             name, expected ? "true" : "false",
+             DS4_MODEL_SHAPE_NAME, got ? "true" : "false");
 }
 
 static void config_validate_fixed_shape(uint32_t n_layer) {
@@ -6488,10 +6473,8 @@ static void config_validate_laguna_model(const ds4_model *m) {
         }
         const uint32_t expected = (il % 4u) == 0 ? 48u : 72u;
         if (got != expected) {
-            fprintf(stderr,
-                    "ds4: unexpected Laguna head count at layer %u: got %u, expected %u\n",
-                    il, got, expected);
-            exit(1);
+            ds4_dief("unexpected Laguna head count at layer %u: "
+                     "got %u, expected %u", il, got, expected);
         }
         g_ds4_head_counts[il] = got;
     }
@@ -58567,6 +58550,87 @@ static int ds4_qualification_plan_options_preflight(
     return 0;
 }
 
+int ds4_qualification_args_preflight(
+        int argc,
+        char *const argv[],
+        ds4_qualification_frontend frontend,
+        char *err,
+        size_t errcap) {
+    if (err && errcap != 0) err[0] = '\0';
+    if (argc <= 1 || !argv) return 0;
+
+    bool planning = false;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] &&
+            (strcmp(argv[i], "--qualification-plan") == 0 ||
+             strncmp(argv[i], "--qualification-plan=", 21u) == 0)) {
+            planning = true;
+            break;
+        }
+    }
+    if (!planning) return 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!arg) {
+            if (err && errcap != 0) {
+                snprintf(err, errcap,
+                         "--qualification-plan received a null argument");
+            }
+            return 2;
+        }
+        bool takes_value = false;
+        bool allowed =
+            strcmp(arg, "--cuda") == 0 ||
+            strcmp(arg, "--ssd-streaming") == 0;
+        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--model") == 0 ||
+            strcmp(arg, "--qualification-plan") == 0 ||
+            strcmp(arg, "--prefill-chunk") == 0 ||
+            strcmp(arg, "--ssd-streaming-cache-bytes") == 0 ||
+            strcmp(arg, "--power") == 0) {
+            allowed = true;
+            takes_value = true;
+        }
+        if ((frontend == DS4_QUALIFICATION_FRONTEND_STANDARD ||
+             frontend == DS4_QUALIFICATION_FRONTEND_SERVER) &&
+            strcmp(arg, "--ctx") == 0) {
+            allowed = true;
+            takes_value = true;
+        }
+        if (frontend == DS4_QUALIFICATION_FRONTEND_SERVER &&
+            strcmp(arg, "--session-slots") == 0) {
+            allowed = true;
+            takes_value = true;
+        }
+        if (frontend == DS4_QUALIFICATION_FRONTEND_BENCH &&
+            strcmp(arg, "--ctx-alloc") == 0) {
+            allowed = true;
+            takes_value = true;
+        }
+        if (!allowed) {
+            if (err && errcap != 0) {
+                snprintf(err, errcap,
+                         "--qualification-plan cannot be combined with "
+                         "frontend option %s",
+                         arg[0] ? arg : "<empty>");
+            }
+            return 2;
+        }
+        if (takes_value) {
+            if (i + 1 >= argc) {
+                if (err && errcap != 0) {
+                    snprintf(err, errcap,
+                             "missing value for %s in qualification-plan mode",
+                             arg);
+                }
+                return 2;
+            }
+            i++;
+        }
+    }
+    return 0;
+}
+
 static int ds4_engine_options_preflight_with_budget(
         const ds4_engine_options *opt,
         bool recommended_known,
@@ -58737,6 +58801,75 @@ static void qualification_plan_error(char *err,
              stage, detail && detail[0] ? detail : "unknown error");
 }
 
+typedef struct {
+    int fd;
+    const ds4_laguna_file_identity *identity;
+} qualification_plan_model_validation;
+
+static bool qualification_plan_validate_model_identity(
+        void *context,
+        char *err,
+        size_t errcap) {
+    const qualification_plan_model_validation *validation = context;
+    if (!validation || !validation->identity) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "qualification model identity callback is invalid");
+        }
+        return false;
+    }
+    return laguna_file_identity_matches(
+        validation->fd, validation->identity, err, errcap);
+}
+
+/* The existing GGUF loader deliberately treats malformed model files as
+ * process-fatal.  Qualification planning is a public, plan-only operation,
+ * so contain that legacy contract in one synchronous scope and translate it
+ * into the writer's ordinary error return.  The trap itself lives on the heap
+ * because its message is modified between setjmp() and longjmp(). */
+static bool qualification_plan_load_laguna(
+        ds4_model *model,
+        ds4_weights *weights,
+        const char *model_path,
+        char *err,
+        size_t errcap) {
+    ds4_failure_trap *trap = calloc(1, sizeof(*trap));
+    if (!trap) {
+        if (err && errcap != 0) {
+            snprintf(err, errcap,
+                     "out of memory while preparing model validation");
+        }
+        return false;
+    }
+
+    ds4_failure_trap *const previous_trap = g_ds4_failure_trap;
+    if (setjmp(trap->environment) != 0) {
+        g_ds4_failure_trap = previous_trap;
+        if (err && errcap != 0) {
+            snprintf(err, errcap, "%s",
+                     trap->message[0] ? trap->message :
+                     "unknown model validation failure");
+        }
+        free(trap);
+        return false;
+    }
+
+    g_ds4_failure_trap = trap;
+    model_open(model, model_path, false, false);
+
+    ds4_str architecture = {0};
+    if (!model_get_string(model, "general.architecture", &architecture) ||
+        !ds4_streq(architecture, "laguna")) {
+        ds4_die("the opened GGUF is not Laguna S 2.1");
+    }
+    config_validate_model(model);
+    weights_bind(weights, model, false, 0, 0, true);
+
+    g_ds4_failure_trap = previous_trap;
+    free(trap);
+    return true;
+}
+
 int ds4_engine_write_qualification_plan(
         const ds4_engine_options *opt,
         char *err,
@@ -58768,14 +58901,12 @@ int ds4_engine_write_qualification_plan(
     size_t plan_size = 0;
     int rc = 2;
 
-    model_open(&model, opt->model_path, false, false);
-    config_validate_model(&model);
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
-        qualification_plan_error(
-            err, errcap, "model", "the opened GGUF is not Laguna S 2.1");
+    if (!qualification_plan_load_laguna(
+            &model, &weights, opt->model_path,
+            detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "model", detail);
         goto cleanup;
     }
-    weights_bind(&weights, &model, false, 0, 0, true);
     if (!laguna_ledger_build_from_bound_weights(
             &ledger, &model, &weights, detail, sizeof(detail))) {
         qualification_plan_error(err, errcap, "ledger", detail);
@@ -58835,15 +58966,15 @@ int ds4_engine_write_qualification_plan(
     }
 
     char plan_sha256[DS4_PLAN_IO_SHA256_HEX_SIZE];
-    if (!ds4_plan_io_publish(
+    const qualification_plan_model_validation validation = {
+        .fd = model.fd,
+        .identity = &model.identity,
+    };
+    if (!ds4_plan_io_publish_checked(
             opt->qualification_plan_path, plan_bytes, plan_size,
-            plan_sha256, detail, sizeof(detail))) {
+            qualification_plan_validate_model_identity,
+            (void *)&validation, plan_sha256, detail, sizeof(detail))) {
         qualification_plan_error(err, errcap, "publication", detail);
-        goto cleanup;
-    }
-    if (!laguna_file_identity_matches(
-            model.fd, &model.identity, detail, sizeof(detail))) {
-        qualification_plan_error(err, errcap, "model identity", detail);
         goto cleanup;
     }
     rc = 0;

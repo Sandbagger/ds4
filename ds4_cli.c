@@ -2104,6 +2104,14 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     cli_config cfg = parse_options(argc, argv);
     cfg.engine.inspect_only = cfg.inspect;
     cfg.engine.first_token_test = cfg.gen.first_token_test;

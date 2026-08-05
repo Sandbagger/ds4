@@ -204,6 +204,22 @@ typedef struct {
 
 struct ds4_gpu_config;
 
+typedef enum {
+    DS4_QUALIFICATION_FRONTEND_STANDARD = 0,
+    DS4_QUALIFICATION_FRONTEND_SERVER = 1,
+    DS4_QUALIFICATION_FRONTEND_BENCH = 2,
+} ds4_qualification_frontend;
+
+/* Before a frontend parses files or changes process state, enforce the small
+ * harness-only argument vocabulary whenever --qualification-plan is present.
+ * Ordinary invocations are left untouched. */
+int ds4_qualification_args_preflight(
+        int argc,
+        char *const argv[],
+        ds4_qualification_frontend frontend,
+        char *err,
+        size_t errcap);
+
 /* Validate model-independent configuration before tokenizer/model access. */
 int ds4_engine_options_preflight(const ds4_engine_options *opt,
                                  char *err,

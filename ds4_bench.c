@@ -380,6 +380,8 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (c.qualification_plan_path_set) return c;
+
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
@@ -597,6 +599,14 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_BENCH,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4-bench: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     bench_config cfg = parse_options(argc, argv);
 
     /* Hint the packer at the largest ctx this bench run will exercise

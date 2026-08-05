@@ -820,6 +820,15 @@ static void test_allocation_profiles(void) {
         CHECK(plan.configured_cache_bytes == cache_bytes[i] &&
                   plan.effective_cache_limit_bytes == cache_bytes[i],
               "effective cache limit preserves the configured byte ceiling");
+        CHECK(plan.context_tokens == 32768u &&
+                  plan.prefill_rows == 4096u &&
+                  plan.session_count == 1u,
+              "allocation plan retains the exact reference runtime shape");
+        CHECK(plan.profile_id != NULL &&
+                  ((i == 0 && strcmp(plan.profile_id, "cache-8gib") == 0) ||
+                   (i == 1 && strcmp(plan.profile_id, "cache-12gib") == 0) ||
+                   (i == 2 && strcmp(plan.profile_id, "cache-16gib") == 0)),
+              "allocation plan assigns the frozen profile identity");
         CHECK(plan.slot_stride_bytes == UINT64_C(5308416) &&
                   plan.slot_count == slot_counts[i],
               "reference profile floors exact cache slots from ledger stride");

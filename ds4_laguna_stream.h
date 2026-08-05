@@ -145,6 +145,10 @@ typedef struct {
 } ds4_laguna_allocation_plan_spec;
 
 typedef struct {
+    const char *profile_id;
+    uint32_t context_tokens;
+    uint32_t prefill_rows;
+    uint32_t session_count;
     uint64_t configured_cache_bytes;
     uint64_t effective_cache_limit_bytes;
     uint64_t slot_stride_bytes;

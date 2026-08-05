@@ -671,6 +671,12 @@ bool ds4_laguna_allocation_plan_make(
                          "allocation plan staging arithmetic overflow");
     }
 
+    out->profile_id = spec->configured_cache_bytes == 8u * gib ?
+        "cache-8gib" : spec->configured_cache_bytes == 12u * gib ?
+        "cache-12gib" : "cache-16gib";
+    out->context_tokens = spec->context_tokens;
+    out->prefill_rows = spec->prefill_rows;
+    out->session_count = spec->session_count;
     out->configured_cache_bytes = spec->configured_cache_bytes;
     out->effective_cache_limit_bytes = spec->configured_cache_bytes;
     out->slot_stride_bytes = ledger->slot_stride_bytes;

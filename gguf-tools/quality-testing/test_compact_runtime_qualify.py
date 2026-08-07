@@ -194,6 +194,10 @@ def schema_expressible_mutations() -> list[Mutation]:
             ),
         ),
         (
+            "model path embedded generic marker",
+            _set(("model",), "path", "/models/<x>/laguna-s-2.1-Q4_K_M.gguf"),
+        ),
+        (
             "model path tab segment",
             _set(("model",), "path", "/models/has\ttab/laguna-s-2.1-Q4_K_M.gguf"),
         ),

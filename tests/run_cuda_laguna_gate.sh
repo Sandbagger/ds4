@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runner_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd "$runner_dir/.." && pwd)
+runner_dir=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(CDPATH= cd -- "$runner_dir/.." && pwd)
 verifier="$repo_root/gguf-tools/quality-testing/compare_laguna_logits.py"
 verifier_module_dir="$repo_root/gguf-tools/quality-testing"
 fixture="$repo_root/tests/test-vectors/laguna-resident"

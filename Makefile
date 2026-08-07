@@ -443,7 +443,9 @@ test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	./tests/test_cuda_laguna_stream --case startup
 
 test-cuda-laguna-resident: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model
-	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(LAGUNA_TOKENIZER_RUNTIME_COMMIT)" tests/run_cuda_laguna_gate.sh resident
+	tests/run_cuda_laguna_gate.sh resident
+test-cuda-laguna-resident: export DS4_TEST_MODEL := $(DS4_TEST_MODEL)
+test-cuda-laguna-resident: export LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(LAGUNA_TOKENIZER_RUNTIME_COMMIT)
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

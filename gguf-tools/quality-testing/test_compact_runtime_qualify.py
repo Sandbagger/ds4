@@ -16,8 +16,11 @@ import re
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
+
+from jsonschema import Draft202012Validator
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -119,6 +122,111 @@ def build_fixture() -> dict:
     )
 
 
+Mutation = tuple[str, Callable[[dict], None]]
+PathPart = str | int
+
+
+def _node_at(manifest: dict, path: tuple[PathPart, ...]) -> dict:
+    node = manifest
+    for part in path:
+        node = node[part]
+    return node
+
+
+def _set(path: tuple[PathPart, ...], key: str, value: object) -> Callable[[dict], None]:
+    return lambda manifest: _node_at(manifest, path).__setitem__(key, value)
+
+
+def _delete(path: tuple[PathPart, ...], key: str) -> Callable[[dict], None]:
+    return lambda manifest: _node_at(manifest, path).__delitem__(key)
+
+
+def schema_expressible_mutations() -> list[Mutation]:
+    mutations: list[Mutation] = [
+        (
+            "uint64 max plus one",
+            _set(("prompts", 0), "payload_prefix_bytes", "18446744073709551616"),
+        ),
+        (
+            "uint64 larger overflow",
+            _set(("prompts", 0), "payload_prefix_bytes", "99999999999999999999"),
+        ),
+        (
+            "positive uint64 max plus one",
+            _set(("model",), "device", "18446744073709551616"),
+        ),
+        (
+            "positive uint64 larger overflow",
+            _set(
+                ("prompt_source", "tokenizer_runtime"),
+                "inode",
+                "99999999999999999999",
+            ),
+        ),
+        ("base64 invalid padding", _set(("prompts", 0), "rendered_base64", "Zg===")),
+        ("base64 invalid alphabet", _set(("prompts", 0), "rendered_base64", "!!!!")),
+        (
+            "base64 noncanonical low bits",
+            _set(("prompts", 0), "rendered_base64", "Zh=="),
+        ),
+        (
+            "model path relative",
+            _set(("model",), "path", "models/laguna-s-2.1-Q4_K_M.gguf"),
+        ),
+        (
+            "model path repeated slash",
+            _set(("model",), "path", "/models//laguna-s-2.1-Q4_K_M.gguf"),
+        ),
+        (
+            "model path wrong basename",
+            _set(("model",), "path", "/models/not-laguna.gguf"),
+        ),
+    ]
+
+    positive_fields = [
+        (("model",), "device"),
+        (("model",), "inode"),
+        (("model",), "mtime_ns"),
+        (("prompt_source", "tokenizer_runtime"), "device"),
+        (("prompt_source", "tokenizer_runtime"), "inode"),
+        (("prompt_source", "tokenizer_runtime"), "size_bytes"),
+        (("prompt_source", "tokenizer_runtime"), "mtime_ns"),
+        *((('prompts', index), "rendered_size_bytes") for index in range(4)),
+    ]
+    mutations.extend(
+        (
+            f"positive uint64 zero at {'.'.join(map(str, path + (key,)))}",
+            _set(path, key, "0"),
+        )
+        for path, key in positive_fields
+    )
+
+    required_fields = [
+        ((), "schema"),
+        (("model",), "path"),
+        (("host",), "hostname"),
+        (("host", "filesystem"), "mount_point"),
+        (("host", "nvme"), "device"),
+        (("host", "io"), "direct_io"),
+        (("prompt_source",), "seed_size_bytes"),
+        (("prompt_source", "tokenizer_runtime"), "source_revision"),
+        (("prompts", 0), "id"),
+        (("sampling",), "max_generated_tokens"),
+        (("execution",), "qualification_cold_preparations"),
+        (("profiles", 0), "profile_id"),
+    ]
+    for path, key in required_fields:
+        location = ".".join(map(str, path + (key,)))
+        mutations.extend(
+            [
+                (f"unknown key beside {location}", _set(path, "extra", "forbidden")),
+                (f"missing required {location}", _delete(path, key)),
+                (f"null required {location}", _set(path, key, None)),
+            ]
+        )
+    return mutations
+
+
 def schema_validates_string(schema: dict, subschema: dict, value: str) -> bool:
     """Evaluate the Draft 2020-12 string constraints used by this schema."""
     if "$ref" in subschema:
@@ -153,6 +261,31 @@ class CompactRuntimeManifestContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.manifest = build_fixture()
+        cls.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(cls.schema)
+        cls.schema_validator = Draft202012Validator(cls.schema)
+
+    def test_checked_schema_matches_strict_validator_mutation_corpus(self) -> None:
+        self.assertTrue(self.schema_validator.is_valid(self.manifest))
+        TOOL.validate_manifest(self.manifest)
+
+        mismatches = []
+        for label, mutate in schema_expressible_mutations():
+            changed = copy.deepcopy(self.manifest)
+            mutate(changed)
+            schema_accepts = self.schema_validator.is_valid(changed)
+            try:
+                TOOL.validate_manifest(changed)
+                custom_accepts = True
+            except ValueError:
+                custom_accepts = False
+            if schema_accepts or custom_accepts or schema_accepts != custom_accepts:
+                mismatches.append(
+                    f"{label}: schema_accepts={schema_accepts} "
+                    f"custom_accepts={custom_accepts}"
+                )
+
+        self.assertEqual(mismatches, [], "schema/custom mismatches:\n" + "\n".join(mismatches))
 
     def test_schema_exists_parses_and_closes_every_object(self) -> None:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -303,31 +436,6 @@ class CompactRuntimeManifestContractTest(unittest.TestCase):
         self.assertEqual(self.manifest["host"], HOST_IDENTITY)
         TOOL.validate_manifest(self.manifest)
 
-    def test_rejects_unknown_keys_at_every_manifest_level(self) -> None:
-        mutations = [
-            ((), "extra"),
-            (("model",), "extra"),
-            (("host",), "extra"),
-            (("host", "filesystem"), "extra"),
-            (("host", "nvme"), "extra"),
-            (("host", "io"), "extra"),
-            (("prompt_source",), "extra"),
-            (("prompt_source", "tokenizer_runtime"), "extra"),
-            (("prompts", 0), "extra"),
-            (("sampling",), "extra"),
-            (("execution",), "extra"),
-            (("profiles", 0), "extra"),
-        ]
-        for path, key in mutations:
-            with self.subTest(path=path):
-                changed = copy.deepcopy(self.manifest)
-                node = changed
-                for part in path:
-                    node = node[part]
-                node[key] = "forbidden"
-                with self.assertRaisesRegex(ValueError, "unknown key"):
-                    TOOL.validate_manifest(changed)
-
     def test_rejects_placeholders_missing_bytes_reordering_and_stale_hashes(self) -> None:
         cases: list[tuple[str, callable]] = [
             ("placeholder", lambda d: d["host"].__setitem__("hostname", "TODO")),
@@ -388,6 +496,16 @@ class CompactRuntimeManifestContractTest(unittest.TestCase):
             mutate(changed)
             with self.assertRaisesRegex(ValueError, "integer|float|number kind"):
                 TOOL.validate_manifest(changed)
+
+    def test_strict_parser_preserves_zero_number_spelling(self) -> None:
+        canonical = json.dumps(self.manifest, separators=(",", ":"))
+        float_spelling = canonical.replace('"temperature":0', '"temperature":0.0', 1)
+        parsed_integer = TOOL.loads_strict(canonical)
+        parsed_float = TOOL.loads_strict(float_spelling)
+        self.assertIs(type(parsed_integer["sampling"]["temperature"]), int)
+        self.assertIs(type(parsed_float["sampling"]["temperature"]), float)
+        with self.assertRaisesRegex(ValueError, "integer|number kind"):
+            TOOL.validate_manifest(parsed_float)
 
     def test_supported_domain_canonical_json_matches_rfc8785_boundaries(self) -> None:
         value = {"\U0001f600": 1, "\u20ac": 2, "a": "\b\n", "n": [0.0, 1.0, 0.05]}

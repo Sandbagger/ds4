@@ -2722,6 +2722,25 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+static int model_source_open(const char *path,
+                             int qualification_fd,
+                             bool qualification_fd_set) {
+    if (!qualification_fd_set) return open(path, O_RDONLY);
+    if (qualification_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    return fcntl(qualification_fd, F_DUPFD_CLOEXEC, 0);
+}
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_model_source_open(const char *path,
+                               int qualification_fd,
+                               bool qualification_fd_set) {
+    return model_source_open(path, qualification_fd, qualification_fd_set);
+}
+#endif
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -2732,19 +2751,14 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
-    int fd = -1;
-    if (qualification_fd_set) {
-        if (qualification_fd < 0) {
-            errno = EBADF;
-            ds4_die_errno("cannot duplicate qualification model descriptor", path);
-        }
-        fd = fcntl(qualification_fd, F_DUPFD_CLOEXEC, 0);
-        if (fd == -1) {
-            ds4_die_errno("cannot duplicate qualification model descriptor", path);
-        }
-    } else {
-        fd = open(path, O_RDONLY);
-        if (fd == -1) ds4_die_errno("cannot open model", path);
+    const int fd = model_source_open(
+        path, qualification_fd, qualification_fd_set);
+    if (fd == -1) {
+        ds4_die_errno(
+            qualification_fd_set ?
+                "cannot duplicate qualification model descriptor" :
+                "cannot open model",
+            path);
     }
     m->fd = fd;
 

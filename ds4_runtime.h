@@ -109,6 +109,7 @@ typedef struct {
     ds4_runtime_allocation_record *records;
     size_t record_capacity;
     size_t record_count;
+    uint64_t issued_sequence_high_water[256];
 
     uint64_t category_bounds[DS4_RUNTIME_OWNED_CATEGORY_COUNT];
     uint64_t category_current[DS4_RUNTIME_OWNED_CATEGORY_COUNT];

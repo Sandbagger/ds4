@@ -78,16 +78,31 @@ static bool record_contains(const ds4_runtime_allocation_record *owner,
 
 static ds4_runtime_allocation_record *append_record(
         ds4_runtime_tracker *tracker, uint64_t id) {
-    if (find_record(tracker, id)) {
+    const uint8_t producer_namespace = (uint8_t)(id >> 56);
+    const uint64_t sequence = id & UINT64_C(0x00ffffffffffffff);
+    if (sequence == 0 ||
+        sequence <=
+            tracker->issued_sequence_high_water[producer_namespace]) {
         latch(tracker, DS4_RUNTIME_VIOLATION_DUPLICATE_ID);
         return NULL;
     }
-    if (tracker->record_count >= tracker->record_capacity) {
-        latch(tracker, DS4_RUNTIME_VIOLATION_CAPACITY);
-        return NULL;
+
+    ds4_runtime_allocation_record *record = NULL;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (!tracker->records[i].live) {
+            record = &tracker->records[i];
+            break;
+        }
     }
-    ds4_runtime_allocation_record *record =
-        &tracker->records[tracker->record_count++];
+    if (!record) {
+        if (tracker->record_count >= tracker->record_capacity) {
+            latch(tracker, DS4_RUNTIME_VIOLATION_CAPACITY);
+            return NULL;
+        }
+        record = &tracker->records[tracker->record_count++];
+    }
+
+    tracker->issued_sequence_high_water[producer_namespace] = sequence;
     memset(record, 0, sizeof(*record));
     record->id = id;
     record->category = (ds4_runtime_category)DS4_RUNTIME_OWNED_CATEGORY_COUNT;

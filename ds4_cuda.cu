@@ -473,7 +473,7 @@ static std::atomic<int> g_laguna_compact_state{DS4_LAGUNA_COMPACT_IDLE};
 static std::mutex g_laguna_compact_mutex;
 static std::atomic<uint64_t> g_laguna_compact_static_allocation_attempts;
 static std::atomic<uint64_t> g_laguna_compact_next_tracker_id{
-    UINT64_C(0x4c4147554e410001)};
+    UINT64_C(0x4d00000000000001)};
 static std::atomic<uint64_t> g_laguna_compact_legacy_full_map_register_bytes;
 static std::atomic<uint64_t> g_laguna_compact_legacy_whole_model_copy_bytes;
 static std::atomic<uint64_t> g_laguna_compact_legacy_range_bytes;
@@ -876,15 +876,19 @@ static int cuda_laguna_compact_release_locked(
 
 static int cuda_laguna_compact_reserve_tracker_ids(
         ds4_gpu_laguna_compact *ctx) {
+    const uint64_t sequence_mask = UINT64_C(0x00ffffffffffffff);
     uint64_t first =
         g_laguna_compact_next_tracker_id.load(std::memory_order_relaxed);
     for (;;) {
-        if (first > UINT64_MAX - 3u) return 0;
+        if ((uint8_t)(first >> 56) != 0x4du ||
+            (first & sequence_mask) > sequence_mask - 2u) {
+            return 0;
+        }
         if (g_laguna_compact_next_tracker_id.compare_exchange_weak(
                 first, first + 3u, std::memory_order_relaxed)) {
-            ctx->mapping_id = first;
+            ctx->offsets_id = first;
             ctx->static_id = first + 1u;
-            ctx->offsets_id = first + 2u;
+            ctx->mapping_id = first + 2u;
             return 1;
         }
     }

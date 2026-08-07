@@ -33,6 +33,7 @@ typedef struct {
 
 typedef struct {
     ds4_laguna_file_identity model_identity;
+    const char *model_sha256;
     const ds4_laguna_ledger *ledger;
     const ds4_laguna_allocation_plan *allocation;
     const ds4_laguna_page_plan *page_cache;

@@ -836,6 +836,25 @@ static bool validate_input(
         return set_error(error, error_size,
                          "qualification opened-model identity is invalid");
     }
+    if (input->model_sha256 == NULL) {
+        return set_error(error, error_size,
+                         "qualification observed model digest is missing");
+    }
+    for (size_t i = 0; i < DS4_PLAN_IO_SHA256_HEX_LENGTH; i++) {
+        const char c = input->model_sha256[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return set_error(error, error_size,
+                             "qualification observed model digest is malformed");
+        }
+    }
+    if (input->model_sha256[DS4_PLAN_IO_SHA256_HEX_LENGTH] != '\0') {
+        return set_error(error, error_size,
+                         "qualification observed model digest is malformed");
+    }
+    if (strcmp(input->model_sha256, DS4_LAGUNA_MODEL_SHA256) != 0) {
+        return set_error(error, error_size,
+                         "qualification observed model digest is not pinned");
+    }
     return true;
 }
 
@@ -1118,15 +1137,15 @@ static bool serialize_allocation(const ds4_laguna_allocation_plan *plan,
 }
 
 static bool serialize_model(const ds4_laguna_file_identity *identity,
+                            const char *model_sha256,
                             json_buffer *buffer,
                             char *error,
                             size_t error_size) {
     return append_literal(buffer, "{\"device\":", error, error_size) &&
            append_u64_string(buffer, identity->device, error, error_size) &&
-           append_literal(buffer, ",\"expected_sha256\":",
+           append_literal(buffer, ",\"sha256\":",
                           error, error_size) &&
-           append_json_string(buffer, DS4_LAGUNA_MODEL_SHA256,
-                              error, error_size) &&
+           append_json_string(buffer, model_sha256, error, error_size) &&
            append_literal(buffer, ",\"filename\":", error, error_size) &&
            append_json_string(buffer, DS4_LAGUNA_MODEL_FILENAME,
                               error, error_size) &&
@@ -1215,7 +1234,7 @@ bool ds4_laguna_qualification_plan_serialize(
                         error, error_size) ||
         !append_json_string(&document, digest, error, error_size) ||
         !append_literal(&document, ",\"model\":", error, error_size) ||
-        !serialize_model(&input->model_identity, &document,
+        !serialize_model(&input->model_identity, input->model_sha256, &document,
                          error, error_size) ||
         !append_literal(&document, ",\"page_cache\":", error, error_size) ||
         !serialize_page_cache(input->page_cache, &document,

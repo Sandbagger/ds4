@@ -28,6 +28,19 @@ typedef struct {
     size_t block_size;
 } ds4_plan_sha256_context;
 
+#ifdef DS4_PLAN_IO_TEST_HOOKS
+static ds4_plan_io_test_after_first_pread_hook
+    ds4_plan_io_after_first_pread_hook;
+static void *ds4_plan_io_after_first_pread_context;
+
+void ds4_plan_io_test_set_after_first_pread_hook(
+        ds4_plan_io_test_after_first_pread_hook hook,
+        void *context) {
+    ds4_plan_io_after_first_pread_hook = hook;
+    ds4_plan_io_after_first_pread_context = context;
+}
+#endif
+
 static const uint32_t ds4_plan_sha256_constants[64] = {
     UINT32_C(0x428a2f98), UINT32_C(0x71374491), UINT32_C(0xb5c0fbcf),
     UINT32_C(0xe9b5dba5), UINT32_C(0x3956c25b), UINT32_C(0x59f111f1),
@@ -229,6 +242,153 @@ bool ds4_plan_io_sha256(const void *data,
         digest_hex[i * 2u + 1u] = hex[digest[i] & 0x0fu];
     }
     digest_hex[DS4_PLAN_IO_SHA256_HEX_LENGTH] = '\0';
+    return true;
+}
+
+static bool ds4_plan_stat_identity_matches(const struct stat *before,
+                                           const struct stat *after) {
+#if defined(__APPLE__)
+    const bool mtime_matches =
+        before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+        before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec;
+#else
+    const bool mtime_matches =
+        before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+        before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+#endif
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_size == after->st_size &&
+           mtime_matches;
+}
+
+bool ds4_plan_io_sha256_fd(
+        int fd,
+        uint64_t expected_size,
+        char out[DS4_PLAN_IO_SHA256_HEX_SIZE],
+        char *err,
+        size_t errcap) {
+    static const char hex[] = "0123456789abcdef";
+    ds4_plan_clear_error(err, errcap);
+    if (out == NULL) {
+        ds4_plan_set_error(err, errcap,
+                           "invalid argument: digest output is null");
+        return false;
+    }
+    out[0] = '\0';
+    if (fd < 0) {
+        ds4_plan_set_error(err, errcap,
+                           "invalid argument: file descriptor is invalid");
+        return false;
+    }
+    if (expected_size > UINT64_MAX / UINT64_C(8)) {
+        ds4_plan_set_error(err, errcap,
+                           "invalid argument: file exceeds SHA-256 limit");
+        return false;
+    }
+    const off_t expected_offset = (off_t)expected_size;
+    if (expected_offset < 0 || (uint64_t)expected_offset != expected_size) {
+        ds4_plan_set_error(err, errcap,
+                           "invalid argument: file size exceeds pread range");
+        return false;
+    }
+
+    struct stat before;
+    if (fstat(fd, &before) != 0) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(err, errcap, "stat opened file: %s",
+                           strerror(saved_errno));
+        return false;
+    }
+    if (!S_ISREG(before.st_mode)) {
+        ds4_plan_set_error(err, errcap,
+                           "opened descriptor is not a regular file");
+        return false;
+    }
+    if (before.st_size < 0 ||
+        (uint64_t)before.st_size != expected_size) {
+        ds4_plan_set_error(err, errcap,
+                           "opened file size does not match expected size");
+        return false;
+    }
+
+    ds4_plan_sha256_context context;
+    ds4_plan_sha256_init(&context);
+    unsigned char buffer[64u * 1024u];
+    uint64_t offset = 0;
+#ifdef DS4_PLAN_IO_TEST_HOOKS
+    bool first_pread_hook_ran = false;
+#endif
+    while (offset != expected_size) {
+        size_t chunk = sizeof(buffer);
+        const uint64_t remaining = expected_size - offset;
+        if (remaining < (uint64_t)chunk) chunk = (size_t)remaining;
+        const off_t read_offset = (off_t)offset;
+        ssize_t count;
+        do {
+            count = pread(fd, buffer, chunk, read_offset);
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            const int saved_errno = errno;
+            ds4_plan_set_error(err, errcap, "read opened file: %s",
+                               strerror(saved_errno));
+            return false;
+        }
+        if (count == 0) {
+            ds4_plan_set_error(err, errcap,
+                               "opened file was truncated while hashing");
+            return false;
+        }
+        ds4_plan_sha256_update(&context, buffer, (size_t)count);
+        offset += (uint64_t)count;
+#ifdef DS4_PLAN_IO_TEST_HOOKS
+        if (!first_pread_hook_ran) {
+            first_pread_hook_ran = true;
+            if (ds4_plan_io_after_first_pread_hook != NULL) {
+                ds4_plan_io_after_first_pread_hook(
+                    fd, ds4_plan_io_after_first_pread_context);
+            }
+        }
+#endif
+    }
+
+    unsigned char extra;
+    ssize_t extra_count;
+    do {
+        extra_count = pread(fd, &extra, 1u, expected_offset);
+    } while (extra_count < 0 && errno == EINTR);
+    if (extra_count < 0) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(err, errcap, "verify opened file length: %s",
+                           strerror(saved_errno));
+        return false;
+    }
+    if (extra_count != 0) {
+        ds4_plan_set_error(err, errcap,
+                           "opened file grew while hashing");
+        return false;
+    }
+
+    struct stat after;
+    if (fstat(fd, &after) != 0) {
+        const int saved_errno = errno;
+        ds4_plan_set_error(err, errcap, "restat opened file: %s",
+                           strerror(saved_errno));
+        return false;
+    }
+    if (!ds4_plan_stat_identity_matches(&before, &after)) {
+        ds4_plan_set_error(err, errcap,
+                           "opened file identity changed while hashing");
+        return false;
+    }
+
+    unsigned char digest[32];
+    ds4_plan_sha256_final(&context, digest);
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        out[i * 2u] = hex[digest[i] >> 4u];
+        out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+    }
+    out[DS4_PLAN_IO_SHA256_HEX_LENGTH] = '\0';
     return true;
 }
 

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,25 @@ bool ds4_plan_io_sha256(const void *data,
                         char digest_hex[DS4_PLAN_IO_SHA256_HEX_SIZE],
                         char *error,
                         size_t error_size);
+
+/* Hash exactly expected_size bytes from an opened regular file without
+ * changing its caller-visible offset.  Device, inode, size, and nanosecond
+ * mtime must remain stable from the initial fstat through the final byte. */
+bool ds4_plan_io_sha256_fd(
+    int fd, uint64_t expected_size,
+    char out[DS4_PLAN_IO_SHA256_HEX_SIZE],
+    char *err, size_t errcap);
+
+#ifdef DS4_PLAN_IO_TEST_HOOKS
+typedef void (*ds4_plan_io_test_after_first_pread_hook)(int fd,
+                                                        void *context);
+
+/* Test-only deterministic race seam.  Production ds4_plan_io.o is built
+ * without this declaration or its backing hook state. */
+void ds4_plan_io_test_set_after_first_pread_hook(
+    ds4_plan_io_test_after_first_pread_hook hook,
+    void *context);
+#endif
 
 /* Validate immutable output identity and probe both exact same-directory
  * temporary names without leaving either final artifact or a probe file.

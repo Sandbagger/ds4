@@ -298,6 +298,9 @@ ds4_runtime.o: ds4_runtime.c ds4_runtime.h
 ds4_plan_io.o: ds4_plan_io.c ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_plan_io.c
 
+ds4_plan_io_test_hooks.o: ds4_plan_io.c ds4_plan_io.h
+	$(CC) $(CFLAGS) -DDS4_PLAN_IO_TEST_HOOKS -c -o $@ ds4_plan_io.c
+
 ds4_laguna_plan.o: ds4_laguna_plan.c ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_laguna_plan.c
 
@@ -310,9 +313,9 @@ tests/test_laguna_stream: tests/test_laguna_stream.o ds4_bound_test_hooks.o ds4_
 	$(CC) $(CFLAGS) $(TEST_GC_LDFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_plan_io.o: tests/test_plan_io.c ds4_plan_io.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
+	$(CC) $(CFLAGS) -DDS4_PLAN_IO_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_plan_io: tests/test_plan_io.o ds4_plan_io.o
+tests/test_plan_io: tests/test_plan_io.o ds4_plan_io_test_hooks.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_laguna_plan.o: tests/test_laguna_plan.c ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_plan_io.h

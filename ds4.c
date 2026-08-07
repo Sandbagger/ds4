@@ -59456,8 +59456,17 @@ int ds4_engine_write_qualification_plan(
         goto cleanup;
     }
 
+    char model_sha256[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    if (!ds4_plan_io_sha256_fd(
+            model.fd, model.identity.size_bytes, model_sha256,
+            detail, sizeof(detail))) {
+        qualification_plan_error(err, errcap, "model hash", detail);
+        goto cleanup;
+    }
+
     const ds4_laguna_qualification_plan_input input = {
         .model_identity = model.identity,
+        .model_sha256 = model_sha256,
         .ledger = &ledger,
         .allocation = &allocation_plan,
         .page_cache = &page_plan,

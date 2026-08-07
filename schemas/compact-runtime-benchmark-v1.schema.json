@@ -186,7 +186,8 @@
           "$ref": "#/$defs/identity",
           "pattern": "^/(?:[^/]+/)*laguna-s-2[.]1-Q4_K_M[.]gguf$",
           "allOf": [
-            { "not": { "pattern": "[\\u0000-\\u001F]" } }
+            { "not": { "pattern": "[\\u0000-\\u001F]" } },
+            { "not": { "pattern": "<[^>]+>" } }
           ]
         },
         "repository": { "const": "poolside/Laguna-S-2.1-GGUF" },

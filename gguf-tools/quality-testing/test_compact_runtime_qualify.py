@@ -181,6 +181,26 @@ def schema_expressible_mutations() -> list[Mutation]:
             "model path wrong basename",
             _set(("model",), "path", "/models/not-laguna.gguf"),
         ),
+        (
+            "model path placeholder segment",
+            _set(("model",), "path", "/models/TODO/laguna-s-2.1-Q4_K_M.gguf"),
+        ),
+        (
+            "model path angle placeholder segment",
+            _set(
+                ("model",),
+                "path",
+                "/models/<placeholder>/laguna-s-2.1-Q4_K_M.gguf",
+            ),
+        ),
+        (
+            "model path tab segment",
+            _set(("model",), "path", "/models/has\ttab/laguna-s-2.1-Q4_K_M.gguf"),
+        ),
+        (
+            "model path trailing slash",
+            _set(("model",), "path", "/models/laguna-s-2.1-Q4_K_M.gguf/"),
+        ),
     ]
 
     positive_fields = [

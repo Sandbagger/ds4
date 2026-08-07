@@ -183,8 +183,11 @@
       "required": ["path", "repository", "revision", "filename", "size_bytes", "sha256", "device", "inode", "mtime_ns"],
       "properties": {
         "path": {
-          "type": "string",
-          "pattern": "^/(?:[^/]+/)*laguna-s-2[.]1-Q4_K_M[.]gguf$"
+          "$ref": "#/$defs/identity",
+          "pattern": "^/(?:[^/]+/)*laguna-s-2[.]1-Q4_K_M[.]gguf$",
+          "allOf": [
+            { "not": { "pattern": "[\\u0000-\\u001F]" } }
+          ]
         },
         "repository": { "const": "poolside/Laguna-S-2.1-GGUF" },
         "revision": { "const": "706fa69799926b6afde1af9e24ca2a4923f110a1" },

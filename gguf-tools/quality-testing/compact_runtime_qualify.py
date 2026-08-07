@@ -306,10 +306,9 @@ def _validate_model(value: Any) -> None:
     path_text = _string(model["path"], "model.path")
     if "//" in path_text:
         raise ValueError("model.path must not contain repeated slashes")
-    path = Path(path_text)
-    if not path.is_absolute():
+    if not Path(path_text).is_absolute():
         raise ValueError("model.path must be absolute")
-    if path.name != MODEL_FILENAME:
+    if path_text.rsplit("/", 1)[-1] != MODEL_FILENAME:
         raise ValueError("model.path does not name the pinned artifact")
     expected = {
         "repository": MODEL_REPOSITORY,

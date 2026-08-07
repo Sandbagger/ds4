@@ -2727,12 +2727,25 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu) {
+                       bool prefetch_cpu, int qualification_fd,
+                       bool qualification_fd_set) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) ds4_die_errno("cannot open model", path);
+    int fd = -1;
+    if (qualification_fd_set) {
+        if (qualification_fd < 0) {
+            errno = EBADF;
+            ds4_die_errno("cannot duplicate qualification model descriptor", path);
+        }
+        fd = fcntl(qualification_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd == -1) {
+            ds4_die_errno("cannot duplicate qualification model descriptor", path);
+        }
+    } else {
+        fd = open(path, O_RDONLY);
+        if (fd == -1) ds4_die_errno("cannot open model", path);
+    }
     m->fd = fd;
 
     struct stat st;
@@ -53320,7 +53333,7 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+    model_open(&model, model_path, false, false, -1, false);
     config_validate_model(&model);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
@@ -59334,7 +59347,7 @@ static bool qualification_plan_load_laguna(
         return false;
     }
 
-    model_open(model, model_path, false, false);
+    model_open(model, model_path, false, false, -1, false);
 
     ds4_str architecture = {0};
     if (!model_get_string(model, "general.architecture", &architecture) ||
@@ -59652,7 +59665,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only,
+               opt->qualification_model_fd,
+               opt->qualification_model_fd_set);
     config_validate_model(&e->model);
     e->laguna_compact_runtime =
         ds4_engine_laguna_compact_requested(e, opt);
@@ -59947,7 +59962,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->inspect_only) {
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-            model_open(&e->mtp_model, opt->mtp_path, false, false);
+            model_open(&e->mtp_model, opt->mtp_path, false, false, -1, false);
             ds4_dspark_summary dspark = {0};
             e->support_kind =
                 support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
@@ -60049,7 +60064,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true, -1, false);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
             support_model_detect(&e->mtp_model, &e->support_stages, &dspark);

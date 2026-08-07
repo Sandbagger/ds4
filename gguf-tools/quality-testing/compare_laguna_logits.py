@@ -151,6 +151,82 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def verify_gguf_fd(fd: int, expected_size: int, expected_sha256: str) -> None:
+    """Hash exact bytes through a retained regular-file descriptor."""
+
+    if type(fd) is not int or fd < 0:
+        fail("GGUF descriptor must be a non-negative integer")
+    if type(expected_size) is not int or expected_size < 0:
+        fail("supplied GGUF size must be a non-negative integer")
+    if expected_size > sys.maxsize:
+        fail("supplied GGUF size exceeds the platform pread range")
+    expected_digest = require_hex(
+        expected_sha256, 64, "supplied GGUF SHA-256"
+    )
+
+    try:
+        before = os.fstat(fd)
+    except OSError as exc:
+        fail(f"cannot stat opened GGUF descriptor: {exc}")
+    if not stat.S_ISREG(before.st_mode):
+        fail("opened GGUF descriptor must refer to a regular file")
+    if before.st_size != expected_size:
+        fail(
+            "opened GGUF size mismatch: "
+            f"expected {expected_size}, got {before.st_size}"
+        )
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    try:
+        initial_offset = os.lseek(fd, 0, os.SEEK_CUR)
+    except OSError as exc:
+        fail(f"cannot inspect opened GGUF descriptor offset: {exc}")
+
+    try:
+        digest = hashlib.sha256()
+        offset = 0
+        chunk_size = 8 * 1024 * 1024
+        while offset < expected_size:
+            count = min(chunk_size, expected_size - offset)
+            payload = os.pread(fd, count, offset)
+            if not payload:
+                fail(f"opened GGUF reached EOF at byte {offset}")
+            if len(payload) > count:
+                fail("opened GGUF pread returned more bytes than requested")
+            digest.update(payload)
+            offset += len(payload)
+        after = os.fstat(fd)
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if after_identity != before_identity:
+            fail("opened GGUF identity changed while hashing")
+        if os.pread(fd, 1, expected_size) != b"":
+            fail("opened GGUF contains bytes beyond the expected size")
+        observed_digest = digest.hexdigest()
+        if observed_digest != expected_digest:
+            fail(
+                "opened GGUF SHA-256 mismatch: "
+                f"expected {expected_digest}, got {observed_digest}"
+            )
+    except OSError as exc:
+        fail(f"cannot hash opened GGUF descriptor: {exc}")
+    finally:
+        try:
+            final_offset = os.lseek(fd, 0, os.SEEK_CUR)
+        except OSError as exc:
+            fail(f"cannot recheck opened GGUF descriptor offset: {exc}")
+        if final_offset != initial_offset:
+            fail("opened GGUF descriptor offset changed while hashing")
+
+
 def require_object(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         fail(f"{label} must be an object")
@@ -1107,6 +1183,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture-manifest-sha256")
     parser.add_argument("--gguf-size", type=int)
     parser.add_argument("--gguf-sha256")
+    parser.add_argument("--gguf-fd", type=int)
     parser.add_argument("--ds4", type=Path)
     parser.add_argument("--llama", type=Path)
     parser.add_argument("--promote", type=Path)
@@ -1131,6 +1208,8 @@ def main() -> int:
                 value is not None for value in promotion_values
             ):
                 fail("verify mode requires all identity arguments and no promotion arguments")
+            if args.gguf_fd is not None:
+                verify_gguf_fd(args.gguf_fd, args.gguf_size, args.gguf_sha256)
             verify_promoted(
                 args.verify_promoted,
                 args.contract_commit,
@@ -1143,7 +1222,7 @@ def main() -> int:
             print(f"verified={args.verify_promoted} cases=4 vectors=4 oracle=poolside")
             return 0
         if not all(value is not None for value in promotion_values) or any(
-            value is not None for value in verify_values
+            value is not None for value in (*verify_values, args.gguf_fd)
         ):
             fail("promotion mode requires --ds4, --llama, and --promote only")
         promote(

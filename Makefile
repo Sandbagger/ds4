@@ -443,18 +443,7 @@ test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	./tests/test_cuda_laguna_stream --case startup
 
 test-cuda-laguna-resident: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model
-	@test -n "$(LAGUNA_TOKENIZER_RUNTIME_COMMIT)" || \
-	  { echo "LAGUNA_TOKENIZER_RUNTIME_COMMIT is required" >&2; exit 1; }
-	python3 gguf-tools/quality-testing/compare_laguna_logits.py \
-	  --verify-promoted tests/test-vectors/laguna-resident \
-	  --contract-commit a250e43722945e293f6044bc7254c4806d5a7912 \
-	  --tokenizer-runtime-commit "$(LAGUNA_TOKENIZER_RUNTIME_COMMIT)" \
-	  --llama-commit 04b2b72cb54048ead292884adbe11f284e3ec950 \
-	  --capture-manifest-sha256 cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e \
-	  --gguf-size 68248759648 \
-	  --gguf-sha256 e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
-	env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
-	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(LAGUNA_TOKENIZER_RUNTIME_COMMIT)" tests/run_cuda_laguna_gate.sh resident
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

@@ -176,6 +176,9 @@ typedef struct {
     bool load_output;
     ds4_distributed_options distributed;
     ds4_tp_options tp;
+    /* Qualification harness only: normal frontends never populate this. */
+    int qualification_model_fd;
+    bool qualification_model_fd_set;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

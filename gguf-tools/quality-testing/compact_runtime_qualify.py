@@ -303,7 +303,10 @@ def _validate_model(value: Any) -> None:
         "sha256", "device", "inode", "mtime_ns",
     }
     model = _mapping(value, "model", required)
-    path = Path(_string(model["path"], "model.path"))
+    path_text = _string(model["path"], "model.path")
+    if "//" in path_text:
+        raise ValueError("model.path must not contain repeated slashes")
+    path = Path(path_text)
     if not path.is_absolute():
         raise ValueError("model.path must be absolute")
     if path.name != MODEL_FILENAME:

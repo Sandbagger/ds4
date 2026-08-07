@@ -472,7 +472,17 @@ test-cuda-build-contract:
 	python3 tests/test_cuda_build_contract.py -v
 
 test-laguna-compact-python:
-	python3 gguf-tools/quality-testing/test_compact_runtime_qualify.py -v
+	@command -v uv >/dev/null 2>&1 || { \
+		echo "error: test-laguna-compact-python requires uv" >&2; \
+		exit 127; \
+	}
+	@uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python -c 'from jsonschema import Draft202012Validator' || { \
+		echo "error: unable to provision pinned jsonschema==4.25.1 with uv" >&2; \
+		exit 1; \
+	}
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_compact_runtime_qualify.py -v
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \

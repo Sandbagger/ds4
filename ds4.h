@@ -574,6 +574,10 @@ bool ds4_test_laguna_file_identity_matches(
         uint64_t mtime_ns,
         char *err,
         size_t errcap);
+int ds4_test_model_source_open(
+        const char *path,
+        int qualification_fd,
+        bool qualification_fd_set);
 bool ds4_test_gpu_config_working_set_bytes(
         const uint64_t *budgets,
         size_t count,

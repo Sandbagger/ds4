@@ -9,12 +9,14 @@
 #include "ds4_laguna_stream.h"
 #include "ds4_runtime.h"
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int g_failed;
@@ -175,6 +177,90 @@ static void test_qualification_model_identity(void) {
               -1, &device, &inode, &size_bytes, &mtime_ns,
               err, sizeof(err)),
           "invalid model descriptor fails identity capture");
+}
+
+static bool descriptor_bytes_equal(int fd, const void *expected, size_t size) {
+    unsigned char actual[128];
+    if (fd < 0 || size > sizeof(actual)) return false;
+    memset(actual, 0, sizeof(actual));
+    return pread(fd, actual, size, 0) == (ssize_t)size &&
+           memcmp(actual, expected, size) == 0;
+}
+
+static void test_model_source_selection(void) {
+    char path[] = "/tmp/ds4-laguna-model-source.XXXXXX";
+    const int original_fd = mkstemp(path);
+    CHECK(original_fd >= 0, "model source fixture opens original descriptor");
+    if (original_fd < 0) return;
+
+    static const char original[] = "retained original model bytes";
+    static const char replacement[] = "replacement pathname bytes";
+    CHECK(write(original_fd, original, sizeof(original)) ==
+              (ssize_t)sizeof(original),
+          "model source fixture writes original bytes");
+
+    struct stat original_status;
+    CHECK(fstat(original_fd, &original_status) == 0,
+          "model source fixture captures original identity");
+
+    char retained_path[sizeof(path) + 16u];
+    snprintf(retained_path, sizeof(retained_path), "%s.retained", path);
+    CHECK(rename(path, retained_path) == 0,
+          "model source fixture moves original pathname aside");
+    const int replacement_fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    CHECK(replacement_fd >= 0,
+          "model source fixture installs replacement pathname");
+    if (replacement_fd < 0) {
+        close(original_fd);
+        unlink(retained_path);
+        return;
+    }
+    CHECK(write(replacement_fd, replacement, sizeof(replacement)) ==
+              (ssize_t)sizeof(replacement),
+          "model source fixture writes replacement bytes");
+    struct stat replacement_status;
+    CHECK(fstat(replacement_fd, &replacement_status) == 0,
+          "model source fixture captures replacement identity");
+    CHECK(close(replacement_fd) == 0,
+          "model source fixture closes replacement writer");
+
+    const int selected_fd = ds4_test_model_source_open(path, original_fd, true);
+    CHECK(selected_fd >= 0,
+          "qualification source selection duplicates retained descriptor");
+    struct stat selected_status;
+    memset(&selected_status, 0, sizeof(selected_status));
+    CHECK(selected_fd >= 0 && fstat(selected_fd, &selected_status) == 0 &&
+              selected_status.st_dev == original_status.st_dev &&
+              selected_status.st_ino == original_status.st_ino &&
+              selected_status.st_ino != replacement_status.st_ino,
+          "qualification source selection retains original device and inode");
+    CHECK(descriptor_bytes_equal(selected_fd, original, sizeof(original)),
+          "qualification source selection reads original bytes after path swap");
+    CHECK(selected_fd >= 0 &&
+              (fcntl(selected_fd, F_GETFD) & FD_CLOEXEC) != 0,
+          "qualification source selection marks its duplicate close-on-exec");
+    CHECK(selected_fd >= 0 && close(selected_fd) == 0,
+          "qualification source selection duplicate closes independently");
+    CHECK(fcntl(original_fd, F_GETFD) >= 0 &&
+              descriptor_bytes_equal(original_fd, original, sizeof(original)),
+          "closing selection duplicate leaves retained owner open");
+
+    const int pathname_fd = ds4_test_model_source_open(path, -1, false);
+    struct stat pathname_status;
+    memset(&pathname_status, 0, sizeof(pathname_status));
+    CHECK(pathname_fd >= 0 && fstat(pathname_fd, &pathname_status) == 0 &&
+              pathname_status.st_dev == replacement_status.st_dev &&
+              pathname_status.st_ino == replacement_status.st_ino,
+          "normal source selection opens the replacement pathname");
+    CHECK(descriptor_bytes_equal(pathname_fd, replacement, sizeof(replacement)),
+          "normal source selection reads replacement pathname bytes");
+    CHECK(pathname_fd >= 0 && close(pathname_fd) == 0,
+          "normal source selection descriptor closes independently");
+
+    CHECK(close(original_fd) == 0,
+          "model source fixture closes original owner last");
+    CHECK(unlink(path) == 0 && unlink(retained_path) == 0,
+          "model source fixture removes both pathname identities");
 }
 
 static void test_qualification_frontend_allowlist(void) {
@@ -348,6 +434,7 @@ static void test_qualification_shape_state_restoration(void) {
 static void test_options(void) {
     test_qualification_option_preflight();
     test_qualification_model_identity();
+    test_model_source_selection();
     test_qualification_frontend_allowlist();
     test_qualification_failure_trap_thread_isolation();
     test_qualification_shape_state_restoration();

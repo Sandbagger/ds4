@@ -325,6 +325,9 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_cancel(
     ds4_laguna_cache_policy *policy,
     ds4_laguna_cache_handle handle);
 
+/* Drain is a non-destructive readiness check: while any slot is LOADING or
+ * IN_USE it returns RECOVERABLE without changing policy state. Once ready,
+ * it clears only reusable READY slots. */
 ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
     ds4_laguna_cache_policy *policy);
 

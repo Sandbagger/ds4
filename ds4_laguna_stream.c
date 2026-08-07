@@ -653,26 +653,23 @@ ds4_laguna_cache_status ds4_laguna_cache_policy_drain(
     if (ds4_laguna_cache_policy_audit(policy) != DS4_LAGUNA_CACHE_OK) {
         return DS4_LAGUNA_CACHE_UNSAFE;
     }
-    bool in_use = false;
     for (size_t i = 0; i < policy->slot_count; i++) {
         if (!cache_slot_state_valid(policy, i, NULL)) {
             return DS4_LAGUNA_CACHE_UNSAFE;
         }
-        if (policy->slots[i].state == DS4_LAGUNA_CACHE_SLOT_IN_USE)
-            in_use = true;
+        if (policy->slots[i].state == DS4_LAGUNA_CACHE_SLOT_LOADING ||
+            policy->slots[i].state == DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
     }
-    if (in_use) return DS4_LAGUNA_CACHE_RECOVERABLE;
     for (size_t i = 0; i < policy->slot_count; i++) {
         ds4_laguna_cache_slot *slot = &policy->slots[i];
-        if (slot->state == DS4_LAGUNA_CACHE_SLOT_LOADING ||
-            slot->state == DS4_LAGUNA_CACHE_SLOT_READY) {
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_READY) {
             size_t entry_index = 0;
             (void)cache_entry_index(policy, cache_slot_key(slot),
                                     &entry_index);
             policy->entry_to_slot[entry_index] =
                 DS4_LAGUNA_CACHE_SLOT_NONE;
-        }
-        if (slot->state != DS4_LAGUNA_CACHE_SLOT_EMPTY) {
             cache_slot_clear(slot);
         }
     }

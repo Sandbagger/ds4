@@ -11,6 +11,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 CUDA_SOURCE = (ROOT / "ds4_cuda.cu").read_text(encoding="utf-8")
+DS4_HEADER = (ROOT / "ds4.h").read_text(encoding="utf-8")
+DS4_SOURCE = (ROOT / "ds4.c").read_text(encoding="utf-8")
+LAGUNA_MODEL_TEST = (ROOT / "tests/test_cuda_laguna_model.c").read_text(
+    encoding="utf-8"
+)
+LAGUNA_STREAM_TEST = (ROOT / "tests/test_cuda_laguna_stream.c").read_text(
+    encoding="utf-8"
+)
 
 STANDALONE_CUDA_TARGETS = (
     "tests/cuda_long_context_smoke",
@@ -60,6 +68,73 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cuda_laguna_compact_destroy_checked", preamble)
         self.assertIn("(void)cudaDeviceSynchronize();", preamble)
         self.assertNotIn("cleanup_sync_error", preamble)
+
+    def test_laguna_engine_options_expose_only_a_hidden_qualification_fd(self) -> None:
+        end = DS4_HEADER.index("} ds4_engine_options;")
+        start = DS4_HEADER.rfind("typedef struct {", 0, end)
+        self.assertGreaterEqual(start, 0)
+        body = DS4_HEADER[start:end]
+        self.assertRegex(body, r"\bint\s+qualification_model_fd\s*;")
+        self.assertRegex(body, r"\bbool\s+qualification_model_fd_set\s*;")
+        self.assertLess(
+            body.index("ds4_tp_options tp;"), body.index("qualification_model_fd")
+        )
+        for frontend in ("ds4_cli.c", "ds4_server.c", "ds4_bench.c"):
+            with self.subTest(frontend=frontend):
+                source = (ROOT / frontend).read_text(encoding="utf-8")
+                self.assertNotIn("qualification_model_fd", source)
+
+    def test_laguna_model_loader_duplicates_the_inherited_fd_atomically(self) -> None:
+        for needle in (
+            "F_DUPFD_CLOEXEC",
+            "qualification_model_fd_set",
+            "qualification_model_fd",
+        ):
+            with self.subTest(needle=needle):
+                if needle not in DS4_SOURCE:
+                    raise AssertionError(f"ds4.c is missing {needle}")
+
+    def test_both_laguna_model_harnesses_forward_fd_to_engine_options(self) -> None:
+        for name, source in (
+            ("model", LAGUNA_MODEL_TEST),
+            ("stream", LAGUNA_STREAM_TEST),
+        ):
+            with self.subTest(name=name):
+                self.assertIn('getenv("DS4_TEST_MODEL_FD")', source)
+                self.assertRegex(
+                    source,
+                    r"\.qualification_model_fd\s*=\s*model_fd\s*,",
+                )
+                self.assertRegex(
+                    source,
+                    r"\.qualification_model_fd_set\s*=\s*model_fd_set\s*,",
+                )
+
+    def test_resident_gate_has_one_runner_recipe_and_build_only_prerequisites(
+        self,
+    ) -> None:
+        prerequisites = rule_prerequisites("test-cuda-laguna-resident")
+        for target in (
+            "tests/test_cuda_laguna_kernels",
+            "tests/test_cuda_laguna_model",
+        ):
+            self.assertIn(target, prerequisites)
+        target_line = re.search(
+            r"(?m)^test-cuda-laguna-resident:[^\n]*$", MAKEFILE
+        )
+        self.assertIsNotNone(target_line)
+        recipe_lines: list[str] = []
+        for line in MAKEFILE[target_line.end() + 1 :].splitlines():
+            if not line.startswith("\t"):
+                break
+            recipe_lines.append(line)
+        self.assertEqual(
+            len(recipe_lines), 1, "resident gate must own fd 9 in one recipe shell"
+        )
+        recipe = recipe_lines[0].strip()
+        self.assertTrue(
+            recipe.endswith("tests/run_cuda_laguna_gate.sh resident"), recipe
+        )
 
 
 if __name__ == "__main__":

@@ -580,6 +580,90 @@ class CompareLagunaLogitsTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tool_module = load_tool_module()
 
+    def test_gguf_fd_hash_uses_exact_bytes_without_moving_the_offset(self) -> None:
+        payload = b"retained Laguna artifact\n" * 257
+        with tempfile.TemporaryFile() as model:
+            model.write(payload)
+            model.flush()
+            os.lseek(model.fileno(), 19, os.SEEK_SET)
+            before = os.fstat(model.fileno())
+
+            self.tool_module.verify_gguf_fd(
+                model.fileno(), len(payload), sha256(payload)
+            )
+
+            after = os.fstat(model.fileno())
+            self.assertEqual(os.lseek(model.fileno(), 0, os.SEEK_CUR), 19)
+            self.assertEqual(
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
+            )
+
+    def test_gguf_fd_hash_rejects_size_and_digest_mismatch_without_moving_offset(
+        self,
+    ) -> None:
+        payload = b"one opened model"
+        cases = (
+            (len(payload) + 1, sha256(payload), "size"),
+            (len(payload), "0" * 64, "SHA-256"),
+        )
+        for expected_size, expected_digest, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic), tempfile.TemporaryFile() as model:
+                model.write(payload)
+                model.flush()
+                os.lseek(model.fileno(), 7, os.SEEK_SET)
+
+                with self.assertRaises(self.tool_module.ContractError) as raised:
+                    self.tool_module.verify_gguf_fd(
+                        model.fileno(), expected_size, expected_digest
+                    )
+
+                self.assertIn(diagnostic, str(raised.exception))
+                self.assertEqual(os.lseek(model.fileno(), 0, os.SEEK_CUR), 7)
+
+    def test_gguf_fd_hash_rejects_non_regular_descriptors(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"not a model")
+            with self.assertRaises(self.tool_module.ContractError) as raised:
+                self.tool_module.verify_gguf_fd(
+                    read_fd, len(b"not a model"), sha256(b"not a model")
+                )
+            self.assertIn("regular", str(raised.exception))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_gguf_fd_hash_detects_identity_mutation_and_preserves_offset(self) -> None:
+        payload = b"identity must remain stable"
+        with tempfile.TemporaryFile() as model:
+            model.write(payload)
+            model.flush()
+            os.lseek(model.fileno(), 5, os.SEEK_SET)
+            real_pread = os.pread
+            mutated = False
+
+            def mutate_after_read(fd: int, count: int, offset: int) -> bytes:
+                nonlocal mutated
+                result = real_pread(fd, count, offset)
+                if not mutated:
+                    mutated = True
+                    os.ftruncate(fd, len(payload) + 1)
+                return result
+
+            with (
+                mock.patch.object(
+                    self.tool_module.os, "pread", side_effect=mutate_after_read
+                ),
+                self.assertRaises(self.tool_module.ContractError) as raised,
+            ):
+                self.tool_module.verify_gguf_fd(
+                    model.fileno(), len(payload), sha256(payload)
+                )
+
+            self.assertIn("identity changed", str(raised.exception))
+            self.assertEqual(os.lseek(model.fileno(), 0, os.SEEK_CUR), 5)
+
     def verify_command(
         self,
         fixture: Path,

@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -40,6 +41,28 @@ static int g_failures;
             fprintf(stderr, "FAIL: %s (line %d)\n", (message), __LINE__); \
         }                                                                   \
     } while (0)
+
+static bool inherited_model_fd(int *out, bool *set) {
+    const char *value = getenv("DS4_TEST_MODEL_FD");
+    *out = -1;
+    *set = false;
+    if (!value) {
+        return true;
+    }
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < 0 || parsed > INT_MAX || fcntl((int)parsed, F_GETFD) == -1) {
+        fprintf(stderr,
+                "FAIL: DS4_TEST_MODEL_FD is not an open descriptor: %s\n",
+                value);
+        return false;
+    }
+    *out = (int)parsed;
+    *set = true;
+    return true;
+}
 
 enum {
     FIXTURE_TENSOR_COUNT = 8,
@@ -888,6 +911,9 @@ static int run_model_startup(void) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
         return 1;
     }
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
     saved_environment saved;
     save_and_clear_forbidden_environment(&saved);
     const ds4_engine_options options = {
@@ -899,6 +925,8 @@ static int run_model_startup(void) {
         .ssd_streaming = true,
         .ssd_streaming_cache_bytes = UINT64_C(8) * 1024u * 1024u * 1024u,
         .ssd_streaming_cache_bytes_set = true,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = model_fd_set,
     };
     ds4_engine *engine = NULL;
     CHECK(ds4_engine_open(&engine, &options) == 0 && engine != NULL,

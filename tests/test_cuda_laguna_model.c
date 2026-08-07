@@ -13,6 +13,8 @@
 #include "ds4.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -55,6 +57,25 @@ static bool fail_message(const char *what, const char *detail) {
     fprintf(stderr, "FAIL: %s%s%s\n", what,
             detail && detail[0] ? ": " : "", detail && detail[0] ? detail : "");
     return false;
+}
+
+static bool inherited_model_fd(int *out, bool *set) {
+    const char *value = getenv("DS4_TEST_MODEL_FD");
+    *out = -1;
+    *set = false;
+    if (!value) {
+        return true;
+    }
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < 0 || parsed > INT_MAX || fcntl((int)parsed, F_GETFD) == -1) {
+        return fail_message("DS4_TEST_MODEL_FD is not an open descriptor", value);
+    }
+    *out = (int)parsed;
+    *set = true;
+    return true;
 }
 
 static uint32_t read_le_u32(const unsigned char *p) {
@@ -815,6 +836,9 @@ int main(void) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
         return 1;
     }
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
 
     oracle_fixtures fixtures;
     if (!load_fixtures(&fixtures)) return 1;
@@ -823,6 +847,8 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
         .n_threads = 1,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = model_fd_set,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &options) != 0) {

@@ -1175,6 +1175,13 @@ bool ds4_laguna_ledger_build(ds4_laguna_ledger *out,
 
         out->tensor_ranges[i].stable_index = tensor->stable_index;
         out->tensor_ranges[i].tensor_class = tensor->tensor_class;
+        out->tensor_ranges[i].routed_layer =
+            tensor->tensor_class == DS4_LAGUNA_TENSOR_ROUTED_EXPERT ?
+                tensor->routed_layer : UINT32_MAX;
+        out->tensor_ranges[i].routed_projection =
+            tensor->tensor_class == DS4_LAGUNA_TENSOR_ROUTED_EXPERT ?
+                tensor->routed_projection :
+                DS4_LAGUNA_ROUTED_PROJECTION_NONE;
         out->tensor_ranges[i].source_offset = tensor->source_offset;
         out->tensor_ranges[i].source_bytes = tensor->source_bytes;
         source_order[i].tensor = tensor;

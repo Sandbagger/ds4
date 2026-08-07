@@ -285,6 +285,16 @@ static const char *tensor_class_name(ds4_laguna_tensor_class tensor_class) {
     return NULL;
 }
 
+static const char *routed_projection_name(
+        ds4_laguna_routed_projection projection) {
+    switch (projection) {
+        case DS4_LAGUNA_ROUTED_PROJECTION_GATE: return "GATE";
+        case DS4_LAGUNA_ROUTED_PROJECTION_UP: return "UP";
+        case DS4_LAGUNA_ROUTED_PROJECTION_DOWN: return "DOWN";
+        default: return NULL;
+    }
+}
+
 static const char *source_kind_name(ds4_laguna_source_range_kind kind) {
     switch (kind) {
         case DS4_LAGUNA_SOURCE_HEADER: return "HEADER";
@@ -408,6 +418,7 @@ static const ds4_laguna_tensor_range *find_tensor(
 static bool validate_expert_view(const ds4_laguna_ledger *ledger,
                                  const ds4_laguna_expert_entry *entry,
                                  const ds4_laguna_expert_view *view,
+                                 ds4_laguna_routed_projection projection,
                                  char *error,
                                  size_t error_size) {
     const ds4_laguna_tensor_range *parent =
@@ -415,18 +426,26 @@ static bool validate_expert_view(const ds4_laguna_ledger *ledger,
     uint64_t view_end = 0;
     uint64_t parent_end = 0;
     uint64_t device_end = 0;
+    uint64_t expert_delta = 0;
+    uint64_t expected_offset = 0;
     if (parent == NULL ||
-        parent->tensor_class != DS4_LAGUNA_TENSOR_ROUTED_EXPERT) {
+        parent->tensor_class != DS4_LAGUNA_TENSOR_ROUTED_EXPERT ||
+        parent->routed_layer != entry->layer ||
+        parent->routed_projection != projection) {
         return set_error(error, error_size,
-                         "ledger expert view has no routed parent");
+                         "ledger expert view has the wrong routed parent");
     }
-    if (!range_end(parent->source_offset, parent->source_bytes, &parent_end) ||
+    if (!mul_u64(entry->expert,
+                 ledger->routed_projection_expert_bytes,
+                 &expert_delta) ||
+        !add_u64(parent->source_offset, expert_delta, &expected_offset) ||
+        !range_end(parent->source_offset, parent->source_bytes, &parent_end) ||
         !range_end(view->source_offset, view->source_bytes, &view_end) ||
-        view->source_offset < parent->source_offset ||
+        view->source_offset != expected_offset ||
         view_end > parent_end ||
         view->source_bytes != ledger->routed_projection_expert_bytes) {
         return set_error(error, error_size,
-                         "ledger expert view is outside its routed parent");
+                         "ledger expert view does not match its exact subrange");
     }
     if (!range_end(view->device_offset, view->source_bytes, &device_end) ||
         device_end > entry->used_bytes) {
@@ -482,7 +501,16 @@ static bool validate_ledger(const ds4_laguna_ledger *ledger,
             return set_error(error, error_size,
                              "qualification tensor order is not stable");
         }
+        const bool routed_identity_valid =
+            (tensor->tensor_class == DS4_LAGUNA_TENSOR_STATIC &&
+             tensor->routed_layer == UINT32_MAX &&
+             tensor->routed_projection ==
+                 DS4_LAGUNA_ROUTED_PROJECTION_NONE) ||
+            (tensor->tensor_class == DS4_LAGUNA_TENSOR_ROUTED_EXPERT &&
+             tensor->routed_layer != UINT32_MAX &&
+             routed_projection_name(tensor->routed_projection) != NULL);
         if (tensor_class_name(tensor->tensor_class) == NULL ||
+            !routed_identity_valid ||
             !range_end(tensor->source_offset, tensor->source_bytes, &end) ||
             end > ledger->file_size) {
             return set_error(error, error_size,
@@ -590,10 +618,13 @@ static bool validate_ledger(const ds4_laguna_ledger *ledger,
             entry->gate.parent_stable_index == entry->down.parent_stable_index ||
             entry->up.parent_stable_index == entry->down.parent_stable_index ||
             !validate_expert_view(ledger, entry, &entry->gate,
+                                  DS4_LAGUNA_ROUTED_PROJECTION_GATE,
                                   error, error_size) ||
             !validate_expert_view(ledger, entry, &entry->up,
+                                  DS4_LAGUNA_ROUTED_PROJECTION_UP,
                                   error, error_size) ||
             !validate_expert_view(ledger, entry, &entry->down,
+                                  DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
                                   error, error_size)) {
             if (error != NULL && error_size != 0 && error[0] == '\0') {
                 (void)set_error(error, error_size,
@@ -926,8 +957,21 @@ static bool serialize_ledger(const ds4_laguna_ledger *ledger,
         if ((i != 0 && !append_literal(buffer, ",", error, error_size)) ||
             !append_literal(buffer, "{\"class\":", error, error_size) ||
             !append_json_string(buffer, tensor_class_name(range->tensor_class),
-                                error, error_size) ||
-            !append_literal(buffer, ",\"source_bytes\":", error, error_size) ||
+                                error, error_size)) {
+            return false;
+        }
+        if (range->tensor_class == DS4_LAGUNA_TENSOR_ROUTED_EXPERT &&
+            (!append_literal(buffer, ",\"routed_layer\":",
+                             error, error_size) ||
+             !append_u32(buffer, range->routed_layer, error, error_size) ||
+             !append_literal(buffer, ",\"routed_projection\":",
+                             error, error_size) ||
+             !append_json_string(
+                 buffer, routed_projection_name(range->routed_projection),
+                 error, error_size))) {
+            return false;
+        }
+        if (!append_literal(buffer, ",\"source_bytes\":", error, error_size) ||
             !append_u64_string(buffer, range->source_bytes,
                                error, error_size) ||
             !append_literal(buffer, ",\"source_offset\":", error, error_size) ||

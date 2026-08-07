@@ -13,6 +13,7 @@ extern "C" {
 
 #define DS4_LAGUNA_MAX_DIMS 8u
 #define DS4_LAGUNA_ALLOCATION_CALLSITE_COUNT 25u
+#define DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY 1
 
 typedef enum {
     DS4_LAGUNA_TENSOR_UNCLASSIFIED = 0,
@@ -67,6 +68,8 @@ typedef struct {
 typedef struct {
     uint64_t stable_index;
     ds4_laguna_tensor_class tensor_class;
+    uint32_t routed_layer;
+    ds4_laguna_routed_projection routed_projection;
     uint64_t source_offset;
     uint64_t source_bytes;
 } ds4_laguna_tensor_range;

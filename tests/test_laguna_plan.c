@@ -24,9 +24,11 @@ static int g_total;
 } while (0)
 
 typedef struct {
-    ds4_laguna_tensor_range tensors[5];
+    ds4_laguna_tensor_range tensors[8];
     ds4_laguna_source_range sources[5];
-    ds4_laguna_expert_entry experts[1];
+    ds4_laguna_expert_entry experts[4];
+    ds4_laguna_tensor_desc expert_tensors[7];
+    char expert_names[7][32];
     ds4_laguna_ledger ledger;
     ds4_laguna_allocation_plan allocation;
     ds4_laguna_page_plan pages;
@@ -143,6 +145,12 @@ static void prepare_ledger(plan_fixture *fixture) {
             DS4_LAGUNA_TENSOR_STATIC : DS4_LAGUNA_TENSOR_ROUTED_EXPERT;
         fixture->tensors[i].source_offset = offsets[i];
         fixture->tensors[i].source_bytes = sizes[i];
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+        fixture->tensors[i].routed_layer = i < 2u ? UINT32_MAX : 1u;
+        fixture->tensors[i].routed_projection = i < 2u ?
+            DS4_LAGUNA_ROUTED_PROJECTION_NONE :
+            (ds4_laguna_routed_projection)(i - 1u);
+#endif
     }
     fixture->sources[0] = (ds4_laguna_source_range){
         DS4_LAGUNA_SOURCE_HEADER, 0u, 20u,
@@ -202,14 +210,16 @@ static void prepare_allocation(plan_fixture *fixture) {
         plan->configured_cache_bytes - plan->cache_payload_bytes;
     plan->staging_buffer_count = 4u;
     plan->staging_buffer_bytes = plan->slot_stride_bytes;
-    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 16384u;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] =
+        fixture->ledger.static_aligned_device_bytes;
     plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] =
         plan->cache_payload_bytes;
     plan->owned_category_bounds[
         DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 100u;
     plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] = 200u;
     plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] = 300u;
-    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_PINNED_STAGING] = 49152u;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_PINNED_STAGING] =
+        4u * plan->slot_stride_bytes;
     plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 400u;
     plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 500u;
     plan->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] =
@@ -235,13 +245,13 @@ static void prepare_allocation(plan_fixture *fixture) {
         site->category = callsite_categories[i];
         site->domain = callsite_domains[i];
     }
-    plan->callsites[0].bound_bytes = 16384u;
+    plan->callsites[0].bound_bytes = fixture->ledger.static_aligned_device_bytes;
     plan->callsites[1].bound_bytes = plan->cache_payload_bytes;
     plan->callsites[2].bound_bytes = 100u;
     plan->callsites[8].bound_bytes = 200u;
     plan->callsites[9].bound_bytes = 300u;
     for (size_t i = 10u; i < 14u; i++) {
-        plan->callsites[i].bound_bytes = 12288u;
+        plan->callsites[i].bound_bytes = plan->slot_stride_bytes;
     }
     plan->callsites[14].bound_bytes = 400u;
     plan->callsites[21].bound_bytes = 500u;
@@ -260,6 +270,84 @@ static bool prepare_fixture(plan_fixture *fixture, char *error, size_t error_siz
     }
     fixture->input.model_identity = (ds4_laguna_file_identity){
         42u, 99u, 28673u, 123456789u,
+    };
+    fixture->input.ledger = &fixture->ledger;
+    fixture->input.allocation = &fixture->allocation;
+    fixture->input.page_cache = &fixture->pages;
+    return true;
+}
+
+static bool prepare_expert_fixture(plan_fixture *fixture,
+                                   char *error,
+                                   size_t error_size) {
+    memset(fixture, 0, sizeof(*fixture));
+    const ds4_laguna_ledger_spec spec = {
+        .file_size = 1024u,
+        .header_end = 16u,
+        .metadata_end = 32u,
+        .tensor_directory_end = 65u,
+        .tensor_data_start = 128u,
+        .gguf_alignment = 64u,
+        .device_alignment = 256u,
+        .first_routed_layer = 1u,
+        .layer_count = 3u,
+        .expert_count = 2u,
+    };
+    const uint64_t offsets[] = {
+        128u, 192u, 320u, 448u, 576u, 704u, 832u,
+    };
+    const ds4_laguna_routed_projection projections[] = {
+        DS4_LAGUNA_ROUTED_PROJECTION_NONE,
+        DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+        DS4_LAGUNA_ROUTED_PROJECTION_UP,
+        DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
+        DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+        DS4_LAGUNA_ROUTED_PROJECTION_UP,
+        DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
+    };
+    for (size_t i = 0; i < 7u; i++) {
+        ds4_laguna_tensor_desc *tensor = &fixture->expert_tensors[i];
+        snprintf(fixture->expert_names[i], sizeof(fixture->expert_names[i]),
+                 "tensor.%zu", i);
+        tensor->stable_index = i + 10u;
+        tensor->name = fixture->expert_names[i];
+        tensor->name_len = strlen(tensor->name);
+        tensor->source_offset = offsets[i];
+        tensor->gguf_type = 2u;
+        tensor->block_elems = 32u;
+        tensor->block_bytes = 18u;
+        tensor->tensor_class = i == 0u ? DS4_LAGUNA_TENSOR_STATIC :
+            DS4_LAGUNA_TENSOR_ROUTED_EXPERT;
+        tensor->routed_layer = i == 0u ? UINT32_MAX :
+            (uint32_t)((i - 1u) / 3u) + 1u;
+        tensor->routed_projection = projections[i];
+        if (i == 0u) {
+            tensor->ndim = 1u;
+            tensor->dim[0] = 33u;
+            tensor->source_bytes = 36u;
+        } else {
+            tensor->ndim = 3u;
+            tensor->dim[0] = 32u;
+            tensor->dim[1] = 2u;
+            tensor->dim[2] = 2u;
+            tensor->source_bytes = 72u;
+        }
+    }
+    if (!ds4_laguna_ledger_build(&fixture->ledger, &spec,
+                                 fixture->expert_tensors, 7u,
+                                 error, error_size)) {
+        return false;
+    }
+    prepare_allocation(fixture);
+    if (!ds4_laguna_page_plan_make(&fixture->pages,
+                                    &fixture->ledger,
+                                    4096u,
+                                    error,
+                                    error_size)) {
+        return false;
+    }
+    fixture->input.model_identity = (ds4_laguna_file_identity){
+        42u, 99u, fixture->ledger.file_size, 123456789u,
     };
     fixture->input.ledger = &fixture->ledger;
     fixture->input.allocation = &fixture->allocation;
@@ -332,10 +420,20 @@ static const char expected_ledger_json[] =
     "\"STATIC\",\"source_bytes\":\"8093\",\"source_offset\":\"100\","
     "\"stable_index\":\"0\"},{\"class\":\"STATIC\",\"source_bytes\":"
     "\"8191\",\"source_offset\":\"8193\",\"stable_index\":\"1\"},{"
-    "\"class\":\"ROUTED_EXPERT\",\"source_bytes\":\"4096\","
-    "\"source_offset\":\"16384\",\"stable_index\":\"2\"},{\"class\":"
-    "\"ROUTED_EXPERT\",\"source_bytes\":\"4096\",\"source_offset\":"
-    "\"20480\",\"stable_index\":\"3\"},{\"class\":\"ROUTED_EXPERT\","
+    "\"class\":\"ROUTED_EXPERT\","
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+    "\"routed_layer\":1,\"routed_projection\":\"GATE\","
+#endif
+    "\"source_bytes\":\"4096\",\"source_offset\":\"16384\","
+    "\"stable_index\":\"2\"},{\"class\":\"ROUTED_EXPERT\","
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+    "\"routed_layer\":1,\"routed_projection\":\"UP\","
+#endif
+    "\"source_bytes\":\"4096\",\"source_offset\":\"20480\","
+    "\"stable_index\":\"3\"},{\"class\":\"ROUTED_EXPERT\","
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+    "\"routed_layer\":1,\"routed_projection\":\"DOWN\","
+#endif
     "\"source_bytes\":\"4096\",\"source_offset\":\"24576\","
     "\"stable_index\":\"4\"}]}";
 
@@ -373,8 +471,14 @@ static void test_serialize(void) {
     CHECK(json != NULL && extract_ledger(json, json_size),
           "serialized plan contains its full canonical ledger");
     CHECK(strcmp(ledger_digest,
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+                 "a2e857b0221fd6ca07ad57443e160396b"
+                 "b76155b542ae7a9d88c63287de5d8a5"
+#else
                  "dd6f102d4cd87b5d9fcbbaa5236797e3"
-                 "b5474376e054f9cfe3eb7bf44b43ccfc") == 0,
+                 "b5474376e054f9cfe3eb7bf44b43ccfc"
+#endif
+                 ) == 0,
           "ledger digest hashes only the included canonical ledger object");
     CHECK(strstr(json, "\"file_size\":\"28673\"") != NULL &&
               strstr(json, "\"context_tokens\":32768") != NULL &&
@@ -416,6 +520,9 @@ static void test_serialize(void) {
     ds4_laguna_qualification_plan_bytes_free(again);
 
     fixture.experts[0].layer = 2u;
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+    for (size_t i = 2u; i < 5u; i++) fixture.tensors[i].routed_layer = 2u;
+#endif
     again = NULL;
     again_size = 0;
     CHECK(ds4_laguna_qualification_plan_serialize(
@@ -426,6 +533,9 @@ static void test_serialize(void) {
           "changing one valid ledger field changes both ledger and plan bytes");
     ds4_laguna_qualification_plan_bytes_free(again);
     fixture.experts[0].layer = 1u;
+#ifdef DS4_LAGUNA_TENSOR_RANGE_HAS_ROUTED_IDENTITY
+    for (size_t i = 2u; i < 5u; i++) fixture.tensors[i].routed_layer = 1u;
+#endif
 
     ds4_laguna_qualification_plan_bytes_free(json);
     ds4_laguna_page_plan_free(&fixture.pages);
@@ -527,6 +637,98 @@ static void expect_serialize_rejected(plan_fixture *fixture,
           message);
 }
 
+static void expect_validation_rejected_without_mutation(
+        plan_fixture *fixture,
+        const char *message) {
+    const plan_fixture fixture_before = *fixture;
+    ds4_laguna_tensor_range tensors_before[8];
+    ds4_laguna_source_range sources_before[19];
+    ds4_laguna_expert_entry experts_before[4];
+    ds4_laguna_page_range ranges_before[8];
+    CHECK(fixture->ledger.tensor_range_count <= 8u &&
+              fixture->ledger.source_range_count <= 19u &&
+              fixture->ledger.expert_entry_count <= 4u &&
+              fixture->pages.range_count <= 8u,
+          "expert fixture snapshots fit");
+    memcpy(tensors_before, fixture->ledger.tensor_ranges,
+           fixture->ledger.tensor_range_count * sizeof(tensors_before[0]));
+    memcpy(sources_before, fixture->ledger.source_ranges,
+           fixture->ledger.source_range_count * sizeof(sources_before[0]));
+    memcpy(experts_before, fixture->ledger.expert_entries,
+           fixture->ledger.expert_entry_count * sizeof(experts_before[0]));
+    memcpy(ranges_before, fixture->pages.ranges,
+           fixture->pages.range_count * sizeof(ranges_before[0]));
+
+    char *json = NULL;
+    size_t size = 0;
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    char error[256];
+    const bool ok = ds4_laguna_qualification_plan_serialize(
+        &fixture->input, &json, &size, digest, error, sizeof(error));
+    CHECK(!ok && json == NULL && size == 0u && error[0] != '\0', message);
+    CHECK(memcmp(&fixture_before, fixture, sizeof(fixture_before)) == 0 &&
+              memcmp(tensors_before, fixture->ledger.tensor_ranges,
+                     fixture->ledger.tensor_range_count *
+                         sizeof(tensors_before[0])) == 0 &&
+              memcmp(sources_before, fixture->ledger.source_ranges,
+                     fixture->ledger.source_range_count *
+                         sizeof(sources_before[0])) == 0 &&
+              memcmp(experts_before, fixture->ledger.expert_entries,
+                     fixture->ledger.expert_entry_count *
+                         sizeof(experts_before[0])) == 0 &&
+              memcmp(ranges_before, fixture->pages.ranges,
+                     fixture->pages.range_count * sizeof(ranges_before[0])) == 0,
+          "expert evidence rejection leaves the fixture byte-identical");
+    ds4_laguna_qualification_plan_bytes_free(json);
+}
+
+static void test_expert_evidence_rejections(void) {
+    plan_fixture fixture;
+    char error[256];
+
+    CHECK(prepare_expert_fixture(&fixture, error, sizeof(error)),
+          "wrong-expert-offset fixture prepares");
+    fixture.ledger.expert_entries[1].gate.source_offset =
+        fixture.ledger.expert_entries[0].gate.source_offset;
+    fixture.ledger.expert_entries[1].up.source_offset =
+        fixture.ledger.expert_entries[0].up.source_offset;
+    fixture.ledger.expert_entries[1].down.source_offset =
+        fixture.ledger.expert_entries[0].down.source_offset;
+    expect_validation_rejected_without_mutation(
+        &fixture, "expert 1 cannot reuse expert 0 source offsets");
+    ds4_laguna_page_plan_free(&fixture.pages);
+    ds4_laguna_ledger_free(&fixture.ledger);
+
+    CHECK(prepare_expert_fixture(&fixture, error, sizeof(error)),
+          "wrong-projection-parent fixture prepares");
+    ds4_laguna_expert_entry *entry = &fixture.ledger.expert_entries[1];
+    const uint64_t gate_parent = entry->gate.parent_stable_index;
+    const uint64_t gate_offset = entry->gate.source_offset;
+    entry->gate.parent_stable_index = entry->up.parent_stable_index;
+    entry->gate.source_offset = entry->up.source_offset;
+    entry->up.parent_stable_index = gate_parent;
+    entry->up.source_offset = gate_offset;
+    expect_validation_rejected_without_mutation(
+        &fixture, "gate and up views cannot exchange routed parents");
+    ds4_laguna_page_plan_free(&fixture.pages);
+    ds4_laguna_ledger_free(&fixture.ledger);
+
+    CHECK(prepare_expert_fixture(&fixture, error, sizeof(error)),
+          "cross-layer-parent fixture prepares");
+    entry = &fixture.ledger.expert_entries[0];
+    const ds4_laguna_expert_entry *other = &fixture.ledger.expert_entries[2];
+    entry->gate.parent_stable_index = other->gate.parent_stable_index;
+    entry->gate.source_offset = other->gate.source_offset;
+    entry->up.parent_stable_index = other->up.parent_stable_index;
+    entry->up.source_offset = other->up.source_offset;
+    entry->down.parent_stable_index = other->down.parent_stable_index;
+    entry->down.source_offset = other->down.source_offset;
+    expect_validation_rejected_without_mutation(
+        &fixture, "expert views cannot use another layer's parent triplet");
+    ds4_laguna_page_plan_free(&fixture.pages);
+    ds4_laguna_ledger_free(&fixture.ledger);
+}
+
 static void test_rejections(void) {
     plan_fixture fixture;
     char error[256];
@@ -594,6 +796,7 @@ int main(void) {
     test_serialize();
     test_publish();
     test_rejections();
+    test_expert_evidence_rejections();
     if (g_failed != 0) {
         fprintf(stderr, "%d/%d Laguna plan checks failed\n", g_failed, g_total);
         return 1;

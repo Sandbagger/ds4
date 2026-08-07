@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -135,6 +136,34 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertTrue(
             recipe.endswith("tests/run_cuda_laguna_gate.sh resident"), recipe
         )
+
+    def test_resident_gate_make_render_never_interpolates_hostile_values(self) -> None:
+        model_payload = 'model"; printf MAKE_MODEL_INJECTED >&2; #.gguf'
+        tokenizer_payload = "revision'; printf MAKE_TOKEN_INJECTED >&2; #"
+        completed = subprocess.run(
+            [
+                "make",
+                "-n",
+                "UNAME_S=Linux",
+                "-o",
+                "tests/test_cuda_laguna_kernels",
+                "-o",
+                "tests/test_cuda_laguna_model",
+                f"DS4_TEST_MODEL={model_payload}",
+                f"LAGUNA_TOKENIZER_RUNTIME_COMMIT={tokenizer_payload}",
+                "test-cuda-laguna-resident",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        rendered = completed.stdout.strip()
+        self.assertEqual(rendered, "tests/run_cuda_laguna_gate.sh resident")
+        self.assertNotIn(model_payload, rendered)
+        self.assertNotIn(tokenizer_payload, rendered)
+        self.assertNotIn(";", rendered)
 
 
 if __name__ == "__main__":

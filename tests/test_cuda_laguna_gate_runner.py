@@ -260,6 +260,31 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 self.assertIn(name, completed.stderr)
                 self.assertNotIn("cannot open", completed.stderr.lower())
 
+    def test_relative_invocation_ignores_hostile_cdpath(self) -> None:
+        environment = os.environ.copy()
+        environment["CDPATH"] = str(ROOT)
+        environment.pop("DS4_TEST_MODEL", None)
+        environment.pop("LAGUNA_TOKENIZER_RUNTIME_COMMIT", None)
+        for name in (
+            "DS4_LAGUNA_GATE_TEST_CHILD_DIR",
+            "DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE",
+            "DS4_LAGUNA_GATE_TEST_EXPECTED_SHA256",
+        ):
+            environment.pop(name, None)
+
+        completed = subprocess.run(
+            ["/bin/bash", "tests/run_cuda_laguna_gate.sh", "resident"],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("DS4_TEST_MODEL is required", completed.stderr)
+        self.assertNotIn("No such file or directory", completed.stderr)
+
     def test_self_test_rejects_noncanonical_expected_identity(self) -> None:
         invalid = (
             ("DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE", "0"),

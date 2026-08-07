@@ -1,4 +1,8 @@
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
+#define DS4_PLAN_IO_TEST_HOOKS 1
 
 #include "../ds4_plan_io.h"
 
@@ -226,6 +230,148 @@ static void test_sha256_vectors(void) {
         CHECK(digest[0] == '\0',
               "SHA-256 overflow clears digest output");
     }
+}
+
+typedef struct {
+    uint64_t size;
+    struct timespec times[2];
+    int calls;
+    bool mutated;
+} sha256_fd_mutation;
+
+static void mutate_sha256_fd_after_first_pread(int fd, void *context) {
+    sha256_fd_mutation *mutation = context;
+    mutation->calls++;
+    if (mutation->size == 0u || mutation->size > (uint64_t)INT64_MAX) return;
+
+    mutation->mutated =
+        ftruncate(fd, (off_t)(mutation->size - 1u)) == 0 &&
+        ftruncate(fd, (off_t)mutation->size) == 0 &&
+        futimens(fd, mutation->times) == 0;
+}
+
+static void expect_sha256_fd_failure(int fd,
+                                     uint64_t expected_size,
+                                     const char *message) {
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    char error[256] = "stale";
+    memset(digest, 'x', sizeof(digest));
+    CHECK(!ds4_plan_io_sha256_fd(fd, expected_size,
+                                 digest, error, sizeof(error)),
+          message);
+    CHECK(digest[0] == '\0',
+          "failed descriptor SHA-256 clears its digest output");
+    CHECK(error[0] != '\0',
+          "failed descriptor SHA-256 returns a diagnostic");
+}
+
+static void test_sha256_fd(const char *root) {
+    char path[512];
+    CHECK(make_path(path, sizeof(path), root, "sha256-fd.bin"),
+          "descriptor SHA-256 fixture path fits");
+    CHECK(write_fixture(path, "abc", 3u),
+          "descriptor SHA-256 fixture is written");
+
+    const int fd = open(path, O_RDWR);
+    CHECK(fd >= 0, "descriptor SHA-256 fixture opens");
+    if (fd >= 0) {
+        CHECK(lseek(fd, 2, SEEK_SET) == 2,
+              "descriptor SHA-256 caller offset is positioned");
+        char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = "stale";
+        char error[256] = "stale";
+        CHECK(ds4_plan_io_sha256_fd(fd, 3u,
+                                    digest, error, sizeof(error)),
+              "descriptor SHA-256 hashes an exact regular file");
+        CHECK(strcmp(digest,
+                     "ba7816bf8f01cfea414140de5dae2223"
+                     "b00361a396177a9cb410ff61f20015ad") == 0,
+              "descriptor SHA-256 abc digest is exact");
+        CHECK(error[0] == '\0',
+              "successful descriptor SHA-256 clears stale error text");
+        CHECK(lseek(fd, 0, SEEK_CUR) == 2,
+              "descriptor SHA-256 preserves the caller offset");
+
+        expect_sha256_fd_failure(
+            fd, 2u, "descriptor SHA-256 rejects a longer-than-expected file");
+        expect_sha256_fd_failure(
+            fd, 4u, "descriptor SHA-256 rejects a truncated file");
+        expect_sha256_fd_failure(
+            fd, UINT64_MAX,
+            "descriptor SHA-256 rejects an unrepresentable hash length");
+        CHECK(lseek(fd, 0, SEEK_CUR) == 2,
+              "failed descriptor SHA-256 preserves the caller offset");
+        CHECK(close(fd) == 0, "descriptor SHA-256 fixture closes");
+    }
+
+    const int directory_fd = open(root, O_RDONLY);
+    CHECK(directory_fd >= 0, "descriptor SHA-256 directory fixture opens");
+    if (directory_fd >= 0) {
+        struct stat directory_status;
+        CHECK(fstat(directory_fd, &directory_status) == 0 &&
+                  directory_status.st_size >= 0,
+              "descriptor SHA-256 directory size is available");
+        if (directory_status.st_size >= 0) {
+            expect_sha256_fd_failure(
+                directory_fd, (uint64_t)directory_status.st_size,
+                "descriptor SHA-256 rejects a non-regular descriptor");
+        }
+        CHECK(close(directory_fd) == 0,
+              "descriptor SHA-256 directory fixture closes");
+    }
+    expect_sha256_fd_failure(
+        -1, 0u, "descriptor SHA-256 rejects an invalid descriptor");
+
+    const size_t mutation_size = 128u * 1024u + 1u;
+    unsigned char *mutation_bytes = malloc(mutation_size);
+    CHECK(mutation_bytes != NULL,
+          "descriptor SHA-256 mutation fixture allocates");
+    if (mutation_bytes != NULL) {
+        memset(mutation_bytes, 'm', mutation_size);
+        CHECK(write_fixture(path, mutation_bytes, mutation_size),
+              "descriptor SHA-256 mutation fixture is written");
+        free(mutation_bytes);
+
+        const int mutation_fd = open(path, O_RDWR);
+        CHECK(mutation_fd >= 0,
+              "descriptor SHA-256 mutation fixture opens");
+        if (mutation_fd >= 0) {
+            struct stat mutation_status;
+            memset(&mutation_status, 0, sizeof(mutation_status));
+            CHECK(fstat(mutation_fd, &mutation_status) == 0,
+                  "descriptor SHA-256 mutation identity is captured");
+#if defined(__APPLE__)
+            const struct timespec mutation_mtime = mutation_status.st_mtimespec;
+            const struct timespec mutation_atime = mutation_status.st_atimespec;
+#else
+            const struct timespec mutation_mtime = mutation_status.st_mtim;
+            const struct timespec mutation_atime = mutation_status.st_atim;
+#endif
+            sha256_fd_mutation mutation = {
+                .size = mutation_size,
+                .times = { mutation_atime, mutation_mtime },
+            };
+            mutation.times[1].tv_nsec =
+                mutation_mtime.tv_nsec == 999999999L
+                    ? mutation_mtime.tv_nsec - 1L
+                    : mutation_mtime.tv_nsec + 1L;
+            CHECK(lseek(mutation_fd, 17, SEEK_SET) == 17,
+                  "descriptor SHA-256 mutation caller offset is positioned");
+            ds4_plan_io_test_set_after_first_pread_hook(
+                mutate_sha256_fd_after_first_pread, &mutation);
+            expect_sha256_fd_failure(
+                mutation_fd, mutation_size,
+                "descriptor SHA-256 rejects before/after identity change");
+            ds4_plan_io_test_set_after_first_pread_hook(NULL, NULL);
+            CHECK(mutation.calls == 1 && mutation.mutated,
+                  "descriptor SHA-256 mutation hook runs once after first pread");
+            CHECK(lseek(mutation_fd, 0, SEEK_CUR) == 17,
+                  "identity-change failure preserves the caller offset");
+            CHECK(close(mutation_fd) == 0,
+                  "descriptor SHA-256 mutation fixture closes");
+        }
+    }
+    CHECK(unlink(path) == 0,
+          "descriptor SHA-256 fixture is removed");
 }
 
 static void test_target_preflight(const char *root) {
@@ -833,6 +979,7 @@ int main(void) {
     if (g_failed != 0) return 1;
 
     test_sha256_vectors();
+    test_sha256_fd(root);
     test_target_preflight(root);
     test_preflight_exact_temporary_names(root);
     test_publish_and_immutability(root);

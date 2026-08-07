@@ -15,6 +15,9 @@
 static int g_failed;
 static int g_total;
 
+static const char pinned_model_sha256[] =
+    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a";
+
 #define CHECK(cond, msg) do {                                                  \
     g_total++;                                                                 \
     if (!(cond)) {                                                             \
@@ -271,6 +274,7 @@ static bool prepare_fixture(plan_fixture *fixture, char *error, size_t error_siz
     fixture->input.model_identity = (ds4_laguna_file_identity){
         42u, 99u, 28673u, 123456789u,
     };
+    fixture->input.model_sha256 = pinned_model_sha256;
     fixture->input.ledger = &fixture->ledger;
     fixture->input.allocation = &fixture->allocation;
     fixture->input.page_cache = &fixture->pages;
@@ -349,6 +353,7 @@ static bool prepare_expert_fixture(plan_fixture *fixture,
     fixture->input.model_identity = (ds4_laguna_file_identity){
         42u, 99u, fixture->ledger.file_size, 123456789u,
     };
+    fixture->input.model_sha256 = pinned_model_sha256;
     fixture->input.ledger = &fixture->ledger;
     fixture->input.allocation = &fixture->allocation;
     fixture->input.page_cache = &fixture->pages;
@@ -490,9 +495,11 @@ static void test_serialize(void) {
           "allocation enums use their fixed qualification names");
     CHECK(strstr(json, "\"repository\":\"poolside/Laguna-S-2.1-GGUF\"") != NULL &&
               strstr(json, "706fa69799926b6afde1af9e24ca2a4923f110a1") != NULL &&
-              strstr(json, "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a") != NULL &&
+              strstr(json,
+                     "\"sha256\":\"e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a\"") != NULL &&
+              strstr(json, "\"expected_sha256\"") == NULL &&
               strstr(json, "path") == NULL,
-          "model identity is pinned without serializing a filesystem path");
+          "model identity publishes the observed pinned digest without a path");
     for (size_t i = 0; i < json_size; i++) {
         CHECK(json[i] != ' ' && json[i] != '\n' &&
                   json[i] != '\r' && json[i] != '\t',
@@ -779,6 +786,15 @@ static void test_rejections(void) {
     fixture.input.model_identity.device = 0u;
     expect_serialize_rejected(&fixture, "placeholder model identity rejected");
     fixture.input.model_identity.device = 42u;
+
+    fixture.input.model_sha256 = NULL;
+    expect_serialize_rejected(&fixture, "missing observed model digest rejected");
+    fixture.input.model_sha256 = "E163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a";
+    expect_serialize_rejected(&fixture, "malformed observed model digest rejected");
+    fixture.input.model_sha256 =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    expect_serialize_rejected(&fixture, "non-pinned observed model digest rejected");
+    fixture.input.model_sha256 = pinned_model_sha256;
 
     fixture.pages.ranges[0].offset = 0u;
     expect_serialize_rejected(&fixture, "noncanonical page union rejected");

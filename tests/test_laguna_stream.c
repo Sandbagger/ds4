@@ -1720,6 +1720,34 @@ static void test_cache_pins_and_drain(void) {
     cache_fixture f;
     ds4_laguna_cache_handle first = {0};
     ds4_laguna_cache_handle second = {0};
+    ds4_laguna_cache_acquire_outcome outcome =
+        DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(cache_fixture_init(&f, 1u, 1u) &&
+              ds4_laguna_cache_policy_acquire(
+                  &f.policy, fixture_key(0), &first, &outcome) ==
+                  DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "drain fixture holds an active load owner");
+    ds4_laguna_cache_slot loading_slots_before[CACHE_FIXTURE_SLOT_COUNT];
+    uint32_t loading_maps_before[CACHE_FIXTURE_ENTRY_COUNT];
+    uint64_t loading_hotness_before[CACHE_FIXTURE_ENTRY_COUNT];
+    memcpy(loading_slots_before, f.slots, sizeof(loading_slots_before));
+    memcpy(loading_maps_before, f.entry_to_slot,
+           sizeof(loading_maps_before));
+    memcpy(loading_hotness_before, f.route_hotness,
+           sizeof(loading_hotness_before));
+    const uint64_t loading_sequence_before = f.policy.sequence;
+    CHECK(ds4_laguna_cache_policy_drain(&f.policy) ==
+              DS4_LAGUNA_CACHE_RECOVERABLE &&
+              memcmp(loading_slots_before, f.slots,
+                     sizeof(loading_slots_before)) == 0 &&
+              memcmp(loading_maps_before, f.entry_to_slot,
+                     sizeof(loading_maps_before)) == 0 &&
+              memcmp(loading_hotness_before, f.route_hotness,
+                     sizeof(loading_hotness_before)) == 0 &&
+              f.policy.sequence == loading_sequence_before,
+          "drain preserves an active load owner");
+
     CHECK(cache_fixture_init(&f, 2u, 2u) &&
               cache_load(&f, fixture_key(0), &first) &&
               cache_load(&f, fixture_key(1), &second) &&
@@ -1729,8 +1757,7 @@ static void test_cache_pins_and_drain(void) {
     f.route_hotness[0] = 0;
     f.route_hotness[1] = 10u;
     ds4_laguna_cache_handle replacement = {0};
-    ds4_laguna_cache_acquire_outcome outcome =
-        DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
     CHECK(ds4_laguna_cache_policy_acquire(
               &f.policy, fixture_key(2), &replacement, &outcome) ==
                   DS4_LAGUNA_CACHE_OK &&

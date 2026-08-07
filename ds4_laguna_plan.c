@@ -1143,9 +1143,6 @@ static bool serialize_model(const ds4_laguna_file_identity *identity,
                             size_t error_size) {
     return append_literal(buffer, "{\"device\":", error, error_size) &&
            append_u64_string(buffer, identity->device, error, error_size) &&
-           append_literal(buffer, ",\"sha256\":",
-                          error, error_size) &&
-           append_json_string(buffer, model_sha256, error, error_size) &&
            append_literal(buffer, ",\"filename\":", error, error_size) &&
            append_json_string(buffer, DS4_LAGUNA_MODEL_FILENAME,
                               error, error_size) &&
@@ -1159,6 +1156,9 @@ static bool serialize_model(const ds4_laguna_file_identity *identity,
            append_literal(buffer, ",\"revision\":", error, error_size) &&
            append_json_string(buffer, DS4_LAGUNA_MODEL_REVISION,
                               error, error_size) &&
+           append_literal(buffer, ",\"sha256\":",
+                          error, error_size) &&
+           append_json_string(buffer, model_sha256, error, error_size) &&
            append_literal(buffer, ",\"size_bytes\":", error, error_size) &&
            append_u64_string(buffer, identity->size_bytes, error, error_size) &&
            append_literal(buffer, "}", error, error_size);

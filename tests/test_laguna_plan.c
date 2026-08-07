@@ -500,6 +500,16 @@ static void test_serialize(void) {
               strstr(json, "\"expected_sha256\"") == NULL &&
               strstr(json, "path") == NULL,
           "model identity publishes the observed pinned digest without a path");
+    static const char canonical_model[] =
+        "\"model\":{\"device\":\"42\","
+        "\"filename\":\"laguna-s-2.1-Q4_K_M.gguf\","
+        "\"inode\":\"99\",\"mtime_ns\":\"123456789\","
+        "\"repository\":\"poolside/Laguna-S-2.1-GGUF\","
+        "\"revision\":\"706fa69799926b6afde1af9e24ca2a4923f110a1\","
+        "\"sha256\":\"e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a\","
+        "\"size_bytes\":\"28673\"}";
+    CHECK(strstr(json, canonical_model) != NULL,
+          "model keys retain exact canonical lexical order");
     for (size_t i = 0; i < json_size; i++) {
         CHECK(json[i] != ' ' && json[i] != '\n' &&
                   json[i] != '\r' && json[i] != '\t',

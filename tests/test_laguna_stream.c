@@ -2329,14 +2329,18 @@ static void test_tracker_reconciliation_and_peaks(void) {
               snapshot.owned_total_current == 250u &&
               snapshot.qualification_total_current == 380u,
           "snapshot copies simultaneous scalar state and active records");
-    CHECK(active_records[0].id == 102u && active_records[0].live &&
-              active_records[0].base == UINT64_C(0x1000) &&
-              active_records[0].requested_bytes == 50u &&
-              active_records[0].charged_bytes == 50u &&
-              active_records[0].category == DS4_RUNTIME_CATEGORY_OTHER_HOST &&
-              active_records[0].domain == DS4_RUNTIME_DOMAIN_HOST &&
-              active_records[0].callsite_id == 8u &&
-              active_records[0].relation ==
+    const ds4_runtime_allocation_record *host_record = NULL;
+    for (size_t i = 0; i < snapshot.active_record_count; i++) {
+        if (active_records[i].id == 102u) host_record = &active_records[i];
+    }
+    CHECK(host_record && host_record->live &&
+              host_record->base == UINT64_C(0x1000) &&
+              host_record->requested_bytes == 50u &&
+              host_record->charged_bytes == 50u &&
+              host_record->category == DS4_RUNTIME_CATEGORY_OTHER_HOST &&
+              host_record->domain == DS4_RUNTIME_DOMAIN_HOST &&
+              host_record->callsite_id == 8u &&
+              host_record->relation ==
                   DS4_RUNTIME_RELATION_OWNED_ALLOCATION,
           "snapshot attribution records preserve every required field");
     active_records[0].live = false;
@@ -2378,6 +2382,119 @@ static void test_tracker_reconciliation_and_peaks(void) {
     CHECK(f.tracker.qualification_total_current == 100u &&
               f.tracker.qualification_total_peak == 100u,
           "crossing samples never manufacture a non-simultaneous peak");
+}
+
+static uint64_t tracker_test_id(uint8_t producer_namespace,
+                                uint64_t sequence) {
+    return ((uint64_t)producer_namespace << 56) | sequence;
+}
+
+static void test_tracker_tombstone_reuse(void) {
+    const uint64_t namespace_10_sequence_1 = tracker_test_id(0x10u, 1u);
+    const uint64_t namespace_10_sequence_2 = tracker_test_id(0x10u, 2u);
+    const uint64_t namespace_10_sequence_3 = tracker_test_id(0x10u, 3u);
+    const uint64_t namespace_11_sequence_1 = tracker_test_id(0x11u, 1u);
+    const uint64_t namespace_10_sequence_0 = tracker_test_id(0x10u, 0u);
+    tracker_fixture f;
+
+    tracker_fixture_prepare(&f);
+    f.config.record_capacity = 1u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_10_sequence_1, 1u,
+                  UINT64_C(0x1000), 100u, 100u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(
+                  &f.tracker, namespace_10_sequence_1) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_10_sequence_2, 1u,
+                  UINT64_C(0x2000), 40u, 40u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "released attribution storage is reused by a newer producer ID");
+    CHECK(f.tracker.record_count == 1u && f.records[0].live &&
+              f.records[0].id == namespace_10_sequence_2 &&
+              f.records[0].base == UINT64_C(0x2000) &&
+              f.tracker.category_current[
+                  DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] == 40u &&
+              f.tracker.category_peak[
+                  DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] == 100u &&
+              f.tracker.owned_total_current == 40u &&
+              f.tracker.owned_total_peak == 100u &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_NONE,
+          "tombstone reuse preserves one live record and tracker-level peaks");
+
+    tracker_fixture_prepare(&f);
+    f.config.record_capacity = 1u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_10_sequence_1, 1u,
+                  UINT64_C(0x3000), 20u, 20u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(
+                  &f.tracker, namespace_10_sequence_1) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_10_sequence_2, 1u,
+                  UINT64_C(0x4000), 20u, 20u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(
+                  &f.tracker, namespace_10_sequence_2) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "historical-ID fixture advances its producer high-water mark");
+    CHECK(ds4_runtime_tracker_allocate(
+              &f.tracker, namespace_10_sequence_1, 1u,
+              UINT64_C(0x5000), 20u, 20u) == DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_DUPLICATE_ID,
+          "a previously issued sequence remains rejected after tombstone reuse");
+
+    tracker_fixture_prepare(&f);
+    f.config.record_capacity = 1u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_10_sequence_3, 1u,
+                  UINT64_C(0x6000), 20u, 20u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(
+                  &f.tracker, namespace_10_sequence_3) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "older-sequence fixture advances past a never-issued ID");
+    CHECK(ds4_runtime_tracker_allocate(
+              &f.tracker, namespace_10_sequence_2, 1u,
+              UINT64_C(0x7000), 20u, 20u) == DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_DUPLICATE_ID,
+          "a never-issued sequence below the producer high-water mark is rejected");
+
+    tracker_fixture_prepare(&f);
+    f.config.record_capacity = 1u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_10_sequence_2, 1u,
+                  UINT64_C(0x8000), 20u, 20u) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_release(
+                  &f.tracker, namespace_10_sequence_2) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate(
+                  &f.tracker, namespace_11_sequence_1, 1u,
+                  UINT64_C(0x9000), 20u, 20u) ==
+                  DS4_RUNTIME_STATUS_OK,
+          "a second producer namespace starts an independent sequence");
+
+    tracker_fixture_prepare(&f);
+    f.config.record_capacity = 1u;
+    CHECK(ds4_runtime_tracker_init(&f.tracker, &f.config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "zero-sequence fixture initializes");
+    CHECK(ds4_runtime_tracker_allocate(
+              &f.tracker, namespace_10_sequence_0, 1u,
+              UINT64_C(0xa000), 20u, 20u) == DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_DUPLICATE_ID,
+          "sequence zero is rejected in every producer namespace");
 }
 
 static void test_tracker_relations(void) {
@@ -2626,6 +2743,7 @@ static void test_inward_page_union(void) {
 static void test_allocation(void) {
     test_allocation_profiles();
     test_tracker_reconciliation_and_peaks();
+    test_tracker_tombstone_reuse();
     test_tracker_relations();
     test_tracker_rejections();
     test_reduction_floor();

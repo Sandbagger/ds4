@@ -2830,6 +2830,82 @@ static int run_model_teardown_unsafe(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
+static int run_model_create_unwind_unsafe(void) {
+    const char *model = getenv("DS4_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
+        return 1;
+    }
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
+    if (!model_fd_set) {
+        fprintf(stderr,
+                "FAIL: model-create-unwind-unsafe requires inherited "
+                "DS4_TEST_MODEL_FD\n");
+        return 1;
+    }
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    const ds4_engine_options options = {
+        .model_path = model,
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = 32768,
+        .prefill_chunk = 4096,
+        .session_slots = 1,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(8) * 1024u * 1024u * 1024u,
+        .ssd_streaming_cache_bytes_set = true,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = true,
+    };
+    const uint64_t cleanup_before =
+        ds4_gpu_test_generic_cleanup_attempts();
+    ds4_gpu_test_laguna_compact_fail_after_identity_once();
+    ds4_gpu_test_laguna_compact_fail_release_once();
+    ds4_engine *engine = NULL;
+    const int open_result = ds4_engine_open(&engine, &options);
+    CHECK(open_result != 0 && engine == NULL,
+          "early unsafe compact unwind fails engine publication");
+
+    ds4_test_laguna_compact_close_observation observation;
+    memset(&observation, 0, sizeof(observation));
+    CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+              observation.first_destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_UNSAFE &&
+              observation.destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_UNSAFE &&
+              observation.destroy_attempt_count == 0u &&
+              observation.engine_retained &&
+              observation.gpu_cleanup_before == cleanup_before &&
+              observation.gpu_cleanup_after == cleanup_before &&
+              ds4_gpu_test_generic_cleanup_attempts() == cleanup_before,
+          "early unsafe create unwind retains engine before generic cleanup");
+
+    ds4_gpu_laguna_compact_test_snapshot retained;
+    memset(&retained, 0, sizeof(retained));
+    const bool retained_captured =
+        ds4_gpu_test_laguna_compact_nonidle_snapshot(&retained);
+    CHECK(retained_captured &&
+              retained.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_RELEASING &&
+              retained.model_fd_live && !retained.static_slab_live &&
+              !retained.static_offsets_live &&
+              !retained.tracker_mapping_live &&
+              !retained.tracker_static_live &&
+              !retained.tracker_offsets_live &&
+              retained.release_attempt_count == 1u,
+          "early unsafe unwind retains only its exact descriptor owner");
+    errno = 0;
+    CHECK(retained_captured && retained.model_fd >= 0 &&
+              (fcntl(retained.model_fd, F_GETFD) & FD_CLOEXEC) != 0,
+          "early unsafe unwind retains a live CLOEXEC descriptor");
+
+    /* The unpublished engine and compact descriptor intentionally remain
+     * retained until this isolated process exits. */
+    restore_forbidden_environment(&saved);
+    return g_failures == 0 ? 0 : 1;
+}
+
 static int run_model_teardown_second_recoverable(void) {
     const char *model = getenv("DS4_TEST_MODEL");
     if (!model || !model[0]) {
@@ -2987,7 +3063,8 @@ static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --case "
             "startup|create-unwind-unsafe|teardown-unsafe|"
-            "model-startup|model-teardown-unsafe|"
+            "model-startup|model-create-unwind-unsafe|"
+            "model-teardown-unsafe|"
             "model-teardown-second-recoverable\n",
             program);
 }
@@ -3007,6 +3084,8 @@ int main(int argc, char **argv) {
         rc = run_teardown_unsafe();
     } else if (strcmp(argv[2], "model-startup") == 0) {
         rc = run_model_startup();
+    } else if (strcmp(argv[2], "model-create-unwind-unsafe") == 0) {
+        rc = run_model_create_unwind_unsafe();
     } else if (strcmp(argv[2], "model-teardown-unsafe") == 0) {
         rc = run_model_teardown_unsafe();
     } else if (strcmp(argv[2],

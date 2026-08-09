@@ -121,6 +121,8 @@ int ds4_gpu_laguna_compact_create(
         ds4_runtime_tracker *tracker);
 ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
         ds4_gpu_laguna_compact *ctx);
+bool ds4_gpu_laguna_compact_ownership_pending(
+        const ds4_runtime_tracker *tracker);
 
 #ifdef DS4_TEST_HOOKS
 typedef enum {
@@ -170,6 +172,7 @@ uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);
 uint64_t ds4_gpu_test_generic_cleanup_attempts(void);
 void ds4_gpu_test_laguna_compact_fail_sync_once(void);
 void ds4_gpu_test_laguna_compact_fail_release_once(void);
+void ds4_gpu_test_laguna_compact_fail_after_identity_once(void);
 void ds4_gpu_test_laguna_compact_pause_creating_once(void);
 void ds4_gpu_test_laguna_compact_wait_creating_paused(void);
 void ds4_gpu_test_laguna_compact_resume_creating(void);

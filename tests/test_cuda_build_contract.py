@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 CUDA_SOURCE = (ROOT / "ds4_cuda.cu").read_text(encoding="utf-8")
 DS4_HEADER = (ROOT / "ds4.h").read_text(encoding="utf-8")
+GPU_HEADER = (ROOT / "ds4_gpu.h").read_text(encoding="utf-8")
 DS4_SOURCE = (ROOT / "ds4.c").read_text(encoding="utf-8")
 LAGUNA_MODEL_TEST = (ROOT / "tests/test_cuda_laguna_model.c").read_text(
     encoding="utf-8"
@@ -111,6 +112,24 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cuda_laguna_compact_destroy_checked", preamble)
         self.assertIn("(void)cudaDeviceSynchronize();", preamble)
         self.assertNotIn("cleanup_sync_error", preamble)
+
+    def test_failed_compact_create_uses_authoritative_cuda_ownership(self) -> None:
+        declaration = "ds4_gpu_laguna_compact_ownership_pending("
+        self.assertIn(declaration, GPU_HEADER)
+        body = function_body(
+            'extern "C" bool ds4_gpu_laguna_compact_ownership_pending('
+        )
+        self.assertIn("g_laguna_compact_mutex", body)
+        self.assertIn("DS4_LAGUNA_COMPACT_IDLE", body)
+        self.assertIn("g_laguna_compact_storage.tracker == tracker", body)
+
+        close_start = DS4_SOURCE.index("void ds4_engine_close(ds4_engine *e)")
+        close_body = DS4_SOURCE[close_start:]
+        ownership_query = close_body.index(declaration)
+        generic_cleanup = close_body.index("ds4_gpu_cleanup();")
+        engine_free = close_body.index("free(e);")
+        self.assertLess(ownership_query, generic_cleanup)
+        self.assertLess(ownership_query, engine_free)
 
     def test_laguna_engine_options_expose_only_a_hidden_qualification_fd(self) -> None:
         end = DS4_HEADER.index("} ds4_engine_options;")

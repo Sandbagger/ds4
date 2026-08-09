@@ -97,6 +97,100 @@ static float reference_f16_to_f32(uint16_t value) {
     return result;
 }
 
+static int run_poolside_q8_projection_case(unsigned char **retained_model) {
+    const uint32_t in_dim = 3072u;
+    const uint32_t out_dim = 64u;
+    const uint32_t n_tokens = 22u;
+    const uint32_t q8_block = 32u;
+    const uint32_t blocks = in_dim / q8_block;
+    const uint64_t model_bytes = (uint64_t)out_dim * blocks * 34u;
+    const uint64_t input_count = (uint64_t)n_tokens * in_dim;
+    const uint64_t output_count = (uint64_t)n_tokens * out_dim;
+    const float amax = 0x1.36573ap-8f;
+    const float selected = 0x1.0a5afep-9f;
+    /* Poolside D4: d_inv=127/amax, q=round(x*d_inv), d=1/d_inv.
+     * Pin the resulting float so -ffast-math cannot reassociate it. */
+    const float expected = 0x1.0ccc8ep-9f;
+    const float tolerance = 2.0e-7f;
+    unsigned char *model = NULL;
+    float *input = NULL;
+    float *actual = NULL;
+    ds4_gpu_tensor *x = NULL;
+    ds4_gpu_tensor *out = NULL;
+    int registered = 0;
+    int rc = 1;
+
+    if (!retained_model || *retained_model) {
+        fprintf(stderr, "poolside-q8: invalid retained-model slot\n");
+        return 1;
+    }
+    model = (unsigned char *)calloc(1, (size_t)model_bytes);
+    input = (float *)calloc((size_t)input_count, sizeof(*input));
+    actual = (float *)malloc((size_t)output_count * sizeof(*actual));
+    if (!model || !input || !actual) {
+        fprintf(stderr, "poolside-q8: synthetic allocation failed\n");
+        goto cleanup;
+    }
+
+    const uint16_t unit_scale = reference_f32_to_f16(1.0f);
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            unsigned char *weight = model +
+                ((uint64_t)row * blocks + block) * 34u;
+            memcpy(weight, &unit_scale, sizeof(unit_scale));
+            if (block == 0u) {
+                ((int8_t *)(weight + sizeof(unit_scale)))[1] = 1;
+            }
+        }
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            float *values = input + (uint64_t)token * in_dim + block * q8_block;
+            values[0] = amax;
+            values[1] = selected;
+        }
+    }
+
+    if (!ds4_gpu_set_model_map(model, model_bytes)) {
+        fprintf(stderr, "poolside-q8: synthetic model map setup failed\n");
+        goto cleanup;
+    }
+    registered = 1;
+    *retained_model = model;
+    x = ds4_gpu_tensor_alloc(input_count * sizeof(*input));
+    out = ds4_gpu_tensor_alloc(output_count * sizeof(*actual));
+    if (!x || !out ||
+        !ds4_gpu_tensor_write(x, 0, input, input_count * sizeof(*input)) ||
+        !ds4_gpu_matmul_q8_0_tensor(out, model, model_bytes, 0u,
+                                    in_dim, out_dim, x, n_tokens) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, actual,
+                             output_count * sizeof(*actual))) {
+        fprintf(stderr, "poolside-q8: CUDA projection failed\n");
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < output_count; i++) {
+        const float error = fabsf(actual[i] - expected);
+        if (!isfinite(actual[i]) || error > tolerance) {
+            fprintf(stderr,
+                    "poolside-q8: output[%llu]=%.9g expected=%.9g "
+                    "abs=%.9g tolerance=%.9g\n",
+                    (unsigned long long)i, actual[i], expected, error,
+                    tolerance);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    free(actual);
+    free(input);
+    if (!registered) free(model);
+    return rc;
+}
+
 static float yarn_ramp(float low, float high, int i) {
     const float y = ((float)(i / 2) - low) / fmaxf(0.001f, high - low);
     return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
@@ -2040,7 +2134,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|routed-moe|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|routed-moe|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2049,6 +2143,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "decode-attention") != 0 &&
          strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
+         strcmp(argv[2], "poolside-q8") != 0 &&
          strcmp(argv[2], "all") != 0)) {
         usage(argv[0]);
         return 2;
@@ -2061,13 +2156,16 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
-    if ((run_decode || run_prefill || run_routed_moe) &&
+    const bool run_poolside_q8 = strcmp(argv[2], "poolside-q8") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    if ((run_decode || run_prefill || run_routed_moe || run_poolside_q8) &&
         run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
         fprintf(stderr, "norm-rope: ds4_gpu_init failed\n");
         return 1;
     }
     float *weights = NULL;
+    unsigned char *poolside_q8_model = NULL;
     static const laguna_norm_rope_case cases[] = {
         { "global-pos0", 1, 48, 64, 0, 8192, 500000.0f,
           1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 0u },
@@ -2137,8 +2235,13 @@ int main(int argc, char **argv) {
     if (run_routed_moe && run_routed_moe_cases() != 0) {
         rc = 1;
     }
+    if (run_poolside_q8 &&
+        run_poolside_q8_projection_case(&poolside_q8_model) != 0) {
+        rc = 1;
+    }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
+    free(poolside_q8_model);
     free(weights);
     return rc;
 }

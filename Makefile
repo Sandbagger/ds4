@@ -441,6 +441,7 @@ tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hoo
 
 test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	./tests/test_cuda_laguna_stream --case startup
+	./tests/test_cuda_laguna_stream --case teardown-unsafe
 
 test-cuda-laguna-resident: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model
 	tests/run_cuda_laguna_gate.sh resident

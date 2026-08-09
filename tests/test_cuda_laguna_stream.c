@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 /* CUDA startup contract for the compact Laguna attachment.
@@ -15,6 +16,7 @@
 
 #include <cuda_runtime.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -27,6 +29,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -213,6 +219,7 @@ typedef struct {
     int model_fd;
     const void *model_map;
     uint64_t model_size;
+    const ds4_laguna_file_identity *model_identity;
     const ds4_laguna_ledger *ledger;
     const ds4_laguna_allocation_plan *plan;
     tracker_fixture *runtime;
@@ -225,7 +232,8 @@ static void *creator_race_run(void *opaque) {
     if (!test_barrier_wait(race->barrier)) return NULL;
     race->created = ds4_gpu_laguna_compact_create(
         &race->context, race->model_fd, race->model_map, race->model_size,
-        NULL, race->ledger, race->plan, &race->runtime->tracker);
+        race->model_identity,
+        race->ledger, race->plan, &race->runtime->tracker);
     return NULL;
 }
 
@@ -302,10 +310,13 @@ static void ledger_fixture_prepare(ledger_fixture *fixture) {
                    DS4_LAGUNA_ROUTED_PROJECTION_DOWN);
 }
 
-static bool ledger_fixture_build(ds4_laguna_ledger *ledger) {
+static bool ledger_fixture_build_for_size(
+        ds4_laguna_ledger *ledger,
+        uint64_t model_size) {
     ledger_fixture fixture;
     char error[256] = {0};
     ledger_fixture_prepare(&fixture);
+    fixture.spec.file_size = model_size;
     memset(ledger, 0, sizeof(*ledger));
     if (!ds4_laguna_ledger_build(
             ledger, &fixture.spec, fixture.tensors,
@@ -314,6 +325,10 @@ static bool ledger_fixture_build(ds4_laguna_ledger *ledger) {
         return false;
     }
     return true;
+}
+
+static bool ledger_fixture_build(ds4_laguna_ledger *ledger) {
+    return ledger_fixture_build_for_size(ledger, FIXTURE_MODEL_BYTES);
 }
 
 static void plan_prepare(
@@ -488,6 +503,192 @@ static bool tracker_has_only_ledger(const ds4_runtime_tracker *tracker) {
         snapshot.qualification_total_current == ledger_bytes;
 }
 
+static bool capture_file_identity(
+        int fd,
+        ds4_laguna_file_identity *identity) {
+    char error[160] = {0};
+    if (!identity) return false;
+    memset(identity, 0, sizeof(*identity));
+    if (!ds4_test_laguna_file_identity_capture(
+            fd,
+            &identity->device,
+            &identity->inode,
+            &identity->size_bytes,
+            &identity->mtime_ns,
+            error,
+            sizeof(error))) {
+        fprintf(stderr, "FAIL: capture model identity: %s\n", error);
+        return false;
+    }
+    return true;
+}
+
+static bool identities_equal(
+        const ds4_laguna_file_identity *a,
+        const ds4_laguna_file_identity *b) {
+    return a && b &&
+        a->device == b->device &&
+        a->inode == b->inode &&
+        a->size_bytes == b->size_bytes &&
+        a->mtime_ns == b->mtime_ns;
+}
+
+static bool write_pattern_file(int fd, uint64_t bytes, unsigned seed) {
+    unsigned char buffer[4096];
+    uint64_t offset = 0;
+    while (offset < bytes) {
+        const size_t amount =
+            bytes - offset < sizeof(buffer) ?
+                (size_t)(bytes - offset) : sizeof(buffer);
+        for (size_t i = 0; i < amount; i++) {
+            buffer[i] = (unsigned char)(
+                ((offset + i) * UINT64_C(37) + seed) & UINT64_C(0xff));
+        }
+        const ssize_t written = pwrite(fd, buffer, amount, (off_t)offset);
+        if (written != (ssize_t)amount) return false;
+        offset += amount;
+    }
+    return fsync(fd) == 0;
+}
+
+static int create_pattern_file(
+        char *path,
+        uint64_t bytes,
+        unsigned seed) {
+    const int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    if (!write_pattern_file(fd, bytes, seed)) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    return fd;
+}
+
+static int open_fd_count(void) {
+    DIR *directory = opendir("/proc/self/fd");
+    if (!directory) return -1;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            count++;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
+static bool compact_snapshot_equal_except_sync_lifecycle(
+        ds4_gpu_laguna_compact_test_snapshot a,
+        ds4_gpu_laguna_compact_test_snapshot b) {
+    a.lifecycle = DS4_GPU_LAGUNA_LIFECYCLE_IDLE;
+    b.lifecycle = DS4_GPU_LAGUNA_LIFECYCLE_IDLE;
+    a.sync_attempt_count = 0;
+    b.sync_attempt_count = 0;
+    return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+static bool compact_snapshot_equal_except_teardown_progress(
+        ds4_gpu_laguna_compact_test_snapshot a,
+        ds4_gpu_laguna_compact_test_snapshot b) {
+    a.lifecycle = DS4_GPU_LAGUNA_LIFECYCLE_IDLE;
+    b.lifecycle = DS4_GPU_LAGUNA_LIFECYCLE_IDLE;
+    a.sync_attempt_count = 0;
+    b.sync_attempt_count = 0;
+    a.release_attempt_count = 0;
+    b.release_attempt_count = 0;
+    return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+typedef struct {
+    uint64_t offsets[FIXTURE_TENSOR_COUNT];
+    unsigned char payloads[2][64];
+} compact_allocation_bytes;
+
+static bool capture_compact_allocation_bytes(
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot,
+        const ds4_laguna_ledger *ledger,
+        compact_allocation_bytes *out) {
+    if (!snapshot || !ledger || !out ||
+        !snapshot->static_offsets || !snapshot->static_slab ||
+        snapshot->static_offset_bytes != sizeof(out->offsets) ||
+        ledger->tensor_range_count < 2) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    memcpy(out->offsets, snapshot->static_offsets, sizeof(out->offsets));
+    for (size_t i = 0; i < 2; i++) {
+        const uint64_t bytes = ledger->tensor_ranges[i].source_bytes;
+        if (bytes > sizeof(out->payloads[i]) ||
+            cudaMemcpy(
+                out->payloads[i],
+                (const char *)snapshot->static_slab + out->offsets[i],
+                (size_t)bytes,
+                cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tracker_snapshots_equal(
+        const ds4_runtime_snapshot *a,
+        const ds4_runtime_allocation_record *a_records,
+        const ds4_runtime_snapshot *b,
+        const ds4_runtime_allocation_record *b_records) {
+    return a && b && a_records && b_records &&
+        memcmp(a, b, sizeof(*a)) == 0 &&
+        a->active_record_count == b->active_record_count &&
+        a->active_record_count <= TRACKER_RECORD_CAPACITY &&
+        memcmp(a_records, b_records,
+               a->active_record_count * sizeof(a_records[0])) == 0;
+}
+
+static bool capture_tracker_snapshot(
+        const ds4_runtime_tracker *tracker,
+        ds4_runtime_snapshot *snapshot,
+        ds4_runtime_allocation_record *records) {
+    if (!tracker || !snapshot || !records) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    memset(records, 0,
+           TRACKER_RECORD_CAPACITY * sizeof(records[0]));
+    return ds4_runtime_tracker_snapshot_copy(
+        tracker, snapshot, records, TRACKER_RECORD_CAPACITY);
+}
+
+static void expect_only_compact_rejection(
+        const ds4_gpu_laguna_compact *context,
+        const ds4_gpu_laguna_compact_test_snapshot *baseline,
+        uint64_t expected_rejection_count,
+        const ds4_runtime_tracker *tracker,
+        const ds4_runtime_snapshot *runtime_baseline,
+        const ds4_runtime_allocation_record *records_baseline,
+        const char *message) {
+    ds4_gpu_laguna_compact_test_snapshot current;
+    ds4_runtime_snapshot runtime_current;
+    ds4_runtime_allocation_record records_current[TRACKER_RECORD_CAPACITY];
+    memset(&current, 0, sizeof(current));
+    const bool compact_captured =
+        ds4_gpu_test_laguna_compact_snapshot(context, &current) != 0;
+    CHECK(compact_captured &&
+              current.rejection_count == expected_rejection_count,
+          message);
+    if (compact_captured) {
+        ds4_gpu_laguna_compact_test_snapshot normalized = current;
+        normalized.rejection_count = baseline->rejection_count;
+        CHECK(memcmp(&normalized, baseline, sizeof(normalized)) == 0,
+              "compact rejection mutates no other compact state or counter");
+    }
+    CHECK(capture_tracker_snapshot(
+              tracker, &runtime_current, records_current) &&
+              tracker_snapshots_equal(
+                  runtime_baseline, records_baseline,
+                  &runtime_current, records_current),
+          "compact rejection leaves runtime tracker byte-identical");
+}
+
 static ds4_laguna_ledger ledger_with_copied_ranges(
         const ds4_laguna_ledger *source) {
     ds4_laguna_ledger copy = *source;
@@ -504,6 +705,7 @@ static void expect_invalid_ledger_before_allocation(
         int model_fd,
         const void *model_map,
         uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
         const ds4_laguna_ledger *ledger,
         const ds4_laguna_allocation_plan *plan,
         const char *message) {
@@ -512,10 +714,12 @@ static void expect_invalid_ledger_before_allocation(
           "invalid-ledger tracker initializes");
     const uint64_t attempts_before =
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
+    const int fds_before = open_fd_count();
     ds4_gpu_laguna_compact *context = NULL;
     CHECK(!ds4_gpu_laguna_compact_create(
               &context, model_fd, model_map, model_size,
-              NULL, ledger, plan, &runtime.tracker) && context == NULL,
+              model_identity, ledger, plan, &runtime.tracker) &&
+              context == NULL,
           message);
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before,
@@ -523,19 +727,217 @@ static void expect_invalid_ledger_before_allocation(
     CHECK(tracker_has_only_ledger(&runtime.tracker),
           "invalid ledger leaves only its live ledger records");
     ds4_gpu_laguna_compact_destroy(context);
+    CHECK(fds_before >= 0 && open_fd_count() == fds_before,
+          "invalid ledger closes its validation duplicate immediately");
+}
+
+static void expect_invalid_model_source_before_allocation(
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        const char *message) {
+    tracker_fixture runtime;
+    CHECK(tracker_fixture_init(&runtime, plan, ledger),
+          "invalid-source tracker initializes");
+    const uint64_t attempts_before =
+        ds4_gpu_test_laguna_compact_static_allocation_attempts();
+    const int fds_before = open_fd_count();
+    ds4_gpu_laguna_compact *context = NULL;
+    const int created = ds4_gpu_laguna_compact_create(
+        &context, model_fd, model_map, model_size, model_identity,
+        ledger, plan, &runtime.tracker);
+    CHECK(!created && context == NULL, message);
+    CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+              attempts_before,
+          "invalid model source fails before a static CUDA allocation attempt");
+    if (context) {
+        CHECK(ds4_gpu_laguna_compact_destroy(context) ==
+                  DS4_GPU_LAGUNA_DESTROY_OK,
+              "unexpected invalid-source context is contained before continuing");
+    }
+    const int fds_after = open_fd_count();
+    CHECK(fds_before >= 0 && fds_after == fds_before,
+          "invalid model source closes its validation duplicate immediately");
+    CHECK(tracker_has_only_ledger(&runtime.tracker),
+          "invalid model source leaves only its live ledger records");
+    CHECK(tracker_fixture_release_ledger(&runtime),
+          "invalid-source ledger records release");
+}
+
+static void exercise_invalid_model_sources(void) {
+    const long page_value = sysconf(_SC_PAGESIZE);
+    CHECK(page_value > 0, "host page size is available for VMA tests");
+    if (page_value <= 0) return;
+    const uint64_t page = (uint64_t)page_value;
+    const uint64_t model_size = page * 3u;
+    char path_a[] = "/tmp/ds4-laguna-source-a.XXXXXX";
+    char path_b[] = "/tmp/ds4-laguna-source-b.XXXXXX";
+    char path_truncated[] = "/tmp/ds4-laguna-source-truncated.XXXXXX";
+    int fd_a = create_pattern_file(path_a, model_size, 11u);
+    int fd_b = create_pattern_file(path_b, model_size, 173u);
+    int fd_truncated =
+        create_pattern_file(path_truncated, model_size, 91u);
+    CHECK(fd_a >= 0 && fd_b >= 0 && fd_truncated >= 0,
+          "source-validation files open with exact multi-page sizes");
+    if (fd_a < 0 || fd_b < 0 || fd_truncated < 0) goto cleanup_files;
+
+    ds4_laguna_file_identity identity_a;
+    ds4_laguna_file_identity identity_truncated;
+    const bool identities_ready =
+        capture_file_identity(fd_a, &identity_a) &&
+        capture_file_identity(fd_truncated, &identity_truncated);
+    CHECK(identities_ready,
+          "source-validation identities are captured after fsync");
+    if (!identities_ready) goto cleanup_files;
+    ds4_laguna_ledger ledger;
+    memset(&ledger, 0, sizeof(ledger));
+    CHECK(ledger_fixture_build_for_size(&ledger, model_size),
+          "multi-page source-validation ledger builds");
+    if (!ledger.tensor_ranges) goto cleanup_files;
+    ds4_laguna_allocation_plan plan;
+    plan_prepare(&plan, &ledger);
+
+    unsigned char *map_a = mmap(
+        NULL, (size_t)model_size, PROT_READ, MAP_SHARED, fd_a, 0);
+    unsigned char *map_b = mmap(
+        NULL, (size_t)model_size, PROT_READ, MAP_SHARED, fd_b, 0);
+    CHECK(map_a != MAP_FAILED && map_b != MAP_FAILED,
+          "distinct source-validation file mappings open");
+    if (map_a != MAP_FAILED && map_b != MAP_FAILED) {
+        expect_invalid_model_source_before_allocation(
+            fd_a, map_b, model_size, &identity_a, &ledger, &plan,
+            "fd A with mmap B is rejected before CUDA allocation");
+        expect_invalid_model_source_before_allocation(
+            fd_b, map_b, model_size, &identity_a, &ledger, &plan,
+            "same-size fd B cannot satisfy expected identity A");
+    }
+
+    unsigned char *anonymous = mmap(
+        NULL, (size_t)model_size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(anonymous != MAP_FAILED,
+          "anonymous source-validation mapping opens");
+    if (anonymous != MAP_FAILED) {
+        const ssize_t copied = pread(fd_a, anonymous, (size_t)model_size, 0);
+        CHECK(copied == (ssize_t)model_size,
+              "anonymous mapping receives exact model bytes");
+        if (copied == (ssize_t)model_size) {
+            CHECK(mprotect(anonymous, (size_t)model_size, PROT_READ) == 0,
+                  "anonymous source-validation mapping becomes read-only");
+            expect_invalid_model_source_before_allocation(
+                fd_a, anonymous, model_size, &identity_a, &ledger, &plan,
+                "anonymous mapping cannot impersonate the opened model file");
+        }
+        munmap(anonymous, (size_t)model_size);
+    }
+
+    unsigned char *protected_map = mmap(
+        NULL, (size_t)model_size, PROT_READ, MAP_SHARED, fd_a, 0);
+    CHECK(protected_map != MAP_FAILED,
+          "partial-PROT_NONE source mapping opens");
+    if (protected_map != MAP_FAILED) {
+        CHECK(mprotect(protected_map + page, (size_t)page, PROT_NONE) == 0,
+              "middle source VMA can be made unreadable");
+        expect_invalid_model_source_before_allocation(
+            fd_a, protected_map, model_size, &identity_a, &ledger, &plan,
+            "PROT_NONE segment rejects the complete source mapping");
+        munmap(protected_map, (size_t)model_size);
+    }
+
+    unsigned char *mixed = mmap(
+        NULL, (size_t)model_size, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mixed != MAP_FAILED, "mixed-inode address range reserves");
+    if (mixed != MAP_FAILED) {
+        void *first = mmap(mixed, (size_t)page, PROT_READ,
+                           MAP_SHARED | MAP_FIXED, fd_a, 0);
+        void *rest = mmap(mixed + page, (size_t)(model_size - page),
+                          PROT_READ, MAP_SHARED | MAP_FIXED, fd_b,
+                          (off_t)page);
+        CHECK(first == mixed && rest == mixed + page,
+              "adjacent mixed-inode VMAs occupy one requested range");
+        if (first == mixed && rest == mixed + page) {
+            expect_invalid_model_source_before_allocation(
+                fd_a, mixed, model_size, &identity_a, &ledger, &plan,
+                "adjacent VMAs from mixed inodes reject the model mapping");
+        }
+        munmap(mixed, (size_t)model_size);
+    }
+
+    unsigned char *gap = mmap(
+        NULL, (size_t)model_size, PROT_READ, MAP_SHARED, fd_a, 0);
+    CHECK(gap != MAP_FAILED, "gapped source mapping opens");
+    if (gap != MAP_FAILED) {
+        CHECK(munmap(gap + page, (size_t)page) == 0,
+              "middle page can be removed from source mapping");
+        expect_invalid_model_source_before_allocation(
+            fd_a, gap, model_size, &identity_a, &ledger, &plan,
+            "a VMA gap rejects the complete source mapping");
+        munmap(gap, (size_t)page);
+        munmap(gap + 2u * page, (size_t)page);
+    }
+
+    unsigned char *shifted = mmap(
+        NULL, (size_t)model_size, PROT_READ, MAP_SHARED, fd_a,
+        (off_t)page);
+    CHECK(shifted != MAP_FAILED, "shifted-offset source mapping opens");
+    if (shifted != MAP_FAILED) {
+        expect_invalid_model_source_before_allocation(
+            fd_a, shifted, model_size, &identity_a, &ledger, &plan,
+            "shifted file offset rejects the model mapping");
+        munmap(shifted, (size_t)model_size);
+    }
+
+    unsigned char *truncated_map = mmap(
+        NULL, (size_t)model_size, PROT_READ, MAP_SHARED, fd_truncated, 0);
+    CHECK(truncated_map != MAP_FAILED,
+          "post-map truncation source mapping opens");
+    if (truncated_map != MAP_FAILED) {
+        CHECK(ftruncate(fd_truncated, (off_t)(model_size - page)) == 0,
+              "source file truncates after its mapping and identity capture");
+        expect_invalid_model_source_before_allocation(
+            fd_truncated, truncated_map, model_size, &identity_truncated,
+            &ledger, &plan,
+            "post-map file truncation rejects stale descriptor identity");
+        munmap(truncated_map, (size_t)model_size);
+    }
+
+    if (map_a != MAP_FAILED) munmap(map_a, (size_t)model_size);
+    if (map_b != MAP_FAILED) munmap(map_b, (size_t)model_size);
+    ds4_laguna_ledger_free(&ledger);
+
+cleanup_files:
+    if (fd_a >= 0) close(fd_a);
+    if (fd_b >= 0) close(fd_b);
+    if (fd_truncated >= 0) close(fd_truncated);
+    unlink(path_a);
+    unlink(path_b);
+    unlink(path_truncated);
 }
 
 static int run_startup(void) {
     int result = 1;
     int fd = -1;
+    int fixture_fd = -1;
+    int other_fd = -1;
+    int reused_fd = -1;
     unsigned char *model_map = MAP_FAILED;
+    unsigned char *alias_map = MAP_FAILED;
+    unsigned char *other_map = MAP_FAILED;
     ds4_laguna_ledger ledger;
     ds4_laguna_allocation_plan plan;
+    ds4_laguna_file_identity model_identity;
     ds4_gpu_laguna_compact *context = NULL;
     saved_environment saved;
     char path[] = "/tmp/ds4-cuda-laguna-startup.XXXXXX";
+    char other_path[] = "/tmp/ds4-cuda-laguna-other.XXXXXX";
+    char reuse_path[] = "/tmp/ds4-cuda-laguna-reuse.XXXXXX";
     memset(&ledger, 0, sizeof(ledger));
     memset(&plan, 0, sizeof(plan));
+    memset(&model_identity, 0, sizeof(model_identity));
     save_and_clear_forbidden_environment(&saved);
 
     int device_count = 0;
@@ -543,6 +945,7 @@ static int run_startup(void) {
           "startup test has one visible CUDA device");
     if (device_count < 1) goto cleanup;
     CHECK(ds4_gpu_init() != 0, "CUDA backend initializes");
+    exercise_invalid_model_sources();
 
     fd = mkstemp(path);
     CHECK(fd >= 0, "synthetic model file opens");
@@ -554,9 +957,25 @@ static int run_startup(void) {
     CHECK(write(fd, model_bytes, sizeof(model_bytes)) ==
               (ssize_t)sizeof(model_bytes),
           "synthetic model file has exact bytes");
+    CHECK(fsync(fd) == 0 && capture_file_identity(fd, &model_identity),
+          "synthetic model identity is captured after its bytes are durable");
+    fixture_fd = dup(fd);
+    CHECK(fixture_fd >= 0, "stable fixture descriptor duplicates caller fd");
     model_map = mmap(NULL, sizeof(model_bytes), PROT_READ, MAP_SHARED, fd, 0);
     CHECK(model_map != MAP_FAILED, "synthetic model mapping opens read-only");
     if (model_map == MAP_FAILED) goto cleanup_file;
+    alias_map = mmap(NULL, sizeof(model_bytes), PROT_READ, MAP_SHARED, fd, 0);
+    CHECK(alias_map != MAP_FAILED,
+          "same-inode alias mapping opens at a distinct address");
+    other_fd = create_pattern_file(
+        other_path, sizeof(model_bytes), 173u);
+    CHECK(other_fd >= 0, "different-inode synthetic model opens");
+    if (other_fd >= 0) {
+        other_map = mmap(NULL, sizeof(model_bytes), PROT_READ,
+                         MAP_SHARED, other_fd, 0);
+    }
+    CHECK(other_map != MAP_FAILED,
+          "different-inode second model mapping opens");
     CHECK(ledger_fixture_build(&ledger), "synthetic Laguna ledger builds");
     if (!ledger.tensor_ranges) goto cleanup_map;
     plan_prepare(&plan, &ledger);
@@ -577,7 +996,8 @@ static int run_startup(void) {
         bad.tensor_ranges[1].source_offset =
             bad.tensor_ranges[0].source_offset + 1u;
         expect_invalid_ledger_before_allocation(
-            fd, model_map, sizeof(model_bytes), &bad, &plan,
+            fd, model_map, sizeof(model_bytes), &model_identity,
+            &bad, &plan,
             "overlapping parent ranges fail closed");
         free(bad.tensor_ranges);
     }
@@ -587,7 +1007,8 @@ static int run_startup(void) {
     if (bad.tensor_ranges) {
         bad.tensor_ranges[7].source_offset = sizeof(model_bytes) - 1u;
         expect_invalid_ledger_before_allocation(
-            fd, model_map, sizeof(model_bytes), &bad, &plan,
+            fd, model_map, sizeof(model_bytes), &model_identity,
+            &bad, &plan,
             "truncated parent range fails closed");
         free(bad.tensor_ranges);
     }
@@ -598,7 +1019,8 @@ static int run_startup(void) {
     if (bad.tensor_ranges) {
         bad.tensor_ranges[2].tensor_class = DS4_LAGUNA_TENSOR_STATIC;
         expect_invalid_ledger_before_allocation(
-            fd, model_map, sizeof(model_bytes), &bad, &plan,
+            fd, model_map, sizeof(model_bytes), &model_identity,
+            &bad, &plan,
             "routed/static misclassification fails closed");
         free(bad.tensor_ranges);
     }
@@ -609,7 +1031,8 @@ static int run_startup(void) {
     bad_plan.qualification_total_bound_bytes--;
     bad_plan.callsites[0].bound_bytes--;
     expect_invalid_ledger_before_allocation(
-        fd, model_map, sizeof(model_bytes), &ledger, &bad_plan,
+        fd, model_map, sizeof(model_bytes), &model_identity,
+        &ledger, &bad_plan,
         "truncated static allocation plan fails closed");
 
     const char *const present_values[] = {"", "0", "1"};
@@ -625,7 +1048,7 @@ static int run_startup(void) {
             ds4_gpu_laguna_compact *rejected = NULL;
             const int created = ds4_gpu_laguna_compact_create(
                 &rejected, fd, model_map, sizeof(model_bytes),
-                NULL, &ledger, &plan, &runtime.tracker);
+                &model_identity, &ledger, &plan, &runtime.tracker);
             if (created || rejected) {
                 fprintf(stderr, "unexpected acceptance: %s=%s\n",
                         forbidden_cuda_env[i], present_values[j]);
@@ -638,9 +1061,13 @@ static int run_startup(void) {
             CHECK(tracker_has_only_ledger(&runtime.tracker),
                   "unsafe CUDA option leaves only live ledger records");
             ds4_gpu_laguna_compact_destroy(rejected);
+            CHECK(tracker_fixture_release_ledger(&runtime),
+                  "forbidden-environment ledger records release");
             unsetenv(forbidden_cuda_env[i]);
         }
     }
+
+    ds4_gpu_set_ssd_streaming(true);
 
     CHECK(setenv("DS4_CUDA_NO_MODEL_COPY", "1", 1) == 0 &&
               setenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE", "1", 1) == 0,
@@ -652,7 +1079,8 @@ static int run_startup(void) {
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
     CHECK(ds4_gpu_laguna_compact_create(
               &context, fd, model_map, sizeof(model_bytes),
-              NULL, &ledger, &plan, &runtime.tracker) && context != NULL,
+              &model_identity, &ledger, &plan, &runtime.tracker) &&
+              context != NULL,
           "compact context attaches the synthetic model");
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before_create + 1u,
@@ -662,9 +1090,19 @@ static int run_startup(void) {
     memset(&compact, 0, sizeof(compact));
     CHECK(ds4_gpu_test_laguna_compact_snapshot(context, &compact),
           "compact context exposes a test snapshot");
-    CHECK(compact.model_fd == fd && compact.model_map == model_map &&
-              compact.model_size == sizeof(model_bytes),
-          "compact attachment preserves exact fd/base/size identity");
+    CHECK(compact.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE &&
+              compact.model_fd >= 0 && compact.model_fd != fd &&
+              compact.model_map == model_map &&
+              compact.model_size == sizeof(model_bytes) &&
+              identities_equal(&compact.model_identity, &model_identity),
+          "compact attachment owns a duplicate with exact map identity");
+    CHECK(compact.model_fd >= 0 &&
+              (fcntl(compact.model_fd, F_GETFD) & FD_CLOEXEC) != 0,
+          "owned compact descriptor is close-on-exec");
+    CHECK(compact.model_fd_live && compact.static_slab_live &&
+              compact.static_offsets_live && compact.tracker_mapping_live &&
+              compact.tracker_static_live && compact.tracker_offsets_live,
+          "active compact snapshot reports all six owners live");
     CHECK(compact.static_range_count == 2 &&
               compact.static_source_copied_bytes == 72 &&
               compact.static_slab_bytes == 512 &&
@@ -729,6 +1167,301 @@ static int run_startup(void) {
               static_offsets[6] == UINT64_MAX &&
               static_offsets[7] == UINT64_MAX,
           "offset table follows ledger order and marks every routed tensor");
+
+    ds4_gpu_tensor *q8_input = ds4_gpu_tensor_alloc(
+        2u * 32u * sizeof(float));
+    ds4_gpu_tensor *q8_output = ds4_gpu_tensor_alloc(
+        2u * 2u * sizeof(float));
+    ds4_gpu_tensor *selected_tensor =
+        ds4_gpu_tensor_alloc(sizeof(int32_t));
+    const int32_t selected_zero = 0;
+    CHECK(q8_input != NULL && q8_output != NULL &&
+              selected_tensor != NULL &&
+              ds4_gpu_tensor_write(
+                  selected_tensor, 0, &selected_zero,
+                  sizeof(selected_zero)) != 0,
+          "tiny Q8 and selected-cache wrapper probes allocate test tensors");
+
+    ds4_gpu_laguna_compact_test_snapshot rejection_baseline;
+    ds4_runtime_snapshot rejection_runtime_baseline;
+    ds4_runtime_allocation_record
+        rejection_records_baseline[TRACKER_RECORD_CAPACITY];
+    memset(&rejection_baseline, 0, sizeof(rejection_baseline));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              context, &rejection_baseline) &&
+              capture_tracker_snapshot(
+                  &runtime.tracker,
+                  &rejection_runtime_baseline,
+                  rejection_records_baseline),
+          "legacy-exclusivity baseline captures compact and tracker state");
+    uint64_t expected_rejections = rejection_baseline.rejection_count;
+
+#define EXPECT_COMPACT_REJECTION(call_is_rejected, label)                  \
+    do {                                                                    \
+        CHECK((call_is_rejected), (label));                                 \
+        expected_rejections++;                                              \
+        expect_only_compact_rejection(                                      \
+            context, &rejection_baseline, expected_rejections,              \
+            &runtime.tracker, &rejection_runtime_baseline,                  \
+            rejection_records_baseline,                                    \
+            "legacy API increments exactly one compact rejection");       \
+    } while (0)
+
+    if (context && alias_map != MAP_FAILED && other_map != MAP_FAILED &&
+        fixture_fd >= 0 && other_fd >= 0) {
+        CHECK(setenv("DS4_CUDA_NO_FD_CACHE", "1", 1) == 0,
+              "ACTIVE alias prewarm disables the large legacy fd arena");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_cache_model_range(
+                alias_map, sizeof(model_bytes),
+                ledger.tensor_ranges[2].source_offset,
+                ledger.tensor_ranges[2].source_bytes,
+                "laguna-alias-prewarm-f32") == 0,
+            "compact ACTIVE rejects an alias range prewarm for Q8-F32");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_cache_model_range(
+                alias_map, sizeof(model_bytes),
+                ledger.tensor_ranges[3].source_offset,
+                ledger.tensor_ranges[3].source_bytes,
+                "laguna-alias-prewarm-f16") == 0,
+            "compact ACTIVE rejects an alias range prewarm for Q8-F16");
+        unsetenv("DS4_CUDA_NO_FD_CACHE");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_test_laguna_compact_resolve_weight_ptr(
+                alias_map,
+                ledger.tensor_ranges[2].source_offset,
+                ledger.tensor_ranges[2].source_bytes,
+                0, "laguna-warm-alias") == NULL,
+            "compact lookup rejects a warm same-inode alias mapping");
+
+        CHECK(setenv("DS4_CUDA_Q8_F32_ALL", "1", 1) == 0,
+              "Q8-F32 internal wrapper probe is enabled late");
+        EXPECT_COMPACT_REJECTION(
+            q8_input && q8_output &&
+                ds4_gpu_matmul_q8_0_tensor(
+                    q8_output, alias_map, sizeof(model_bytes),
+                    ledger.tensor_ranges[2].source_offset,
+                    32, 2, q8_input, 2) == 0,
+            "compact ACTIVE rejects Q8-F32 resolution from a warm alias");
+        unsetenv("DS4_CUDA_Q8_F32_ALL");
+        CHECK(setenv("DS4_CUDA_Q8_F16_ALL", "1", 1) == 0,
+              "Q8-F16 internal wrapper probe is enabled late");
+        EXPECT_COMPACT_REJECTION(
+            q8_input && q8_output &&
+                ds4_gpu_matmul_q8_0_tensor(
+                    q8_output, alias_map, sizeof(model_bytes),
+                    ledger.tensor_ranges[3].source_offset,
+                    32, 2, q8_input, 2) == 0,
+            "compact ACTIVE rejects Q8-F16 resolution from a warm alias");
+        unsetenv("DS4_CUDA_Q8_F16_ALL");
+
+        int setter_fds_before = open_fd_count();
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_set_model_fd_for_map(fixture_fd, alias_map) == 0,
+            "compact ACTIVE rejects model-fd-for-map placement");
+        CHECK(setter_fds_before >= 0 &&
+                  open_fd_count() == setter_fds_before,
+              "rejected model-fd-for-map placement leaks no descriptor");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_cache_model_range(
+                alias_map, sizeof(model_bytes),
+                ledger.tensor_ranges[4].source_offset,
+                ledger.tensor_ranges[4].source_bytes,
+                "laguna-fd-arena") == 0,
+            "compact ACTIVE rejects the internal fd-arena path");
+        setter_fds_before = open_fd_count();
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_set_model_fd(fixture_fd) == 0,
+            "compact ACTIVE rejects model-fd placement");
+        CHECK(setter_fds_before >= 0 &&
+                  open_fd_count() == setter_fds_before,
+              "rejected model-fd placement leaks no descriptor");
+
+        int lookup_device = 77;
+        void *lookup_pointer = (void *)(uintptr_t)UINT64_C(0x1234);
+        const int lookup_result = ds4_gpu_lookup_cache(
+            ledger.tensor_ranges[4].source_offset,
+            ledger.tensor_ranges[4].source_bytes,
+            &lookup_device, &lookup_pointer);
+        EXPECT_COMPACT_REJECTION(
+            lookup_result == 0 && lookup_device == 77 &&
+                lookup_pointer == (void *)(uintptr_t)UINT64_C(0x1234),
+            "compact ACTIVE rejects fd-arena lookup without touching outputs");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_lookup_cache_device(
+                ledger.tensor_ranges[5].source_offset,
+                ledger.tensor_ranges[5].source_bytes) == -1,
+            "compact ACTIVE rejects fd-arena device lookup");
+
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_set_model_map(other_map, sizeof(model_bytes)) == 0,
+            "compact ACTIVE rejects a distinct model mapping");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_register_model_map_no_copy(
+                other_map, sizeof(model_bytes)) == 0,
+            "compact ACTIVE rejects no-copy model-map registration");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_set_model_map_range(
+                other_map, sizeof(model_bytes), 0,
+                sizeof(model_bytes), 72) == 0,
+            "compact ACTIVE rejects range model-map placement");
+        const uint64_t span_offsets[] = {0, 256};
+        const uint64_t span_sizes[] = {64, 64};
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_set_model_map_spans(
+                alias_map, sizeof(model_bytes),
+                span_offsets, span_sizes, ARRAY_LEN(span_offsets), 72) == 0,
+            "compact ACTIVE rejects span model-map placement");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_register_support_map(
+                other_map, sizeof(model_bytes), UINT64_C(0x100000000)) == 0,
+            "compact ACTIVE rejects support-model mapping");
+
+        const ds4_tensor_range cache_range = {
+            .source_offset = ledger.tensor_ranges[0].source_offset,
+            .bytes = ledger.tensor_ranges[0].source_bytes,
+            .target_device = 0,
+        };
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_device_cache_tensors(0, &cache_range, 1) != 0,
+            "compact ACTIVE rejects main selective-cache placement");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_device_cache_support_tensors(
+                0, 0, &cache_range, 1, 0) != 0,
+            "compact ACTIVE rejects support selective-cache placement");
+        void *main_strict =
+            (void *)(uintptr_t)UINT64_C(0x4444);
+        EXPECT_COMPACT_REJECTION(
+            !ds4_gpu_lookup_cache_strict(
+                cache_range.source_offset, cache_range.bytes,
+                0, &main_strict) &&
+                main_strict == (void *)(uintptr_t)UINT64_C(0x4444),
+            "compact ACTIVE rejects strict main-cache lookup");
+        void *support_strict =
+            (void *)(uintptr_t)UINT64_C(0x5555);
+        EXPECT_COMPACT_REJECTION(
+            !ds4_gpu_lookup_cache_strict(
+                UINT64_C(0x100000000) + cache_range.source_offset,
+                cache_range.bytes, 0, &support_strict) &&
+                support_strict == (void *)(uintptr_t)UINT64_C(0x5555),
+            "compact ACTIVE rejects strict support-cache lookup");
+
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_cache_model_range(
+                model_map, sizeof(model_bytes),
+                ledger.tensor_ranges[4].source_offset,
+                ledger.tensor_ranges[4].source_bytes,
+                "laguna-generic-range") == 0,
+            "compact ACTIVE rejects generic model-range caching");
+
+        CHECK(setenv("DS4_CUDA_Q8_F16_ALL", "1", 1) == 0,
+              "Q8-F16 cache wrapper probe is enabled late");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_cache_q8_f16_range(
+                model_map, sizeof(model_bytes),
+                ledger.tensor_ranges[2].source_offset,
+                ledger.tensor_ranges[2].source_bytes,
+                32, 2, "laguna-q8-f16") == 0,
+            "compact ACTIVE rejects the Q8-F16 cache entrypoint");
+        unsetenv("DS4_CUDA_Q8_F16_ALL");
+        CHECK(setenv("DS4_CUDA_Q8_F32_PRELOAD", "1", 1) == 0 &&
+                  setenv("DS4_CUDA_Q8_F32_ALL", "1", 1) == 0,
+              "Q8-F32 cache wrapper probe is enabled late");
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_cache_q8_f16_range(
+                model_map, sizeof(model_bytes),
+                ledger.tensor_ranges[3].source_offset,
+                ledger.tensor_ranges[3].source_bytes,
+                32, 2, "laguna-q8-f32") == 0,
+            "compact ACTIVE rejects the Q8-F32 cache entrypoint");
+        unsetenv("DS4_CUDA_Q8_F32_PRELOAD");
+        unsetenv("DS4_CUDA_Q8_F32_ALL");
+
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_preload_q4_expert_tables(
+                model_map, sizeof(model_bytes),
+                ledger.tensor_ranges[2].source_offset,
+                ledger.tensor_ranges[3].source_offset,
+                ledger.tensor_ranges[4].source_offset,
+                36, 36, 2) == 0,
+            "compact ACTIVE rejects Q4 expert-table preload");
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = model_map,
+            .model_size = sizeof(model_bytes),
+            .layer = 1,
+            .n_total_expert = 2,
+            .gate_offset = ledger.tensor_ranges[2].source_offset,
+            .up_offset = ledger.tensor_ranges[3].source_offset,
+            .down_offset = ledger.tensor_ranges[4].source_offset,
+            .gate_expert_bytes = 36,
+            .down_expert_bytes = 36,
+        };
+        const int32_t selected[] = {0};
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_stream_expert_cache_begin_selected_load(
+                &table, selected, ARRAY_LEN(selected)) == 0,
+            "compact ACTIVE rejects selected-expert begin");
+        EXPECT_COMPACT_REJECTION(
+            selected_tensor &&
+                ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                    &table, selected_tensor, ARRAY_LEN(selected)) == 0,
+            "compact ACTIVE rejects GLM selected-tensor begin");
+#if defined(DS4_ROCM_BUILD) || \
+    (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                &table, selected, 1, ARRAY_LEN(selected)) == 0,
+            "compact ACTIVE rejects selected-expert prepare");
+#endif
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_stream_expert_cache_seed_selected(
+                &table, selected, ARRAY_LEN(selected)) == 0,
+            "compact ACTIVE rejects selected-expert seed");
+        const uint32_t priorities[] = {1};
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_stream_expert_cache_seed_experts(
+                &table, selected, priorities, ARRAY_LEN(selected)) == 0,
+            "compact ACTIVE rejects prioritized selected-expert seed");
+
+        EXPECT_COMPACT_REJECTION(
+            ds4_gpu_test_laguna_compact_resolve_weight_ptr(
+                other_map,
+                ledger.tensor_ranges[3].source_offset,
+                ledger.tensor_ranges[3].source_bytes,
+                0, "laguna-distinct-map") == NULL,
+            "compact lookup rejects a different-inode second mapping");
+    }
+#undef EXPECT_COMPACT_REJECTION
+
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "legacy selected-expert cache remains empty under compact ACTIVE");
+    ds4_gpu_tensor_free(q8_input);
+    ds4_gpu_tensor_free(q8_output);
+    ds4_gpu_tensor_free(selected_tensor);
+
+    const int caller_fd = fd;
+    const int owned_fd = compact.model_fd;
+    CHECK(close(fd) == 0, "caller closes its model descriptor after create");
+    fd = -1;
+    reused_fd = create_pattern_file(
+        reuse_path, sizeof(model_bytes), 211u);
+    if (reused_fd >= 0 && reused_fd != caller_fd) {
+        const int duplicate = dup2(reused_fd, caller_fd);
+        close(reused_fd);
+        reused_fd = duplicate;
+    }
+    CHECK(reused_fd == caller_fd,
+          "caller model descriptor number is deliberately reused");
+    unsigned char owned_probe[32] = {0};
+    ds4_laguna_file_identity owned_identity;
+    memset(&owned_identity, 0, sizeof(owned_identity));
+    CHECK(owned_fd >= 0 &&
+              pread(owned_fd, owned_probe, sizeof(owned_probe), 0) ==
+                  (ssize_t)sizeof(owned_probe) &&
+              memcmp(owned_probe, model_bytes, sizeof(owned_probe)) == 0 &&
+              capture_file_identity(owned_fd, &owned_identity) &&
+              identities_equal(&owned_identity, &model_identity),
+          "compact owned duplicate still reads identity A after caller-fd reuse");
 
     void *first_static_ptr = NULL;
     for (size_t i = 0; i < 2; i++) {
@@ -804,19 +1537,127 @@ static int run_startup(void) {
     const uint64_t attempts_before_second =
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
     CHECK(!ds4_gpu_laguna_compact_create(
-              &second, fd, model_map, sizeof(model_bytes),
-              NULL, &ledger, &plan, &second_runtime.tracker) && second == NULL,
+              &second, fixture_fd, model_map, sizeof(model_bytes),
+              &model_identity, &ledger, &plan,
+              &second_runtime.tracker) && second == NULL,
           "only one compact context may be active per process");
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before_second &&
               tracker_has_only_ledger(&second_runtime.tracker),
           "second-context refusal preserves only its ledger records");
 
+    ds4_gpu_laguna_compact_test_snapshot before_recoverable;
+    ds4_gpu_laguna_compact_test_snapshot after_recoverable;
+    ds4_runtime_snapshot runtime_before_recoverable;
+    ds4_runtime_snapshot runtime_after_recoverable;
+    ds4_runtime_allocation_record
+        records_before_recoverable[TRACKER_RECORD_CAPACITY];
+    ds4_runtime_allocation_record
+        records_after_recoverable[TRACKER_RECORD_CAPACITY];
+    memset(&before_recoverable, 0, sizeof(before_recoverable));
+    memset(&after_recoverable, 0, sizeof(after_recoverable));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              context, &before_recoverable) &&
+              capture_tracker_snapshot(
+                  &runtime.tracker,
+                  &runtime_before_recoverable,
+                  records_before_recoverable),
+          "recoverable teardown captures byte-exact owners before sync");
+    uint64_t offsets_before_recoverable[FIXTURE_TENSOR_COUNT] = {0};
+    unsigned char payload_before_recoverable[2][64] = {{0}};
+    bool allocation_data_ready =
+        before_recoverable.static_offsets &&
+        before_recoverable.static_slab &&
+        before_recoverable.static_offset_bytes ==
+            sizeof(offsets_before_recoverable);
+    if (allocation_data_ready) {
+        memcpy(offsets_before_recoverable,
+               before_recoverable.static_offsets,
+               sizeof(offsets_before_recoverable));
+        for (size_t i = 0; i < 2 && allocation_data_ready; i++) {
+            const uint64_t bytes = ledger.tensor_ranges[i].source_bytes;
+            allocation_data_ready =
+                bytes <= sizeof(payload_before_recoverable[i]) &&
+                cudaMemcpy(
+                    payload_before_recoverable[i],
+                    (const char *)before_recoverable.static_slab +
+                        offsets_before_recoverable[i],
+                    (size_t)bytes,
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+    }
+    CHECK(allocation_data_ready,
+          "recoverable teardown captures offset and static payload bytes");
+    ds4_gpu_test_laguna_compact_fail_sync_once();
+    const ds4_gpu_laguna_destroy_status recoverable =
+        ds4_gpu_laguna_compact_destroy(context);
+    CHECK(recoverable == DS4_GPU_LAGUNA_DESTROY_RECOVERABLE,
+          "pre-commit synchronization failure is recoverable");
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              context, &after_recoverable) &&
+              after_recoverable.lifecycle ==
+                  DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING &&
+              after_recoverable.sync_attempt_count ==
+                  before_recoverable.sync_attempt_count + 1u &&
+              after_recoverable.release_attempt_count ==
+                  before_recoverable.release_attempt_count &&
+              compact_snapshot_equal_except_sync_lifecycle(
+                  before_recoverable, after_recoverable),
+          "recoverable sync failure changes only lifecycle and sync count");
+    uint64_t offsets_after_recoverable[FIXTURE_TENSOR_COUNT] = {0};
+    unsigned char payload_after_recoverable[2][64] = {{0}};
+    bool allocation_data_preserved =
+        allocation_data_ready && after_recoverable.static_offsets &&
+        after_recoverable.static_slab;
+    if (allocation_data_preserved) {
+        memcpy(offsets_after_recoverable,
+               after_recoverable.static_offsets,
+               sizeof(offsets_after_recoverable));
+        allocation_data_preserved = memcmp(
+            offsets_before_recoverable,
+            offsets_after_recoverable,
+            sizeof(offsets_before_recoverable)) == 0;
+        for (size_t i = 0; i < 2 && allocation_data_preserved; i++) {
+            const uint64_t bytes = ledger.tensor_ranges[i].source_bytes;
+            allocation_data_preserved =
+                cudaMemcpy(
+                    payload_after_recoverable[i],
+                    (const char *)after_recoverable.static_slab +
+                        offsets_after_recoverable[i],
+                    (size_t)bytes,
+                    cudaMemcpyDeviceToHost) == cudaSuccess &&
+                memcmp(payload_before_recoverable[i],
+                       payload_after_recoverable[i],
+                       (size_t)bytes) == 0;
+        }
+    }
+    CHECK(allocation_data_preserved,
+          "recoverable sync failure preserves offset and static payload bytes");
+    CHECK(capture_tracker_snapshot(
+              &runtime.tracker,
+              &runtime_after_recoverable,
+              records_after_recoverable) &&
+              tracker_snapshots_equal(
+                  &runtime_before_recoverable,
+                  records_before_recoverable,
+                  &runtime_after_recoverable,
+                  records_after_recoverable),
+          "recoverable sync failure preserves tracker records byte-for-byte");
+    memset(owned_probe, 0, sizeof(owned_probe));
+    CHECK(owned_fd >= 0 &&
+              pread(owned_fd, owned_probe, sizeof(owned_probe), 0) ==
+                  (ssize_t)sizeof(owned_probe) &&
+              memcmp(owned_probe, model_bytes, sizeof(owned_probe)) == 0,
+          "recoverable sync failure preserves readable descriptor ownership");
+
     ds4_gpu_laguna_compact *destroyed_context = context;
     CHECK(ds4_gpu_laguna_compact_destroy(context) ==
               DS4_GPU_LAGUNA_DESTROY_OK,
-          "typed teardown reports success after releasing every owner");
+          "one retry commits and releases every compact owner");
     context = NULL;
+    errno = 0;
+    CHECK(fcntl(owned_fd, F_GETFD) == -1 && errno == EBADF,
+          "successful compact destroy closes its owned descriptor last");
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "destroy clears the process-global compact attachment");
     CHECK(ds4_runtime_tracker_snapshot_copy(
@@ -843,6 +1684,41 @@ static int run_startup(void) {
               0, &after_destroy),
           "teardown removes compact static lookup entries before freeing slab");
 
+    const ds4_tensor_range post_destroy_range = {
+        .source_offset = ledger.tensor_ranges[0].source_offset,
+        .bytes = ledger.tensor_ranges[0].source_bytes,
+        .target_device = 0,
+    };
+    CHECK(ds4_gpu_device_cache_tensors(
+              0, &post_destroy_range, 1) == 3,
+          "rejected main-map placement leaves no hidden registered base");
+    CHECK(ds4_gpu_device_cache_support_tensors(
+              0, 0, &post_destroy_range, 1, 0) == 3,
+          "rejected support-map placement leaves no hidden registered base");
+    void *post_strict = (void *)(uintptr_t)UINT64_C(0x9999);
+    CHECK(!ds4_gpu_lookup_cache_strict(
+              post_destroy_range.source_offset,
+              post_destroy_range.bytes, 0, &post_strict) &&
+              post_strict == (void *)(uintptr_t)UINT64_C(0x9999),
+          "rejected main selective cache leaves no post-destroy entry");
+    post_strict = (void *)(uintptr_t)UINT64_C(0xaaaa);
+    CHECK(!ds4_gpu_lookup_cache_strict(
+              UINT64_C(0x100000000) + post_destroy_range.source_offset,
+              post_destroy_range.bytes, 0, &post_strict) &&
+              post_strict == (void *)(uintptr_t)UINT64_C(0xaaaa),
+          "rejected support selective cache leaves no post-destroy entry");
+    CHECK(setenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB", "1", 1) == 0,
+          "post-destroy hidden-fd probe has a bounded no-allocation limit");
+    int bounded_device = 99;
+    void *bounded_pointer = (void *)(uintptr_t)UINT64_C(0xbbbb);
+    CHECK(!ds4_gpu_lookup_cache(
+              1, UINT64_C(1073741824) + 1u,
+              &bounded_device, &bounded_pointer) &&
+              bounded_device == 99 &&
+              bounded_pointer == (void *)(uintptr_t)UINT64_C(0xbbbb),
+          "rejected fd setters leave no bounded post-destroy fd fallback");
+    unsetenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+
     tracker_fixture race_runtime[2];
     CHECK(tracker_fixture_init(&race_runtime[0], &plan, &ledger) &&
               tracker_fixture_init(&race_runtime[1], &plan, &ledger),
@@ -850,11 +1726,15 @@ static int run_startup(void) {
     test_barrier barrier;
     pthread_t creators[2];
     creator_race race[2] = {
-        {.barrier = &barrier, .model_fd = fd, .model_map = model_map,
-         .model_size = sizeof(model_bytes), .ledger = &ledger, .plan = &plan,
+        {.barrier = &barrier, .model_fd = fixture_fd,
+         .model_map = model_map, .model_size = sizeof(model_bytes),
+         .model_identity = &model_identity,
+         .ledger = &ledger, .plan = &plan,
          .runtime = &race_runtime[0]},
-        {.barrier = &barrier, .model_fd = fd, .model_map = model_map,
-         .model_size = sizeof(model_bytes), .ledger = &ledger, .plan = &plan,
+        {.barrier = &barrier, .model_fd = fixture_fd,
+         .model_map = model_map, .model_size = sizeof(model_bytes),
+         .model_identity = &model_identity,
+         .ledger = &ledger, .plan = &plan,
          .runtime = &race_runtime[1]},
     };
     const bool barrier_ready = test_barrier_init(&barrier, 3);
@@ -898,8 +1778,9 @@ static int run_startup(void) {
     ds4_gpu_laguna_compact *reusable = NULL;
     CHECK(tracker_fixture_init(&reusable_runtime, &plan, &ledger) &&
               ds4_gpu_laguna_compact_create(
-                  &reusable, fd, model_map, sizeof(model_bytes),
-                  NULL, &ledger, &plan, &reusable_runtime.tracker) &&
+                  &reusable, fixture_fd, model_map, sizeof(model_bytes),
+                  &model_identity,
+                  &ledger, &plan, &reusable_runtime.tracker) &&
               reusable != NULL,
           "singleton is reusable after raced attachment teardown");
     CHECK(ds4_gpu_laguna_compact_destroy(reusable) ==
@@ -931,10 +1812,17 @@ static int run_startup(void) {
 cleanup_map:
     ds4_gpu_laguna_compact_destroy(context);
     ds4_laguna_ledger_free(&ledger);
+    if (alias_map != MAP_FAILED) munmap(alias_map, FIXTURE_MODEL_BYTES);
+    if (other_map != MAP_FAILED) munmap(other_map, FIXTURE_MODEL_BYTES);
     if (model_map != MAP_FAILED) munmap(model_map, FIXTURE_MODEL_BYTES);
 cleanup_file:
     if (fd >= 0) close(fd);
+    if (fixture_fd >= 0) close(fixture_fd);
+    if (other_fd >= 0) close(other_fd);
+    if (reused_fd >= 0) close(reused_fd);
     unlink(path);
+    unlink(other_path);
+    unlink(reuse_path);
 cleanup_gpu:
     unsetenv("DS4_CUDA_NO_MODEL_COPY");
     unsetenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE");
@@ -942,6 +1830,175 @@ cleanup_gpu:
 cleanup:
     restore_forbidden_environment(&saved);
     return result;
+}
+
+static int run_teardown_unsafe(void) {
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    char path[] = "/tmp/ds4-cuda-laguna-unsafe.XXXXXX";
+    int fd = -1;
+    unsigned char *model_map = MAP_FAILED;
+    unsigned char *alias_map = MAP_FAILED;
+    ds4_laguna_ledger ledger;
+    ds4_laguna_allocation_plan plan;
+    tracker_fixture runtime;
+    ds4_laguna_file_identity identity;
+    ds4_gpu_laguna_compact *context = NULL;
+    memset(&ledger, 0, sizeof(ledger));
+    memset(&plan, 0, sizeof(plan));
+    memset(&runtime, 0, sizeof(runtime));
+    memset(&identity, 0, sizeof(identity));
+
+    int device_count = 0;
+    CHECK(cudaGetDeviceCount(&device_count) == cudaSuccess && device_count >= 1,
+          "unsafe teardown test has one visible CUDA device");
+    CHECK(device_count >= 1 && ds4_gpu_init() != 0,
+          "unsafe teardown initializes CUDA");
+    fd = create_pattern_file(path, FIXTURE_MODEL_BYTES, 11u);
+    CHECK(fd >= 0 && capture_file_identity(fd, &identity),
+          "unsafe teardown opens an identity-bearing synthetic model");
+    if (fd >= 0) {
+        model_map = mmap(NULL, FIXTURE_MODEL_BYTES, PROT_READ,
+                         MAP_SHARED, fd, 0);
+        alias_map = mmap(NULL, FIXTURE_MODEL_BYTES, PROT_READ,
+                         MAP_SHARED, fd, 0);
+    }
+    CHECK(model_map != MAP_FAILED && alias_map != MAP_FAILED,
+          "unsafe teardown opens exact and alias mappings");
+    CHECK(ledger_fixture_build(&ledger),
+          "unsafe teardown synthetic ledger builds");
+    if (ledger.tensor_ranges) plan_prepare(&plan, &ledger);
+    CHECK(ledger.tensor_ranges &&
+              tracker_fixture_init(&runtime, &plan, &ledger),
+          "unsafe teardown runtime tracker initializes");
+    CHECK(model_map != MAP_FAILED && ledger.tensor_ranges &&
+              ds4_gpu_laguna_compact_create(
+                  &context, fd, model_map, FIXTURE_MODEL_BYTES,
+                  &identity, &ledger, &plan, &runtime.tracker) &&
+              context != NULL,
+          "unsafe teardown creates one active compact context");
+
+    ds4_gpu_laguna_compact_test_snapshot before;
+    ds4_gpu_laguna_compact_test_snapshot after;
+    ds4_gpu_laguna_compact_test_snapshot repeated;
+    ds4_runtime_snapshot runtime_before;
+    ds4_runtime_snapshot runtime_after;
+    ds4_runtime_allocation_record
+        records_before[TRACKER_RECORD_CAPACITY];
+    ds4_runtime_allocation_record
+        records_after[TRACKER_RECORD_CAPACITY];
+    memset(&before, 0, sizeof(before));
+    memset(&after, 0, sizeof(after));
+    memset(&repeated, 0, sizeof(repeated));
+    CHECK(context &&
+              ds4_gpu_test_laguna_compact_snapshot(context, &before) &&
+              capture_tracker_snapshot(
+                  &runtime.tracker, &runtime_before, records_before),
+          "unsafe teardown captures all owners before commit");
+    compact_allocation_bytes allocation_before;
+    compact_allocation_bytes allocation_after;
+    compact_allocation_bytes allocation_repeated;
+    CHECK(capture_compact_allocation_bytes(
+              &before, &ledger, &allocation_before),
+          "unsafe teardown captures offset and static payload bytes");
+
+    ds4_gpu_test_laguna_compact_fail_release_once();
+    const ds4_gpu_laguna_destroy_status unsafe_result =
+        ds4_gpu_laguna_compact_destroy(context);
+    CHECK(unsafe_result == DS4_GPU_LAGUNA_DESTROY_UNSAFE,
+          "first post-commit release failure returns UNSAFE");
+    const bool after_captured = context &&
+        ds4_gpu_test_laguna_compact_snapshot(context, &after);
+    CHECK(after_captured &&
+              after.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_RELEASING &&
+              after.sync_attempt_count == before.sync_attempt_count + 1u &&
+              after.release_attempt_count ==
+                  before.release_attempt_count + 1u &&
+              after.model_fd_live && after.static_slab_live &&
+              after.static_offsets_live && after.tracker_mapping_live &&
+              after.tracker_static_live && after.tracker_offsets_live &&
+              compact_snapshot_equal_except_teardown_progress(before, after),
+          "UNSAFE release latches RELEASING with every owner retained");
+    CHECK(capture_compact_allocation_bytes(
+              &after, &ledger, &allocation_after) &&
+              memcmp(&allocation_before,
+                     &allocation_after,
+                     sizeof(allocation_before)) == 0,
+          "UNSAFE release preserves offset and static payload bytes");
+    CHECK(capture_tracker_snapshot(
+              &runtime.tracker, &runtime_after, records_after) &&
+              tracker_snapshots_equal(
+                  &runtime_before, records_before,
+                  &runtime_after, records_after),
+          "UNSAFE release retains all six engine-owned tracker records");
+    unsigned char unsafe_expected[32];
+    unsigned char unsafe_probe[32] = {0};
+    for (size_t i = 0; i < sizeof(unsafe_expected); i++) {
+        unsafe_expected[i] = (unsigned char)((i * 37u + 11u) & 0xffu);
+    }
+    ds4_laguna_file_identity retained_identity;
+    memset(&retained_identity, 0, sizeof(retained_identity));
+    CHECK(after_captured && after.model_fd >= 0 &&
+              pread(after.model_fd, unsafe_probe, sizeof(unsafe_probe), 0) ==
+                  (ssize_t)sizeof(unsafe_probe) &&
+              memcmp(unsafe_probe, unsafe_expected,
+                     sizeof(unsafe_probe)) == 0 &&
+              capture_file_identity(after.model_fd, &retained_identity) &&
+              identities_equal(&retained_identity, &identity),
+          "UNSAFE release retains a readable exact model duplicate");
+
+    const ds4_gpu_laguna_destroy_status repeated_result =
+        ds4_gpu_laguna_compact_destroy(context);
+    const bool repeated_captured = context &&
+        ds4_gpu_test_laguna_compact_snapshot(context, &repeated);
+    CHECK(repeated_result == DS4_GPU_LAGUNA_DESTROY_UNSAFE &&
+              repeated_captured &&
+              memcmp(&after, &repeated, sizeof(after)) == 0,
+          "UNSAFE destroy retry is rejected without repeating a release");
+    CHECK(capture_compact_allocation_bytes(
+              &repeated, &ledger, &allocation_repeated) &&
+              memcmp(&allocation_before,
+                     &allocation_repeated,
+                     sizeof(allocation_before)) == 0,
+          "rejected UNSAFE retry preserves offset and static payload bytes");
+    memset(unsafe_probe, 0, sizeof(unsafe_probe));
+    memset(&retained_identity, 0, sizeof(retained_identity));
+    CHECK(repeated_captured && repeated.model_fd >= 0 &&
+              pread(repeated.model_fd,
+                    unsafe_probe, sizeof(unsafe_probe), 0) ==
+                  (ssize_t)sizeof(unsafe_probe) &&
+              memcmp(unsafe_probe, unsafe_expected,
+                     sizeof(unsafe_probe)) == 0 &&
+              capture_file_identity(
+                  repeated.model_fd, &retained_identity) &&
+              identities_equal(&retained_identity, &identity),
+          "rejected UNSAFE retry still retains the readable duplicate");
+
+    ds4_gpu_laguna_compact_test_snapshot unsafe_runtime_baseline = repeated;
+    ds4_runtime_snapshot unsafe_tracker_baseline;
+    ds4_runtime_allocation_record
+        unsafe_records_baseline[TRACKER_RECORD_CAPACITY];
+    CHECK(capture_tracker_snapshot(
+              &runtime.tracker,
+              &unsafe_tracker_baseline,
+              unsafe_records_baseline),
+          "UNSAFE legacy-rejection tracker baseline captures");
+    CHECK(alias_map != MAP_FAILED &&
+              ds4_gpu_set_model_map(alias_map, FIXTURE_MODEL_BYTES) == 0,
+          "RELEASING rejects legacy model placement");
+    expect_only_compact_rejection(
+        context, &unsafe_runtime_baseline,
+        unsafe_runtime_baseline.rejection_count + 1u,
+        &runtime.tracker,
+        &unsafe_tracker_baseline,
+        unsafe_records_baseline,
+        "RELEASING placement increments exactly one rejection");
+
+    /* Deliberately retain the unsafe context, mappings, descriptors, ledger,
+     * and tracker until this isolated process exits. */
+    unlink(path);
+    restore_forbidden_environment(&saved);
+    return g_failures == 0 ? 0 : 1;
 }
 
 static int run_model_startup(void) {
@@ -1001,8 +2058,95 @@ static int run_model_startup(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
+static int run_model_teardown_unsafe(void) {
+    const char *model = getenv("DS4_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
+        return 1;
+    }
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
+    if (!model_fd_set) {
+        fprintf(stderr,
+                "FAIL: model-teardown-unsafe requires inherited "
+                "DS4_TEST_MODEL_FD\n");
+        return 1;
+    }
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    const ds4_engine_options options = {
+        .model_path = model,
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = 32768,
+        .prefill_chunk = 4096,
+        .session_slots = 1,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(8) * 1024u * 1024u * 1024u,
+        .ssd_streaming_cache_bytes_set = true,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = true,
+    };
+    ds4_engine *engine = NULL;
+    CHECK(ds4_engine_open(&engine, &options) == 0 && engine != NULL,
+          "pinned unsafe Laguna engine opens from retained fd 9");
+    ds4_gpu_laguna_compact_test_snapshot active;
+    memset(&active, 0, sizeof(active));
+    const bool active_captured = engine &&
+        ds4_gpu_test_laguna_compact_active_snapshot(&active);
+    CHECK(active_captured &&
+              active.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE,
+          "pinned unsafe engine starts with one ACTIVE compact attachment");
+    const uint64_t cleanup_before =
+        ds4_gpu_test_generic_cleanup_attempts();
+    ds4_gpu_test_laguna_compact_fail_release_once();
+    ds4_engine_close(engine);
+
+    ds4_test_laguna_compact_close_observation observation;
+    memset(&observation, 0, sizeof(observation));
+    CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+              observation.destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_UNSAFE &&
+              observation.engine_retained &&
+              observation.gpu_cleanup_before == cleanup_before &&
+              observation.gpu_cleanup_after == cleanup_before &&
+              ds4_gpu_test_generic_cleanup_attempts() == cleanup_before,
+          "engine UNSAFE close retains owners and bypasses generic cleanup");
+    unsigned char retained_probe[32] = {0};
+    ds4_laguna_file_identity retained_identity;
+    memset(&retained_identity, 0, sizeof(retained_identity));
+    CHECK(active_captured && active.model_fd >= 0 &&
+              (fcntl(active.model_fd, F_GETFD) & FD_CLOEXEC) != 0 &&
+              pread(active.model_fd,
+                    retained_probe, sizeof(retained_probe), 0) ==
+                  (ssize_t)sizeof(retained_probe) &&
+              capture_file_identity(
+                  active.model_fd, &retained_identity) &&
+              identities_equal(
+                  &retained_identity, &active.model_identity),
+          "engine UNSAFE close retains its readable exact model duplicate");
+    memset(&active, 0, sizeof(active));
+    CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&active),
+          "engine UNSAFE close leaves no falsely ACTIVE compact snapshot");
+    const int placement_fds_before = open_fd_count();
+    CHECK(ds4_gpu_set_model_fd(model_fd) == 0,
+          "retained engine state rejects legacy placement after UNSAFE close");
+    CHECK(placement_fds_before >= 0 &&
+              open_fd_count() == placement_fds_before,
+          "post-UNSAFE legacy rejection leaks no descriptor");
+
+    /* The close observation proves the engine is intentionally retained;
+     * direct teardown-unsafe proves the corresponding exact RELEASING state.
+     * This isolated process owns both until exit. */
+    restore_forbidden_environment(&saved);
+    return g_failures == 0 ? 0 : 1;
+}
+
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s --case startup|model-startup\n", program);
+    fprintf(stderr,
+            "Usage: %s --case "
+            "startup|teardown-unsafe|model-startup|model-teardown-unsafe\n",
+            program);
 }
 
 int main(int argc, char **argv) {
@@ -1014,8 +2158,12 @@ int main(int argc, char **argv) {
     int rc = 2;
     if (strcmp(argv[2], "startup") == 0) {
         rc = run_startup();
+    } else if (strcmp(argv[2], "teardown-unsafe") == 0) {
+        rc = run_teardown_unsafe();
     } else if (strcmp(argv[2], "model-startup") == 0) {
         rc = run_model_startup();
+    } else if (strcmp(argv[2], "model-teardown-unsafe") == 0) {
+        rc = run_model_teardown_unsafe();
     } else {
         usage(argv[0]);
         return 2;

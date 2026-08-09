@@ -54,6 +54,17 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_compact_lifecycle_compile_units_track_identity_headers(self) -> None:
+        cuda_prerequisites = rule_prerequisites("ds4_cuda.o")
+        self.assertIn("ds4_laguna_plan.h", cuda_prerequisites)
+
+        cpp_contract_prerequisites = rule_prerequisites(
+            "tests/test_runtime_cpp_link.o"
+        )
+        for header in ("ds4.h", "ds4_gpu.h", "ds4_laguna_plan.h"):
+            with self.subTest(header=header):
+                self.assertIn(header, cpp_contract_prerequisites)
+
     def test_standalone_cuda_links_include_runtime_tracker(self) -> None:
         for target in STANDALONE_CUDA_TARGETS:
             with self.subTest(target=target):

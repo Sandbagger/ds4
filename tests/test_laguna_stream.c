@@ -3103,6 +3103,71 @@ static void test_inward_page_union(void) {
           "insufficient fixed output capacity fails without allocation");
 }
 
+static void test_close_snapshot_clean_predicate(void) {
+    ds4_runtime_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        snapshot.category_bounds[i] = i + 1u;
+        snapshot.category_peak[i] = i + 2u;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        snapshot.report_bounds[i] = i + 1u;
+        snapshot.report_peak[i] = i + 2u;
+    }
+    snapshot.owned_total_bound_bytes = 100u;
+    snapshot.owned_total_peak = 80u;
+    snapshot.qualification_total_bound_bytes = 120u;
+    snapshot.qualification_total_peak = 90u;
+    snapshot.event_sequence = 42u;
+
+    CHECK(ds4_test_laguna_close_snapshot_is_clean(&snapshot),
+          "historical peaks and bounds do not dirty a clean close snapshot");
+    CHECK(!ds4_test_laguna_close_snapshot_is_clean(NULL),
+          "missing close snapshot is never clean");
+
+    snapshot.active_record_count = 1u;
+    CHECK(!ds4_test_laguna_close_snapshot_is_clean(&snapshot),
+          "live record rejects a close snapshot");
+    snapshot.active_record_count = 0;
+
+    snapshot.violation = DS4_RUNTIME_VIOLATION_OVERFLOW;
+    CHECK(!ds4_test_laguna_close_snapshot_is_clean(&snapshot),
+          "latched violation rejects a close snapshot");
+    snapshot.violation = DS4_RUNTIME_VIOLATION_NONE;
+
+    snapshot.owned_total_current = 1u;
+    CHECK(!ds4_test_laguna_close_snapshot_is_clean(&snapshot),
+          "nonzero owned total rejects a close snapshot");
+    snapshot.owned_total_current = 0;
+
+    snapshot.qualification_total_current = 1u;
+    CHECK(!ds4_test_laguna_close_snapshot_is_clean(&snapshot),
+          "nonzero qualification total rejects a close snapshot");
+    snapshot.qualification_total_current = 0;
+
+    bool all_categories_rejected = true;
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        snapshot.category_current[i] = 1u;
+        if (ds4_test_laguna_close_snapshot_is_clean(&snapshot)) {
+            all_categories_rejected = false;
+        }
+        snapshot.category_current[i] = 0;
+    }
+    CHECK(all_categories_rejected,
+          "every nonzero category current rejects a close snapshot");
+
+    bool all_reports_rejected = true;
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        snapshot.report_current[i] = 1u;
+        if (ds4_test_laguna_close_snapshot_is_clean(&snapshot)) {
+            all_reports_rejected = false;
+        }
+        snapshot.report_current[i] = 0;
+    }
+    CHECK(all_reports_rejected,
+          "every nonzero report current rejects a close snapshot");
+}
+
 static void test_allocation(void) {
     test_allocation_profiles();
     test_tracker_reconciliation_and_peaks();
@@ -3113,6 +3178,7 @@ static void test_allocation(void) {
     test_tracker_rejections();
     test_reduction_floor();
     test_inward_page_union();
+    test_close_snapshot_clean_predicate();
 }
 
 static void usage(const char *argv0) {

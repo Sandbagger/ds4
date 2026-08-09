@@ -520,6 +520,33 @@ static bool tracker_has_only_ledger(const ds4_runtime_tracker *tracker) {
         snapshot.qualification_total_current == ledger_bytes;
 }
 
+static bool tracker_fixture_fill_with_tombstones(
+        tracker_fixture *fixture) {
+    const size_t tombstone_count =
+        ARRAY_LEN(fixture->records) - ARRAY_LEN(fixture->ledger_ids);
+    for (size_t i = 0; i < tombstone_count; i++) {
+        if (ds4_runtime_tracker_allocate(
+                &fixture->tracker,
+                UINT64_C(0x5400000000000001) + i,
+                DS4_LAGUNA_CALLSITE_STATIC_SLAB,
+                UINT64_C(0x7000000000000000) +
+                    i * UINT64_C(0x100),
+                1u, 1u) != DS4_RUNTIME_STATUS_OK) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < tombstone_count; i++) {
+        if (ds4_runtime_tracker_release(
+                &fixture->tracker,
+                UINT64_C(0x5400000000000001) + i) !=
+            DS4_RUNTIME_STATUS_OK) {
+            return false;
+        }
+    }
+    return fixture->tracker.record_count == ARRAY_LEN(fixture->records) &&
+        tracker_has_only_ledger(&fixture->tracker);
+}
+
 static bool capture_file_identity(
         int fd,
         ds4_laguna_file_identity *identity) {
@@ -1768,6 +1795,33 @@ static int run_startup(void) {
               setenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE", "1", 1) == 0,
           "harmless disabling and verbose CUDA knobs can be injected");
 
+    tracker_fixture tombstone_runtime;
+    const bool tombstone_runtime_ready =
+        tracker_fixture_init(&tombstone_runtime, &plan, &ledger) &&
+        tracker_fixture_fill_with_tombstones(&tombstone_runtime);
+    CHECK(tombstone_runtime_ready,
+          "full tracker retains exactly three live ledger records over tombstones");
+    if (tombstone_runtime_ready) {
+        ds4_gpu_laguna_compact *tombstone_context = NULL;
+        const int tombstone_created = ds4_gpu_laguna_compact_create(
+            &tombstone_context, fd, model_map, sizeof(model_bytes),
+            &model_identity, &ledger, &plan,
+            &tombstone_runtime.tracker);
+        CHECK(tombstone_created && tombstone_context != NULL &&
+                  tombstone_runtime.tracker.record_count ==
+                      TRACKER_RECORD_CAPACITY,
+              "compact create accepts the ledger baseline and reuses dead tracker slots");
+        if (tombstone_context) {
+            CHECK(ds4_gpu_laguna_compact_destroy(tombstone_context) ==
+                      DS4_GPU_LAGUNA_DESTROY_OK,
+                  "tombstone-backed compact context tears down");
+        }
+        CHECK(tracker_has_only_ledger(&tombstone_runtime.tracker),
+              "tombstone-backed teardown restores the ledger-only baseline");
+        CHECK(tracker_fixture_release_ledger(&tombstone_runtime),
+              "tombstone-backed ledger records release");
+    }
+
     tracker_fixture unwind_runtime;
     const bool unwind_tracker_ready =
         tracker_fixture_init(&unwind_runtime, &plan, &ledger);
@@ -3000,7 +3054,7 @@ static int run_teardown_unsafe(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
-static int run_model_startup(void) {
+static int run_model_startup(bool corrupt_inventory_live_flag) {
     const char *model = getenv("DS4_TEST_MODEL");
     if (!model || !model[0]) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
@@ -3144,6 +3198,43 @@ static int run_model_startup(void) {
                   &runtime, records, owners, ledger_owners,
                   owner_bytes, &compact),
           "pinned runtime snapshot reconciles the production inventory");
+
+    if (corrupt_inventory_live_flag) {
+        CHECK(ds4_test_engine_laguna_inventory_live_flag_clear(
+                  engine, PINNED_OWNER_COUNT - 1u),
+              "test seam leaves one tracker owner live but clears its engine flag");
+        const uint64_t cleanup_before =
+            ds4_gpu_test_generic_cleanup_attempts();
+        ds4_engine_close(engine);
+
+        ds4_test_laguna_compact_close_observation observation;
+        memset(&observation, 0, sizeof(observation));
+        CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+                  observation.first_destroy_result ==
+                      DS4_GPU_LAGUNA_DESTROY_OK &&
+                  observation.destroy_result ==
+                      DS4_GPU_LAGUNA_DESTROY_OK &&
+                  observation.destroy_attempt_count == 1u &&
+                  observation.engine_retained &&
+                  observation.gpu_cleanup_before == cleanup_before &&
+                  observation.gpu_cleanup_after == cleanup_before &&
+                  ds4_gpu_test_generic_cleanup_attempts() == cleanup_before,
+              "successful compact destroy still retains an unreconciled engine");
+        ds4_gpu_laguna_compact_test_snapshot nonidle;
+        memset(&nonidle, 0, sizeof(nonidle));
+        CHECK(!ds4_gpu_test_laguna_compact_nonidle_snapshot(&nonidle),
+              "successful compact destroy leaves no non-IDLE residue");
+        errno = 0;
+        CHECK(owned_model_fd >= 0 &&
+                  fcntl(owned_model_fd, F_GETFD) == -1 && errno == EBADF,
+              "successful compact destroy closes its owned model descriptor");
+        ds4_runtime_snapshot closed_runtime;
+        memset(&closed_runtime, 0, sizeof(closed_runtime));
+        CHECK(!ds4_test_laguna_last_close_snapshot(&closed_runtime),
+              "unreconciled retained engine publishes no clean close snapshot");
+        restore_forbidden_environment(&saved);
+        return g_failures == 0 ? 0 : 1;
+    }
 
     const uint64_t cleanup_before =
         ds4_gpu_test_generic_cleanup_attempts();
@@ -3504,6 +3595,7 @@ static void usage(const char *program) {
             "startup|create-unwind-unsafe|teardown-unsafe|"
             "model-startup|model-create-unwind-unsafe|"
             "model-teardown-unsafe|"
+            "model-teardown-reconcile-unsafe|"
             "model-teardown-second-recoverable\n",
             program);
 }
@@ -3522,11 +3614,14 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "teardown-unsafe") == 0) {
         rc = run_teardown_unsafe();
     } else if (strcmp(argv[2], "model-startup") == 0) {
-        rc = run_model_startup();
+        rc = run_model_startup(false);
     } else if (strcmp(argv[2], "model-create-unwind-unsafe") == 0) {
         rc = run_model_create_unwind_unsafe();
     } else if (strcmp(argv[2], "model-teardown-unsafe") == 0) {
         rc = run_model_teardown_unsafe();
+    } else if (strcmp(argv[2],
+                      "model-teardown-reconcile-unsafe") == 0) {
+        rc = run_model_startup(true);
     } else if (strcmp(argv[2],
                       "model-teardown-second-recoverable") == 0) {
         rc = run_model_teardown_second_recoverable();

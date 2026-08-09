@@ -2895,9 +2895,11 @@ static int run_model_create_unwind_unsafe(void) {
               !retained.tracker_offsets_live &&
               retained.release_attempt_count == 1u,
           "early unsafe unwind retains only its exact descriptor owner");
+    const int retained_fd_flags = retained_captured && retained.model_fd >= 0
+        ? fcntl(retained.model_fd, F_GETFD) : -1;
     errno = 0;
-    CHECK(retained_captured && retained.model_fd >= 0 &&
-              (fcntl(retained.model_fd, F_GETFD) & FD_CLOEXEC) != 0,
+    CHECK(retained_fd_flags >= 0 &&
+              (retained_fd_flags & FD_CLOEXEC) != 0,
           "early unsafe unwind retains a live CLOEXEC descriptor");
 
     /* The unpublished engine and compact descriptor intentionally remain

@@ -61005,7 +61005,9 @@ void ds4_engine_close(ds4_engine *e) {
         }
         e->laguna_compact = NULL;
     } else if (e->laguna_compact_create_attempted &&
-               !ds4_engine_laguna_compact_ownership_released(e)) {
+               (ds4_gpu_laguna_compact_ownership_pending(
+                    &e->laguna_runtime_tracker) ||
+                !ds4_engine_laguna_compact_ownership_released(e))) {
         fprintf(stderr,
                 "ds4: compact Laguna creation retained unpublished owners; "
                 "retaining engine until restart\n");

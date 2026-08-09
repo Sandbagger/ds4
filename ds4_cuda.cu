@@ -525,6 +525,7 @@ static std::atomic<uint64_t> g_laguna_compact_generic_cleanup_attempts;
 #ifdef DS4_TEST_HOOKS
 static std::atomic<uint64_t> g_laguna_compact_fail_sync_count;
 static std::atomic<uint64_t> g_laguna_compact_fail_release_count;
+static std::atomic<bool> g_laguna_compact_fail_after_identity{false};
 static std::mutex g_laguna_compact_creating_pause_mutex;
 static std::condition_variable g_laguna_compact_creating_pause_condition;
 static bool g_laguna_compact_creating_pause_armed;
@@ -1212,6 +1213,13 @@ extern "C" int ds4_gpu_laguna_compact_create(
     ctx->static_slab_bytes = ledger->static_aligned_device_bytes;
     ctx->static_offset_count = ledger->tensor_range_count;
     ctx->static_offset_bytes = static_offset_bytes;
+#ifdef DS4_TEST_HOOKS
+    if (g_laguna_compact_fail_after_identity.exchange(
+            false, std::memory_order_relaxed)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+#endif
     if (!cuda_laguna_compact_reserve_tracker_ids(ctx)) {
         cuda_laguna_compact_create_unwind_locked(ctx);
         return 0;
@@ -1363,6 +1371,15 @@ extern "C" ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
     return cuda_laguna_compact_destroy_checked(ctx);
 }
 
+extern "C" bool ds4_gpu_laguna_compact_ownership_pending(
+        const ds4_runtime_tracker *tracker) {
+    if (!tracker) return false;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    return g_laguna_compact_state.load(std::memory_order_relaxed) !=
+               DS4_LAGUNA_COMPACT_IDLE &&
+           g_laguna_compact_storage.tracker == tracker;
+}
+
 extern "C" void ds4_gpu_test_laguna_compact_fail_sync_once(void) {
 #ifdef DS4_TEST_HOOKS
     g_laguna_compact_fail_sync_count.fetch_add(
@@ -1378,6 +1395,11 @@ extern "C" void ds4_gpu_test_laguna_compact_fail_release_once(void) {
 }
 
 #ifdef DS4_TEST_HOOKS
+extern "C" void ds4_gpu_test_laguna_compact_fail_after_identity_once(void) {
+    g_laguna_compact_fail_after_identity.store(
+        true, std::memory_order_relaxed);
+}
+
 extern "C" void ds4_gpu_test_laguna_compact_pause_creating_once(void) {
     std::lock_guard<std::mutex> guard(
         g_laguna_compact_creating_pause_mutex);

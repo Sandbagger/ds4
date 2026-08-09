@@ -563,6 +563,11 @@ bool ds4_test_engine_laguna_live_owners(
         ds4_test_laguna_live_owner *owners,
         size_t capacity,
         size_t *required);
+bool ds4_test_engine_laguna_ledger_owners(
+        const ds4_engine *engine,
+        ds4_test_laguna_live_owner *owners,
+        size_t capacity,
+        size_t *required);
 int ds4_test_session_limit_lifecycle(
         bool exact_cache,
         bool graph_backend,

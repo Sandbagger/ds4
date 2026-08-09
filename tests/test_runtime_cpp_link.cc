@@ -94,6 +94,10 @@ static_assert(std::is_same<
               engine_live_owners_fn>::value,
               "engine live owners C ABI drifted");
 static_assert(std::is_same<
+              decltype(&ds4_test_engine_laguna_ledger_owners),
+              engine_live_owners_fn>::value,
+              "engine ledger owners C ABI drifted");
+static_assert(std::is_same<
               decltype(ds4_test_laguna_live_owner::base),
               uint64_t>::value &&
               std::is_same<

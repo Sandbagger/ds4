@@ -118,6 +118,7 @@ enum {
     FIXTURE_MODEL_BYTES = 1152,
     TRACKER_RECORD_CAPACITY = 16,
     PINNED_OWNER_COUNT = 6,
+    PINNED_LEDGER_OWNER_COUNT = 3,
     PINNED_ACTIVE_RECORD_COUNT = 12,
 };
 
@@ -730,6 +731,16 @@ static bool checked_add_u64_test(uint64_t a, uint64_t b, uint64_t *out) {
     return true;
 }
 
+static bool bytes_are_value(
+        const void *bytes, size_t byte_count, unsigned char value) {
+    if (!bytes) return false;
+    const unsigned char *cursor = bytes;
+    for (size_t i = 0; i < byte_count; i++) {
+        if (cursor[i] != value) return false;
+    }
+    return true;
+}
+
 static bool pinned_live_owners_valid(
         const ds4_test_laguna_live_owner owners[PINNED_OWNER_COUNT],
         uint64_t *total_bytes) {
@@ -767,6 +778,75 @@ static bool pinned_live_owners_valid(
     }
     *total_bytes = total;
     return engine_count == 1 && model_count == 2 && vocab_count == 3;
+}
+
+static bool pinned_ledger_owners_valid(
+        const ds4_test_laguna_live_owner
+            owners[PINNED_LEDGER_OWNER_COUNT],
+        uint64_t *total_bytes) {
+    if (!owners || !total_bytes) return false;
+    uint64_t total = 0;
+    for (size_t i = 0; i < PINNED_LEDGER_OWNER_COUNT; i++) {
+        if (owners[i].base == 0 || owners[i].bytes == 0 ||
+            owners[i].callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS ||
+            owners[i].base > UINT64_MAX - owners[i].bytes ||
+            !checked_add_u64_test(total, owners[i].bytes, &total)) {
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            const uint64_t i_end = owners[i].base + owners[i].bytes;
+            const uint64_t j_end = owners[j].base + owners[j].bytes;
+            if (owners[i].base < j_end && owners[j].base < i_end) {
+                return false;
+            }
+        }
+    }
+    *total_bytes = total;
+    return true;
+}
+
+static bool pinned_ledger_records_match(
+        const ds4_runtime_snapshot *runtime,
+        const ds4_runtime_allocation_record *records,
+        const ds4_test_laguna_live_owner
+            owners[PINNED_LEDGER_OWNER_COUNT],
+        uint64_t *ledger_bytes) {
+    if (!runtime || !records || !owners || !ledger_bytes) return false;
+    bool owner_seen[PINNED_LEDGER_OWNER_COUNT] = {false};
+    size_t ledger_count = 0;
+    uint64_t total = 0;
+    for (size_t i = 0; i < runtime->active_record_count; i++) {
+        const ds4_runtime_allocation_record *record = &records[i];
+        if (record->callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) {
+            continue;
+        }
+        size_t match = PINNED_LEDGER_OWNER_COUNT;
+        for (size_t j = 0; j < PINNED_LEDGER_OWNER_COUNT; j++) {
+            if (record->base == owners[j].base &&
+                record->requested_bytes == owners[j].bytes) {
+                if (match != PINNED_LEDGER_OWNER_COUNT) return false;
+                match = j;
+            }
+        }
+        if (match == PINNED_LEDGER_OWNER_COUNT || owner_seen[match] ||
+            !owned_record_matches(
+                record, owners[match].base, owners[match].bytes,
+                DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+                DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+                DS4_RUNTIME_DOMAIN_HOST) ||
+            !checked_add_u64_test(
+                total, owners[match].bytes, &total)) {
+            return false;
+        }
+        owner_seen[match] = true;
+        ledger_count++;
+    }
+    if (ledger_count != PINNED_LEDGER_OWNER_COUNT) return false;
+    for (size_t i = 0; i < PINNED_LEDGER_OWNER_COUNT; i++) {
+        if (!owner_seen[i]) return false;
+    }
+    *ledger_bytes = total;
+    return true;
 }
 
 static bool pinned_inventory_records_match(
@@ -834,11 +914,19 @@ static bool pinned_runtime_inventory_reconciles(
         const ds4_runtime_snapshot *runtime,
         const ds4_runtime_allocation_record *records,
         const ds4_test_laguna_live_owner owners[PINNED_OWNER_COUNT],
+        const ds4_test_laguna_live_owner
+            ledger_owners[PINNED_LEDGER_OWNER_COUNT],
         uint64_t owner_bytes,
         const ds4_gpu_laguna_compact_test_snapshot *compact) {
-    if (!runtime || !records || !owners || !compact ||
+    if (!runtime || !records || !owners || !ledger_owners || !compact ||
         runtime->violation != DS4_RUNTIME_VIOLATION_NONE ||
         runtime->active_record_count != PINNED_ACTIVE_RECORD_COUNT) {
+        return false;
+    }
+    uint64_t ledger_bytes = 0;
+    if (!pinned_inventory_records_match(runtime, records, owners) ||
+        !pinned_ledger_records_match(
+            runtime, records, ledger_owners, &ledger_bytes)) {
         return false;
     }
     size_t ledger_count = 0;
@@ -846,7 +934,6 @@ static bool pinned_runtime_inventory_reconciles(
     size_t offsets_count = 0;
     size_t mapping_count = 0;
     size_t inventory_count = 0;
-    uint64_t ledger_bytes = 0;
     uint64_t charged_bytes = 0;
     for (size_t i = 0; i < runtime->active_record_count; i++) {
         const ds4_runtime_allocation_record *record = &records[i];
@@ -856,15 +943,6 @@ static bool pinned_runtime_inventory_reconciles(
             return false;
         }
         if (record->callsite_id == DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) {
-            if (!owned_record_matches(
-                    record, record->base, record->requested_bytes,
-                    DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
-                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
-                    DS4_RUNTIME_DOMAIN_HOST) ||
-                !checked_add_u64_test(
-                    ledger_bytes, record->charged_bytes, &ledger_bytes)) {
-                return false;
-            }
             ledger_count++;
         } else if (record->callsite_id ==
                        DS4_LAGUNA_CALLSITE_STATIC_SLAB) {
@@ -2995,6 +3073,21 @@ static int run_model_startup(void) {
               memcmp(owners, fresh_owners, sizeof(owners)) == 0,
           "pinned engine recomputes a stable fresh owner snapshot");
 
+    ds4_test_laguna_live_owner
+        ledger_owners[PINNED_LEDGER_OWNER_COUNT];
+    size_t ledger_owner_required = 0;
+    uint64_t ledger_owner_bytes = 0;
+    memset(ledger_owners, 0, sizeof(ledger_owners));
+    const bool ledger_owners_captured = engine &&
+        ds4_test_engine_laguna_ledger_owners(
+            engine, ledger_owners, ARRAY_LEN(ledger_owners),
+            &ledger_owner_required);
+    CHECK(ledger_owners_captured &&
+              ledger_owner_required == PINNED_LEDGER_OWNER_COUNT &&
+              pinned_ledger_owners_valid(
+                  ledger_owners, &ledger_owner_bytes),
+          "pinned engine exposes three independent ledger array owners");
+
     ds4_runtime_snapshot runtime;
     ds4_runtime_allocation_record
         records[PINNED_ACTIVE_RECORD_COUNT];
@@ -3005,17 +3098,51 @@ static int run_model_startup(void) {
         ds4_test_engine_laguna_runtime_snapshot(
             engine, &runtime, records, ARRAY_LEN(records),
             &record_required);
+
+    ds4_runtime_snapshot rejected_runtime;
+    size_t null_buffer_required = SIZE_MAX;
+    memset(&rejected_runtime, 0xa5, sizeof(rejected_runtime));
+    CHECK(engine && record_required != 0 &&
+              !ds4_test_engine_laguna_runtime_snapshot(
+                  engine, &rejected_runtime, NULL,
+                  PINNED_ACTIVE_RECORD_COUNT, &null_buffer_required) &&
+              null_buffer_required == record_required,
+          "null record buffer still reports the exact live requirement");
+
+    ds4_runtime_allocation_record
+        undersized_records[PINNED_ACTIVE_RECORD_COUNT];
+    size_t undersized_required = SIZE_MAX;
+    memset(&rejected_runtime, 0xa5, sizeof(rejected_runtime));
+    memset(undersized_records, 0xa5, sizeof(undersized_records));
+    CHECK(engine && record_required != 0 &&
+              !ds4_test_engine_laguna_runtime_snapshot(
+                  engine, &rejected_runtime, undersized_records,
+                  record_required - 1u, &undersized_required) &&
+              undersized_required == record_required &&
+              bytes_are_value(
+                  undersized_records, sizeof(undersized_records), 0xa5),
+          "undersized record buffer reports required without partial writes");
+
     CHECK(runtime_captured &&
               record_required == PINNED_ACTIVE_RECORD_COUNT &&
               runtime.active_record_count == PINNED_ACTIVE_RECORD_COUNT,
           "pinned runtime snapshot exposes twelve active records");
+    uint64_t tracked_ledger_bytes = 0;
+    CHECK(runtime_captured && ledger_owners_captured &&
+              pinned_ledger_records_match(
+                  &runtime, records, ledger_owners,
+                  &tracked_ledger_bytes) &&
+              tracked_ledger_bytes == ledger_owner_bytes,
+          "pinned tracker contains the exact independent ledger multiset");
     CHECK(runtime_captured && owners_captured &&
               pinned_inventory_records_match(
                   &runtime, records, owners),
           "pinned tracker contains the exact 0x4e owner multiset");
     CHECK(runtime_captured && owners_captured &&
+              ledger_owners_captured &&
               pinned_runtime_inventory_reconciles(
-                  &runtime, records, owners, owner_bytes, &compact),
+                  &runtime, records, owners, ledger_owners,
+                  owner_bytes, &compact),
           "pinned runtime snapshot reconciles the production inventory");
 
     const uint64_t cleanup_before =

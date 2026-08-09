@@ -2712,7 +2712,22 @@ static int run_model_startup(void) {
               bypass.model_cache_entries == 0 &&
               bypass.model_warm_entries == 0,
           "pinned compact startup bypasses every legacy model entrypoint");
+    const uint64_t cleanup_before =
+        ds4_gpu_test_generic_cleanup_attempts();
+    ds4_gpu_test_laguna_compact_fail_sync_once();
     ds4_engine_close(engine);
+    ds4_test_laguna_compact_close_observation observation;
+    memset(&observation, 0, sizeof(observation));
+    CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+              observation.first_destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_RECOVERABLE &&
+              observation.destroy_result == DS4_GPU_LAGUNA_DESTROY_OK &&
+              observation.destroy_attempt_count == 2u &&
+              !observation.engine_retained &&
+              observation.gpu_cleanup_before == cleanup_before &&
+              observation.gpu_cleanup_after == cleanup_before + 1u &&
+              ds4_gpu_test_generic_cleanup_attempts() == cleanup_before + 1u,
+          "engine retries one RECOVERABLE close and cleans up after terminal OK");
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "pinned engine teardown destroys compact attachment");
     restore_forbidden_environment(&saved);
@@ -2766,8 +2781,11 @@ static int run_model_teardown_unsafe(void) {
     ds4_test_laguna_compact_close_observation observation;
     memset(&observation, 0, sizeof(observation));
     CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+              observation.first_destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_UNSAFE &&
               observation.destroy_result ==
                   DS4_GPU_LAGUNA_DESTROY_UNSAFE &&
+              observation.destroy_attempt_count == 1u &&
               observation.engine_retained &&
               observation.gpu_cleanup_before == cleanup_before &&
               observation.gpu_cleanup_after == cleanup_before &&
@@ -2803,11 +2821,115 @@ static int run_model_teardown_unsafe(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
+static int run_model_teardown_second_recoverable(void) {
+    const char *model = getenv("DS4_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
+        return 1;
+    }
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
+    if (!model_fd_set) {
+        fprintf(stderr,
+                "FAIL: model-teardown-second-recoverable requires inherited "
+                "DS4_TEST_MODEL_FD\n");
+        return 1;
+    }
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    const ds4_engine_options options = {
+        .model_path = model,
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = 32768,
+        .prefill_chunk = 4096,
+        .session_slots = 1,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(8) * 1024u * 1024u * 1024u,
+        .ssd_streaming_cache_bytes_set = true,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = true,
+    };
+    ds4_engine *engine = NULL;
+    CHECK(ds4_engine_open(&engine, &options) == 0 && engine != NULL,
+          "pinned second-RECOVERABLE Laguna engine opens from retained fd 9");
+    ds4_gpu_laguna_compact_test_snapshot active;
+    memset(&active, 0, sizeof(active));
+    const bool active_captured = engine &&
+        ds4_gpu_test_laguna_compact_active_snapshot(&active);
+    CHECK(active_captured &&
+              active.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE,
+          "pinned second-RECOVERABLE engine starts ACTIVE");
+    const uint64_t cleanup_before =
+        ds4_gpu_test_generic_cleanup_attempts();
+    ds4_gpu_test_laguna_compact_fail_sync_once();
+    ds4_gpu_test_laguna_compact_fail_sync_once();
+    ds4_engine_close(engine);
+
+    ds4_test_laguna_compact_close_observation observation;
+    memset(&observation, 0, sizeof(observation));
+    CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+              observation.first_destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_RECOVERABLE &&
+              observation.destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_RECOVERABLE &&
+              observation.destroy_attempt_count == 2u &&
+              observation.engine_retained &&
+              observation.gpu_cleanup_before == cleanup_before &&
+              observation.gpu_cleanup_after == cleanup_before &&
+              ds4_gpu_test_generic_cleanup_attempts() == cleanup_before,
+          "engine retains owners after a second RECOVERABLE close");
+
+    ds4_gpu_laguna_compact_test_snapshot retained;
+    memset(&retained, 0, sizeof(retained));
+    const bool retained_captured =
+        ds4_gpu_test_laguna_compact_nonidle_snapshot(&retained);
+    CHECK(active_captured && retained_captured &&
+              retained.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING &&
+              retained.model_fd_live && retained.static_slab_live &&
+              retained.static_offsets_live &&
+              retained.tracker_mapping_live &&
+              retained.tracker_static_live &&
+              retained.tracker_offsets_live &&
+              retained.sync_attempt_count == active.sync_attempt_count + 2u &&
+              retained.release_attempt_count == active.release_attempt_count,
+          "second RECOVERABLE close retains exact DESTROYING ownership");
+    unsigned char retained_probe[32] = {0};
+    ds4_laguna_file_identity retained_identity;
+    memset(&retained_identity, 0, sizeof(retained_identity));
+    CHECK(retained_captured && retained.model_fd >= 0 &&
+              (fcntl(retained.model_fd, F_GETFD) & FD_CLOEXEC) != 0 &&
+              pread(retained.model_fd,
+                    retained_probe, sizeof(retained_probe), 0) ==
+                  (ssize_t)sizeof(retained_probe) &&
+              capture_file_identity(
+                  retained.model_fd, &retained_identity) &&
+              identities_equal(
+                  &retained_identity, &retained.model_identity),
+          "second RECOVERABLE close retains its readable exact model duplicate");
+    ds4_gpu_laguna_compact_test_snapshot active_after;
+    memset(&active_after, 0, sizeof(active_after));
+    CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&active_after),
+          "second RECOVERABLE close leaves no falsely ACTIVE snapshot");
+    const int placement_fds_before = open_fd_count();
+    CHECK(ds4_gpu_set_model_fd(model_fd) == 0,
+          "second RECOVERABLE retained state rejects legacy placement");
+    CHECK(placement_fds_before >= 0 &&
+              open_fd_count() == placement_fds_before,
+          "post-second-RECOVERABLE rejection leaks no descriptor");
+
+    /* The engine and exact compact owners intentionally remain retained until
+     * this isolated process exits. */
+    restore_forbidden_environment(&saved);
+    return g_failures == 0 ? 0 : 1;
+}
+
 static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --case "
             "startup|create-unwind-unsafe|teardown-unsafe|"
-            "model-startup|model-teardown-unsafe\n",
+            "model-startup|model-teardown-unsafe|"
+            "model-teardown-second-recoverable\n",
             program);
 }
 
@@ -2828,6 +2950,9 @@ int main(int argc, char **argv) {
         rc = run_model_startup();
     } else if (strcmp(argv[2], "model-teardown-unsafe") == 0) {
         rc = run_model_teardown_unsafe();
+    } else if (strcmp(argv[2],
+                      "model-teardown-second-recoverable") == 0) {
+        rc = run_model_teardown_second_recoverable();
     } else {
         usage(argv[0]);
         return 2;

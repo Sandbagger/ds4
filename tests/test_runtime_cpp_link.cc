@@ -74,9 +74,48 @@ static_assert(std::is_same<
               uint64_t *>::value,
               "compact snapshot static offsets owner drifted");
 static_assert(std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::model_fd_live),
+              bool>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::static_slab_live),
+              bool>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::static_offsets_live),
+              bool>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::tracker_mapping_live),
+              bool>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::tracker_static_live),
+              bool>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::tracker_offsets_live),
+              bool>::value,
+              "compact snapshot owner-live flags drifted");
+static_assert(std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::sync_attempt_count),
+              uint64_t>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::release_attempt_count),
+              uint64_t>::value &&
+              std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::rejection_count),
+              uint64_t>::value,
+              "compact snapshot lifecycle counters drifted");
+static_assert(std::is_same<
               decltype(ds4_test_laguna_compact_close_observation::destroy_result),
               int>::value,
               "engine close observation destroy result drifted");
+static_assert(std::is_same<
+              decltype(ds4_test_laguna_compact_close_observation::engine_retained),
+              bool>::value &&
+              std::is_same<
+              decltype(ds4_test_laguna_compact_close_observation::gpu_cleanup_before),
+              uint64_t>::value &&
+              std::is_same<
+              decltype(ds4_test_laguna_compact_close_observation::gpu_cleanup_after),
+              uint64_t>::value,
+              "engine close observation layout drifted");
 
 int main() {
     const uint64_t gib = 1024ull * 1024ull * 1024ull;

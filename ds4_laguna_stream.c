@@ -1396,7 +1396,24 @@ bool ds4_laguna_allocation_plan_make(
         return set_error(err, errlen, "allocation plan cache payload overflow");
     }
 
-    const uint64_t ledger_arrays = UINT64_C(1412824);
+    uint64_t source_capacity = 0;
+    uint64_t tensor_range_bytes = 0;
+    uint64_t source_range_bytes = 0;
+    uint64_t expert_entry_bytes = 0;
+    uint64_t ledger_arrays = 0;
+    if (!mul_u64(ledger->tensor_count, UINT64_C(2), &source_capacity) ||
+        !add_u64(source_capacity, UINT64_C(5), &source_capacity) ||
+        !mul_u64(ledger->tensor_count,
+                 sizeof(ledger->tensor_ranges[0]), &tensor_range_bytes) ||
+        !mul_u64(source_capacity,
+                 sizeof(ledger->source_ranges[0]), &source_range_bytes) ||
+        !mul_u64(ledger->expert_entry_count,
+                 sizeof(ledger->expert_entries[0]), &expert_entry_bytes) ||
+        !add_u64(tensor_range_bytes, source_range_bytes, &ledger_arrays) ||
+        !add_u64(ledger_arrays, expert_entry_bytes, &ledger_arrays)) {
+        return set_error(err, errlen,
+                         "allocation plan ledger array arithmetic overflow");
+    }
     const uint64_t route_hotness = UINT64_C(96256);
     const uint64_t host_entry_to_slot = UINT64_C(48128);
     const uint64_t device_entry_to_slot = UINT64_C(48128);

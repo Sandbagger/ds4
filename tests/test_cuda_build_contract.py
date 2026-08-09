@@ -38,6 +38,18 @@ def rule_prerequisites(target: str) -> str:
     return match.group(1)
 
 
+def rule_recipe_lines(target: str) -> list[str]:
+    target_line = re.search(rf"(?m)^{re.escape(target)}:[^\n]*$", MAKEFILE)
+    if target_line is None:
+        raise AssertionError(f"missing Makefile rule for {target}")
+    recipe_lines: list[str] = []
+    for line in MAKEFILE[target_line.end() + 1 :].splitlines():
+        if not line.startswith("\t"):
+            break
+        recipe_lines.append(line)
+    return recipe_lines
+
+
 def function_body(signature: str) -> str:
     start = CUDA_SOURCE.find(signature)
     if start < 0:
@@ -181,15 +193,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "tests/test_cuda_laguna_model",
         ):
             self.assertIn(target, prerequisites)
-        target_line = re.search(
-            r"(?m)^test-cuda-laguna-resident:[^\n]*$", MAKEFILE
-        )
-        self.assertIsNotNone(target_line)
-        recipe_lines: list[str] = []
-        for line in MAKEFILE[target_line.end() + 1 :].splitlines():
-            if not line.startswith("\t"):
-                break
-            recipe_lines.append(line)
+        recipe_lines = rule_recipe_lines("test-cuda-laguna-resident")
         self.assertEqual(
             len(recipe_lines), 1, "resident gate must own fd 9 in one recipe shell"
         )
@@ -222,6 +226,58 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         rendered = completed.stdout.strip()
         self.assertEqual(rendered, "tests/run_cuda_laguna_gate.sh resident")
+        self.assertNotIn(model_payload, rendered)
+        self.assertNotIn(tokenizer_payload, rendered)
+        self.assertNotIn(";", rendered)
+
+    def test_c7_gate_is_phony(self) -> None:
+        phony_targets = rule_prerequisites(".PHONY").split()
+        self.assertIn("test-cuda-laguna-c7", phony_targets)
+
+    def test_c7_gate_has_exact_cuda_prerequisites_and_runner_recipe(
+        self,
+    ) -> None:
+        prerequisites = rule_prerequisites("test-cuda-laguna-c7").split()
+        self.assertEqual(
+            prerequisites,
+            [
+                "tests/test_cuda_laguna_kernels",
+                "tests/test_cuda_laguna_model",
+                "tests/test_cuda_laguna_stream",
+            ],
+        )
+        self.assertEqual(
+            rule_recipe_lines("test-cuda-laguna-c7"),
+            ["\ttests/run_cuda_laguna_gate.sh c7"],
+            "C7 gate must retain fd 9 in one exact runner process",
+        )
+
+    def test_c7_gate_make_render_never_interpolates_hostile_values(self) -> None:
+        model_payload = 'model"; printf MAKE_MODEL_INJECTED >&2; #.gguf'
+        tokenizer_payload = "revision'; printf MAKE_TOKEN_INJECTED >&2; #"
+        completed = subprocess.run(
+            [
+                "make",
+                "-n",
+                "UNAME_S=Linux",
+                "-o",
+                "tests/test_cuda_laguna_kernels",
+                "-o",
+                "tests/test_cuda_laguna_model",
+                "-o",
+                "tests/test_cuda_laguna_stream",
+                f"DS4_TEST_MODEL={model_payload}",
+                f"LAGUNA_TOKENIZER_RUNTIME_COMMIT={tokenizer_payload}",
+                "test-cuda-laguna-c7",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        rendered = completed.stdout.strip()
+        self.assertEqual(rendered, "tests/run_cuda_laguna_gate.sh c7")
         self.assertNotIn(model_payload, rendered)
         self.assertNotIn(tokenizer_payload, rendered)
         self.assertNotIn(";", rendered)

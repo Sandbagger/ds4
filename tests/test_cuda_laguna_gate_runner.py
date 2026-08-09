@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import shutil
 import stat
 import subprocess
@@ -23,6 +24,18 @@ ISOLATED_FIXTURE_VARIABLES = (
     "DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE",
     "DS4_LAGUNA_GATE_TEST_EXPECTED_SHA256",
 )
+FAKE_ENVIRONMENT_VARIABLES = (
+    "LAGUNA_FAKE_FAIL_ROLE",
+    "LAGUNA_FAKE_HANG_ROLE",
+    "LAGUNA_FAKE_LOG",
+    "LAGUNA_FAKE_MUTATION",
+    "LAGUNA_FAKE_ORIGINAL_HEX",
+    "LAGUNA_FAKE_REPLACEMENT_HEX",
+    "LAGUNA_FAKE_TIMEOUT_LOG",
+    "LAGUNA_FAKE_TIMEOUT_ROLE",
+    "LAGUNA_FAKE_UNLINK_ORIGINAL",
+    "LAGUNA_TEST_REMOVE_STAGED_OFFSET_GUARD",
+)
 
 FAKE_CHILD = r'''#!/usr/bin/env python3
 import hashlib
@@ -30,6 +43,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 class ContractError(Exception):
@@ -143,14 +157,84 @@ def main():
             original_path,
             ns=(status.st_atime_ns, status.st_mtime_ns),
         )
+    if (
+        role == "stream"
+        and case == "startup"
+        and mutation == "seek-after-stream-startup"
+    ):
+        os.lseek(9, 7, os.SEEK_SET)
 
     fail_role = os.environ.get("LAGUNA_FAKE_FAIL_ROLE")
     if fail_role in (role, f"{role}:{case}"):
         raise SystemExit(23)
+    hang_role = os.environ.get("LAGUNA_FAKE_HANG_ROLE")
+    if hang_role in (role, f"{role}:{case}"):
+        time.sleep(60)
 
 
 if __name__ == "__main__":
     main()
+'''
+
+FAKE_TIMEOUT = r'''#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+if len(sys.argv) < 3:
+    raise SystemExit(f"fake timeout argv mismatch: {sys.argv[1:]!r}")
+if os.environ.get("DS4_TEST_MODEL_FD") != "9":
+    raise SystemExit("timeout: DS4_TEST_MODEL_FD was not forced to 9")
+
+duration = sys.argv[1]
+command = sys.argv[2:]
+before_offset = os.lseek(9, 0, os.SEEK_CUR)
+status = os.fstat(9)
+if not stat.S_ISREG(status.st_mode):
+    raise SystemExit("timeout: fd 9 is not regular")
+payload = os.pread(9, status.st_size, 0)
+after_offset = os.lseek(9, 0, os.SEEK_CUR)
+expected = bytes.fromhex(os.environ["LAGUNA_FAKE_ORIGINAL_HEX"])
+if payload != expected or before_offset != after_offset:
+    raise SystemExit("timeout: fd 9 bytes or offset changed")
+
+child_name = Path(command[0]).name
+roles = {
+    "test_cuda_laguna_kernels": "kernels",
+    "test_cuda_laguna_model": "model",
+    "test_cuda_laguna_stream": "stream",
+}
+role = roles.get(child_name, child_name)
+case = None
+if "--case" in command:
+    case_index = command.index("--case")
+    if case_index + 1 < len(command):
+        case = command[case_index + 1]
+selector = role if case is None else f"{role}:{case}"
+record = {
+    "selector": selector,
+    "duration": duration,
+    "command": command,
+    "pid": os.getpid(),
+    "fd": 9,
+    "device": status.st_dev,
+    "inode": status.st_ino,
+    "size": status.st_size,
+    "sha256": hashlib.sha256(payload).hexdigest(),
+    "before_offset": before_offset,
+    "after_offset": after_offset,
+}
+with Path(os.environ["LAGUNA_FAKE_TIMEOUT_LOG"]).open(
+    "a", encoding="utf-8"
+) as handle:
+    handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+if os.environ.get("LAGUNA_FAKE_TIMEOUT_ROLE") == selector:
+    raise SystemExit(124)
+os.execvp(command[0], command)
 '''
 
 
@@ -162,12 +246,13 @@ class LagunaGateRunnerTest(unittest.TestCase):
             "DS4_TEST_MODEL_FD",
             "LAGUNA_TOKENIZER_RUNTIME_COMMIT",
             *ISOLATED_FIXTURE_VARIABLES,
+            *FAKE_ENVIRONMENT_VARIABLES,
         ):
             environment.pop(name, None)
         return environment
 
-    def stage_executable(self, path: Path) -> None:
-        path.write_text(textwrap.dedent(FAKE_CHILD), encoding="utf-8")
+    def stage_executable(self, path: Path, source: str = FAKE_CHILD) -> None:
+        path.write_text(textwrap.dedent(source), encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     def stage_fake_children(self, child_dir: Path, names: tuple[str, ...]) -> None:
@@ -246,7 +331,32 @@ class LagunaGateRunnerTest(unittest.TestCase):
         verifier_dir = staged_root / "gguf-tools" / "quality-testing"
         self.stage_fake_children(verifier_dir, ("compare_laguna_logits.py",))
         environment["LAGUNA_FAKE_UNLINK_ORIGINAL"] = "1"
+        if os.environ.get("LAGUNA_TEST_REMOVE_STAGED_OFFSET_GUARD") == "1":
+            source = staged_runner.read_text(encoding="utf-8")
+            offset_probe = "; o = os.lseek(9, 0, os.SEEK_CUR)"
+            offset_field = ":{o}"
+            self.assertEqual(source.count(offset_probe), 1)
+            self.assertEqual(source.count(offset_field), 1)
+            staged_runner.write_text(
+                source.replace(offset_probe, "", 1).replace(
+                    offset_field, "", 1
+                ),
+                encoding="utf-8",
+            )
         return environment, staged_runner, model, log, original, replacement
+
+    def stage_fake_timeout(
+        self, root: Path, environment: dict[str, str]
+    ) -> Path:
+        fake_bin = root / "fake timeout bin"
+        fake_bin.mkdir()
+        self.stage_executable(fake_bin / "timeout", FAKE_TIMEOUT)
+        timeout_log = root / "timeouts.jsonl"
+        environment["PATH"] = (
+            str(fake_bin) + os.pathsep + environment.get("PATH", "")
+        )
+        environment["LAGUNA_FAKE_TIMEOUT_LOG"] = str(timeout_log)
+        return timeout_log
 
     def run_runner(
         self,
@@ -263,6 +373,41 @@ class LagunaGateRunnerTest(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+        )
+
+    def run_runner_with_outer_timeout(
+        self,
+        mode: str,
+        environment: dict[str, str],
+        *,
+        runner: Path,
+        cwd: Path,
+        outer_timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = ["/bin/bash", str(runner), mode]
+        process = subprocess.Popen(
+            arguments,
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=outer_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            self.fail(
+                f"C7 runner did not bound its hanging child within "
+                f"{outer_timeout:.1f}s\nstdout={stdout!r}\nstderr={stderr!r}"
+            )
+        return subprocess.CompletedProcess(
+            arguments, process.returncode, stdout, stderr
         )
 
     def assert_c7_validation_error(
@@ -360,6 +505,10 @@ class LagunaGateRunnerTest(unittest.TestCase):
             temporary_cwd = Path(tmp)
             default_model = temporary_cwd / "ds4flash.gguf"
             default_model.write_bytes(b"a default-named model exists here\n")
+            relative_model = Path("relative inputs") / "explicit.gguf"
+            absolute_relative_model = temporary_cwd / relative_model
+            absolute_relative_model.parent.mkdir()
+            absolute_relative_model.write_bytes(b"relative model bytes\n")
             missing_model = temporary_cwd / "missing" / "explicit.gguf"
             cases = (
                 ("unset", None, "DS4_TEST_MODEL is required"),
@@ -369,6 +518,11 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     "DS4_TEST_MODEL must be an explicit path",
                 ),
                 (
+                    "existing relative path",
+                    str(relative_model),
+                    "DS4_TEST_MODEL must be an absolute path",
+                ),
+                (
                     "nonexistent explicit path",
                     str(missing_model),
                     "DS4_TEST_MODEL is not a regular file",
@@ -376,20 +530,33 @@ class LagunaGateRunnerTest(unittest.TestCase):
             )
             for label, model, diagnostic in cases:
                 with self.subTest(label=label):
-                    environment = self.clean_gate_environment()
-                    environment["LAGUNA_TOKENIZER_RUNTIME_COMMIT"] = (
-                        PINNED_TOKENIZER_COMMIT
-                    )
+                    runner = RUNNER
+                    if model == str(relative_model):
+                        environment, runner, _, _, _, _ = (
+                            self.stage_c7_fixture(temporary_cwd)
+                        )
+                    else:
+                        environment = self.clean_gate_environment()
+                        environment["LAGUNA_TOKENIZER_RUNTIME_COMMIT"] = (
+                            PINNED_TOKENIZER_COMMIT
+                        )
                     if model is not None:
                         environment["DS4_TEST_MODEL"] = model
 
                     completed = self.run_runner(
-                        "c7", environment, cwd=temporary_cwd
+                        "c7",
+                        environment,
+                        runner=runner,
+                        cwd=temporary_cwd,
                     )
 
                     self.assert_c7_validation_error(completed, diagnostic)
                     if model == "ds4flash.gguf":
                         self.assertIn("ds4flash.gguf", completed.stderr)
+                    if model == str(relative_model):
+                        self.assertNotIn(
+                            "no such file", completed.stderr.lower()
+                        )
                     if model == str(missing_model):
                         self.assertIn(str(missing_model), completed.stderr)
 
@@ -561,6 +728,120 @@ class LagunaGateRunnerTest(unittest.TestCase):
             self.assertFalse(
                 original_path.exists(),
                 "the retained descriptor must be the only reference to original bytes",
+            )
+
+    def test_c7_bounds_a_hanging_child_and_stops_before_later_children(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary_root = Path(tmp)
+            (
+                environment,
+                staged_runner,
+                model,
+                log,
+                original,
+                _,
+            ) = self.stage_c7_fixture(temporary_root)
+            original_status = model.stat()
+            timeout_log = self.stage_fake_timeout(
+                temporary_root, environment
+            )
+            hanging_role = "stream:teardown-unsafe"
+            environment["LAGUNA_FAKE_HANG_ROLE"] = hanging_role
+            environment["LAGUNA_FAKE_TIMEOUT_ROLE"] = hanging_role
+
+            completed = self.run_runner_with_outer_timeout(
+                "c7",
+                environment,
+                runner=staged_runner,
+                cwd=temporary_root,
+                outer_timeout=2.0,
+            )
+
+            self.assertEqual(completed.returncode, 124, completed.stderr)
+            child_records = [
+                json.loads(line)
+                for line in log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [(record["role"], record["case"]) for record in child_records],
+                [
+                    ("verifier", None),
+                    ("kernels", None),
+                    ("model", None),
+                    ("stream", "startup"),
+                ],
+                "the timed-out child and every later child must not complete",
+            )
+            timeout_records = [
+                json.loads(line)
+                for line in timeout_log.read_text(encoding="utf-8").splitlines()
+            ]
+            selected = [
+                record
+                for record in timeout_records
+                if record["selector"] == hanging_role
+            ]
+            self.assertEqual(
+                len(selected),
+                1,
+                "the runner must invoke the hanging case through timeout",
+            )
+            timeout_record = selected[0]
+            self.assertEqual(
+                Path(timeout_record["command"][0]).name,
+                "test_cuda_laguna_stream",
+            )
+            self.assertEqual(
+                timeout_record["command"][1:],
+                ["--case", "teardown-unsafe"],
+            )
+            self.assertEqual(timeout_record["fd"], 9)
+            self.assertEqual(timeout_record["device"], original_status.st_dev)
+            self.assertEqual(timeout_record["inode"], original_status.st_ino)
+            self.assertEqual(timeout_record["size"], len(original))
+            self.assertEqual(
+                timeout_record["sha256"], hashlib.sha256(original).hexdigest()
+            )
+            self.assertEqual(timeout_record["before_offset"], 0)
+            self.assertEqual(timeout_record["after_offset"], 0)
+
+    def test_c7_rejects_child_offset_change_before_the_next_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary_root = Path(tmp)
+            environment, staged_runner, _, log, _, _ = self.stage_c7_fixture(
+                temporary_root
+            )
+            environment["LAGUNA_FAKE_MUTATION"] = (
+                "seek-after-stream-startup"
+            )
+
+            completed = self.run_runner(
+                "c7",
+                environment,
+                runner=staged_runner,
+                cwd=temporary_root,
+            )
+
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn(
+                "retained descriptor identity changed after stream-startup",
+                completed.stderr,
+            )
+            records = [
+                json.loads(line)
+                for line in log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [(record["role"], record["case"]) for record in records],
+                [
+                    ("verifier", None),
+                    ("kernels", None),
+                    ("model", None),
+                    ("stream", "startup"),
+                ],
+                "offset drift must stop the gate before unsafe teardown",
             )
 
     def test_resident_rejects_each_self_test_variable_before_opening_fd9(self) -> None:

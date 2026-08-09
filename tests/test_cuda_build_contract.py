@@ -282,6 +282,79 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertNotIn(tokenizer_payload, rendered)
         self.assertNotIn(";", rendered)
 
+    def test_gate_make_exports_do_not_expand_caller_make_syntax(self) -> None:
+        gates = (
+            (
+                "resident",
+                (
+                    "tests/test_cuda_laguna_kernels",
+                    "tests/test_cuda_laguna_model",
+                ),
+            ),
+            (
+                "c7",
+                (
+                    "tests/test_cuda_laguna_kernels",
+                    "tests/test_cuda_laguna_model",
+                    "tests/test_cuda_laguna_stream",
+                ),
+            ),
+        )
+        for mode, prerequisites in gates:
+            with self.subTest(mode=mode):
+                model_sentinel = f"LAGUNA_{mode.upper()}_MODEL_MAKE_EXPANDED"
+                tokenizer_sentinel = (
+                    f"LAGUNA_{mode.upper()}_TOKENIZER_MAKE_EXPANDED"
+                )
+                arguments = ["make", "-n", "UNAME_S=Linux"]
+                for prerequisite in prerequisites:
+                    arguments.extend(("-o", prerequisite))
+                arguments.extend(
+                    (
+                        f"DS4_TEST_MODEL=$(warning {model_sentinel})",
+                        "LAGUNA_TOKENIZER_RUNTIME_COMMIT="
+                        f"$(warning {tokenizer_sentinel})",
+                        f"test-cuda-laguna-{mode}",
+                    )
+                )
+
+                completed = subprocess.run(
+                    arguments,
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    completed.stdout.strip(),
+                    f"tests/run_cuda_laguna_gate.sh {mode}",
+                )
+                emitted = completed.stdout + completed.stderr
+                self.assertNotIn(model_sentinel, emitted)
+                self.assertNotIn(tokenizer_sentinel, emitted)
+
+    def test_c7_gate_rejects_darwin_as_unsupported(self) -> None:
+        completed = subprocess.run(
+            ["make", "UNAME_S=Darwin", "test-cuda-laguna-c7"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        diagnostic = (completed.stdout + completed.stderr).lower()
+        for required in (
+            "test-cuda-laguna-c7",
+            "unsupported",
+            "cuda",
+            "linux",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, diagnostic)
+
 
 if __name__ == "__main__":
     unittest.main()

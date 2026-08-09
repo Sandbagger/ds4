@@ -61341,16 +61341,37 @@ static bool ds4_test_engine_laguna_inventory_release_rejected(
 }
 #endif
 
-static void ds4_engine_laguna_release_record(
+static bool ds4_engine_laguna_record_is_dead(
+        const ds4_engine *e,
+        uint64_t record_id) {
+    if (!e || !e->laguna_runtime_tracker_ready || record_id == 0 ||
+        !e->laguna_runtime_tracker.records ||
+        e->laguna_runtime_tracker.record_count >
+            e->laguna_runtime_tracker.record_capacity) {
+        return false;
+    }
+    size_t match_count = 0;
+    for (size_t i = 0;
+         i < e->laguna_runtime_tracker.record_count;
+         i++) {
+        const ds4_runtime_allocation_record *record =
+            &e->laguna_runtime_tracker.records[i];
+        if (record->id != record_id) continue;
+        match_count++;
+        if (record->live) return false;
+    }
+    return match_count == 1u;
+}
+
+static bool ds4_engine_laguna_release_record(
         ds4_engine *e,
         uint64_t record_id,
         bool *record_live,
         const char *owner_kind,
         size_t owner_index) {
-    if (!e || !record_live || !*record_live ||
-        !e->laguna_runtime_tracker_ready) {
-        return;
-    }
+    if (!e || !record_live) return false;
+    if (!*record_live) return true;
+    if (!e->laguna_runtime_tracker_ready) return false;
     ds4_runtime_status release_status;
 #ifdef DS4_TEST_HOOKS
     if (ds4_test_engine_laguna_inventory_release_rejected(record_id)) {
@@ -61366,7 +61387,26 @@ static void ds4_engine_laguna_release_record(
                 "ds4: Laguna %s tracker release %zu failed\n",
                 owner_kind, owner_index);
     }
+    if (!ds4_engine_laguna_record_is_dead(e, record_id)) return false;
     *record_live = false;
+    return true;
+}
+
+static void ds4_engine_laguna_retain_release_failure(
+        const char *owner_group,
+        const char *next_free) {
+    fprintf(stderr,
+            "ds4: Laguna %s ownership release remained live; "
+            "retaining engine before %s\n",
+            owner_group, next_free);
+#ifdef DS4_TEST_HOOKS
+    g_ds4_test_laguna_compact_close_observation.engine_retained = true;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+    g_ds4_test_laguna_compact_close_observation.gpu_cleanup_after =
+        ds4_gpu_test_generic_cleanup_attempts();
+#endif
+#endif
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -61478,24 +61518,37 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
     ds4_expert_profile_close();
     for (size_t i = 0; i < 3; i++) {
-        ds4_engine_laguna_release_record(
-            e, e->laguna_ledger_record_ids[i],
-            &e->laguna_ledger_records_live[i], "ledger", i);
+        if (!ds4_engine_laguna_release_record(
+                e, e->laguna_ledger_record_ids[i],
+                &e->laguna_ledger_records_live[i], "ledger", i)) {
+            ds4_engine_laguna_retain_release_failure(
+                "ledger", "ledger free");
+            return;
+        }
     }
     ds4_laguna_ledger_free(&e->laguna_ledger);
     weights_free(&e->weights);
     for (size_t i = 3; i < DS4_LAGUNA_INVENTORY_RECORD_COUNT; i++) {
-        ds4_engine_laguna_release_record(
-            e, e->laguna_inventory_record_ids[i],
-            &e->laguna_inventory_records_live[i], "vocabulary", i - 3u);
+        if (!ds4_engine_laguna_release_record(
+                e, e->laguna_inventory_record_ids[i],
+                &e->laguna_inventory_records_live[i],
+                "vocabulary", i - 3u)) {
+            ds4_engine_laguna_retain_release_failure(
+                "vocabulary", "vocabulary free");
+            return;
+        }
     }
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
     for (size_t i = 1; i < 3; i++) {
-        ds4_engine_laguna_release_record(
-            e, e->laguna_inventory_record_ids[i],
-            &e->laguna_inventory_records_live[i], "model", i - 1u);
+        if (!ds4_engine_laguna_release_record(
+                e, e->laguna_inventory_record_ids[i],
+                &e->laguna_inventory_records_live[i], "model", i - 1u)) {
+            ds4_engine_laguna_retain_release_failure(
+                "model", "primary model close");
+            return;
+        }
     }
     model_close(&e->model);
 #ifndef DS4_NO_GPU
@@ -61511,15 +61564,19 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
-    ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     if (e->exact_cache_session_mutex_initialized) {
         pthread_mutex_destroy(&e->exact_cache_session_mutex);
     }
-    ds4_engine_laguna_release_record(
-        e, e->laguna_inventory_record_ids[0],
-        &e->laguna_inventory_records_live[0], "engine", 0);
+    if (!ds4_engine_laguna_release_record(
+            e, e->laguna_inventory_record_ids[0],
+            &e->laguna_inventory_records_live[0], "engine", 0)) {
+        ds4_engine_laguna_retain_release_failure(
+            "engine", "engine free");
+        return;
+    }
+    ds4_release_instance_lock();
 #ifdef DS4_TEST_HOOKS
     if (e->laguna_runtime_tracker_ready &&
         ds4_runtime_tracker_snapshot_copy(

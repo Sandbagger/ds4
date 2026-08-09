@@ -405,11 +405,11 @@ ds4_runtime_status ds4_runtime_tracker_replay_owned(
         const ds4_runtime_owned_descriptor *owners,
         size_t owner_count,
         bool *owner_live) {
-    if (owner_count != 0 && (!owners || !owner_live)) {
+    if (owner_count != 0 && !owner_live) return DS4_RUNTIME_STATUS_UNSAFE;
+    for (size_t i = 0; i < owner_count; i++) owner_live[i] = false;
+    if (!tracker || (owner_count != 0 && !owners)) {
         return DS4_RUNTIME_STATUS_UNSAFE;
     }
-    for (size_t i = 0; i < owner_count; i++) owner_live[i] = false;
-    if (!tracker) return DS4_RUNTIME_STATUS_UNSAFE;
 
     for (size_t i = 0; i < owner_count; i++) {
         const bool allocation_id_already_known =
@@ -429,7 +429,7 @@ ds4_runtime_status ds4_runtime_tracker_replay_owned(
         }
         if (result != DS4_RUNTIME_STATUS_OK) return result;
     }
-    return DS4_RUNTIME_STATUS_OK;
+    return status(tracker);
 }
 
 static bool has_live_relation(const ds4_runtime_tracker *tracker,

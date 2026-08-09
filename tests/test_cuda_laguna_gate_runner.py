@@ -736,6 +736,40 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 "the retained descriptor must be the only reference to original bytes",
             )
 
+    def test_c7_budgets_the_verifier_separately_from_cuda_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary_root = Path(tmp)
+            environment, staged_runner, _, _, _, _ = self.stage_c7_fixture(
+                temporary_root
+            )
+            timeout_log = Path(environment["LAGUNA_FAKE_TIMEOUT_LOG"])
+
+            completed = self.run_runner(
+                "c7",
+                environment,
+                runner=staged_runner,
+                cwd=temporary_root,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            records = [
+                json.loads(line)
+                for line in timeout_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(records), 7)
+            verifier = records[0]
+            self.assertEqual(verifier["kill_after"], "5s")
+            self.assertEqual(verifier["duration"], "180s")
+            self.assertEqual(Path(verifier["command"][0]).name, "python3")
+            self.assertEqual(
+                Path(verifier["command"][1]).name,
+                "compare_laguna_logits.py",
+            )
+            for record in records[1:]:
+                with self.subTest(selector=record["selector"]):
+                    self.assertEqual(record["kill_after"], "5s")
+                    self.assertEqual(record["duration"], "60s")
+
     def test_c7_bounds_a_hanging_child_and_stops_before_later_children(
         self,
     ) -> None:

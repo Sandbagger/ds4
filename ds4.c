@@ -58418,9 +58418,7 @@ bool ds4_test_engine_laguna_runtime_snapshot(
         size_t *required) {
     if (snapshot) memset(snapshot, 0, sizeof(*snapshot));
     if (required) *required = 0;
-    if (!engine || !snapshot || !required ||
-        !engine->laguna_runtime_tracker_ready ||
-        (capacity != 0 && !records)) {
+    if (!engine || !required || !engine->laguna_runtime_tracker_ready) {
         return false;
     }
     size_t live_count = 0;
@@ -58430,7 +58428,10 @@ bool ds4_test_engine_laguna_runtime_snapshot(
         if (engine->laguna_runtime_tracker.records[i].live) live_count++;
     }
     *required = live_count;
-    if (live_count > capacity) return false;
+    if (!snapshot || (capacity != 0 && !records) ||
+        live_count > capacity) {
+        return false;
+    }
     return ds4_runtime_tracker_snapshot_copy(
         &engine->laguna_runtime_tracker, snapshot, records, capacity);
 }
@@ -58505,6 +58506,48 @@ bool ds4_test_engine_laguna_live_owners(
             engine->vocab.merge_rank.cap,
             sizeof(engine->vocab.merge_rank.entry[0]),
             DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB)) {
+        return false;
+    }
+    memcpy(owners, fresh, sizeof(fresh));
+    return true;
+}
+
+bool ds4_test_engine_laguna_ledger_owners(
+        const ds4_engine *engine,
+        ds4_test_laguna_live_owner *owners,
+        size_t capacity,
+        size_t *required) {
+    enum { OWNER_COUNT = 3 };
+    if (required) *required = 0;
+    if (!engine || !required) return false;
+    *required = OWNER_COUNT;
+    if (!owners || capacity < OWNER_COUNT ||
+        engine->laguna_ledger.tensor_range_count > (SIZE_MAX - 5u) / 2u ||
+        engine->laguna_ledger.tensor_range_count >
+            (UINT64_MAX - 5u) / 2u) {
+        return false;
+    }
+
+    const uint64_t tensor_range_count =
+        (uint64_t)engine->laguna_ledger.tensor_range_count;
+    const uint64_t source_capacity = tensor_range_count * 2u + 5u;
+    ds4_test_laguna_live_owner fresh[OWNER_COUNT];
+    memset(fresh, 0, sizeof(fresh));
+    if (!ds4_test_laguna_live_owner_set(
+            &fresh[0], engine->laguna_ledger.tensor_ranges,
+            tensor_range_count,
+            sizeof(engine->laguna_ledger.tensor_ranges[0]),
+            DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[1], engine->laguna_ledger.source_ranges,
+            source_capacity,
+            sizeof(engine->laguna_ledger.source_ranges[0]),
+            DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[2], engine->laguna_ledger.expert_entries,
+            engine->laguna_ledger.expert_entry_count,
+            sizeof(engine->laguna_ledger.expert_entries[0]),
+            DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS)) {
         return false;
     }
     memcpy(owners, fresh, sizeof(fresh));

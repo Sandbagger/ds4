@@ -754,6 +754,9 @@ static bool retained_tracker_matches_compact(
     bool static_seen = false;
     bool offsets_seen = false;
     bool mapping_seen = false;
+    uint64_t static_id = 0;
+    uint64_t offsets_id = 0;
+    uint64_t mapping_id = 0;
 
     for (size_t i = 0; i < runtime->active_record_count; i++) {
         const ds4_runtime_allocation_record *record = &records[i];
@@ -779,10 +782,14 @@ static bool retained_tracker_matches_compact(
                 record->base != (uint64_t)(uintptr_t)compact->model_map ||
                 record->requested_bytes != compact->model_size ||
                 record->charged_bytes != 0 ||
-                record->domain != DS4_RUNTIME_DOMAIN_HOST) {
+                record->category !=
+                    (ds4_runtime_category)DS4_RUNTIME_OWNED_CATEGORY_COUNT ||
+                record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+                record->callsite_id != 0 || record->owner_id != 0) {
                 return false;
             }
             mapping_seen = true;
+            mapping_id = record->id;
         } else if (record->callsite_id ==
                    DS4_LAGUNA_CALLSITE_STATIC_SLAB) {
             if (static_seen ||
@@ -796,6 +803,7 @@ static bool retained_tracker_matches_compact(
                 return false;
             }
             static_seen = true;
+            static_id = record->id;
         } else if (record->callsite_id ==
                    DS4_LAGUNA_CALLSITE_STATIC_OFFSETS) {
             if (offsets_seen ||
@@ -809,6 +817,7 @@ static bool retained_tracker_matches_compact(
                 return false;
             }
             offsets_seen = true;
+            offsets_id = record->id;
         } else {
             return false;
         }
@@ -816,6 +825,13 @@ static bool retained_tracker_matches_compact(
 
     if (!ledger_seen[0] || !ledger_seen[1] || !ledger_seen[2] ||
         !static_seen || !offsets_seen || !mapping_seen) {
+        return false;
+    }
+    const uint64_t sequence_mask = UINT64_C(0x00ffffffffffffff);
+    if ((uint8_t)(offsets_id >> 56) != 0x4du ||
+        (offsets_id & sequence_mask) == 0 ||
+        (offsets_id & sequence_mask) > sequence_mask - 2u ||
+        static_id != offsets_id + 1u || mapping_id != offsets_id + 2u) {
         return false;
     }
     const uint64_t ledger_total =

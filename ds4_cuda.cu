@@ -498,6 +498,7 @@ struct ds4_gpu_laguna_compact {
     uint64_t sync_attempt_count;
     uint64_t release_attempt_count;
     uint64_t rejection_count;
+    size_t baseline_live_record_count;
     int tracker_mapping_live;
     int tracker_static_live;
     int tracker_offsets_live;
@@ -682,26 +683,29 @@ static int cuda_laguna_compact_ledger_array_sizes(
     return 1;
 }
 
-static int cuda_laguna_compact_tracker_has_ledger(
+static int cuda_laguna_compact_tracker_has_baseline(
         const ds4_runtime_tracker *tracker,
         const ds4_laguna_ledger *ledger,
-        uint64_t ledger_array_bytes) {
+        uint64_t ledger_array_bytes,
+        size_t expected_live_count,
+        int require_pristine_records,
+        size_t *live_count_out) {
     if (!tracker || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
         !tracker->callsites || tracker->callsite_count == 0 ||
-        !tracker->records || tracker->record_capacity < 6 ||
-        tracker->record_count != 3 ||
-        tracker->owned_total_current != ledger_array_bytes ||
-        tracker->qualification_total_current != ledger_array_bytes) {
+        !tracker->records || tracker->record_count > tracker->record_capacity) {
         return 0;
     }
-    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
-        const uint64_t expected =
-            i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ?
-                ledger_array_bytes : 0;
-        if (tracker->category_current[i] != expected) return 0;
+    size_t live_count = 0;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (tracker->records[i].live) live_count++;
     }
-    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
-        if (tracker->report_current[i] != 0) return 0;
+    if ((live_count != 3 && live_count != 9) ||
+        (expected_live_count != 0 && live_count != expected_live_count) ||
+        (require_pristine_records && tracker->record_count != live_count) ||
+        (require_pristine_records &&
+         (tracker->record_capacity < tracker->record_count ||
+          tracker->record_capacity - tracker->record_count < 3))) {
+        return 0;
     }
 
     uint64_t bytes[3] = {0};
@@ -715,30 +719,90 @@ static int cuda_laguna_compact_tracker_has_ledger(
         ledger->source_ranges,
         ledger->expert_entries,
     };
-    bool seen[3] = {false, false, false};
+    bool ledger_seen[3] = {false, false, false};
+    bool inventory_seen[6] = {false, false, false, false, false, false};
+    uint64_t inventory_bytes = 0;
     for (size_t i = 0; i < tracker->record_count; i++) {
         const ds4_runtime_allocation_record *record = &tracker->records[i];
-        if (!record->live ||
-            record->callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS ||
-            record->category !=
-                DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ||
-            record->domain != DS4_RUNTIME_DOMAIN_HOST ||
-            record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION) {
-            return 0;
-        }
-        int matched = 0;
+        if (!record->live) continue;
+        size_t ledger_index = 3;
         for (size_t j = 0; j < 3; j++) {
-            if (!seen[j] && record->base == (uint64_t)(uintptr_t)bases[j] &&
+            if (!ledger_seen[j] &&
+                record->base == (uint64_t)(uintptr_t)bases[j] &&
                 record->requested_bytes == bytes[j] &&
                 record->charged_bytes == bytes[j]) {
-                seen[j] = true;
-                matched = 1;
+                ledger_index = j;
                 break;
             }
         }
-        if (!matched) return 0;
+        if (ledger_index != 3) {
+            if (record->callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS ||
+                record->category !=
+                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ||
+                record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+                record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+                record->owner_id != 0) {
+                return 0;
+            }
+            ledger_seen[ledger_index] = true;
+            continue;
+        }
+
+        if (live_count != 9 || (uint8_t)(record->id >> 56) != 0x4eu) {
+            return 0;
+        }
+        const uint64_t sequence =
+            record->id & UINT64_C(0x00ffffffffffffff);
+        if (sequence == 0 || sequence > 6 ||
+            inventory_seen[sequence - 1u] || record->base == 0 ||
+            record->requested_bytes == 0 ||
+            record->charged_bytes != record->requested_bytes ||
+            record->base > UINT64_MAX - record->charged_bytes ||
+            record->category != DS4_RUNTIME_CATEGORY_OTHER_HOST ||
+            record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+            record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+            record->owner_id != 0) {
+            return 0;
+        }
+        const uint32_t expected_callsite = sequence == 1 ?
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE : sequence <= 3 ?
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL :
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB;
+        if (record->callsite_id != expected_callsite ||
+            inventory_bytes > UINT64_MAX - record->charged_bytes) {
+            return 0;
+        }
+        inventory_seen[sequence - 1u] = true;
+        inventory_bytes += record->charged_bytes;
     }
-    return seen[0] && seen[1] && seen[2];
+    for (size_t i = 0; i < 3; i++) {
+        if (!ledger_seen[i]) return 0;
+    }
+    if (live_count == 9) {
+        for (size_t i = 0; i < 6; i++) {
+            if (!inventory_seen[i]) return 0;
+        }
+    }
+    if (ledger_array_bytes > UINT64_MAX - inventory_bytes) return 0;
+    const uint64_t expected_total = ledger_array_bytes + inventory_bytes;
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        uint64_t expected = 0;
+        if (i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES) {
+            expected = ledger_array_bytes;
+        } else if (i == DS4_RUNTIME_CATEGORY_OTHER_HOST) {
+            expected = inventory_bytes;
+        }
+        if (tracker->category_current[i] != expected) return 0;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (tracker->report_current[i] != 0) return 0;
+    }
+    if (tracker->owned_total_current != expected_total ||
+        tracker->qualification_total_current != expected_total) {
+        return 0;
+    }
+    if (live_count_out) *live_count_out = live_count;
+    return 1;
 }
 
 static int cuda_laguna_compact_callsite_exact(
@@ -875,9 +939,11 @@ static int cuda_laguna_compact_validate(
         const ds4_laguna_ledger *ledger,
         const ds4_laguna_allocation_plan *plan,
         const ds4_runtime_tracker *tracker,
-        uint64_t *static_offset_bytes_out) {
+        uint64_t *static_offset_bytes_out,
+        size_t *baseline_live_record_count_out) {
     if (model_fd < 0 || !model_map || model_size == 0 || !model_identity ||
         model_size > SIZE_MAX || !ledger || !plan || !tracker ||
+        !static_offset_bytes_out || !baseline_live_record_count_out ||
         g_n_gpus != 1 || g_gpu[0].device_id != 0 ||
         g_model_host_base || g_model_registered || g_model_device_owned ||
         g_model_fd >= 0 || g_model_direct_fd >= 0 ||
@@ -1018,8 +1084,9 @@ static int cuda_laguna_compact_validate(
         tracker->owned_total_bound_bytes != plan->owned_total_bound_bytes ||
         tracker->qualification_total_bound_bytes !=
             plan->qualification_total_bound_bytes ||
-        !cuda_laguna_compact_tracker_has_ledger(
-            tracker, ledger, ledger_array_bytes)) {
+        !cuda_laguna_compact_tracker_has_baseline(
+            tracker, ledger, ledger_array_bytes, 0, 1,
+            baseline_live_record_count_out)) {
         return 0;
     }
     *static_offset_bytes_out = static_offset_bytes;
@@ -1081,6 +1148,19 @@ static int cuda_laguna_compact_release_locked(
             return 0;
         }
         ctx->tracker_mapping_live = 0;
+    }
+    uint64_t ledger_array_parts[3] = {0};
+    uint64_t ledger_array_bytes = 0;
+    if ((ctx->baseline_live_record_count != 3 &&
+         ctx->baseline_live_record_count != 9) ||
+        !cuda_laguna_compact_ledger_array_sizes(
+            ctx->ledger, ledger_array_parts, &ledger_array_bytes) ||
+        !cuda_laguna_compact_tracker_has_baseline(
+            ctx->tracker, ctx->ledger, ledger_array_bytes,
+            ctx->baseline_live_record_count, 0, NULL)) {
+        fprintf(stderr,
+                "ds4: compact Laguna baseline tracker reconciliation failed\n");
+        return 0;
     }
     if (ctx->model_fd >= 0) {
         if (close(ctx->model_fd) != 0) {
@@ -1192,11 +1272,12 @@ extern "C" int ds4_gpu_laguna_compact_create(
 #endif
     const int owned_fd = fcntl(model_fd, F_DUPFD_CLOEXEC, 0);
     uint64_t static_offset_bytes = 0;
+    size_t baseline_live_record_count = 0;
     if (owned_fd < 0 || !cuda_laguna_compact_environment_allowed() ||
         !cuda_laguna_compact_validate(
             owned_fd, model_map, model_size, model_identity,
             ledger, plan, tracker,
-            &static_offset_bytes)) {
+            &static_offset_bytes, &baseline_live_record_count)) {
         if (owned_fd >= 0) (void)close(owned_fd);
         g_laguna_compact_state.store(
             DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
@@ -1213,6 +1294,7 @@ extern "C" int ds4_gpu_laguna_compact_create(
     ctx->static_slab_bytes = ledger->static_aligned_device_bytes;
     ctx->static_offset_count = ledger->tensor_range_count;
     ctx->static_offset_bytes = static_offset_bytes;
+    ctx->baseline_live_record_count = baseline_live_record_count;
 #ifdef DS4_TEST_HOOKS
     if (g_laguna_compact_fail_after_identity.exchange(
             false, std::memory_order_relaxed)) {

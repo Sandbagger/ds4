@@ -155,7 +155,7 @@ if [ "$mode" = self-test ]; then
         --gguf-size "$expected_size" \
         --gguf-sha256 "$expected_sha256"
 elif [ "$mode" = c7 ]; then
-    timeout 60s python3 "$verifier" \
+    timeout --kill-after=5s 60s python3 "$verifier" \
         --verify-promoted "$fixture" \
         --contract-commit "$pinned_contract" \
         --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
@@ -178,30 +178,31 @@ fi
 assert_retained_identity verifier
 
 if [ "$mode" = c7 ]; then
-    env -u DS4_CUDA_MOE_DECODE_GRAPH timeout 60s "$kernel_child" --case all
+    env -u DS4_CUDA_MOE_DECODE_GRAPH \
+        timeout --kill-after=5s 60s "$kernel_child" --case all
 else
     env -u DS4_CUDA_MOE_DECODE_GRAPH "$kernel_child" --case all
 fi
 assert_retained_identity kernels
 
 if [ "$mode" = c7 ]; then
-    timeout 60s "$model_child"
+    timeout --kill-after=5s 60s "$model_child"
 else
     "$model_child"
 fi
 assert_retained_identity model
 
 if [ "$mode" = c7 ]; then
-    timeout 60s "$stream_child" --case startup
+    timeout --kill-after=5s 60s "$stream_child" --case startup
     assert_retained_identity stream-startup
 
-    timeout 60s "$stream_child" --case teardown-unsafe
+    timeout --kill-after=5s 60s "$stream_child" --case teardown-unsafe
     assert_retained_identity stream-teardown-unsafe
 
-    timeout 60s "$stream_child" --case model-startup
+    timeout --kill-after=5s 60s "$stream_child" --case model-startup
     assert_retained_identity stream-model-startup
 
-    timeout 60s "$stream_child" --case model-teardown-unsafe
+    timeout --kill-after=5s 60s "$stream_child" --case model-teardown-unsafe
     assert_retained_identity stream-model-teardown-unsafe
 fi
 

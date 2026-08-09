@@ -184,13 +184,17 @@ import stat
 import sys
 from pathlib import Path
 
-if len(sys.argv) < 3:
+arguments = sys.argv[1:]
+kill_after = None
+if arguments and arguments[0].startswith("--kill-after="):
+    kill_after = arguments.pop(0).split("=", 1)[1]
+if len(arguments) < 2:
     raise SystemExit(f"fake timeout argv mismatch: {sys.argv[1:]!r}")
 if os.environ.get("DS4_TEST_MODEL_FD") != "9":
     raise SystemExit("timeout: DS4_TEST_MODEL_FD was not forced to 9")
 
-duration = sys.argv[1]
-command = sys.argv[2:]
+duration = arguments[0]
+command = arguments[1:]
 before_offset = os.lseek(9, 0, os.SEEK_CUR)
 status = os.fstat(9)
 if not stat.S_ISREG(status.st_mode):
@@ -216,6 +220,7 @@ if "--case" in command:
 selector = role if case is None else f"{role}:{case}"
 record = {
     "selector": selector,
+    "kill_after": kill_after,
     "duration": duration,
     "command": command,
     "pid": os.getpid(),
@@ -331,6 +336,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
         verifier_dir = staged_root / "gguf-tools" / "quality-testing"
         self.stage_fake_children(verifier_dir, ("compare_laguna_logits.py",))
         environment["LAGUNA_FAKE_UNLINK_ORIGINAL"] = "1"
+        self.stage_fake_timeout(root, environment)
         if os.environ.get("LAGUNA_TEST_REMOVE_STAGED_OFFSET_GUARD") == "1":
             source = staged_runner.read_text(encoding="utf-8")
             offset_probe = "; o = os.lseek(9, 0, os.SEEK_CUR)"
@@ -744,9 +750,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 _,
             ) = self.stage_c7_fixture(temporary_root)
             original_status = model.stat()
-            timeout_log = self.stage_fake_timeout(
-                temporary_root, environment
-            )
+            timeout_log = Path(environment["LAGUNA_FAKE_TIMEOUT_LOG"])
             hanging_role = "stream:teardown-unsafe"
             environment["LAGUNA_FAKE_HANG_ROLE"] = hanging_role
             environment["LAGUNA_FAKE_TIMEOUT_ROLE"] = hanging_role
@@ -789,6 +793,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 "the runner must invoke the hanging case through timeout",
             )
             timeout_record = selected[0]
+            self.assertEqual(timeout_record["kill_after"], "5s")
             self.assertEqual(timeout_record["duration"], "60s")
             self.assertEqual(
                 Path(timeout_record["command"][0]).name,

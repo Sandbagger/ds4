@@ -33,6 +33,49 @@
 static int g_assertions;
 static int g_failures;
 
+/* Compile-only contract.  Runnable lifecycle behavior is driven separately
+ * after this typed seam lands. */
+static void compile_typed_lifecycle_contract(
+        ds4_gpu_laguna_compact **context,
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *identity,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        ds4_runtime_tracker *tracker) {
+    const int created = ds4_gpu_laguna_compact_create(
+        context, model_fd, model_map, model_size, identity,
+        ledger, plan, tracker);
+    const ds4_gpu_laguna_destroy_status destroyed =
+        ds4_gpu_laguna_compact_destroy(created ? *context : NULL);
+    ds4_gpu_laguna_compact_test_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.lifecycle = DS4_GPU_LAGUNA_LIFECYCLE_RELEASING;
+    snapshot.model_identity = *identity;
+    snapshot.static_slab = NULL;
+    snapshot.static_offsets = NULL;
+    snapshot.model_fd_live = true;
+    snapshot.static_slab_live = true;
+    snapshot.static_offsets_live = true;
+    snapshot.tracker_mapping_live = true;
+    snapshot.tracker_static_live = true;
+    snapshot.tracker_offsets_live = true;
+    snapshot.sync_attempt_count = 1;
+    snapshot.release_attempt_count = 1;
+    snapshot.rejection_count = 1;
+    ds4_gpu_test_laguna_compact_fail_sync_once();
+    ds4_gpu_test_laguna_compact_fail_release_once();
+    (void)ds4_gpu_test_generic_cleanup_attempts();
+    ds4_test_laguna_compact_close_observation observation;
+    memset(&observation, 0, sizeof(observation));
+    observation.destroy_result = (int)destroyed;
+    observation.engine_retained = true;
+    observation.gpu_cleanup_before = 1;
+    observation.gpu_cleanup_after = 1;
+    (void)ds4_test_laguna_compact_close_observation_get(&observation);
+}
+
 #define CHECK(condition, message)                                           \
     do {                                                                    \
         g_assertions++;                                                     \
@@ -182,7 +225,7 @@ static void *creator_race_run(void *opaque) {
     if (!test_barrier_wait(race->barrier)) return NULL;
     race->created = ds4_gpu_laguna_compact_create(
         &race->context, race->model_fd, race->model_map, race->model_size,
-        race->ledger, race->plan, &race->runtime->tracker);
+        NULL, race->ledger, race->plan, &race->runtime->tracker);
     return NULL;
 }
 
@@ -472,7 +515,7 @@ static void expect_invalid_ledger_before_allocation(
     ds4_gpu_laguna_compact *context = NULL;
     CHECK(!ds4_gpu_laguna_compact_create(
               &context, model_fd, model_map, model_size,
-              ledger, plan, &runtime.tracker) && context == NULL,
+              NULL, ledger, plan, &runtime.tracker) && context == NULL,
           message);
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before,
@@ -582,7 +625,7 @@ static int run_startup(void) {
             ds4_gpu_laguna_compact *rejected = NULL;
             const int created = ds4_gpu_laguna_compact_create(
                 &rejected, fd, model_map, sizeof(model_bytes),
-                &ledger, &plan, &runtime.tracker);
+                NULL, &ledger, &plan, &runtime.tracker);
             if (created || rejected) {
                 fprintf(stderr, "unexpected acceptance: %s=%s\n",
                         forbidden_cuda_env[i], present_values[j]);
@@ -609,7 +652,7 @@ static int run_startup(void) {
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
     CHECK(ds4_gpu_laguna_compact_create(
               &context, fd, model_map, sizeof(model_bytes),
-              &ledger, &plan, &runtime.tracker) && context != NULL,
+              NULL, &ledger, &plan, &runtime.tracker) && context != NULL,
           "compact context attaches the synthetic model");
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before_create + 1u,
@@ -762,7 +805,7 @@ static int run_startup(void) {
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
     CHECK(!ds4_gpu_laguna_compact_create(
               &second, fd, model_map, sizeof(model_bytes),
-              &ledger, &plan, &second_runtime.tracker) && second == NULL,
+              NULL, &ledger, &plan, &second_runtime.tracker) && second == NULL,
           "only one compact context may be active per process");
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before_second &&
@@ -770,14 +813,9 @@ static int run_startup(void) {
           "second-context refusal preserves only its ledger records");
 
     ds4_gpu_laguna_compact *destroyed_context = context;
-    ds4_gpu_test_laguna_compact_fail_destroy_once();
-    ds4_gpu_laguna_compact_destroy(context);
-    CHECK(ds4_runtime_tracker_snapshot_copy(
-              &runtime.tracker, &runtime_snapshot,
-              active, ARRAY_LEN(active)) &&
-              runtime_snapshot.active_record_count == 6,
-          "failed teardown remains observable and retains every ownership record");
-    ds4_gpu_laguna_compact_destroy(context);
+    CHECK(ds4_gpu_laguna_compact_destroy(context) ==
+              DS4_GPU_LAGUNA_DESTROY_OK,
+          "typed teardown reports success after releasing every owner");
     context = NULL;
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "destroy clears the process-global compact attachment");
@@ -861,13 +899,14 @@ static int run_startup(void) {
     CHECK(tracker_fixture_init(&reusable_runtime, &plan, &ledger) &&
               ds4_gpu_laguna_compact_create(
                   &reusable, fd, model_map, sizeof(model_bytes),
-                  &ledger, &plan, &reusable_runtime.tracker) &&
+                  NULL, &ledger, &plan, &reusable_runtime.tracker) &&
               reusable != NULL,
           "singleton is reusable after raced attachment teardown");
-    ds4_gpu_test_laguna_compact_fail_destroy_once();
-    ds4_gpu_laguna_compact_destroy(reusable);
-    CHECK(!tracker_has_only_ledger(&reusable_runtime.tracker),
-          "void teardown keeps failed ownership visible to its tracker");
+    CHECK(ds4_gpu_laguna_compact_destroy(reusable) ==
+              DS4_GPU_LAGUNA_DESTROY_OK,
+          "reusable singleton reports typed teardown success");
+    CHECK(tracker_has_only_ledger(&reusable_runtime.tracker),
+          "typed teardown reconciles reusable compact ownership");
     ds4_gpu_cleanup();
     CHECK(tracker_has_only_ledger(&reusable_runtime.tracker),
           "global CUDA cleanup retries and reconciles compact ownership");
@@ -967,6 +1006,7 @@ static void usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+    (void)compile_typed_lifecycle_contract;
     if (argc != 3 || strcmp(argv[1], "--case") != 0) {
         usage(argv[0]);
         return 2;

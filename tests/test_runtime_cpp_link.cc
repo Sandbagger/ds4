@@ -1,3 +1,6 @@
+#define DS4_TEST_HOOKS 1
+
+#include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_laguna_stream.h"
 #include "ds4_runtime.h"
@@ -9,10 +12,16 @@ using laguna_compact_create_fn = int (*)(
     int,
     const void *,
     uint64_t,
+    const ds4_laguna_file_identity *,
     const ds4_laguna_ledger *,
     const ds4_laguna_allocation_plan *,
     ds4_runtime_tracker *);
-using laguna_compact_destroy_fn = void (*)(ds4_gpu_laguna_compact *);
+using laguna_compact_destroy_fn = ds4_gpu_laguna_destroy_status (*)(
+    ds4_gpu_laguna_compact *);
+using laguna_compact_failure_fn = void (*)();
+using gpu_cleanup_attempts_fn = uint64_t (*)();
+using close_observation_get_fn = bool (*)(
+    ds4_test_laguna_compact_close_observation *);
 
 static_assert(std::is_same<
               decltype(&ds4_gpu_laguna_compact_create),
@@ -22,6 +31,52 @@ static_assert(std::is_same<
               decltype(&ds4_gpu_laguna_compact_destroy),
               laguna_compact_destroy_fn>::value,
               "compact destroy C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_fail_sync_once),
+              laguna_compact_failure_fn>::value,
+              "compact sync failure hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_fail_release_once),
+              laguna_compact_failure_fn>::value,
+              "compact release failure hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_generic_cleanup_attempts),
+              gpu_cleanup_attempts_fn>::value,
+              "generic cleanup attempt hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_test_laguna_compact_close_observation_get),
+              close_observation_get_fn>::value,
+              "engine close observation C ABI drifted");
+static_assert(DS4_GPU_LAGUNA_DESTROY_OK == 0 &&
+              DS4_GPU_LAGUNA_DESTROY_RECOVERABLE == 1 &&
+              DS4_GPU_LAGUNA_DESTROY_UNSAFE == 2,
+              "compact destroy result values drifted");
+static_assert(DS4_GPU_LAGUNA_LIFECYCLE_IDLE == 0 &&
+              DS4_GPU_LAGUNA_LIFECYCLE_CREATING == 1 &&
+              DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE == 2 &&
+              DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING == 3 &&
+              DS4_GPU_LAGUNA_LIFECYCLE_RELEASING == 4,
+              "compact lifecycle values drifted");
+static_assert(std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::lifecycle),
+              ds4_gpu_laguna_lifecycle>::value,
+              "compact snapshot lifecycle is not typed");
+static_assert(std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::model_identity),
+              ds4_laguna_file_identity>::value,
+              "compact snapshot model identity drifted");
+static_assert(std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::static_slab),
+              void *>::value,
+              "compact snapshot static slab owner drifted");
+static_assert(std::is_same<
+              decltype(ds4_gpu_laguna_compact_test_snapshot::static_offsets),
+              uint64_t *>::value,
+              "compact snapshot static offsets owner drifted");
+static_assert(std::is_same<
+              decltype(ds4_test_laguna_compact_close_observation::destroy_result),
+              int>::value,
+              "engine close observation destroy result drifted");
 
 int main() {
     const uint64_t gib = 1024ull * 1024ull * 1024ull;

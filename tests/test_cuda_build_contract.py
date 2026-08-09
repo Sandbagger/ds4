@@ -54,6 +54,24 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_laguna_stream_links_cuda_lifecycle_test_hooks(self) -> None:
+        hook_object = "tests/ds4_cuda_laguna_stream_test_hooks.o"
+        hook_prerequisites = rule_prerequisites(hook_object)
+        self.assertIn("ds4_cuda.cu", hook_prerequisites)
+
+        hook_recipe = re.search(
+            rf"(?m)^{re.escape(hook_object)}:[^\n]*\n\t([^\n]+)$",
+            MAKEFILE,
+        )
+        self.assertIsNotNone(hook_recipe)
+        self.assertIn("-DDS4_TEST_HOOKS", hook_recipe.group(1))
+
+        stream_objects = rule_prerequisites(
+            "tests/test_cuda_laguna_stream"
+        ).split()
+        self.assertIn(hook_object, stream_objects)
+        self.assertNotIn("ds4_cuda.o", stream_objects)
+
     def test_compact_lifecycle_compile_units_track_identity_headers(self) -> None:
         cuda_prerequisites = rule_prerequisites("ds4_cuda.o")
         self.assertIn("ds4_laguna_plan.h", cuda_prerequisites)

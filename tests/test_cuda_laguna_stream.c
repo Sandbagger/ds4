@@ -117,6 +117,8 @@ enum {
     FIXTURE_TENSOR_COUNT = 8,
     FIXTURE_MODEL_BYTES = 1152,
     TRACKER_RECORD_CAPACITY = 16,
+    PINNED_OWNER_COUNT = 6,
+    PINNED_ACTIVE_RECORD_COUNT = 12,
 };
 
 static const char *const forbidden_cuda_env[] = {
@@ -720,6 +722,264 @@ static bool owned_record_matches(
         record->category == category && record->domain == domain &&
         record->relation == DS4_RUNTIME_RELATION_OWNED_ALLOCATION &&
         record->owner_id == 0;
+}
+
+static bool checked_add_u64_test(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || a > UINT64_MAX - b) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool pinned_live_owners_valid(
+        const ds4_test_laguna_live_owner owners[PINNED_OWNER_COUNT],
+        uint64_t *total_bytes) {
+    if (!owners || !total_bytes) return false;
+    size_t engine_count = 0;
+    size_t model_count = 0;
+    size_t vocab_count = 0;
+    uint64_t total = 0;
+    for (size_t i = 0; i < PINNED_OWNER_COUNT; i++) {
+        if (owners[i].base == 0 || owners[i].bytes == 0 ||
+            owners[i].base > UINT64_MAX - owners[i].bytes ||
+            !checked_add_u64_test(total, owners[i].bytes, &total)) {
+            return false;
+        }
+        switch (owners[i].callsite_id) {
+        case DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE:
+            engine_count++;
+            break;
+        case DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL:
+            model_count++;
+            break;
+        case DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB:
+            vocab_count++;
+            break;
+        default:
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            const uint64_t i_end = owners[i].base + owners[i].bytes;
+            const uint64_t j_end = owners[j].base + owners[j].bytes;
+            if (owners[i].base < j_end && owners[j].base < i_end) {
+                return false;
+            }
+        }
+    }
+    *total_bytes = total;
+    return engine_count == 1 && model_count == 2 && vocab_count == 3;
+}
+
+static bool pinned_inventory_records_match(
+        const ds4_runtime_snapshot *runtime,
+        const ds4_runtime_allocation_record *records,
+        const ds4_test_laguna_live_owner owners[PINNED_OWNER_COUNT]) {
+    if (!runtime || !records || !owners ||
+        runtime->active_record_count != PINNED_ACTIVE_RECORD_COUNT) {
+        return false;
+    }
+    bool owner_seen[PINNED_OWNER_COUNT] = {false};
+    bool sequence_seen[PINNED_OWNER_COUNT] = {false};
+    size_t inventory_count = 0;
+    size_t engine_count = 0;
+    size_t model_count = 0;
+    size_t vocab_count = 0;
+    const uint64_t sequence_mask = UINT64_C(0x00ffffffffffffff);
+
+    for (size_t i = 0; i < runtime->active_record_count; i++) {
+        const ds4_runtime_allocation_record *record = &records[i];
+        if (record->callsite_id != DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE &&
+            record->callsite_id != DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL &&
+            record->callsite_id != DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB) {
+            continue;
+        }
+        inventory_count++;
+        if ((uint8_t)(record->id >> 56) != 0x4eu) return false;
+        const uint64_t sequence = record->id & sequence_mask;
+        if (sequence == 0 || sequence > PINNED_OWNER_COUNT ||
+            sequence_seen[sequence - 1u]) {
+            return false;
+        }
+        sequence_seen[sequence - 1u] = true;
+        const size_t owner_index = (size_t)(sequence - 1u);
+        const ds4_test_laguna_live_owner *owner = &owners[owner_index];
+        if (owner_seen[owner_index] ||
+            !owned_record_matches(
+                record, owner->base, owner->bytes, owner->callsite_id,
+                DS4_RUNTIME_CATEGORY_OTHER_HOST,
+                DS4_RUNTIME_DOMAIN_HOST)) {
+            return false;
+        }
+        owner_seen[owner_index] = true;
+        if (record->callsite_id ==
+                DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE) {
+            engine_count++;
+        } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL) {
+            model_count++;
+        } else {
+            vocab_count++;
+        }
+    }
+    if (inventory_count != PINNED_OWNER_COUNT || engine_count != 1 ||
+        model_count != 2 || vocab_count != 3) {
+        return false;
+    }
+    for (size_t i = 0; i < PINNED_OWNER_COUNT; i++) {
+        if (!owner_seen[i] || !sequence_seen[i]) return false;
+    }
+    return true;
+}
+
+static bool pinned_runtime_inventory_reconciles(
+        const ds4_runtime_snapshot *runtime,
+        const ds4_runtime_allocation_record *records,
+        const ds4_test_laguna_live_owner owners[PINNED_OWNER_COUNT],
+        uint64_t owner_bytes,
+        const ds4_gpu_laguna_compact_test_snapshot *compact) {
+    if (!runtime || !records || !owners || !compact ||
+        runtime->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        runtime->active_record_count != PINNED_ACTIVE_RECORD_COUNT) {
+        return false;
+    }
+    size_t ledger_count = 0;
+    size_t static_count = 0;
+    size_t offsets_count = 0;
+    size_t mapping_count = 0;
+    size_t inventory_count = 0;
+    uint64_t ledger_bytes = 0;
+    uint64_t charged_bytes = 0;
+    for (size_t i = 0; i < runtime->active_record_count; i++) {
+        const ds4_runtime_allocation_record *record = &records[i];
+        if (!record->live ||
+            !checked_add_u64_test(
+                charged_bytes, record->charged_bytes, &charged_bytes)) {
+            return false;
+        }
+        if (record->callsite_id == DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) {
+            if (!owned_record_matches(
+                    record, record->base, record->requested_bytes,
+                    DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+                    DS4_RUNTIME_DOMAIN_HOST) ||
+                !checked_add_u64_test(
+                    ledger_bytes, record->charged_bytes, &ledger_bytes)) {
+                return false;
+            }
+            ledger_count++;
+        } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_STATIC_SLAB) {
+            if (!owned_record_matches(
+                    record, (uint64_t)(uintptr_t)compact->static_slab,
+                    compact->static_slab_bytes,
+                    DS4_LAGUNA_CALLSITE_STATIC_SLAB,
+                    DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS,
+                    DS4_RUNTIME_DOMAIN_CUDA_DEVICE)) {
+                return false;
+            }
+            static_count++;
+        } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_STATIC_OFFSETS) {
+            if (!owned_record_matches(
+                    record, (uint64_t)(uintptr_t)compact->static_offsets,
+                    compact->static_offset_bytes,
+                    DS4_LAGUNA_CALLSITE_STATIC_OFFSETS,
+                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+                    DS4_RUNTIME_DOMAIN_HOST)) {
+                return false;
+            }
+            offsets_count++;
+        } else if (record->relation ==
+                       DS4_RUNTIME_RELATION_MODEL_MAPPING) {
+            if (record->base != (uint64_t)(uintptr_t)compact->model_map ||
+                record->requested_bytes != compact->model_size ||
+                record->charged_bytes != 0 || record->callsite_id != 0 ||
+                record->category !=
+                    (ds4_runtime_category)DS4_RUNTIME_OWNED_CATEGORY_COUNT ||
+                record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+                record->owner_id != 0) {
+                return false;
+            }
+            mapping_count++;
+        } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE ||
+                   record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL ||
+                   record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB) {
+            inventory_count++;
+        } else {
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (records[j].id == record->id) return false;
+        }
+    }
+    if (ledger_count != 3 || static_count != 1 || offsets_count != 1 ||
+        mapping_count != 1 || inventory_count != PINNED_OWNER_COUNT) {
+        return false;
+    }
+    uint64_t metadata_bytes = 0;
+    uint64_t expected_owned = 0;
+    if (!checked_add_u64_test(
+            ledger_bytes, compact->static_offset_bytes, &metadata_bytes) ||
+        !checked_add_u64_test(
+            compact->static_slab_bytes, metadata_bytes, &expected_owned) ||
+        !checked_add_u64_test(
+            expected_owned, owner_bytes, &expected_owned) ||
+        charged_bytes != expected_owned) {
+        return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        uint64_t expected = 0;
+        if (i == DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS) {
+            expected = compact->static_slab_bytes;
+        } else if (i ==
+                   DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES) {
+            expected = metadata_bytes;
+        } else if (i == DS4_RUNTIME_CATEGORY_OTHER_HOST) {
+            expected = owner_bytes;
+        }
+        if (runtime->category_current[i] != expected ||
+            runtime->category_peak[i] != expected ||
+            runtime->category_current[i] > runtime->category_bounds[i]) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        const uint64_t expected =
+            i == DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ?
+                compact->model_size : 0;
+        if (runtime->report_current[i] != expected ||
+            runtime->report_peak[i] != expected ||
+            runtime->report_current[i] > runtime->report_bounds[i]) {
+            return false;
+        }
+    }
+    return runtime->owned_total_current == expected_owned &&
+        runtime->owned_total_peak == expected_owned &&
+        runtime->qualification_total_current == expected_owned &&
+        runtime->qualification_total_peak == expected_owned &&
+        runtime->owned_total_current <= runtime->owned_total_bound_bytes &&
+        runtime->qualification_total_current <=
+            runtime->qualification_total_bound_bytes;
+}
+
+static bool runtime_snapshot_is_clean(
+        const ds4_runtime_snapshot *snapshot) {
+    if (!snapshot ||
+        snapshot->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        snapshot->active_record_count != 0 ||
+        snapshot->owned_total_current != 0 ||
+        snapshot->qualification_total_current != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        if (snapshot->category_current[i] != 0) return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (snapshot->report_current[i] != 0) return false;
+    }
+    return true;
 }
 
 static bool retained_tracker_matches_compact(
@@ -2713,6 +2973,51 @@ static int run_model_startup(void) {
               bypass.model_cache_entries == 0 &&
               bypass.model_warm_entries == 0,
           "pinned compact startup bypasses every legacy model entrypoint");
+
+    ds4_test_laguna_live_owner owners[PINNED_OWNER_COUNT];
+    ds4_test_laguna_live_owner fresh_owners[PINNED_OWNER_COUNT];
+    size_t owner_required = 0;
+    size_t fresh_owner_required = 0;
+    uint64_t owner_bytes = 0;
+    memset(owners, 0, sizeof(owners));
+    memset(fresh_owners, 0, sizeof(fresh_owners));
+    const bool owners_captured = engine &&
+        ds4_test_engine_laguna_live_owners(
+            engine, owners, ARRAY_LEN(owners), &owner_required);
+    CHECK(owners_captured && owner_required == PINNED_OWNER_COUNT &&
+              pinned_live_owners_valid(owners, &owner_bytes),
+          "pinned engine exposes six exact private allocation owners");
+    CHECK(engine &&
+              ds4_test_engine_laguna_live_owners(
+                  engine, fresh_owners, ARRAY_LEN(fresh_owners),
+                  &fresh_owner_required) &&
+              fresh_owner_required == PINNED_OWNER_COUNT &&
+              memcmp(owners, fresh_owners, sizeof(owners)) == 0,
+          "pinned engine recomputes a stable fresh owner snapshot");
+
+    ds4_runtime_snapshot runtime;
+    ds4_runtime_allocation_record
+        records[PINNED_ACTIVE_RECORD_COUNT];
+    size_t record_required = 0;
+    memset(&runtime, 0, sizeof(runtime));
+    memset(records, 0, sizeof(records));
+    const bool runtime_captured = engine &&
+        ds4_test_engine_laguna_runtime_snapshot(
+            engine, &runtime, records, ARRAY_LEN(records),
+            &record_required);
+    CHECK(runtime_captured &&
+              record_required == PINNED_ACTIVE_RECORD_COUNT &&
+              runtime.active_record_count == PINNED_ACTIVE_RECORD_COUNT,
+          "pinned runtime snapshot exposes twelve active records");
+    CHECK(runtime_captured && owners_captured &&
+              pinned_inventory_records_match(
+                  &runtime, records, owners),
+          "pinned tracker contains the exact 0x4e owner multiset");
+    CHECK(runtime_captured && owners_captured &&
+              pinned_runtime_inventory_reconciles(
+                  &runtime, records, owners, owner_bytes, &compact),
+          "pinned runtime snapshot reconciles the production inventory");
+
     const uint64_t cleanup_before =
         ds4_gpu_test_generic_cleanup_attempts();
     ds4_gpu_test_laguna_compact_fail_sync_once();
@@ -2739,6 +3044,11 @@ static int run_model_startup(void) {
           "terminal OK closes the compact-owned model descriptor");
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "pinned engine teardown destroys compact attachment");
+    ds4_runtime_snapshot closed_runtime;
+    memset(&closed_runtime, 0, sizeof(closed_runtime));
+    CHECK(ds4_test_laguna_last_close_snapshot(&closed_runtime) &&
+              runtime_snapshot_is_clean(&closed_runtime),
+          "pinned engine close captures one clean runtime snapshot");
     restore_forbidden_environment(&saved);
     return g_failures == 0 ? 0 : 1;
 }

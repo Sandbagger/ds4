@@ -24,6 +24,18 @@ using laguna_compact_snapshot_get_fn = int (*)(
 using gpu_cleanup_attempts_fn = uint64_t (*)();
 using close_observation_get_fn = bool (*)(
     ds4_test_laguna_compact_close_observation *);
+using engine_runtime_snapshot_fn = bool (*)(
+    const ds4_engine *,
+    ds4_runtime_snapshot *,
+    ds4_runtime_allocation_record *,
+    size_t,
+    size_t *);
+using last_close_snapshot_fn = bool (*)(ds4_runtime_snapshot *);
+using engine_live_owners_fn = bool (*)(
+    const ds4_engine *,
+    ds4_test_laguna_live_owner *,
+    size_t,
+    size_t *);
 
 static_assert(std::is_same<
               decltype(&ds4_gpu_laguna_compact_create),
@@ -69,6 +81,28 @@ static_assert(std::is_same<
               decltype(&ds4_test_laguna_compact_close_observation_get),
               close_observation_get_fn>::value,
               "engine close observation C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_test_engine_laguna_runtime_snapshot),
+              engine_runtime_snapshot_fn>::value,
+              "engine runtime snapshot C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_test_laguna_last_close_snapshot),
+              last_close_snapshot_fn>::value,
+              "last close runtime snapshot C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_test_engine_laguna_live_owners),
+              engine_live_owners_fn>::value,
+              "engine live owners C ABI drifted");
+static_assert(std::is_same<
+              decltype(ds4_test_laguna_live_owner::base),
+              uint64_t>::value &&
+              std::is_same<
+              decltype(ds4_test_laguna_live_owner::bytes),
+              uint64_t>::value &&
+              std::is_same<
+              decltype(ds4_test_laguna_live_owner::callsite_id),
+              uint32_t>::value,
+              "engine live owner layout drifted");
 static_assert(DS4_GPU_LAGUNA_DESTROY_OK == 0 &&
               DS4_GPU_LAGUNA_DESTROY_RECOVERABLE == 1 &&
               DS4_GPU_LAGUNA_DESTROY_UNSAFE == 2,

@@ -7,6 +7,9 @@
 #include <stdio.h>
 
 #include "ds4_ssd.h"
+#ifdef DS4_TEST_HOOKS
+#include "ds4_runtime.h"
+#endif
 
 /* Public engine boundary.
  *
@@ -478,6 +481,12 @@ typedef struct {
     uint64_t gpu_cleanup_after;
 } ds4_test_laguna_compact_close_observation;
 
+typedef struct {
+    uint64_t base;
+    uint64_t bytes;
+    uint32_t callsite_id;
+} ds4_test_laguna_live_owner;
+
 typedef void (*ds4_test_thread_sync_fn)(void *context);
 
 int ds4_test_logits_only_sync_mode(
@@ -539,6 +548,21 @@ bool ds4_test_laguna_compact_bypass_snapshot_get(
         ds4_test_laguna_compact_bypass_snapshot *out);
 bool ds4_test_laguna_compact_close_observation_get(
         ds4_test_laguna_compact_close_observation *out);
+/* Copy-only engine accounting views. `required` reports the exact live count;
+ * insufficient output capacity fails without returning a partial copy. */
+bool ds4_test_engine_laguna_runtime_snapshot(
+        const ds4_engine *engine,
+        ds4_runtime_snapshot *snapshot,
+        ds4_runtime_allocation_record *records,
+        size_t capacity,
+        size_t *required);
+bool ds4_test_laguna_last_close_snapshot(
+        ds4_runtime_snapshot *snapshot);
+bool ds4_test_engine_laguna_live_owners(
+        const ds4_engine *engine,
+        ds4_test_laguna_live_owner *owners,
+        size_t capacity,
+        size_t *required);
 int ds4_test_session_limit_lifecycle(
         bool exact_cache,
         bool graph_backend,

@@ -122,6 +122,12 @@ enum {
     PINNED_ACTIVE_RECORD_COUNT = 12,
 };
 
+typedef enum {
+    PINNED_MODEL_STARTUP_NORMAL,
+    PINNED_MODEL_TEARDOWN_RECONCILE_UNSAFE,
+    PINNED_MODEL_CLEANUP_RELEASE_UNSAFE,
+} pinned_model_case;
+
 static const char *const forbidden_cuda_env[] = {
     "DS4_CUDA_COPY_MODEL",
     "DS4_CUDA_COPY_MODEL_CHUNKED",
@@ -3054,7 +3060,7 @@ static int run_teardown_unsafe(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
-static int run_model_startup(bool corrupt_inventory_live_flag) {
+static int run_model_startup(pinned_model_case model_case) {
     const char *model = getenv("DS4_TEST_MODEL");
     if (!model || !model[0]) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
@@ -3199,7 +3205,7 @@ static int run_model_startup(bool corrupt_inventory_live_flag) {
                   owner_bytes, &compact),
           "pinned runtime snapshot reconciles the production inventory");
 
-    if (corrupt_inventory_live_flag) {
+    if (model_case == PINNED_MODEL_TEARDOWN_RECONCILE_UNSAFE) {
         CHECK(ds4_test_engine_laguna_inventory_live_flag_clear(
                   engine, PINNED_OWNER_COUNT - 1u),
               "test seam leaves one tracker owner live but clears its engine flag");
@@ -3232,6 +3238,35 @@ static int run_model_startup(bool corrupt_inventory_live_flag) {
         memset(&closed_runtime, 0, sizeof(closed_runtime));
         CHECK(!ds4_test_laguna_last_close_snapshot(&closed_runtime),
               "unreconciled retained engine publishes no clean close snapshot");
+        restore_forbidden_environment(&saved);
+        return g_failures == 0 ? 0 : 1;
+    }
+
+    if (model_case == PINNED_MODEL_CLEANUP_RELEASE_UNSAFE) {
+        CHECK(ds4_test_engine_laguna_inventory_release_reject_once(
+                  engine, 3u),
+              "test seam arms one rejected vocabulary-owner release");
+        const uint64_t cleanup_before =
+            ds4_gpu_test_generic_cleanup_attempts();
+        ds4_engine_close(engine);
+
+        ds4_test_laguna_compact_close_observation observation;
+        memset(&observation, 0, sizeof(observation));
+        CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+                  observation.first_destroy_result ==
+                      DS4_GPU_LAGUNA_DESTROY_OK &&
+                  observation.destroy_result ==
+                      DS4_GPU_LAGUNA_DESTROY_OK &&
+                  observation.destroy_attempt_count == 1u &&
+                  observation.engine_retained &&
+                  observation.gpu_cleanup_before == cleanup_before &&
+                  observation.gpu_cleanup_after == cleanup_before &&
+                  ds4_gpu_test_generic_cleanup_attempts() == cleanup_before,
+              "rejected vocabulary release retains its engine before cleanup");
+        ds4_runtime_snapshot closed_runtime;
+        memset(&closed_runtime, 0, sizeof(closed_runtime));
+        CHECK(!ds4_test_laguna_last_close_snapshot(&closed_runtime),
+              "rejected ordinary release publishes no clean close snapshot");
         restore_forbidden_environment(&saved);
         return g_failures == 0 ? 0 : 1;
     }
@@ -3596,6 +3631,7 @@ static void usage(const char *program) {
             "model-startup|model-create-unwind-unsafe|"
             "model-teardown-unsafe|"
             "model-teardown-reconcile-unsafe|"
+            "model-cleanup-release-unsafe|"
             "model-teardown-second-recoverable\n",
             program);
 }
@@ -3614,14 +3650,17 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "teardown-unsafe") == 0) {
         rc = run_teardown_unsafe();
     } else if (strcmp(argv[2], "model-startup") == 0) {
-        rc = run_model_startup(false);
+        rc = run_model_startup(PINNED_MODEL_STARTUP_NORMAL);
     } else if (strcmp(argv[2], "model-create-unwind-unsafe") == 0) {
         rc = run_model_create_unwind_unsafe();
     } else if (strcmp(argv[2], "model-teardown-unsafe") == 0) {
         rc = run_model_teardown_unsafe();
     } else if (strcmp(argv[2],
                       "model-teardown-reconcile-unsafe") == 0) {
-        rc = run_model_startup(true);
+        rc = run_model_startup(PINNED_MODEL_TEARDOWN_RECONCILE_UNSAFE);
+    } else if (strcmp(argv[2],
+                      "model-cleanup-release-unsafe") == 0) {
+        rc = run_model_startup(PINNED_MODEL_CLEANUP_RELEASE_UNSAFE);
     } else if (strcmp(argv[2],
                       "model-teardown-second-recoverable") == 0) {
         rc = run_model_teardown_second_recoverable();

@@ -563,6 +563,9 @@ bool ds4_test_laguna_close_snapshot_is_clean(
 bool ds4_test_engine_laguna_inventory_live_flag_clear(
         ds4_engine *engine,
         size_t index);
+bool ds4_test_engine_laguna_inventory_release_reject_once(
+        ds4_engine *engine,
+        size_t index);
 bool ds4_test_engine_laguna_live_owners(
         const ds4_engine *engine,
         ds4_test_laguna_live_owner *owners,

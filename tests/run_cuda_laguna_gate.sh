@@ -93,6 +93,8 @@ case "$mode" in
         if [ "$DS4_TEST_MODEL" = ds4flash.gguf ]; then
             die "DS4_TEST_MODEL must be an explicit path, not ds4flash.gguf"
         fi
+        [[ $DS4_TEST_MODEL = /* ]] || \
+            die "DS4_TEST_MODEL must be an absolute path: $DS4_TEST_MODEL"
         [ -f "$DS4_TEST_MODEL" ] || die "DS4_TEST_MODEL is not a regular file: $DS4_TEST_MODEL"
         [ -n "${LAGUNA_TOKENIZER_RUNTIME_COMMIT:-}" ] || \
             die "LAGUNA_TOKENIZER_RUNTIME_COMMIT is required"
@@ -152,6 +154,16 @@ if [ "$mode" = self-test ]; then
         --gguf-fd 9 \
         --gguf-size "$expected_size" \
         --gguf-sha256 "$expected_sha256"
+elif [ "$mode" = c7 ]; then
+    timeout 60s python3 "$verifier" \
+        --verify-promoted "$fixture" \
+        --contract-commit "$pinned_contract" \
+        --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
+        --llama-commit "$pinned_llama" \
+        --capture-manifest-sha256 "$pinned_capture" \
+        --gguf-size "$expected_size" \
+        --gguf-sha256 "$expected_sha256" \
+        --gguf-fd 9
 else
     python3 "$verifier" \
         --verify-promoted "$fixture" \
@@ -165,23 +177,31 @@ else
 fi
 assert_retained_identity verifier
 
-env -u DS4_CUDA_MOE_DECODE_GRAPH "$kernel_child" --case all
+if [ "$mode" = c7 ]; then
+    env -u DS4_CUDA_MOE_DECODE_GRAPH timeout 60s "$kernel_child" --case all
+else
+    env -u DS4_CUDA_MOE_DECODE_GRAPH "$kernel_child" --case all
+fi
 assert_retained_identity kernels
 
-"$model_child"
+if [ "$mode" = c7 ]; then
+    timeout 60s "$model_child"
+else
+    "$model_child"
+fi
 assert_retained_identity model
 
 if [ "$mode" = c7 ]; then
-    "$stream_child" --case startup
+    timeout 60s "$stream_child" --case startup
     assert_retained_identity stream-startup
 
-    "$stream_child" --case teardown-unsafe
+    timeout 60s "$stream_child" --case teardown-unsafe
     assert_retained_identity stream-teardown-unsafe
 
-    "$stream_child" --case model-startup
+    timeout 60s "$stream_child" --case model-startup
     assert_retained_identity stream-model-startup
 
-    "$stream_child" --case model-teardown-unsafe
+    timeout 60s "$stream_child" --case model-teardown-unsafe
     assert_retained_identity stream-model-teardown-unsafe
 fi
 

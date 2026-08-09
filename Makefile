@@ -447,15 +447,23 @@ test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	timeout 60s ./tests/test_cuda_laguna_stream --case create-unwind-unsafe
 	timeout 60s ./tests/test_cuda_laguna_stream --case teardown-unsafe
 
+export DS4_TEST_MODEL
+export LAGUNA_TOKENIZER_RUNTIME_COMMIT
+
 test-cuda-laguna-resident: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model
 	tests/run_cuda_laguna_gate.sh resident
-test-cuda-laguna-resident: export DS4_TEST_MODEL := $(DS4_TEST_MODEL)
-test-cuda-laguna-resident: export LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(LAGUNA_TOKENIZER_RUNTIME_COMMIT)
+test-cuda-laguna-resident: override DS4_TEST_MODEL := $(value DS4_TEST_MODEL)
+test-cuda-laguna-resident: override LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(value LAGUNA_TOKENIZER_RUNTIME_COMMIT)
 
 test-cuda-laguna-c7: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_stream
 	tests/run_cuda_laguna_gate.sh c7
-test-cuda-laguna-c7: export DS4_TEST_MODEL := $(DS4_TEST_MODEL)
-test-cuda-laguna-c7: export LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(LAGUNA_TOKENIZER_RUNTIME_COMMIT)
+test-cuda-laguna-c7: override DS4_TEST_MODEL := $(value DS4_TEST_MODEL)
+test-cuda-laguna-c7: override LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(value LAGUNA_TOKENIZER_RUNTIME_COMMIT)
+endif
+
+ifeq ($(UNAME_S),Darwin)
+test-cuda-laguna-c7:
+	@echo "error: test-cuda-laguna-c7 is unsupported; requires CUDA on Linux" >&2; exit 2
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

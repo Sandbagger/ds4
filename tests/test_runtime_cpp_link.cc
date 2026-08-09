@@ -19,6 +19,8 @@ using laguna_compact_create_fn = int (*)(
 using laguna_compact_destroy_fn = ds4_gpu_laguna_destroy_status (*)(
     ds4_gpu_laguna_compact *);
 using laguna_compact_failure_fn = void (*)();
+using laguna_compact_snapshot_get_fn = int (*)(
+    ds4_gpu_laguna_compact_test_snapshot *);
 using gpu_cleanup_attempts_fn = uint64_t (*)();
 using close_observation_get_fn = bool (*)(
     ds4_test_laguna_compact_close_observation *);
@@ -39,6 +41,26 @@ static_assert(std::is_same<
               decltype(&ds4_gpu_test_laguna_compact_fail_release_once),
               laguna_compact_failure_fn>::value,
               "compact release failure hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_pause_creating_once),
+              laguna_compact_failure_fn>::value,
+              "compact creating pause hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_wait_creating_paused),
+              laguna_compact_failure_fn>::value,
+              "compact creating wait hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_resume_creating),
+              laguna_compact_failure_fn>::value,
+              "compact creating resume hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_fail_before_publish_once),
+              laguna_compact_failure_fn>::value,
+              "compact pre-publish failure hook C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_gpu_test_laguna_compact_nonidle_snapshot),
+              laguna_compact_snapshot_get_fn>::value,
+              "compact non-idle snapshot hook C ABI drifted");
 static_assert(std::is_same<
               decltype(&ds4_gpu_test_generic_cleanup_attempts),
               gpu_cleanup_attempts_fn>::value,
@@ -103,9 +125,17 @@ static_assert(std::is_same<
               uint64_t>::value,
               "compact snapshot lifecycle counters drifted");
 static_assert(std::is_same<
+              decltype(ds4_test_laguna_compact_close_observation::first_destroy_result),
+              int>::value,
+              "engine close observation first destroy result drifted");
+static_assert(std::is_same<
               decltype(ds4_test_laguna_compact_close_observation::destroy_result),
               int>::value,
               "engine close observation destroy result drifted");
+static_assert(std::is_same<
+              decltype(ds4_test_laguna_compact_close_observation::destroy_attempt_count),
+              uint64_t>::value,
+              "engine close observation destroy attempt count drifted");
 static_assert(std::is_same<
               decltype(ds4_test_laguna_compact_close_observation::engine_retained),
               bool>::value &&

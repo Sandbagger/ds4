@@ -766,6 +766,8 @@ static ds4_test_laguna_compact_bypass_snapshot
     g_ds4_test_laguna_compact_bypass;
 static ds4_test_laguna_compact_close_observation
     g_ds4_test_laguna_compact_close_observation;
+static ds4_runtime_snapshot g_ds4_test_laguna_last_close_snapshot;
+static bool g_ds4_test_laguna_last_close_snapshot_valid;
 #endif
 
 typedef enum {
@@ -58405,6 +58407,107 @@ bool ds4_test_laguna_compact_close_observation_get(
         ds4_test_laguna_compact_close_observation *out) {
     if (!out) return false;
     *out = g_ds4_test_laguna_compact_close_observation;
+    return true;
+}
+
+bool ds4_test_engine_laguna_runtime_snapshot(
+        const ds4_engine *engine,
+        ds4_runtime_snapshot *snapshot,
+        ds4_runtime_allocation_record *records,
+        size_t capacity,
+        size_t *required) {
+    if (snapshot) memset(snapshot, 0, sizeof(*snapshot));
+    if (required) *required = 0;
+    if (!engine || !snapshot || !required ||
+        !engine->laguna_runtime_tracker_ready ||
+        (capacity != 0 && !records)) {
+        return false;
+    }
+    size_t live_count = 0;
+    for (size_t i = 0;
+         i < engine->laguna_runtime_tracker.record_count;
+         i++) {
+        if (engine->laguna_runtime_tracker.records[i].live) live_count++;
+    }
+    *required = live_count;
+    if (live_count > capacity) return false;
+    return ds4_runtime_tracker_snapshot_copy(
+        &engine->laguna_runtime_tracker, snapshot, records, capacity);
+}
+
+bool ds4_test_laguna_last_close_snapshot(
+        ds4_runtime_snapshot *snapshot) {
+    if (!snapshot) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!g_ds4_test_laguna_last_close_snapshot_valid) return false;
+    *snapshot = g_ds4_test_laguna_last_close_snapshot;
+    return true;
+}
+
+static bool ds4_test_laguna_live_owner_set(
+        ds4_test_laguna_live_owner *owner,
+        const void *base,
+        uint64_t count,
+        uint64_t element_bytes,
+        uint32_t callsite_id) {
+    if (!owner || !base || count == 0 || element_bytes == 0 ||
+        count > UINT64_MAX / element_bytes) {
+        return false;
+    }
+    const uint64_t bytes = count * element_bytes;
+    const uint64_t address = (uint64_t)(uintptr_t)base;
+    if (address == 0 || address > UINT64_MAX - bytes) return false;
+    owner->base = address;
+    owner->bytes = bytes;
+    owner->callsite_id = callsite_id;
+    return true;
+}
+
+bool ds4_test_engine_laguna_live_owners(
+        const ds4_engine *engine,
+        ds4_test_laguna_live_owner *owners,
+        size_t capacity,
+        size_t *required) {
+    enum { OWNER_COUNT = 6 };
+    if (required) *required = 0;
+    if (!engine || !required) return false;
+    *required = OWNER_COUNT;
+    if (!owners || capacity < OWNER_COUNT || engine->vocab.n_vocab <= 0) {
+        return false;
+    }
+
+    ds4_test_laguna_live_owner fresh[OWNER_COUNT];
+    memset(fresh, 0, sizeof(fresh));
+    if (!ds4_test_laguna_live_owner_set(
+            &fresh[0], engine, 1u, sizeof(*engine),
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[1], engine->model.kv, engine->model.n_kv,
+            sizeof(engine->model.kv[0]),
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[2], engine->model.tensors,
+            engine->model.n_tensors,
+            sizeof(engine->model.tensors[0]),
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[3], engine->vocab.token,
+            (uint64_t)engine->vocab.n_vocab,
+            sizeof(engine->vocab.token[0]),
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[4], engine->vocab.token_to_id.entry,
+            engine->vocab.token_to_id.cap,
+            sizeof(engine->vocab.token_to_id.entry[0]),
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB) ||
+        !ds4_test_laguna_live_owner_set(
+            &fresh[5], engine->vocab.merge_rank.entry,
+            engine->vocab.merge_rank.cap,
+            sizeof(engine->vocab.merge_rank.entry[0]),
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB)) {
+        return false;
+    }
+    memcpy(owners, fresh, sizeof(fresh));
     return true;
 }
 

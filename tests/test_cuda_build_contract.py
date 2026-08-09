@@ -58,12 +58,25 @@ class CudaBuildContractTest(unittest.TestCase):
         cuda_prerequisites = rule_prerequisites("ds4_cuda.o")
         self.assertIn("ds4_laguna_plan.h", cuda_prerequisites)
 
-        cpp_contract_prerequisites = rule_prerequisites(
-            "tests/test_runtime_cpp_link.o"
+        ds4_test_prerequisites = rule_prerequisites("ds4_test.o")
+        self.assertIn("ds4_gpu.h", ds4_test_prerequisites)
+
+        gpu_header_targets = {
+            match.group(1)
+            for match in re.finditer(
+                r"(?m)^([^:\s]+\.o):[^\n]*\bds4_gpu\.h\b", MAKEFILE
+            )
+        }
+        gpu_header_targets.add("ds4_test.o")
+        for target in sorted(gpu_header_targets):
+            with self.subTest(target=target):
+                self.assertIn(
+                    "ds4_laguna_plan.h", rule_prerequisites(target)
+                )
+
+        self.assertIn(
+            "ds4.h", rule_prerequisites("tests/test_runtime_cpp_link.o")
         )
-        for header in ("ds4.h", "ds4_gpu.h", "ds4_laguna_plan.h"):
-            with self.subTest(header=header):
-                self.assertIn(header, cpp_contract_prerequisites)
 
     def test_standalone_cuda_links_include_runtime_tracker(self) -> None:
         for target in STANDALONE_CUDA_TARGETS:

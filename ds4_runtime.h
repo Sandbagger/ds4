@@ -146,6 +146,14 @@ typedef struct {
     size_t active_record_count;
 } ds4_runtime_snapshot;
 
+typedef struct {
+    uint64_t allocation_id;
+    uint32_t callsite_id;
+    uint64_t base;
+    uint64_t requested_bytes;
+    uint64_t charged_bytes;
+} ds4_runtime_owned_descriptor;
+
 ds4_runtime_status ds4_runtime_tracker_init(
     ds4_runtime_tracker *tracker,
     const ds4_runtime_tracker_config *config);
@@ -157,6 +165,12 @@ ds4_runtime_status ds4_runtime_tracker_allocate(
     uint64_t base,
     uint64_t requested_bytes,
     uint64_t charged_bytes);
+
+ds4_runtime_status ds4_runtime_tracker_replay_owned(
+    ds4_runtime_tracker *tracker,
+    const ds4_runtime_owned_descriptor *owners,
+    size_t owner_count,
+    bool *owner_live);
 
 ds4_runtime_status ds4_runtime_tracker_release(
     ds4_runtime_tracker *tracker,

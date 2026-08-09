@@ -2490,6 +2490,214 @@ static uint64_t tracker_test_id(uint8_t producer_namespace,
     return ((uint64_t)producer_namespace << 56) | sequence;
 }
 
+enum { REPLAY_OWNER_COUNT = 6 };
+
+typedef struct {
+    ds4_runtime_callsite callsites[3];
+    ds4_runtime_allocation_record records[REPLAY_OWNER_COUNT];
+    ds4_runtime_tracker_config config;
+    ds4_runtime_tracker tracker;
+} replay_tracker_fixture;
+
+static void replay_tracker_fixture_prepare(replay_tracker_fixture *f) {
+    memset(f, 0, sizeof(*f));
+    const ds4_runtime_callsite sites[] = {
+        { DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE,
+          "laguna.other_host.engine",
+          DS4_RUNTIME_CATEGORY_OTHER_HOST,
+          DS4_RUNTIME_DOMAIN_HOST,
+          64u },
+        { DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL,
+          "laguna.other_host.model",
+          DS4_RUNTIME_CATEGORY_OTHER_HOST,
+          DS4_RUNTIME_DOMAIN_HOST,
+          192u },
+        { DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB,
+          "laguna.other_host.vocab",
+          DS4_RUNTIME_CATEGORY_OTHER_HOST,
+          DS4_RUNTIME_DOMAIN_HOST,
+          384u },
+    };
+    memcpy(f->callsites, sites, sizeof(sites));
+    f->config.callsites = f->callsites;
+    f->config.callsite_count = sizeof(f->callsites) / sizeof(f->callsites[0]);
+    f->config.records = f->records;
+    f->config.record_capacity =
+        sizeof(f->records) / sizeof(f->records[0]);
+    f->config.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 640u;
+    f->config.owned_total_bound_bytes = 640u;
+    f->config.qualification_total_bound_bytes = 640u;
+}
+
+static bool replay_tracker_fixture_init(replay_tracker_fixture *f,
+                                        size_t record_capacity) {
+    replay_tracker_fixture_prepare(f);
+    f->config.record_capacity = record_capacity;
+    return ds4_runtime_tracker_init(&f->tracker, &f->config) ==
+           DS4_RUNTIME_STATUS_OK;
+}
+
+static void replay_owner_descriptors(
+        ds4_runtime_owned_descriptor owners[REPLAY_OWNER_COUNT]) {
+    const ds4_runtime_owned_descriptor expected[REPLAY_OWNER_COUNT] = {
+        { tracker_test_id(0x4eu, 1u),
+          DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE,
+          UINT64_C(0x1000), 16u, 16u },
+        { tracker_test_id(0x4eu, 2u),
+          DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL,
+          UINT64_C(0x2000), 24u, 32u },
+        { tracker_test_id(0x4eu, 3u),
+          DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL,
+          UINT64_C(0x3000), 40u, 48u },
+        { tracker_test_id(0x4eu, 4u),
+          DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB,
+          UINT64_C(0x4000), 56u, 64u },
+        { tracker_test_id(0x4eu, 5u),
+          DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB,
+          UINT64_C(0x5000), 72u, 80u },
+        { tracker_test_id(0x4eu, 6u),
+          DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB,
+          UINT64_C(0x6000), 88u, 96u },
+    };
+    memcpy(owners, expected, sizeof(expected));
+}
+
+static bool replay_record_matches(
+        const ds4_runtime_allocation_record *record,
+        const ds4_runtime_owned_descriptor *owner) {
+    return record->id == owner->allocation_id &&
+           record->base == owner->base &&
+           record->requested_bytes == owner->requested_bytes &&
+           record->charged_bytes == owner->charged_bytes &&
+           record->category == DS4_RUNTIME_CATEGORY_OTHER_HOST &&
+           record->domain == DS4_RUNTIME_DOMAIN_HOST &&
+           record->callsite_id == owner->callsite_id &&
+           record->relation == DS4_RUNTIME_RELATION_OWNED_ALLOCATION &&
+           record->owner_id == 0 && record->live;
+}
+
+static void test_tracker_replay_owned(void) {
+    ds4_runtime_owned_descriptor owners[REPLAY_OWNER_COUNT];
+    replay_owner_descriptors(owners);
+
+    replay_tracker_fixture f;
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "owned replay tracker initializes");
+    bool owner_live[REPLAY_OWNER_COUNT] = {false};
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, owners, REPLAY_OWNER_COUNT, owner_live) ==
+              DS4_RUNTIME_STATUS_OK,
+          "six live Laguna owners replay in descriptor order");
+
+    ds4_runtime_snapshot snapshot;
+    ds4_runtime_allocation_record active[REPLAY_OWNER_COUNT];
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &f.tracker, &snapshot, active, REPLAY_OWNER_COUNT) &&
+              snapshot.active_record_count == REPLAY_OWNER_COUNT,
+          "owned replay exposes exactly six active records");
+    for (size_t i = 0; i < REPLAY_OWNER_COUNT; i++) {
+        CHECK(owner_live[i],
+              "owned replay marks each owner live only after commit");
+        CHECK(replay_record_matches(&active[i], &owners[i]),
+              "owned replay preserves every descriptor and attribution field");
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        const uint64_t expected =
+            i == DS4_RUNTIME_CATEGORY_OTHER_HOST ? 336u : 0;
+        CHECK(snapshot.category_current[i] == expected &&
+                  snapshot.category_peak[i] == expected,
+              "owned replay reconciles exact category current and peak totals");
+    }
+    CHECK(snapshot.owned_total_current == 336u &&
+              snapshot.owned_total_peak == 336u &&
+              snapshot.qualification_total_current == 336u &&
+              snapshot.qualification_total_peak == 336u,
+          "owned replay reconciles exact simultaneous totals");
+}
+
+static void test_tracker_replay_owned_rejections(void) {
+    ds4_runtime_owned_descriptor owners[REPLAY_OWNER_COUNT];
+    replay_owner_descriptors(owners);
+    replay_tracker_fixture f;
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "unknown-callsite replay tracker initializes");
+    ds4_runtime_owned_descriptor unknown = owners[0];
+    unknown.callsite_id = UINT32_MAX;
+    bool unknown_live = true;
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, &unknown, 1u, &unknown_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE &&
+              !unknown_live && f.tracker.record_count == 0,
+          "owned replay rejects an unknown callsite before commit");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "overlap replay tracker initializes");
+    ds4_runtime_owned_descriptor overlapping[2] = { owners[0], owners[1] };
+    overlapping[1].base = overlapping[0].base + 8u;
+    bool overlap_live[2] = {true, true};
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, overlapping, 2u, overlap_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_OVERLAP &&
+              overlap_live[0] && !overlap_live[1] &&
+              f.tracker.record_count == 1u && f.records[0].live,
+          "owned replay preserves only the committed prefix on overlap");
+
+    CHECK(replay_tracker_fixture_init(&f, 3u),
+          "capacity replay tracker initializes");
+    bool capacity_live[REPLAY_OWNER_COUNT] = {
+        true, true, true, true, true, true,
+    };
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, owners, REPLAY_OWNER_COUNT, capacity_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_CAPACITY &&
+              capacity_live[0] && capacity_live[1] && capacity_live[2] &&
+              !capacity_live[3] && !capacity_live[4] && !capacity_live[5] &&
+              f.tracker.record_count == 3u,
+          "owned replay preserves its committed prefix at record capacity");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "callsite-bound replay tracker initializes");
+    f.callsites[0].bound_bytes = owners[0].charged_bytes - 1u;
+    bool callsite_live = false;
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, owners, 1u, &callsite_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_CALLSITE_BOUND &&
+              callsite_live && f.tracker.record_count == 1u &&
+              f.records[0].live,
+          "owned replay reports a committed callsite-bound violation as live");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "category-bound replay tracker initializes");
+    f.tracker.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] =
+        owners[0].charged_bytes - 1u;
+    bool category_live = false;
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, owners, 1u, &category_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
+              category_live && f.tracker.record_count == 1u &&
+              f.records[0].live,
+          "owned replay reports a committed category-bound violation as live");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "total-bound replay tracker initializes");
+    f.tracker.owned_total_bound_bytes = owners[0].charged_bytes - 1u;
+    bool total_live = false;
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, owners, 1u, &total_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation ==
+                  DS4_RUNTIME_VIOLATION_OWNED_TOTAL_BOUND &&
+              total_live && f.tracker.record_count == 1u &&
+              f.records[0].live,
+          "owned replay reports a committed total-bound violation as live");
+}
+
 static void test_tracker_tombstone_reuse(void) {
     const uint64_t namespace_10_sequence_1 = tracker_test_id(0x10u, 1u);
     const uint64_t namespace_10_sequence_2 = tracker_test_id(0x10u, 2u);
@@ -2844,6 +3052,8 @@ static void test_inward_page_union(void) {
 static void test_allocation(void) {
     test_allocation_profiles();
     test_tracker_reconciliation_and_peaks();
+    test_tracker_replay_owned();
+    test_tracker_replay_owned_rejections();
     test_tracker_tombstone_reuse();
     test_tracker_relations();
     test_tracker_rejections();

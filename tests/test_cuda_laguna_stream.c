@@ -237,6 +237,20 @@ static void *creator_race_run(void *opaque) {
     return NULL;
 }
 
+static void *direct_creator_run(void *opaque) {
+    creator_race *creator = opaque;
+    creator->created = ds4_gpu_laguna_compact_create(
+        &creator->context,
+        creator->model_fd,
+        creator->model_map,
+        creator->model_size,
+        creator->model_identity,
+        creator->ledger,
+        creator->plan,
+        &creator->runtime->tracker);
+    return NULL;
+}
+
 static void fixture_tensor(
         ledger_fixture *fixture,
         size_t index,
@@ -580,6 +594,41 @@ static int open_fd_count(void) {
     return count;
 }
 
+static bool proc_maps_has_readable_split_cover(
+        const void *base,
+        size_t bytes,
+        unsigned *entry_count) {
+    if (entry_count) *entry_count = 0;
+    const uintptr_t range_start = (uintptr_t)base;
+    if (!base || bytes == 0 || bytes > UINTPTR_MAX - range_start) {
+        return false;
+    }
+    const unsigned long long range_end =
+        (unsigned long long)(range_start + bytes);
+    unsigned long long cursor = (unsigned long long)range_start;
+    unsigned readable_entries = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return false;
+
+    char line[512];
+    while (cursor < range_end && fgets(line, sizeof(line), maps)) {
+        unsigned long long map_start = 0;
+        unsigned long long map_end = 0;
+        char permissions[5] = {0};
+        if (sscanf(line, "%llx-%llx %4s",
+                   &map_start, &map_end, permissions) != 3) {
+            continue;
+        }
+        if (map_end <= cursor) continue;
+        if (map_start > cursor || permissions[0] != 'r') break;
+        readable_entries++;
+        cursor = map_end < range_end ? map_end : range_end;
+    }
+    fclose(maps);
+    if (entry_count) *entry_count = readable_entries;
+    return cursor == range_end && readable_entries >= 2;
+}
+
 static bool compact_snapshot_equal_except_sync_lifecycle(
         ds4_gpu_laguna_compact_test_snapshot a,
         ds4_gpu_laguna_compact_test_snapshot b) {
@@ -807,6 +856,11 @@ static void exercise_invalid_model_sources(void) {
     CHECK(map_a != MAP_FAILED && map_b != MAP_FAILED,
           "distinct source-validation file mappings open");
     if (map_a != MAP_FAILED && map_b != MAP_FAILED) {
+        ds4_laguna_file_identity mtime_mismatch = identity_a;
+        mtime_mismatch.mtime_ns ^= UINT64_C(1);
+        expect_invalid_model_source_before_allocation(
+            fd_a, map_a, model_size, &mtime_mismatch, &ledger, &plan,
+            "mtime-only expected identity mismatch rejects the exact source");
         expect_invalid_model_source_before_allocation(
             fd_a, map_b, model_size, &identity_a, &ledger, &plan,
             "fd A with mmap B is rejected before CUDA allocation");
@@ -865,6 +919,67 @@ static void exercise_invalid_model_sources(void) {
                 "adjacent VMAs from mixed inodes reject the model mapping");
         }
         munmap(mixed, (size_t)model_size);
+    }
+
+    unsigned char *split = mmap(
+        NULL, (size_t)model_size, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(split != MAP_FAILED,
+          "same-inode split-VMA address range reserves");
+    if (split != MAP_FAILED) {
+        void *first = mmap(split, (size_t)page, PROT_READ,
+                           MAP_SHARED | MAP_FIXED, fd_a, 0);
+        void *rest = mmap(split + page, (size_t)(model_size - page),
+                          PROT_READ, MAP_PRIVATE | MAP_FIXED, fd_a,
+                          (off_t)page);
+        const bool split_mapped =
+            first == split && rest == split + page;
+        CHECK(split_mapped,
+              "same-inode exact-offset mappings occupy one contiguous range");
+        unsigned readable_entries = 0;
+        const bool split_covered = split_mapped &&
+            proc_maps_has_readable_split_cover(
+                split, (size_t)model_size, &readable_entries);
+        CHECK(split_covered && readable_entries >= 2,
+              "/proc/self/maps confirms two readable VMAs cover the exact range");
+        if (split_covered) {
+            tracker_fixture split_runtime;
+            const bool tracker_ready =
+                tracker_fixture_init(&split_runtime, &plan, &ledger);
+            CHECK(tracker_ready,
+                  "same-inode split-VMA tracker initializes");
+            if (tracker_ready) {
+                const uint64_t attempts_before =
+                    ds4_gpu_test_laguna_compact_static_allocation_attempts();
+                ds4_gpu_laguna_compact *split_context = NULL;
+                const int created = ds4_gpu_laguna_compact_create(
+                    &split_context, fd_a, split, model_size,
+                    &identity_a, &ledger, &plan, &split_runtime.tracker);
+                CHECK(created && split_context != NULL,
+                      "same-inode contiguous split VMAs form a valid source");
+                CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+                          attempts_before + 1u,
+                      "split-VMA source performs exactly one slab allocation");
+                ds4_gpu_laguna_compact_test_snapshot split_snapshot;
+                memset(&split_snapshot, 0, sizeof(split_snapshot));
+                CHECK(split_context &&
+                          ds4_gpu_test_laguna_compact_snapshot(
+                              split_context, &split_snapshot) &&
+                          split_snapshot.model_map == split &&
+                          split_snapshot.model_size == model_size &&
+                          identities_equal(
+                              &split_snapshot.model_identity, &identity_a),
+                      "split-VMA context binds the supplied map and identity");
+                CHECK(ds4_gpu_laguna_compact_destroy(split_context) ==
+                          DS4_GPU_LAGUNA_DESTROY_OK,
+                      "split-VMA context reports typed teardown success");
+                CHECK(tracker_has_only_ledger(&split_runtime.tracker),
+                      "split-VMA teardown restores ledger-only tracking");
+                CHECK(tracker_fixture_release_ledger(&split_runtime),
+                      "split-VMA ledger records release before unmap");
+            }
+        }
+        munmap(split, (size_t)model_size);
     }
 
     unsigned char *gap = mmap(
@@ -1067,11 +1182,142 @@ static int run_startup(void) {
         }
     }
 
+    tracker_fixture creating_runtime;
+    ds4_runtime_snapshot creating_tracker_baseline;
+    ds4_runtime_allocation_record
+        creating_records_baseline[TRACKER_RECORD_CAPACITY];
+    const bool creating_tracker_ready =
+        tracker_fixture_init(&creating_runtime, &plan, &ledger) &&
+        capture_tracker_snapshot(
+            &creating_runtime.tracker,
+            &creating_tracker_baseline,
+            creating_records_baseline);
+    CHECK(creating_tracker_ready,
+          "CREATING legacy-rejection tracker baseline captures");
+    creator_race creating_creator = {
+        .model_fd = fixture_fd,
+        .model_map = model_map,
+        .model_size = sizeof(model_bytes),
+        .model_identity = &model_identity,
+        .ledger = &ledger,
+        .plan = &plan,
+        .runtime = &creating_runtime,
+    };
+    pthread_t creating_thread;
+    bool creating_thread_started = false;
+    if (creating_tracker_ready) {
+        ds4_gpu_test_laguna_compact_pause_creating_once();
+        creating_thread_started = pthread_create(
+            &creating_thread, NULL,
+            direct_creator_run, &creating_creator) == 0;
+    }
+    CHECK(creating_thread_started,
+          "direct compact creator launches for a deterministic CREATING probe");
+    if (creating_thread_started) {
+        ds4_gpu_test_laguna_compact_wait_creating_paused();
+        int creating_probe_result = -1;
+        const bool copy_model_set =
+            setenv("DS4_CUDA_COPY_MODEL", "1", 1) == 0;
+        if (copy_model_set) {
+            creating_probe_result = ds4_gpu_set_model_map(
+                alias_map, sizeof(model_bytes));
+        }
+        unsetenv("DS4_CUDA_COPY_MODEL");
+        CHECK(copy_model_set && creating_probe_result == 0,
+              "CREATING rejects canonical legacy model placement");
+
+        ds4_runtime_snapshot creating_tracker_paused;
+        ds4_runtime_allocation_record
+            creating_records_paused[TRACKER_RECORD_CAPACITY];
+        CHECK(capture_tracker_snapshot(
+                  &creating_runtime.tracker,
+                  &creating_tracker_paused,
+                  creating_records_paused) &&
+                  tracker_snapshots_equal(
+                      &creating_tracker_baseline,
+                      creating_records_baseline,
+                      &creating_tracker_paused,
+                      creating_records_paused),
+              "CREATING rejection leaves its tracker byte-identical while paused");
+
+        ds4_gpu_test_laguna_compact_resume_creating();
+        const int creating_join_result =
+            pthread_join(creating_thread, NULL);
+        CHECK(creating_join_result == 0,
+              "paused direct compact creator resumes and joins");
+        CHECK(creating_creator.created && creating_creator.context != NULL,
+              "creator publishes after the CREATING rejection probe");
+
+        ds4_gpu_laguna_compact_test_snapshot creating_active;
+        memset(&creating_active, 0, sizeof(creating_active));
+        CHECK(creating_creator.context &&
+                  ds4_gpu_test_laguna_compact_snapshot(
+                      creating_creator.context, &creating_active) &&
+                  creating_active.lifecycle ==
+                      DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE &&
+                  creating_active.rejection_count == 1u &&
+                  creating_active.model_mapping_registered_bytes == 0 &&
+                  creating_active.whole_model_copied_bytes == 0 &&
+                  creating_active.routed_payload_bytes == 0 &&
+                  creating_active.opportunistic_range_allocated_bytes == 0 &&
+                  creating_active.legacy_model_range_count == 0 &&
+                  creating_active.legacy_model_arena_count == 0,
+              "CREATING publishes ACTIVE with one rejection and no legacy mutation");
+        CHECK(ds4_gpu_laguna_compact_destroy(creating_creator.context) ==
+                  DS4_GPU_LAGUNA_DESTROY_OK,
+              "CREATING probe context reports typed teardown success");
+        CHECK(tracker_has_only_ledger(&creating_runtime.tracker),
+              "CREATING probe teardown restores ledger-only tracking");
+    }
+    if (creating_tracker_ready) {
+        CHECK(tracker_fixture_release_ledger(&creating_runtime),
+              "CREATING probe ledger records release");
+    }
+    if (!creating_thread_started) goto cleanup_map;
+
     ds4_gpu_set_ssd_streaming(true);
 
     CHECK(setenv("DS4_CUDA_NO_MODEL_COPY", "1", 1) == 0 &&
               setenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE", "1", 1) == 0,
           "harmless disabling and verbose CUDA knobs can be injected");
+
+    tracker_fixture unwind_runtime;
+    const bool unwind_tracker_ready =
+        tracker_fixture_init(&unwind_runtime, &plan, &ledger);
+    CHECK(unwind_tracker_ready,
+          "late pre-publication unwind tracker initializes");
+    if (unwind_tracker_ready) {
+        const int unwind_fds_before = open_fd_count();
+        const uint64_t unwind_attempts_before =
+            ds4_gpu_test_laguna_compact_static_allocation_attempts();
+        ds4_gpu_laguna_compact *unwind_context = NULL;
+        ds4_gpu_test_laguna_compact_fail_before_publish_once();
+        const int unwind_created = ds4_gpu_laguna_compact_create(
+            &unwind_context, fd, model_map, sizeof(model_bytes),
+            &model_identity, &ledger, &plan, &unwind_runtime.tracker);
+        CHECK(!unwind_created && unwind_context == NULL,
+              "late pre-publication failure returns no compact context");
+        CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+                  unwind_attempts_before + 1u,
+              "late pre-publication failure follows one slab allocation");
+        CHECK(unwind_fds_before >= 0 &&
+                  open_fd_count() == unwind_fds_before,
+              "successful late unwind restores the descriptor baseline");
+        CHECK(tracker_has_only_ledger(&unwind_runtime.tracker),
+              "successful late unwind restores ledger-only tracking");
+        ds4_gpu_laguna_compact_test_snapshot unwind_nonidle;
+        memset(&unwind_nonidle, 0, sizeof(unwind_nonidle));
+        CHECK(!ds4_gpu_test_laguna_compact_nonidle_snapshot(&unwind_nonidle),
+              "successful late unwind restores singleton IDLE");
+        if (unwind_context) {
+            CHECK(ds4_gpu_laguna_compact_destroy(unwind_context) ==
+                      DS4_GPU_LAGUNA_DESTROY_OK,
+                  "unexpected late-unwind context is contained");
+        }
+        CHECK(tracker_fixture_release_ledger(&unwind_runtime),
+              "late-unwind ledger records release");
+    }
+
     tracker_fixture runtime;
     CHECK(tracker_fixture_init(&runtime, &plan, &ledger),
           "startup runtime tracker initializes");
@@ -1081,7 +1327,7 @@ static int run_startup(void) {
               &context, fd, model_map, sizeof(model_bytes),
               &model_identity, &ledger, &plan, &runtime.tracker) &&
               context != NULL,
-          "compact context attaches the synthetic model");
+          "singleton is reusable after late unwind and attaches the model");
     CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
               attempts_before_create + 1u,
           "startup performs exactly one static CUDA slab allocation");
@@ -1643,6 +1889,26 @@ static int run_startup(void) {
                   &runtime_after_recoverable,
                   records_after_recoverable),
           "recoverable sync failure preserves tracker records byte-for-byte");
+
+    int destroying_probe_result = -1;
+    const bool destroying_copy_model_set =
+        setenv("DS4_CUDA_COPY_MODEL", "1", 1) == 0;
+    if (destroying_copy_model_set) {
+        destroying_probe_result = ds4_gpu_set_model_map(
+            alias_map, sizeof(model_bytes));
+    }
+    unsetenv("DS4_CUDA_COPY_MODEL");
+    CHECK(destroying_copy_model_set && destroying_probe_result == 0,
+          "DESTROYING rejects canonical legacy model placement");
+    expect_only_compact_rejection(
+        context,
+        &after_recoverable,
+        after_recoverable.rejection_count + 1u,
+        &runtime.tracker,
+        &runtime_after_recoverable,
+        records_after_recoverable,
+        "DESTROYING placement increments exactly one rejection");
+
     memset(owned_probe, 0, sizeof(owned_probe));
     CHECK(owned_fd >= 0 &&
               pread(owned_fd, owned_probe, sizeof(owned_probe), 0) ==
@@ -1830,6 +2096,238 @@ cleanup_gpu:
 cleanup:
     restore_forbidden_environment(&saved);
     return result;
+}
+
+static int run_create_unwind_unsafe(void) {
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    char path[] = "/tmp/ds4-cuda-laguna-create-unsafe.XXXXXX";
+    int fd = -1;
+    unsigned char *model_map = MAP_FAILED;
+    unsigned char *alias_map = MAP_FAILED;
+    ds4_laguna_ledger ledger;
+    ds4_laguna_allocation_plan plan;
+    tracker_fixture runtime;
+    ds4_laguna_file_identity identity;
+    ds4_gpu_laguna_compact *context = NULL;
+    memset(&ledger, 0, sizeof(ledger));
+    memset(&plan, 0, sizeof(plan));
+    memset(&runtime, 0, sizeof(runtime));
+    memset(&identity, 0, sizeof(identity));
+
+    int device_count = 0;
+    CHECK(cudaGetDeviceCount(&device_count) == cudaSuccess && device_count >= 1,
+          "unsafe create-unwind test has one visible CUDA device");
+    const bool gpu_ready = device_count >= 1 && ds4_gpu_init() != 0;
+    CHECK(gpu_ready, "unsafe create-unwind initializes CUDA");
+    fd = create_pattern_file(path, FIXTURE_MODEL_BYTES, 11u);
+    const bool source_ready =
+        fd >= 0 && capture_file_identity(fd, &identity);
+    CHECK(source_ready,
+          "unsafe create-unwind opens an identity-bearing synthetic model");
+    if (fd >= 0) {
+        model_map = mmap(NULL, FIXTURE_MODEL_BYTES, PROT_READ,
+                         MAP_SHARED, fd, 0);
+        alias_map = mmap(NULL, FIXTURE_MODEL_BYTES, PROT_READ,
+                         MAP_SHARED, fd, 0);
+    }
+    const bool maps_ready =
+        model_map != MAP_FAILED && alias_map != MAP_FAILED;
+    CHECK(maps_ready,
+          "unsafe create-unwind opens exact and alias mappings");
+    const bool ledger_ready = ledger_fixture_build(&ledger);
+    CHECK(ledger_ready,
+          "unsafe create-unwind synthetic ledger builds");
+    if (ledger_ready) plan_prepare(&plan, &ledger);
+    const bool tracker_ready = ledger_ready &&
+        tracker_fixture_init(&runtime, &plan, &ledger);
+    CHECK(tracker_ready,
+          "unsafe create-unwind runtime tracker initializes");
+    const bool fixture_ready =
+        gpu_ready && source_ready && maps_ready && tracker_ready;
+
+    const int fd_baseline = open_fd_count();
+    const uint64_t attempts_before =
+        ds4_gpu_test_laguna_compact_static_allocation_attempts();
+    int created = 0;
+    if (fixture_ready) {
+        ds4_gpu_test_laguna_compact_fail_before_publish_once();
+        ds4_gpu_test_laguna_compact_fail_release_once();
+        created = ds4_gpu_laguna_compact_create(
+            &context, fd, model_map, FIXTURE_MODEL_BYTES,
+            &identity, &ledger, &plan, &runtime.tracker);
+    }
+    CHECK(fixture_ready && !created && context == NULL,
+          "failed unsafe pre-publication unwind returns no context");
+    CHECK(fixture_ready &&
+              ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+                  attempts_before + 1u,
+          "unsafe pre-publication unwind follows one slab allocation");
+
+    ds4_gpu_laguna_compact_test_snapshot retained;
+    memset(&retained, 0, sizeof(retained));
+    const bool retained_captured = fixture_ready &&
+        ds4_gpu_test_laguna_compact_nonidle_snapshot(&retained);
+    CHECK(retained_captured &&
+              retained.lifecycle != DS4_GPU_LAGUNA_LIFECYCLE_IDLE &&
+              retained.lifecycle != DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE,
+          "unsafe create unwind latches a fail-closed transitional state");
+    CHECK(retained_captured &&
+              retained.model_map == model_map &&
+              retained.model_size == FIXTURE_MODEL_BYTES &&
+              identities_equal(&retained.model_identity, &identity) &&
+              retained.model_fd_live && retained.static_slab_live &&
+              retained.static_offsets_live &&
+              retained.tracker_mapping_live &&
+              retained.tracker_static_live &&
+              retained.tracker_offsets_live,
+          "unsafe create unwind retains all six exact owners");
+
+    unsigned char expected[32];
+    unsigned char retained_probe[32] = {0};
+    for (size_t i = 0; i < sizeof(expected); i++) {
+        expected[i] = (unsigned char)((i * 37u + 11u) & 0xffu);
+    }
+    ds4_laguna_file_identity retained_identity;
+    memset(&retained_identity, 0, sizeof(retained_identity));
+    const int retained_fd_flags = retained_captured && retained.model_fd >= 0
+        ? fcntl(retained.model_fd, F_GETFD) : -1;
+    CHECK(retained_captured && retained.model_fd >= 0 &&
+              retained.model_fd != fd && retained_fd_flags >= 0 &&
+              (retained_fd_flags & FD_CLOEXEC) != 0 &&
+              pread(retained.model_fd,
+                    retained_probe, sizeof(retained_probe), 0) ==
+                  (ssize_t)sizeof(retained_probe) &&
+              memcmp(retained_probe, expected, sizeof(expected)) == 0 &&
+              capture_file_identity(retained.model_fd, &retained_identity) &&
+              identities_equal(&retained_identity, &identity),
+          "unsafe create unwind retains a distinct CLOEXEC exact model fd");
+    CHECK(fd_baseline >= 0 && open_fd_count() == fd_baseline + 1,
+          "unsafe create unwind retains exactly one owned descriptor");
+
+    ds4_runtime_snapshot retained_tracker;
+    ds4_runtime_allocation_record
+        retained_records[TRACKER_RECORD_CAPACITY];
+    const bool retained_tracker_captured = tracker_ready &&
+        capture_tracker_snapshot(
+            &runtime.tracker, &retained_tracker, retained_records);
+    bool six_live_records = retained_tracker_captured &&
+        retained_tracker.violation == DS4_RUNTIME_VIOLATION_NONE &&
+        retained_tracker.active_record_count == 6;
+    size_t ledger_records = 0;
+    size_t static_records = 0;
+    size_t offset_records = 0;
+    size_t mapping_records = 0;
+    if (six_live_records) {
+        for (size_t i = 0; i < retained_tracker.active_record_count; i++) {
+            const ds4_runtime_allocation_record *record =
+                &retained_records[i];
+            if (!record->live) {
+                six_live_records = false;
+            } else if (record->relation ==
+                       DS4_RUNTIME_RELATION_MODEL_MAPPING) {
+                mapping_records++;
+            } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) {
+                ledger_records++;
+            } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_STATIC_SLAB) {
+                static_records++;
+            } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_STATIC_OFFSETS) {
+                offset_records++;
+            }
+        }
+    }
+    CHECK(six_live_records && ledger_records == 3 &&
+              static_records == 1 && offset_records == 1 &&
+              mapping_records == 1,
+          "unsafe create unwind retains all six exact tracker records");
+
+    const uint64_t attempts_after_unwind =
+        ds4_gpu_test_laguna_compact_static_allocation_attempts();
+    const int operation_fds_before = open_fd_count();
+    tracker_fixture second_runtime;
+    const bool second_tracker_ready = ledger_ready &&
+        tracker_fixture_init(&second_runtime, &plan, &ledger);
+    CHECK(second_tracker_ready,
+          "poisoned-singleton refusal tracker initializes");
+    ds4_gpu_laguna_compact *second_context = NULL;
+    const int second_created = fixture_ready && second_tracker_ready
+        ? ds4_gpu_laguna_compact_create(
+              &second_context, fd, model_map, FIXTURE_MODEL_BYTES,
+              &identity, &ledger, &plan, &second_runtime.tracker)
+        : 0;
+    CHECK(fixture_ready && second_tracker_ready &&
+              !second_created && second_context == NULL,
+          "poisoned singleton rejects a second compact creator");
+    CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+              attempts_after_unwind &&
+              (!second_tracker_ready ||
+               tracker_has_only_ledger(&second_runtime.tracker)),
+          "second creator rejection performs no allocation or tracking mutation");
+
+    ds4_gpu_laguna_compact_test_snapshot after_second_create;
+    memset(&after_second_create, 0, sizeof(after_second_create));
+    const bool after_second_captured =
+        ds4_gpu_test_laguna_compact_nonidle_snapshot(&after_second_create);
+    CHECK(retained_captured && after_second_captured &&
+              memcmp(&retained, &after_second_create,
+                     sizeof(retained)) == 0,
+          "second creator rejection mutates no retained owner or counter");
+    if (!retained_captured && second_context) {
+        CHECK(ds4_gpu_laguna_compact_destroy(second_context) ==
+                  DS4_GPU_LAGUNA_DESTROY_OK,
+              "unexpected current-behavior second context is contained");
+        second_context = NULL;
+    }
+
+    int placement_result = -1;
+    const bool placement_copy_model_set = fixture_ready &&
+        setenv("DS4_CUDA_COPY_MODEL", "1", 1) == 0;
+    if (placement_copy_model_set) {
+        placement_result = ds4_gpu_set_model_map(
+            alias_map, FIXTURE_MODEL_BYTES);
+    }
+    unsetenv("DS4_CUDA_COPY_MODEL");
+    CHECK(placement_copy_model_set && placement_result == 0,
+          "poisoned singleton rejects canonical legacy model placement");
+    ds4_gpu_laguna_compact_test_snapshot after_placement;
+    memset(&after_placement, 0, sizeof(after_placement));
+    const bool after_placement_captured =
+        ds4_gpu_test_laguna_compact_nonidle_snapshot(&after_placement);
+    CHECK(retained_captured && after_placement_captured &&
+              after_placement.rejection_count ==
+                  retained.rejection_count + 1u,
+          "poisoned singleton records exactly one legacy rejection");
+    if (retained_captured && after_placement_captured) {
+        ds4_gpu_laguna_compact_test_snapshot normalized = after_placement;
+        normalized.rejection_count = retained.rejection_count;
+        CHECK(memcmp(&normalized, &retained, sizeof(normalized)) == 0,
+              "poisoned legacy rejection mutates no owner, data, or release state");
+    }
+
+    ds4_runtime_snapshot final_tracker;
+    ds4_runtime_allocation_record final_records[TRACKER_RECORD_CAPACITY];
+    CHECK(retained_tracker_captured &&
+              capture_tracker_snapshot(
+                  &runtime.tracker, &final_tracker, final_records) &&
+              tracker_snapshots_equal(
+                  &retained_tracker, retained_records,
+                  &final_tracker, final_records),
+          "poisoned creator and placement rejections leave tracking byte-identical");
+    CHECK(ds4_gpu_test_laguna_compact_static_allocation_attempts() ==
+              attempts_after_unwind,
+          "poisoned creator and placement perform no new static allocation");
+    CHECK(operation_fds_before >= 0 &&
+              open_fd_count() == operation_fds_before,
+          "poisoned creator and placement leak no descriptors");
+
+    /* Deliberately retain the poisoned singleton, mappings, descriptors,
+     * ledger, and trackers until this isolated process exits. */
+    unlink(path);
+    restore_forbidden_environment(&saved);
+    return g_failures == 0 ? 0 : 1;
 }
 
 static int run_teardown_unsafe(void) {
@@ -2145,7 +2643,8 @@ static int run_model_teardown_unsafe(void) {
 static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --case "
-            "startup|teardown-unsafe|model-startup|model-teardown-unsafe\n",
+            "startup|create-unwind-unsafe|teardown-unsafe|"
+            "model-startup|model-teardown-unsafe\n",
             program);
 }
 
@@ -2158,6 +2657,8 @@ int main(int argc, char **argv) {
     int rc = 2;
     if (strcmp(argv[2], "startup") == 0) {
         rc = run_startup();
+    } else if (strcmp(argv[2], "create-unwind-unsafe") == 0) {
+        rc = run_create_unwind_unsafe();
     } else if (strcmp(argv[2], "teardown-unsafe") == 0) {
         rc = run_teardown_unsafe();
     } else if (strcmp(argv[2], "model-startup") == 0) {

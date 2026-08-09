@@ -469,6 +469,13 @@ typedef struct {
     uint64_t model_warm_entries;
 } ds4_test_laguna_compact_bypass_snapshot;
 
+typedef struct {
+    int destroy_result;
+    bool engine_retained;
+    uint64_t gpu_cleanup_before;
+    uint64_t gpu_cleanup_after;
+} ds4_test_laguna_compact_close_observation;
+
 typedef void (*ds4_test_thread_sync_fn)(void *context);
 
 int ds4_test_logits_only_sync_mode(
@@ -528,6 +535,8 @@ int ds4_test_engine_exact_cache_preflight(
         size_t errcap);
 bool ds4_test_laguna_compact_bypass_snapshot_get(
         ds4_test_laguna_compact_bypass_snapshot *out);
+bool ds4_test_laguna_compact_close_observation_get(
+        ds4_test_laguna_compact_close_observation *out);
 int ds4_test_session_limit_lifecycle(
         bool exact_cache,
         bool graph_backend,

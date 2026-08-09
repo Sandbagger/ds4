@@ -58399,6 +58399,13 @@ bool ds4_test_laguna_compact_bypass_snapshot_get(
     return true;
 }
 
+bool ds4_test_laguna_compact_close_observation_get(
+        ds4_test_laguna_compact_close_observation *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    return true;
+}
+
 bool ds4_test_laguna_file_identity_capture(
         int fd,
         uint64_t *device,
@@ -60220,6 +60227,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->model.fd,
                     e->model.map,
                     e->model.size,
+                    &e->model.identity,
                     &e->laguna_ledger,
                     &e->laguna_allocation_plan,
                     &e->laguna_runtime_tracker)) {

@@ -74,6 +74,7 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+#include "ds4_laguna_plan.h"
 #include "ds4_laguna_stream.h"
 #include "ds4_iq2_tables_cuda.inc"
 
@@ -418,10 +419,37 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 typedef struct ds4_gpu_laguna_compact ds4_gpu_laguna_compact;
 
+typedef enum {
+    DS4_GPU_LAGUNA_DESTROY_OK = 0,
+    DS4_GPU_LAGUNA_DESTROY_RECOVERABLE = 1,
+    DS4_GPU_LAGUNA_DESTROY_UNSAFE = 2,
+} ds4_gpu_laguna_destroy_status;
+
+typedef enum {
+    DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
+    DS4_GPU_LAGUNA_LIFECYCLE_CREATING = 1,
+    DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE = 2,
+    DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING = 3,
+    DS4_GPU_LAGUNA_LIFECYCLE_RELEASING = 4,
+} ds4_gpu_laguna_lifecycle;
+
 typedef struct {
+    ds4_gpu_laguna_lifecycle lifecycle;
     int model_fd;
     const void *model_map;
     uint64_t model_size;
+    ds4_laguna_file_identity model_identity;
+    void *static_slab;
+    uint64_t *static_offsets;
+    bool model_fd_live;
+    bool static_slab_live;
+    bool static_offsets_live;
+    bool tracker_mapping_live;
+    bool tracker_static_live;
+    bool tracker_offsets_live;
+    uint64_t sync_attempt_count;
+    uint64_t release_attempt_count;
+    uint64_t rejection_count;
     uint64_t static_slab_bytes;
     uint64_t static_source_copied_bytes;
     uint64_t static_range_count;
@@ -439,6 +467,7 @@ struct ds4_gpu_laguna_compact {
     int model_fd;
     const void *model_map;
     uint64_t model_size;
+    ds4_laguna_file_identity model_identity;
     const ds4_laguna_ledger *ledger;
     const ds4_laguna_allocation_plan *plan;
     ds4_runtime_tracker *tracker;
@@ -457,6 +486,9 @@ struct ds4_gpu_laguna_compact {
     uint64_t legacy_range_bytes_base;
     uint64_t legacy_range_attempts_base;
     uint64_t legacy_arena_attempts_base;
+    uint64_t sync_attempt_count;
+    uint64_t release_attempt_count;
+    uint64_t rejection_count;
     int tracker_mapping_live;
     int tracker_static_live;
     int tracker_offsets_live;
@@ -468,6 +500,7 @@ enum {
     DS4_LAGUNA_COMPACT_CREATING = 1,
     DS4_LAGUNA_COMPACT_ACTIVE = 2,
     DS4_LAGUNA_COMPACT_DESTROYING = 3,
+    DS4_LAGUNA_COMPACT_RELEASING = 4,
 };
 static std::atomic<int> g_laguna_compact_state{DS4_LAGUNA_COMPACT_IDLE};
 static std::mutex g_laguna_compact_mutex;
@@ -479,7 +512,7 @@ static std::atomic<uint64_t> g_laguna_compact_legacy_whole_model_copy_bytes;
 static std::atomic<uint64_t> g_laguna_compact_legacy_range_bytes;
 static std::atomic<uint64_t> g_laguna_compact_legacy_range_attempts;
 static std::atomic<uint64_t> g_laguna_compact_legacy_arena_attempts;
-static std::atomic<int> g_laguna_compact_test_fail_destroy_once;
+static std::atomic<uint64_t> g_laguna_compact_generic_cleanup_attempts;
 
 static const char *const g_laguna_compact_forbidden_env[] = {
     "DS4_CUDA_COPY_MODEL",
@@ -912,6 +945,7 @@ extern "C" int ds4_gpu_laguna_compact_create(
         int model_fd,
         const void *model_map,
         uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
         const ds4_laguna_ledger *ledger,
         const ds4_laguna_allocation_plan *plan,
         ds4_runtime_tracker *tracker) {
@@ -952,6 +986,7 @@ extern "C" int ds4_gpu_laguna_compact_create(
     ctx->model_fd = model_fd;
     ctx->model_map = model_map;
     ctx->model_size = model_size;
+    if (model_identity) ctx->model_identity = *model_identity;
     ctx->ledger = ledger;
     ctx->plan = plan;
     ctx->tracker = tracker;
@@ -1058,10 +1093,7 @@ static int cuda_laguna_compact_destroy_checked(
     }
     g_laguna_compact_state.store(
         DS4_LAGUNA_COMPACT_DESTROYING, std::memory_order_release);
-    if (g_laguna_compact_test_fail_destroy_once.exchange(
-            0, std::memory_order_relaxed) != 0) {
-        return 0;
-    }
+    ctx->sync_attempt_count++;
     const cudaError_t sync_error = cudaDeviceSynchronize();
     if (sync_error != cudaSuccess) {
         fprintf(stderr,
@@ -1070,6 +1102,7 @@ static int cuda_laguna_compact_destroy_checked(
         (void)cudaGetLastError();
         return 0;
     }
+    ctx->release_attempt_count++;
     if (!cuda_laguna_compact_release_locked(ctx)) return 0;
     memset(ctx, 0, sizeof(*ctx));
     g_laguna_compact_state.store(
@@ -1077,30 +1110,40 @@ static int cuda_laguna_compact_destroy_checked(
     return 1;
 }
 
-extern "C" void ds4_gpu_laguna_compact_destroy(
+extern "C" ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
         ds4_gpu_laguna_compact *ctx) {
-    (void)cuda_laguna_compact_destroy_checked(ctx);
+    return cuda_laguna_compact_destroy_checked(ctx)
+        ? DS4_GPU_LAGUNA_DESTROY_OK
+        : DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
 }
 
-extern "C" void ds4_gpu_test_laguna_compact_fail_destroy_once(void) {
-    g_laguna_compact_test_fail_destroy_once.store(
-        1, std::memory_order_relaxed);
-}
+extern "C" void ds4_gpu_test_laguna_compact_fail_sync_once(void) {}
 
-extern "C" int ds4_gpu_test_laguna_compact_snapshot(
+extern "C" void ds4_gpu_test_laguna_compact_fail_release_once(void) {}
+
+/* g_laguna_compact_mutex must be held and state must be non-IDLE. */
+static int cuda_laguna_compact_snapshot_locked(
         const ds4_gpu_laguna_compact *ctx,
-        ds4_gpu_laguna_compact_test_snapshot *out) {
-    if (out) memset(out, 0, sizeof(*out));
-    if (!ctx || !out) return 0;
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
-    if (ctx != &g_laguna_compact_storage ||
-        g_laguna_compact_state.load(std::memory_order_relaxed) !=
-            DS4_LAGUNA_COMPACT_ACTIVE) {
-        return 0;
-    }
+        ds4_gpu_laguna_compact_test_snapshot *out,
+        int state) {
+    if (ctx != &g_laguna_compact_storage || !out ||
+        state == DS4_LAGUNA_COMPACT_IDLE) return 0;
+    out->lifecycle = (ds4_gpu_laguna_lifecycle)state;
     out->model_fd = ctx->model_fd;
     out->model_map = ctx->model_map;
     out->model_size = ctx->model_size;
+    out->model_identity = ctx->model_identity;
+    out->static_slab = ctx->static_slab;
+    out->static_offsets = ctx->static_offsets;
+    out->model_fd_live = ctx->model_fd >= 0;
+    out->static_slab_live = ctx->static_slab != NULL;
+    out->static_offsets_live = ctx->static_offsets != NULL;
+    out->tracker_mapping_live = ctx->tracker_mapping_live != 0;
+    out->tracker_static_live = ctx->tracker_static_live != 0;
+    out->tracker_offsets_live = ctx->tracker_offsets_live != 0;
+    out->sync_attempt_count = ctx->sync_attempt_count;
+    out->release_attempt_count = ctx->release_attempt_count;
+    out->rejection_count = ctx->rejection_count;
     out->static_slab_bytes = ctx->static_slab_bytes;
     out->static_source_copied_bytes = ctx->static_source_copied_bytes;
     out->static_range_count = ctx->static_range_count;
@@ -1130,15 +1173,37 @@ extern "C" int ds4_gpu_test_laguna_compact_snapshot(
     return 1;
 }
 
+extern "C" int ds4_gpu_test_laguna_compact_snapshot(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_laguna_compact_test_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !out) return 0;
+    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    return cuda_laguna_compact_snapshot_locked(ctx, out, state);
+}
+
 extern "C" int ds4_gpu_test_laguna_compact_active_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out) {
-    return ds4_gpu_test_laguna_compact_snapshot(
-        &g_laguna_compact_storage, out);
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return 0;
+    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state != DS4_LAGUNA_COMPACT_ACTIVE) return 0;
+    return cuda_laguna_compact_snapshot_locked(
+        &g_laguna_compact_storage, out, state);
 }
 
 extern "C" uint64_t
 ds4_gpu_test_laguna_compact_static_allocation_attempts(void) {
     return g_laguna_compact_static_allocation_attempts.load(
+        std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ds4_gpu_test_generic_cleanup_attempts(void) {
+    return g_laguna_compact_generic_cleanup_attempts.load(
         std::memory_order_relaxed);
 }
 
@@ -3025,6 +3090,8 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    g_laguna_compact_generic_cleanup_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
     const int compact_cleanup_required =
         g_laguna_compact_state.load(std::memory_order_acquire) !=
             DS4_LAGUNA_COMPACT_IDLE;

@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "ds4_laguna_stream.h"
+#include "ds4_laguna_plan.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,21 +104,50 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
  * records the existing file mapping without registering it, owns the exact
  * ledger-approved static CUDA slab, and resolves compact weights strictly. */
 typedef struct ds4_gpu_laguna_compact ds4_gpu_laguna_compact;
+typedef enum {
+    DS4_GPU_LAGUNA_DESTROY_OK = 0,
+    DS4_GPU_LAGUNA_DESTROY_RECOVERABLE = 1,
+    DS4_GPU_LAGUNA_DESTROY_UNSAFE = 2,
+} ds4_gpu_laguna_destroy_status;
+
 int ds4_gpu_laguna_compact_create(
         ds4_gpu_laguna_compact **out,
         int model_fd,
         const void *model_map,
         uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
         const ds4_laguna_ledger *ledger,
         const ds4_laguna_allocation_plan *plan,
         ds4_runtime_tracker *tracker);
-void ds4_gpu_laguna_compact_destroy(ds4_gpu_laguna_compact *ctx);
+ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
+        ds4_gpu_laguna_compact *ctx);
 
 #ifdef DS4_TEST_HOOKS
+typedef enum {
+    DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
+    DS4_GPU_LAGUNA_LIFECYCLE_CREATING = 1,
+    DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE = 2,
+    DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING = 3,
+    DS4_GPU_LAGUNA_LIFECYCLE_RELEASING = 4,
+} ds4_gpu_laguna_lifecycle;
+
 typedef struct {
+    ds4_gpu_laguna_lifecycle lifecycle;
     int model_fd;
     const void *model_map;
     uint64_t model_size;
+    ds4_laguna_file_identity model_identity;
+    void *static_slab;
+    uint64_t *static_offsets;
+    bool model_fd_live;
+    bool static_slab_live;
+    bool static_offsets_live;
+    bool tracker_mapping_live;
+    bool tracker_static_live;
+    bool tracker_offsets_live;
+    uint64_t sync_attempt_count;
+    uint64_t release_attempt_count;
+    uint64_t rejection_count;
     uint64_t static_slab_bytes;
     uint64_t static_source_copied_bytes;
     uint64_t static_range_count;
@@ -138,7 +167,9 @@ int ds4_gpu_test_laguna_compact_snapshot(
 int ds4_gpu_test_laguna_compact_active_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out);
 uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);
-void ds4_gpu_test_laguna_compact_fail_destroy_once(void);
+uint64_t ds4_gpu_test_generic_cleanup_attempts(void);
+void ds4_gpu_test_laguna_compact_fail_sync_once(void);
+void ds4_gpu_test_laguna_compact_fail_release_once(void);
 int ds4_gpu_test_laguna_compact_lookup(
         const ds4_gpu_laguna_compact *ctx,
         uint64_t source_offset,

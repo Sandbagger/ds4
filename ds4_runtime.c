@@ -400,6 +400,38 @@ ds4_runtime_status ds4_runtime_tracker_allocate(
     return status(tracker);
 }
 
+ds4_runtime_status ds4_runtime_tracker_replay_owned(
+        ds4_runtime_tracker *tracker,
+        const ds4_runtime_owned_descriptor *owners,
+        size_t owner_count,
+        bool *owner_live) {
+    if (owner_count != 0 && (!owners || !owner_live)) {
+        return DS4_RUNTIME_STATUS_UNSAFE;
+    }
+    for (size_t i = 0; i < owner_count; i++) owner_live[i] = false;
+    if (!tracker) return DS4_RUNTIME_STATUS_UNSAFE;
+
+    for (size_t i = 0; i < owner_count; i++) {
+        const bool allocation_id_already_known =
+            find_record(tracker, owners[i].allocation_id) != NULL;
+        const ds4_runtime_status result = ds4_runtime_tracker_allocate(
+            tracker,
+            owners[i].allocation_id,
+            owners[i].callsite_id,
+            owners[i].base,
+            owners[i].requested_bytes,
+            owners[i].charged_bytes);
+        const ds4_runtime_allocation_record *record =
+            find_record(tracker, owners[i].allocation_id);
+        if (!allocation_id_already_known && record && record->live &&
+            record->relation == DS4_RUNTIME_RELATION_OWNED_ALLOCATION) {
+            owner_live[i] = true;
+        }
+        if (result != DS4_RUNTIME_STATUS_OK) return result;
+    }
+    return DS4_RUNTIME_STATUS_OK;
+}
+
 static bool has_live_relation(const ds4_runtime_tracker *tracker,
                               uint64_t owner_id) {
     for (size_t i = 0; i < tracker->record_count; i++) {

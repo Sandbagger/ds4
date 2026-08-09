@@ -2621,6 +2621,17 @@ static void test_tracker_replay_owned_rejections(void) {
     replay_tracker_fixture f;
 
     CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "missing-owner replay tracker initializes");
+    bool missing_owners_live[2] = {true, true};
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, NULL, 2u, missing_owners_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              !missing_owners_live[0] && !missing_owners_live[1] &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_NONE &&
+              f.tracker.record_count == 0,
+          "owned replay clears valid outputs before missing-owner rejection");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
           "unknown-callsite replay tracker initializes");
     ds4_runtime_owned_descriptor unknown = owners[0];
     unknown.callsite_id = UINT32_MAX;
@@ -2631,6 +2642,35 @@ static void test_tracker_replay_owned_rejections(void) {
               f.tracker.violation == DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE &&
               !unknown_live && f.tracker.record_count == 0,
           "owned replay rejects an unknown callsite before commit");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "unclassified-callsite replay tracker initializes");
+    f.callsites[0].category =
+        (ds4_runtime_category)DS4_RUNTIME_OWNED_CATEGORY_COUNT;
+    bool unclassified_live = false;
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, owners, 1u, &unclassified_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation ==
+                  DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE &&
+              unclassified_live && f.tracker.record_count == 1u &&
+              f.records[0].live,
+          "owned replay reports an unclassified committed owner as live");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "overflow replay tracker initializes");
+    ds4_runtime_owned_descriptor overflowing = owners[0];
+    overflowing.base = UINT64_MAX;
+    overflowing.requested_bytes = 1u;
+    overflowing.charged_bytes = 1u;
+    bool overflow_live = true;
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, &overflowing, 1u, &overflow_live) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation ==
+                  DS4_RUNTIME_VIOLATION_ADDRESS_OVERFLOW &&
+              !overflow_live && f.tracker.record_count == 0,
+          "owned replay delegates address-overflow rejection before commit");
 
     CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
           "overlap replay tracker initializes");
@@ -2696,6 +2736,20 @@ static void test_tracker_replay_owned_rejections(void) {
               total_live && f.tracker.record_count == 1u &&
               f.records[0].live,
           "owned replay reports a committed total-bound violation as live");
+
+    CHECK(replay_tracker_fixture_init(&f, REPLAY_OWNER_COUNT),
+          "latched-status replay tracker initializes");
+    CHECK(ds4_runtime_tracker_allocate(
+              &f.tracker, owners[0].allocation_id, UINT32_MAX,
+              owners[0].base, owners[0].requested_bytes,
+              owners[0].charged_bytes) == DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE,
+          "zero-owner replay fixture latches an existing violation");
+    CHECK(ds4_runtime_tracker_replay_owned(
+              &f.tracker, NULL, 0, NULL) == DS4_RUNTIME_STATUS_UNSAFE &&
+              f.tracker.violation == DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE &&
+              f.tracker.record_count == 0,
+          "zero-owner replay returns and preserves existing tracker status");
 }
 
 static void test_tracker_tombstone_reuse(void) {

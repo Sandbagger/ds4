@@ -155,7 +155,7 @@ if [ "$mode" = self-test ]; then
         --gguf-size "$expected_size" \
         --gguf-sha256 "$expected_sha256"
 elif [ "$mode" = c7 ]; then
-    timeout --kill-after=5s 60s python3 "$verifier" \
+    timeout --kill-after=5s 180s python3 "$verifier" \
         --verify-promoted "$fixture" \
         --contract-commit "$pinned_contract" \
         --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \

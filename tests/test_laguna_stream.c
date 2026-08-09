@@ -2119,6 +2119,13 @@ static uint64_t sum_u64(const uint64_t *values, size_t count) {
 
 static void test_allocation_profiles(void) {
     const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    const uint64_t tensor_range_count = UINT64_C(814);
+    const uint64_t source_range_count = tensor_range_count * 2u + 5u;
+    const uint64_t expert_entry_count = UINT64_C(12032);
+    const uint64_t ledger_array_bytes =
+        tensor_range_count * sizeof(ds4_laguna_tensor_range) +
+        source_range_count * sizeof(ds4_laguna_source_range) +
+        expert_entry_count * sizeof(ds4_laguna_expert_entry);
     const uint64_t cache_bytes[] = { 8u * gib, 12u * gib, 16u * gib };
     const uint32_t slot_counts[] = { 1618u, 2427u, 3236u };
     const uint64_t payload_bytes[] = {
@@ -2132,14 +2139,14 @@ static void test_allocation_profiles(void) {
         UINT64_C(1835008),
     };
     const uint64_t metadata_bytes[] = {
-        UINT64_C(1663624),
-        UINT64_C(1689512),
-        UINT64_C(1715400),
+        UINT64_C(1670136),
+        UINT64_C(1696024),
+        UINT64_C(1721912),
     };
     const uint64_t qualification_non_cache[] = {
-        UINT64_C(14062675600),
-        UINT64_C(14062701488),
-        UINT64_C(14062727376),
+        UINT64_C(14062682112),
+        UINT64_C(14062708000),
+        UINT64_C(14062733888),
     };
     const uint64_t profile_bounds[] = {
         UINT64_C(25769803776),
@@ -2149,11 +2156,11 @@ static void test_allocation_profiles(void) {
     ds4_laguna_ledger ledger;
     memset(&ledger, 0, sizeof(ledger));
     ledger.file_size = UINT64_C(68248759648);
-    ledger.tensor_count = UINT64_C(814);
+    ledger.tensor_count = tensor_range_count;
     ledger.static_parent_count = UINT64_C(673);
     ledger.routed_parent_count = UINT64_C(141);
     ledger.static_aligned_device_bytes = UINT64_C(4374164480);
-    ledger.expert_entry_count = UINT64_C(12032);
+    ledger.expert_entry_count = expert_entry_count;
     ledger.slot_stride_bytes = UINT64_C(5308416);
 
     for (size_t i = 0; i < sizeof(cache_bytes) / sizeof(cache_bytes[0]); i++) {
@@ -2241,6 +2248,7 @@ static void test_allocation_profiles(void) {
         size_t other_host_callsites = 0;
         size_t other_cuda_callsites = 0;
         bool static_offsets_are_host = false;
+        const ds4_runtime_callsite *ledger_arrays = NULL;
         CHECK(plan.callsite_count == DS4_LAGUNA_ALLOCATION_CALLSITE_COUNT,
               "allocation plan exposes the complete stable callsite registry");
         for (size_t j = 0; j < plan.callsite_count; j++) {
@@ -2258,11 +2266,17 @@ static void test_allocation_profiles(void) {
                 site->domain == DS4_RUNTIME_DOMAIN_HOST) {
                 static_offsets_are_host = true;
             }
+            if (site->id == DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) {
+                ledger_arrays = site;
+            }
         }
         CHECK(other_host_callsites == 7u && other_cuda_callsites == 4u,
               "other envelopes decompose into explicit stable allocation callsites");
         CHECK(static_offsets_are_host,
               "static offset metadata is attributed to its host physical domain");
+        CHECK(ledger_arrays &&
+                  ledger_arrays->bound_bytes == ledger_array_bytes,
+              "ledger callsite bound follows the live runtime array layout");
         for (size_t j = 0; j < DS4_RUNTIME_OWNED_CATEGORY_COUNT; j++) {
             CHECK(callsite_sum[j] == plan.owned_category_bounds[j],
                   "callsite bounds reconcile exactly to their owned category");

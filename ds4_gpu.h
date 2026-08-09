@@ -170,6 +170,12 @@ uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);
 uint64_t ds4_gpu_test_generic_cleanup_attempts(void);
 void ds4_gpu_test_laguna_compact_fail_sync_once(void);
 void ds4_gpu_test_laguna_compact_fail_release_once(void);
+void ds4_gpu_test_laguna_compact_pause_creating_once(void);
+void ds4_gpu_test_laguna_compact_wait_creating_paused(void);
+void ds4_gpu_test_laguna_compact_resume_creating(void);
+void ds4_gpu_test_laguna_compact_fail_before_publish_once(void);
+int ds4_gpu_test_laguna_compact_nonidle_snapshot(
+        ds4_gpu_laguna_compact_test_snapshot *out);
 int ds4_gpu_test_laguna_compact_lookup(
         const ds4_gpu_laguna_compact *ctx,
         uint64_t source_offset,

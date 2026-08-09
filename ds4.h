@@ -470,7 +470,9 @@ typedef struct {
 } ds4_test_laguna_compact_bypass_snapshot;
 
 typedef struct {
+    int first_destroy_result;
     int destroy_result;
+    uint64_t destroy_attempt_count;
     bool engine_retained;
     uint64_t gpu_cleanup_before;
     uint64_t gpu_cleanup_after;

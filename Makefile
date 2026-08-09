@@ -436,7 +436,10 @@ test-cuda-laguna-model: tests/test_cuda_laguna_model
 tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o ds4_cuda.o ds4_layer_pack.o
+tests/ds4_cuda_laguna_stream_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
+	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_cuda.cu
+
+tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_stream_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-stream: tests/test_cuda_laguna_stream

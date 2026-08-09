@@ -51,7 +51,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-resident dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-resident test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -451,6 +451,11 @@ test-cuda-laguna-resident: tests/test_cuda_laguna_kernels tests/test_cuda_laguna
 	tests/run_cuda_laguna_gate.sh resident
 test-cuda-laguna-resident: export DS4_TEST_MODEL := $(DS4_TEST_MODEL)
 test-cuda-laguna-resident: export LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(LAGUNA_TOKENIZER_RUNTIME_COMMIT)
+
+test-cuda-laguna-c7: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_stream
+	tests/run_cuda_laguna_gate.sh c7
+test-cuda-laguna-c7: export DS4_TEST_MODEL := $(DS4_TEST_MODEL)
+test-cuda-laguna-c7: export LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(LAGUNA_TOKENIZER_RUNTIME_COMMIT)
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

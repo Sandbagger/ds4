@@ -52,7 +52,7 @@ except ContractError as exc:
 }
 
 if [ "$#" -ne 1 ]; then
-    die "usage: tests/run_cuda_laguna_gate.sh resident|self-test"
+    die "usage: tests/run_cuda_laguna_gate.sh resident|c7|self-test"
 fi
 
 mode=$1
@@ -78,6 +78,36 @@ case "$mode" in
         model_child="$repo_root/tests/test_cuda_laguna_model"
         [ -x "$kernel_child" ] || die "missing executable: $kernel_child"
         [ -x "$model_child" ] || die "missing executable: $model_child"
+        ;;
+    c7)
+        if [ "${DS4_LAGUNA_GATE_TEST_CHILD_DIR+present}" = present ]; then
+            die "DS4_LAGUNA_GATE_TEST_CHILD_DIR is forbidden in c7 mode"
+        fi
+        if [ "${DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE+present}" = present ]; then
+            die "DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE is forbidden in c7 mode"
+        fi
+        if [ "${DS4_LAGUNA_GATE_TEST_EXPECTED_SHA256+present}" = present ]; then
+            die "DS4_LAGUNA_GATE_TEST_EXPECTED_SHA256 is forbidden in c7 mode"
+        fi
+        [ -n "${DS4_TEST_MODEL:-}" ] || die "DS4_TEST_MODEL is required"
+        if [ "$DS4_TEST_MODEL" = ds4flash.gguf ]; then
+            die "DS4_TEST_MODEL must be an explicit path, not ds4flash.gguf"
+        fi
+        [ -f "$DS4_TEST_MODEL" ] || die "DS4_TEST_MODEL is not a regular file: $DS4_TEST_MODEL"
+        [ -n "${LAGUNA_TOKENIZER_RUNTIME_COMMIT:-}" ] || \
+            die "LAGUNA_TOKENIZER_RUNTIME_COMMIT is required"
+        if [[ ! $LAGUNA_TOKENIZER_RUNTIME_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+            die "LAGUNA_TOKENIZER_RUNTIME_COMMIT must be 40 lowercase hexadecimal characters"
+        fi
+        model=$DS4_TEST_MODEL
+        expected_size=$pinned_size
+        expected_sha256=$pinned_sha256
+        kernel_child="$repo_root/tests/test_cuda_laguna_kernels"
+        model_child="$repo_root/tests/test_cuda_laguna_model"
+        stream_child="$repo_root/tests/test_cuda_laguna_stream"
+        [ -x "$kernel_child" ] || die "missing executable: $kernel_child"
+        [ -x "$model_child" ] || die "missing executable: $model_child"
+        [ -x "$stream_child" ] || die "missing executable: $stream_child"
         ;;
     self-test)
         require_present DS4_LAGUNA_GATE_TEST_CHILD_DIR \
@@ -140,5 +170,19 @@ assert_retained_identity kernels
 
 "$model_child"
 assert_retained_identity model
+
+if [ "$mode" = c7 ]; then
+    "$stream_child" --case startup
+    assert_retained_identity stream-startup
+
+    "$stream_child" --case teardown-unsafe
+    assert_retained_identity stream-teardown-unsafe
+
+    "$stream_child" --case model-startup
+    assert_retained_identity stream-model-startup
+
+    "$stream_child" --case model-teardown-unsafe
+    assert_retained_identity stream-model-teardown-unsafe
+fi
 
 hash_retained_fd

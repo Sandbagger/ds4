@@ -771,7 +771,20 @@ static bool g_ds4_test_laguna_last_close_snapshot_valid;
 
 static bool ds4_laguna_close_snapshot_is_clean(
         const ds4_runtime_snapshot *snapshot) {
-    return snapshot && snapshot->active_record_count == 0;
+    if (!snapshot ||
+        snapshot->active_record_count != 0 ||
+        snapshot->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        snapshot->owned_total_current != 0 ||
+        snapshot->qualification_total_current != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        if (snapshot->category_current[i] != 0) return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (snapshot->report_current[i] != 0) return false;
+    }
+    return true;
 }
 #endif
 
@@ -61375,6 +61388,18 @@ void ds4_engine_close(ds4_engine *e) {
             return;
         }
         e->laguna_compact = NULL;
+        if (!ds4_engine_laguna_compact_ownership_released(e)) {
+            fprintf(stderr,
+                    "ds4: compact Laguna teardown ownership did not "
+                    "reconcile; retaining engine until restart\n");
+#ifdef DS4_TEST_HOOKS
+            g_ds4_test_laguna_compact_close_observation.engine_retained =
+                true;
+            g_ds4_test_laguna_compact_close_observation.gpu_cleanup_after =
+                ds4_gpu_test_generic_cleanup_attempts();
+#endif
+            return;
+        }
     } else if (e->laguna_compact_create_attempted &&
                (ds4_gpu_laguna_compact_ownership_pending(
                     &e->laguna_runtime_tracker) ||

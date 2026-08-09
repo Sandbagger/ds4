@@ -688,7 +688,7 @@ static int cuda_laguna_compact_tracker_has_baseline(
         const ds4_laguna_ledger *ledger,
         uint64_t ledger_array_bytes,
         size_t expected_live_count,
-        int require_pristine_records,
+        int require_create_capacity,
         size_t *live_count_out) {
     if (!tracker || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
         !tracker->callsites || tracker->callsite_count == 0 ||
@@ -701,10 +701,9 @@ static int cuda_laguna_compact_tracker_has_baseline(
     }
     if ((live_count != 3 && live_count != 9) ||
         (expected_live_count != 0 && live_count != expected_live_count) ||
-        (require_pristine_records && tracker->record_count != live_count) ||
-        (require_pristine_records &&
-         (tracker->record_capacity < tracker->record_count ||
-          tracker->record_capacity - tracker->record_count < 3))) {
+        live_count > tracker->record_capacity ||
+        (require_create_capacity &&
+         tracker->record_capacity - live_count < 3)) {
         return 0;
     }
 

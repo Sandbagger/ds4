@@ -26,7 +26,7 @@ require_present() {
 
 fd_identity() {
     python3 -c \
-        'import os; s = os.fstat(9); print(f"{s.st_dev}:{s.st_ino}:{s.st_size}:{s.st_mtime_ns}")'
+        'import os; s = os.fstat(9); o = os.lseek(9, 0, os.SEEK_CUR); print(f"{s.st_dev}:{s.st_ino}:{s.st_size}:{s.st_mtime_ns}:{o}")'
 }
 
 assert_retained_identity() {

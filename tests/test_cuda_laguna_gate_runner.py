@@ -756,7 +756,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 environment,
                 runner=staged_runner,
                 cwd=temporary_root,
-                outer_timeout=2.0,
+                outer_timeout=5.0,
             )
 
             self.assertEqual(completed.returncode, 124, completed.stderr)
@@ -789,6 +789,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 "the runner must invoke the hanging case through timeout",
             )
             timeout_record = selected[0]
+            self.assertEqual(timeout_record["duration"], "60s")
             self.assertEqual(
                 Path(timeout_record["command"][0]).name,
                 "test_cuda_laguna_stream",

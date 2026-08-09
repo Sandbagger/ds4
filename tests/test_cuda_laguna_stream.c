@@ -2692,6 +2692,7 @@ static int run_model_startup(void) {
     memset(&compact, 0, sizeof(compact));
     CHECK(engine && ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "pinned engine owns one active compact attachment");
+    const int owned_model_fd = compact.model_fd;
     CHECK(compact.model_map != NULL && compact.model_size != 0 &&
               compact.static_offset_count == 814 &&
               compact.static_offset_bytes == 6512 &&
@@ -2728,6 +2729,14 @@ static int run_model_startup(void) {
               observation.gpu_cleanup_after == cleanup_before + 1u &&
               ds4_gpu_test_generic_cleanup_attempts() == cleanup_before + 1u,
           "engine retries one RECOVERABLE close and cleans up after terminal OK");
+    ds4_gpu_laguna_compact_test_snapshot nonidle;
+    memset(&nonidle, 0, sizeof(nonidle));
+    CHECK(!ds4_gpu_test_laguna_compact_nonidle_snapshot(&nonidle),
+          "terminal OK leaves no non-IDLE compact residue");
+    errno = 0;
+    CHECK(owned_model_fd >= 0 &&
+              fcntl(owned_model_fd, F_GETFD) == -1 && errno == EBADF,
+          "terminal OK closes the compact-owned model descriptor");
     CHECK(!ds4_gpu_test_laguna_compact_active_snapshot(&compact),
           "pinned engine teardown destroys compact attachment");
     restore_forbidden_environment(&saved);
@@ -2860,6 +2869,32 @@ static int run_model_teardown_second_recoverable(void) {
     CHECK(active_captured &&
               active.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE,
           "pinned second-RECOVERABLE engine starts ACTIVE");
+    uint64_t offsets_before[814] = {0};
+    unsigned char payload_before[32] = {0};
+    uint64_t payload_offset = UINT64_MAX;
+    bool allocation_before_ready = active_captured &&
+        active.static_offsets && active.static_slab &&
+        active.static_offset_bytes == sizeof(offsets_before);
+    if (allocation_before_ready) {
+        memcpy(offsets_before,
+               active.static_offsets, sizeof(offsets_before));
+        for (size_t i = 0; i < 814; i++) {
+            if (offsets_before[i] != UINT64_MAX &&
+                offsets_before[i] <= active.static_slab_bytes &&
+                active.static_slab_bytes - offsets_before[i] >=
+                    sizeof(payload_before)) {
+                payload_offset = offsets_before[i];
+                break;
+            }
+        }
+        allocation_before_ready = payload_offset != UINT64_MAX &&
+            cudaMemcpy(payload_before,
+                       (const char *)active.static_slab + payload_offset,
+                       sizeof(payload_before),
+                       cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    CHECK(allocation_before_ready,
+          "second-RECOVERABLE engine captures exact live allocation bytes");
     const uint64_t cleanup_before =
         ds4_gpu_test_generic_cleanup_attempts();
     ds4_gpu_test_laguna_compact_fail_sync_once();
@@ -2892,8 +2927,32 @@ static int run_model_teardown_second_recoverable(void) {
               retained.tracker_static_live &&
               retained.tracker_offsets_live &&
               retained.sync_attempt_count == active.sync_attempt_count + 2u &&
-              retained.release_attempt_count == active.release_attempt_count,
+              retained.release_attempt_count == active.release_attempt_count &&
+              compact_snapshot_equal_except_sync_lifecycle(active, retained),
           "second RECOVERABLE close retains exact DESTROYING ownership");
+    uint64_t offsets_after[814] = {0};
+    unsigned char payload_after[32] = {0};
+    bool allocation_after_ready = retained_captured &&
+        retained.static_offsets && retained.static_slab &&
+        retained.static_offset_bytes == sizeof(offsets_after) &&
+        payload_offset != UINT64_MAX &&
+        payload_offset <= retained.static_slab_bytes &&
+        retained.static_slab_bytes - payload_offset >= sizeof(payload_after);
+    if (allocation_after_ready) {
+        memcpy(offsets_after,
+               retained.static_offsets, sizeof(offsets_after));
+        allocation_after_ready =
+            cudaMemcpy(payload_after,
+                       (const char *)retained.static_slab + payload_offset,
+                       sizeof(payload_after),
+                       cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    CHECK(allocation_before_ready && allocation_after_ready &&
+              memcmp(offsets_before,
+                     offsets_after, sizeof(offsets_before)) == 0 &&
+              memcmp(payload_before,
+                     payload_after, sizeof(payload_before)) == 0,
+          "second RECOVERABLE close preserves exact offset and payload bytes");
     unsigned char retained_probe[32] = {0};
     ds4_laguna_file_identity retained_identity;
     memset(&retained_identity, 0, sizeof(retained_identity));

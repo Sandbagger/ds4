@@ -764,6 +764,8 @@ static pthread_mutex_t g_ds4_qualification_plan_mutex =
 static bool g_ds4_test_force_qualification_shape_failure;
 static ds4_test_laguna_compact_bypass_snapshot
     g_ds4_test_laguna_compact_bypass;
+static ds4_test_laguna_compact_close_observation
+    g_ds4_test_laguna_compact_close_observation;
 #endif
 
 typedef enum {
@@ -58402,7 +58404,7 @@ bool ds4_test_laguna_compact_bypass_snapshot_get(
 bool ds4_test_laguna_compact_close_observation_get(
         ds4_test_laguna_compact_close_observation *out) {
     if (!out) return false;
-    memset(out, 0, sizeof(*out));
+    *out = g_ds4_test_laguna_compact_close_observation;
     return true;
 }
 
@@ -60952,8 +60954,72 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#ifndef DS4_NO_GPU
-    bool gpu_cleanup_complete = false;
+#ifdef DS4_TEST_HOOKS
+    memset(&g_ds4_test_laguna_compact_close_observation, 0,
+           sizeof(g_ds4_test_laguna_compact_close_observation));
+#endif
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+#ifdef DS4_TEST_HOOKS
+    if (e->laguna_compact_create_attempted) {
+        g_ds4_test_laguna_compact_close_observation.gpu_cleanup_before =
+            ds4_gpu_test_generic_cleanup_attempts();
+    }
+#endif
+    if (e->laguna_compact) {
+        ds4_gpu_laguna_destroy_status destroy_status =
+            ds4_gpu_laguna_compact_destroy(e->laguna_compact);
+#ifdef DS4_TEST_HOOKS
+        const ds4_gpu_laguna_destroy_status first_destroy_status =
+            destroy_status;
+#endif
+        uint64_t destroy_attempt_count = 1;
+        if (destroy_status == DS4_GPU_LAGUNA_DESTROY_RECOVERABLE) {
+            destroy_status =
+                ds4_gpu_laguna_compact_destroy(e->laguna_compact);
+            destroy_attempt_count++;
+        }
+#ifdef DS4_TEST_HOOKS
+        g_ds4_test_laguna_compact_close_observation.first_destroy_result =
+            (int)first_destroy_status;
+        g_ds4_test_laguna_compact_close_observation.destroy_result =
+            (int)destroy_status;
+        g_ds4_test_laguna_compact_close_observation.destroy_attempt_count =
+            destroy_attempt_count;
+#endif
+        if (destroy_status != DS4_GPU_LAGUNA_DESTROY_OK) {
+            fprintf(stderr,
+                    "ds4: compact Laguna teardown is %s after %llu "
+                    "attempt%s; retaining engine owners until restart\n",
+                    destroy_status == DS4_GPU_LAGUNA_DESTROY_UNSAFE ?
+                        "unsafe" : "still recoverable",
+                    (unsigned long long)destroy_attempt_count,
+                    destroy_attempt_count == 1 ? "" : "s");
+#ifdef DS4_TEST_HOOKS
+            g_ds4_test_laguna_compact_close_observation.engine_retained =
+                true;
+            g_ds4_test_laguna_compact_close_observation.gpu_cleanup_after =
+                ds4_gpu_test_generic_cleanup_attempts();
+#endif
+            return;
+        }
+        e->laguna_compact = NULL;
+    } else if (e->laguna_compact_create_attempted &&
+               !ds4_engine_laguna_compact_ownership_released(e)) {
+        fprintf(stderr,
+                "ds4: compact Laguna creation retained unpublished owners; "
+                "retaining engine until restart\n");
+#ifdef DS4_TEST_HOOKS
+        g_ds4_test_laguna_compact_close_observation.first_destroy_result =
+            DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+        g_ds4_test_laguna_compact_close_observation.destroy_result =
+            DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+        g_ds4_test_laguna_compact_close_observation.engine_retained = true;
+        g_ds4_test_laguna_compact_close_observation.gpu_cleanup_after =
+            ds4_gpu_test_generic_cleanup_attempts();
+#endif
+        return;
+    }
 #endif
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
@@ -60977,25 +61043,6 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
-#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
-    !defined(DS4_ROCM_BUILD)
-    if (e->laguna_compact) {
-        ds4_gpu_laguna_compact_destroy(e->laguna_compact);
-    }
-    if (e->laguna_compact_create_attempted &&
-        !ds4_engine_laguna_compact_ownership_released(e)) {
-        ds4_gpu_cleanup();
-        gpu_cleanup_complete = true;
-    }
-    if (e->laguna_compact_create_attempted &&
-        !ds4_engine_laguna_compact_ownership_released(e)) {
-        fprintf(stderr,
-                "ds4: compact Laguna teardown remains unreconciled after "
-                "cleanup retry; retaining engine owners until restart\n");
-        return;
-    }
-    e->laguna_compact = NULL;
-#endif
     ds4_laguna_ledger_free(&e->laguna_ledger);
     if (e->laguna_runtime_tracker_ready) {
         for (size_t i = 0; i < 3; i++) {
@@ -61016,7 +61063,16 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_model.map) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
-    if (!gpu_cleanup_complete) ds4_gpu_cleanup();
+    ds4_gpu_cleanup();
+#endif
+#ifdef DS4_TEST_HOOKS
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+    if (e->laguna_compact_create_attempted) {
+        g_ds4_test_laguna_compact_close_observation.gpu_cleanup_after =
+            ds4_gpu_test_generic_cleanup_attempts();
+    }
+#endif
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();

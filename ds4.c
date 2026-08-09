@@ -768,6 +768,11 @@ static ds4_test_laguna_compact_close_observation
     g_ds4_test_laguna_compact_close_observation;
 static ds4_runtime_snapshot g_ds4_test_laguna_last_close_snapshot;
 static bool g_ds4_test_laguna_last_close_snapshot_valid;
+
+static bool ds4_laguna_close_snapshot_is_clean(
+        const ds4_runtime_snapshot *snapshot) {
+    return snapshot && snapshot->active_record_count == 0;
+}
 #endif
 
 typedef enum {
@@ -58452,6 +58457,23 @@ bool ds4_test_laguna_last_close_snapshot(
     return true;
 }
 
+bool ds4_test_laguna_close_snapshot_is_clean(
+        const ds4_runtime_snapshot *snapshot) {
+    return ds4_laguna_close_snapshot_is_clean(snapshot);
+}
+
+bool ds4_test_engine_laguna_inventory_live_flag_clear(
+        ds4_engine *engine,
+        size_t index) {
+    if (!engine || !engine->laguna_runtime_tracker_ready ||
+        index >= DS4_LAGUNA_INVENTORY_RECORD_COUNT ||
+        !engine->laguna_inventory_records_live[index]) {
+        return false;
+    }
+    engine->laguna_inventory_records_live[index] = false;
+    return true;
+}
+
 static bool ds4_test_laguna_live_owner_set(
         ds4_test_laguna_live_owner *owner,
         const void *base,
@@ -61442,7 +61464,8 @@ void ds4_engine_close(ds4_engine *e) {
         ds4_runtime_tracker_snapshot_copy(
             &e->laguna_runtime_tracker,
             &g_ds4_test_laguna_last_close_snapshot, NULL, 0) &&
-        g_ds4_test_laguna_last_close_snapshot.active_record_count == 0) {
+        ds4_laguna_close_snapshot_is_clean(
+            &g_ds4_test_laguna_last_close_snapshot)) {
         g_ds4_test_laguna_last_close_snapshot_valid = true;
     }
 #endif

@@ -31,6 +31,10 @@ using engine_runtime_snapshot_fn = bool (*)(
     size_t,
     size_t *);
 using last_close_snapshot_fn = bool (*)(ds4_runtime_snapshot *);
+using close_snapshot_is_clean_fn = bool (*)(
+    const ds4_runtime_snapshot *);
+using engine_inventory_live_flag_clear_fn = bool (*)(
+    ds4_engine *, size_t);
 using engine_live_owners_fn = bool (*)(
     const ds4_engine *,
     ds4_test_laguna_live_owner *,
@@ -89,6 +93,14 @@ static_assert(std::is_same<
               decltype(&ds4_test_laguna_last_close_snapshot),
               last_close_snapshot_fn>::value,
               "last close runtime snapshot C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_test_laguna_close_snapshot_is_clean),
+              close_snapshot_is_clean_fn>::value,
+              "close snapshot predicate C ABI drifted");
+static_assert(std::is_same<
+              decltype(&ds4_test_engine_laguna_inventory_live_flag_clear),
+              engine_inventory_live_flag_clear_fn>::value,
+              "engine inventory corruption hook C ABI drifted");
 static_assert(std::is_same<
               decltype(&ds4_test_engine_laguna_live_owners),
               engine_live_owners_fn>::value,

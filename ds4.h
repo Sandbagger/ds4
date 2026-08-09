@@ -558,6 +558,11 @@ bool ds4_test_engine_laguna_runtime_snapshot(
         size_t *required);
 bool ds4_test_laguna_last_close_snapshot(
         ds4_runtime_snapshot *snapshot);
+bool ds4_test_laguna_close_snapshot_is_clean(
+        const ds4_runtime_snapshot *snapshot);
+bool ds4_test_engine_laguna_inventory_live_flag_clear(
+        ds4_engine *engine,
+        size_t index);
 bool ds4_test_engine_laguna_live_owners(
         const ds4_engine *engine,
         ds4_test_laguna_live_owner *owners,

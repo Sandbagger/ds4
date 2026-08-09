@@ -707,6 +707,139 @@ static bool capture_tracker_snapshot(
         tracker, snapshot, records, TRACKER_RECORD_CAPACITY);
 }
 
+static bool owned_record_matches(
+        const ds4_runtime_allocation_record *record,
+        uint64_t base,
+        uint64_t bytes,
+        uint32_t callsite_id,
+        ds4_runtime_category category,
+        ds4_runtime_physical_domain domain) {
+    return record && record->live && record->base == base &&
+        record->requested_bytes == bytes && record->charged_bytes == bytes &&
+        record->callsite_id == callsite_id &&
+        record->category == category && record->domain == domain &&
+        record->relation == DS4_RUNTIME_RELATION_OWNED_ALLOCATION &&
+        record->owner_id == 0;
+}
+
+static bool retained_tracker_matches_compact(
+        const tracker_fixture *fixture,
+        const ds4_laguna_ledger *ledger,
+        const ds4_gpu_laguna_compact_test_snapshot *compact,
+        const ds4_runtime_snapshot *runtime,
+        const ds4_runtime_allocation_record *records) {
+    if (!fixture || !ledger || !compact || !runtime || !records ||
+        runtime->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        runtime->active_record_count != 6 ||
+        compact->static_slab_bytes != 512 ||
+        compact->static_offset_bytes !=
+            FIXTURE_TENSOR_COUNT * sizeof(uint64_t) ||
+        compact->model_size != FIXTURE_MODEL_BYTES) {
+        return false;
+    }
+
+    const uint64_t source_capacity =
+        ledger->tensor_range_count * 2u + 5u;
+    const uint64_t ledger_bytes[3] = {
+        ledger->tensor_range_count * sizeof(ledger->tensor_ranges[0]),
+        source_capacity * sizeof(ledger->source_ranges[0]),
+        ledger->expert_entry_count * sizeof(ledger->expert_entries[0]),
+    };
+    const uint64_t ledger_bases[3] = {
+        (uint64_t)(uintptr_t)ledger->tensor_ranges,
+        (uint64_t)(uintptr_t)ledger->source_ranges,
+        (uint64_t)(uintptr_t)ledger->expert_entries,
+    };
+    bool ledger_seen[3] = {false, false, false};
+    bool static_seen = false;
+    bool offsets_seen = false;
+    bool mapping_seen = false;
+
+    for (size_t i = 0; i < runtime->active_record_count; i++) {
+        const ds4_runtime_allocation_record *record = &records[i];
+        bool matched = false;
+        for (size_t j = 0; j < ARRAY_LEN(ledger_seen); j++) {
+            if (record->id != fixture->ledger_ids[j]) continue;
+            if (ledger_seen[j] ||
+                !owned_record_matches(
+                    record, ledger_bases[j], ledger_bytes[j],
+                    DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+                    DS4_RUNTIME_DOMAIN_HOST)) {
+                return false;
+            }
+            ledger_seen[j] = true;
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+
+        if (record->relation == DS4_RUNTIME_RELATION_MODEL_MAPPING) {
+            if (mapping_seen || !record->live ||
+                record->base != (uint64_t)(uintptr_t)compact->model_map ||
+                record->requested_bytes != compact->model_size ||
+                record->charged_bytes != 0 ||
+                record->domain != DS4_RUNTIME_DOMAIN_HOST) {
+                return false;
+            }
+            mapping_seen = true;
+        } else if (record->callsite_id ==
+                   DS4_LAGUNA_CALLSITE_STATIC_SLAB) {
+            if (static_seen ||
+                !owned_record_matches(
+                    record,
+                    (uint64_t)(uintptr_t)compact->static_slab,
+                    512,
+                    DS4_LAGUNA_CALLSITE_STATIC_SLAB,
+                    DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS,
+                    DS4_RUNTIME_DOMAIN_CUDA_DEVICE)) {
+                return false;
+            }
+            static_seen = true;
+        } else if (record->callsite_id ==
+                   DS4_LAGUNA_CALLSITE_STATIC_OFFSETS) {
+            if (offsets_seen ||
+                !owned_record_matches(
+                    record,
+                    (uint64_t)(uintptr_t)compact->static_offsets,
+                    FIXTURE_TENSOR_COUNT * sizeof(uint64_t),
+                    DS4_LAGUNA_CALLSITE_STATIC_OFFSETS,
+                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+                    DS4_RUNTIME_DOMAIN_HOST)) {
+                return false;
+            }
+            offsets_seen = true;
+        } else {
+            return false;
+        }
+    }
+
+    if (!ledger_seen[0] || !ledger_seen[1] || !ledger_seen[2] ||
+        !static_seen || !offsets_seen || !mapping_seen) {
+        return false;
+    }
+    const uint64_t ledger_total =
+        ledger_bytes[0] + ledger_bytes[1] + ledger_bytes[2];
+    const uint64_t metadata_total =
+        ledger_total + FIXTURE_TENSOR_COUNT * sizeof(uint64_t);
+    const uint64_t owned_total = metadata_total + 512u;
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        const uint64_t expected =
+            i == DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS ? 512u :
+            i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ?
+                metadata_total : 0;
+        if (runtime->category_current[i] != expected) return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        const uint64_t expected =
+            i == DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ?
+                FIXTURE_MODEL_BYTES : 0;
+        if (runtime->report_current[i] != expected) return false;
+    }
+    return runtime->owned_total_current == owned_total &&
+        runtime->qualification_total_current == owned_total;
+}
+
 static void expect_only_compact_rejection(
         const ds4_gpu_laguna_compact *context,
         const ds4_gpu_laguna_compact_test_snapshot *baseline,
@@ -2180,8 +2313,36 @@ static int run_create_unwind_unsafe(void) {
               retained.static_offsets_live &&
               retained.tracker_mapping_live &&
               retained.tracker_static_live &&
-              retained.tracker_offsets_live,
+              retained.tracker_offsets_live &&
+              retained.static_slab_bytes == 512 &&
+              retained.static_source_copied_bytes ==
+                  ledger.static_source_bytes &&
+              retained.static_range_count == ledger.static_parent_count &&
+              retained.static_offset_count == FIXTURE_TENSOR_COUNT &&
+              retained.static_offset_bytes ==
+                  FIXTURE_TENSOR_COUNT * sizeof(uint64_t),
           "unsafe create unwind retains all six exact owners");
+
+    const uint64_t expected_offsets[FIXTURE_TENSOR_COUNT] = {
+        0, 256, UINT64_MAX, UINT64_MAX,
+        UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
+    };
+    compact_allocation_bytes retained_allocation;
+    bool retained_allocation_exact = retained_captured &&
+        capture_compact_allocation_bytes(
+            &retained, &ledger, &retained_allocation) &&
+        memcmp(retained_allocation.offsets,
+               expected_offsets, sizeof(expected_offsets)) == 0;
+    for (size_t i = 0; i < 2 && retained_allocation_exact; i++) {
+        const uint64_t bytes = ledger.tensor_ranges[i].source_bytes;
+        retained_allocation_exact =
+            bytes <= sizeof(retained_allocation.payloads[i]) &&
+            memcmp(retained_allocation.payloads[i],
+                   model_map + ledger.tensor_ranges[i].source_offset,
+                   (size_t)bytes) == 0;
+    }
+    CHECK(retained_allocation_exact,
+          "unsafe create unwind retains readable exact offsets and payload");
 
     unsigned char expected[32];
     unsigned char retained_probe[32] = {0};
@@ -2211,38 +2372,11 @@ static int run_create_unwind_unsafe(void) {
     const bool retained_tracker_captured = tracker_ready &&
         capture_tracker_snapshot(
             &runtime.tracker, &retained_tracker, retained_records);
-    bool six_live_records = retained_tracker_captured &&
-        retained_tracker.violation == DS4_RUNTIME_VIOLATION_NONE &&
-        retained_tracker.active_record_count == 6;
-    size_t ledger_records = 0;
-    size_t static_records = 0;
-    size_t offset_records = 0;
-    size_t mapping_records = 0;
-    if (six_live_records) {
-        for (size_t i = 0; i < retained_tracker.active_record_count; i++) {
-            const ds4_runtime_allocation_record *record =
-                &retained_records[i];
-            if (!record->live) {
-                six_live_records = false;
-            } else if (record->relation ==
-                       DS4_RUNTIME_RELATION_MODEL_MAPPING) {
-                mapping_records++;
-            } else if (record->callsite_id ==
-                       DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS) {
-                ledger_records++;
-            } else if (record->callsite_id ==
-                       DS4_LAGUNA_CALLSITE_STATIC_SLAB) {
-                static_records++;
-            } else if (record->callsite_id ==
-                       DS4_LAGUNA_CALLSITE_STATIC_OFFSETS) {
-                offset_records++;
-            }
-        }
-    }
-    CHECK(six_live_records && ledger_records == 3 &&
-              static_records == 1 && offset_records == 1 &&
-              mapping_records == 1,
-          "unsafe create unwind retains all six exact tracker records");
+    CHECK(retained_tracker_captured &&
+              retained_tracker_matches_compact(
+                  &runtime, &ledger, &retained,
+                  &retained_tracker, retained_records),
+          "unsafe create unwind retains six exact reconciled tracker records");
 
     const uint64_t attempts_after_unwind =
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
@@ -2327,7 +2461,20 @@ static int run_create_unwind_unsafe(void) {
      * ledger, and trackers until this isolated process exits. */
     unlink(path);
     restore_forbidden_environment(&saved);
-    return g_failures == 0 ? 0 : 1;
+    const int result = g_failures == 0 ? 0 : 1;
+    if (result == 0) {
+        fprintf(stderr,
+                "test_cuda_laguna_stream create-unwind-unsafe "
+                "PASS (%d assertions)\n",
+                g_assertions);
+    } else {
+        fprintf(stderr,
+                "test_cuda_laguna_stream create-unwind-unsafe "
+                "FAIL (%d/%d assertions)\n",
+                g_failures, g_assertions);
+    }
+    fflush(NULL);
+    _Exit(result);
 }
 
 static int run_teardown_unsafe(void) {

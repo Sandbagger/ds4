@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -101,6 +104,9 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
+static const void *g_support_host_base;
+static uint64_t g_support_host_size;
+static uint64_t g_support_offset_bias;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
@@ -506,7 +512,7 @@ enum {
     DS4_LAGUNA_COMPACT_RELEASING = 4,
 };
 static std::atomic<int> g_laguna_compact_state{DS4_LAGUNA_COMPACT_IDLE};
-static std::mutex g_laguna_compact_mutex;
+static std::recursive_mutex g_laguna_compact_mutex;
 static std::atomic<uint64_t> g_laguna_compact_static_allocation_attempts;
 static std::atomic<uint64_t> g_laguna_compact_next_tracker_id{
     UINT64_C(0x4d00000000000001)};
@@ -517,6 +523,8 @@ static std::atomic<uint64_t> g_laguna_compact_legacy_range_attempts;
 static std::atomic<uint64_t> g_laguna_compact_legacy_arena_attempts;
 static std::atomic<uint64_t> g_laguna_compact_generic_cleanup_attempts;
 #ifdef DS4_TEST_HOOKS
+static std::atomic<uint64_t> g_laguna_compact_fail_sync_count;
+static std::atomic<uint64_t> g_laguna_compact_fail_release_count;
 static std::mutex g_laguna_compact_creating_pause_mutex;
 static std::condition_variable g_laguna_compact_creating_pause_condition;
 static bool g_laguna_compact_creating_pause_armed;
@@ -558,21 +566,45 @@ static int cuda_laguna_compact_environment_allowed(void) {
     return 1;
 }
 
-/* Return 0 when legacy routing is allowed, 1 for this compact model, and -1
- * while compact lifecycle work is in flight.  The transitional states fail
- * every model lookup closed so a resolver can never fall into legacy mapping
- * while the singleton is being published or torn down. */
-static int cuda_laguna_compact_route_state(const void *model_map) {
+/* A legacy operation holds this permit until its last mutation.  Creation
+ * takes the same mutex before changing IDLE to CREATING, closing the
+ * check-then-mutate race rather than merely sampling the atomic state. */
+class cuda_laguna_compact_legacy_permit {
+public:
+    cuda_laguna_compact_legacy_permit()
+        : guard_(g_laguna_compact_mutex), allowed_(false) {
+        if (g_laguna_compact_state.load(std::memory_order_relaxed) ==
+                DS4_LAGUNA_COMPACT_IDLE) {
+            allowed_ = true;
+        } else {
+            g_laguna_compact_storage.rejection_count++;
+        }
+    }
+
+    bool allowed(void) const { return allowed_; }
+
+private:
+    std::unique_lock<std::recursive_mutex> guard_;
+    bool allowed_;
+};
+
+/* Return 0 when no compact context exists, 1 only for the exact ACTIVE
+ * mapping, and -1 for every other non-IDLE lookup.  Unlike the legacy
+ * permission predicate above, an exact ACTIVE mapping is the one allowed
+ * compact-resolution path. */
+static int cuda_laguna_compact_lookup_route(const void *model_map) {
     const int observed =
         g_laguna_compact_state.load(std::memory_order_acquire);
     if (observed == DS4_LAGUNA_COMPACT_IDLE) return 0;
-    if (observed != DS4_LAGUNA_COMPACT_ACTIVE) return -1;
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
-    if (g_laguna_compact_state.load(std::memory_order_relaxed) !=
-            DS4_LAGUNA_COMPACT_ACTIVE) {
-        return -1;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state == DS4_LAGUNA_COMPACT_ACTIVE &&
+        g_laguna_compact_storage.model_map == model_map) {
+        return 1;
     }
-    return g_laguna_compact_storage.model_map == model_map ? 1 : 0;
+    g_laguna_compact_storage.rejection_count++;
+    return -1;
 }
 
 /* g_laguna_compact_mutex must be held. */
@@ -725,28 +757,156 @@ static int cuda_laguna_compact_callsite_exact(
     return matches == 1;
 }
 
+static int cuda_laguna_compact_identity_matches(
+        int model_fd,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *expected,
+        struct stat *status_out) {
+    if (model_fd < 0 || model_size == 0 || !expected || !status_out) {
+        return 0;
+    }
+    struct stat status;
+    if (fstat(model_fd, &status) != 0 ||
+        !S_ISREG(status.st_mode) || status.st_size < 0) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    const time_t mtime_seconds = status.st_mtimespec.tv_sec;
+    const long mtime_nanoseconds = status.st_mtimespec.tv_nsec;
+#else
+    const time_t mtime_seconds = status.st_mtim.tv_sec;
+    const long mtime_nanoseconds = status.st_mtim.tv_nsec;
+#endif
+    if (mtime_seconds < 0 || mtime_nanoseconds < 0 ||
+        mtime_nanoseconds >= 1000000000L) {
+        return 0;
+    }
+    const uintmax_t seconds = (uintmax_t)mtime_seconds;
+    const uint64_t nanoseconds = (uint64_t)mtime_nanoseconds;
+    if (seconds >
+            (UINT64_MAX - nanoseconds) / UINT64_C(1000000000)) {
+        return 0;
+    }
+    const uintmax_t device = (uintmax_t)status.st_dev;
+    const uintmax_t inode = (uintmax_t)status.st_ino;
+    const uintmax_t size_bytes = (uintmax_t)status.st_size;
+    if (device > UINT64_MAX || inode > UINT64_MAX ||
+        size_bytes > UINT64_MAX ||
+        (uint64_t)size_bytes != model_size ||
+        expected->device != (uint64_t)device ||
+        expected->inode != (uint64_t)inode ||
+        expected->size_bytes != (uint64_t)size_bytes ||
+        expected->mtime_ns !=
+            (uint64_t)seconds * UINT64_C(1000000000) + nanoseconds) {
+        return 0;
+    }
+    *status_out = status;
+    return 1;
+}
+
+static int cuda_laguna_compact_mapping_matches(
+        const void *model_map,
+        uint64_t model_size,
+        const struct stat *model_status) {
+#if !defined(__linux__)
+    (void)model_map;
+    (void)model_size;
+    (void)model_status;
+    return 0;
+#else
+    if (!model_map || model_size == 0 || !model_status ||
+        model_size > UINTPTR_MAX - (uintptr_t)model_map) {
+        return 0;
+    }
+    const uint64_t range_start = (uint64_t)(uintptr_t)model_map;
+    const uint64_t range_end = range_start + model_size;
+    uint64_t cursor = range_start;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    int valid = 1;
+    char line[1024];
+    while (cursor < range_end && fgets(line, sizeof(line), maps)) {
+        unsigned long long map_start_raw = 0;
+        unsigned long long map_end_raw = 0;
+        unsigned long long file_offset_raw = 0;
+        unsigned int device_major = 0;
+        unsigned int device_minor = 0;
+        unsigned long long inode_raw = 0;
+        char permissions[5] = {0};
+        if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu",
+                   &map_start_raw, &map_end_raw, permissions,
+                   &file_offset_raw, &device_major, &device_minor,
+                   &inode_raw) != 7) {
+            continue;
+        }
+        const uint64_t map_start = (uint64_t)map_start_raw;
+        const uint64_t map_end = (uint64_t)map_end_raw;
+        if (map_end <= cursor) continue;
+        if (map_start > cursor || map_end <= map_start ||
+            permissions[0] != 'r' ||
+            device_major != (unsigned int)major(model_status->st_dev) ||
+            device_minor != (unsigned int)minor(model_status->st_dev) ||
+            (uint64_t)inode_raw != (uint64_t)model_status->st_ino) {
+            valid = 0;
+            break;
+        }
+        const uint64_t into_vma = cursor - map_start;
+        const uint64_t expected_offset = cursor - range_start;
+        if ((uint64_t)file_offset_raw > UINT64_MAX - into_vma ||
+            (uint64_t)file_offset_raw + into_vma != expected_offset) {
+            valid = 0;
+            break;
+        }
+        cursor = map_end < range_end ? map_end : range_end;
+    }
+    if (ferror(maps) || cursor != range_end) valid = 0;
+    fclose(maps);
+    return valid;
+#endif
+}
+
 static int cuda_laguna_compact_validate(
         int model_fd,
         const void *model_map,
         uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
         const ds4_laguna_ledger *ledger,
         const ds4_laguna_allocation_plan *plan,
         const ds4_runtime_tracker *tracker,
         uint64_t *static_offset_bytes_out) {
-    if (model_fd < 0 || !model_map || model_size == 0 ||
+    if (model_fd < 0 || !model_map || model_size == 0 || !model_identity ||
         model_size > SIZE_MAX || !ledger || !plan || !tracker ||
         g_n_gpus != 1 || g_gpu[0].device_id != 0 ||
         g_model_host_base || g_model_registered || g_model_device_owned ||
+        g_model_fd >= 0 || g_model_direct_fd >= 0 ||
+        g_model_fd_host_base || !g_cache_ranges.empty() ||
+        g_support_host_base || g_support_host_size != 0 ||
+        g_support_offset_bias != 0 || g_stream_selected_cache.valid ||
+        g_stream_selected_cache.gate_ptr ||
+        g_stream_selected_cache.up_ptr ||
+        g_stream_selected_cache.down_ptr ||
+        g_stream_selected_cache.slot_selected_ptr ||
         !g_model_ranges.empty() || !g_model_arenas.empty() ||
         !g_q8_f16_ranges.empty() || !g_q8_f32_ranges.empty()) {
         return 0;
     }
+    for (size_t i = 0; i < DS4_MAX_GPUS; i++) {
+        if (g_dev_cache[i].present || g_dev_cache[i].base ||
+            g_dev_cache[i].bytes != 0) {
+            return 0;
+        }
+    }
     const uintptr_t map_base = (uintptr_t)model_map;
     if (map_base == 0 || model_size > UINTPTR_MAX - map_base) return 0;
     struct stat model_stat;
-    if (fstat(model_fd, &model_stat) != 0 ||
-        !S_ISREG(model_stat.st_mode) || model_stat.st_size < 0 ||
-        (uint64_t)model_stat.st_size != model_size) {
+    struct stat model_stat_after;
+    if (!cuda_laguna_compact_identity_matches(
+            model_fd, model_size, model_identity, &model_stat) ||
+        !cuda_laguna_compact_mapping_matches(
+            model_map, model_size, &model_stat) ||
+        !cuda_laguna_compact_identity_matches(
+            model_fd, model_size, model_identity, &model_stat_after)) {
         return 0;
     }
     if (ledger->file_size != model_size || !ledger->tensor_ranges ||
@@ -871,6 +1031,16 @@ static int cuda_laguna_compact_validate(
 static int cuda_laguna_compact_release_locked(
         ds4_gpu_laguna_compact *ctx) {
     if (!ctx) return 1;
+#ifdef DS4_TEST_HOOKS
+    uint64_t pending =
+        g_laguna_compact_fail_release_count.load(std::memory_order_relaxed);
+    while (pending != 0) {
+        if (g_laguna_compact_fail_release_count.compare_exchange_weak(
+                pending, pending - 1u, std::memory_order_relaxed)) {
+            return 0;
+        }
+    }
+#endif
     if (ctx->static_slab) {
         const cudaError_t error = cudaFree(ctx->static_slab);
         if (error != cudaSuccess) {
@@ -882,16 +1052,14 @@ static int cuda_laguna_compact_release_locked(
         }
         ctx->static_slab = NULL;
     }
-    int released = 1;
     if (ctx->tracker_static_live) {
         if (ds4_runtime_tracker_release(ctx->tracker, ctx->static_id) !=
             DS4_RUNTIME_STATUS_OK) {
             fprintf(stderr,
                     "ds4: compact Laguna static tracker release failed\n");
-            released = 0;
-        } else {
-            ctx->tracker_static_live = 0;
+            return 0;
         }
+        ctx->tracker_static_live = 0;
     }
     free(ctx->static_offsets);
     ctx->static_offsets = NULL;
@@ -900,22 +1068,29 @@ static int cuda_laguna_compact_release_locked(
             DS4_RUNTIME_STATUS_OK) {
             fprintf(stderr,
                     "ds4: compact Laguna offset tracker release failed\n");
-            released = 0;
-        } else {
-            ctx->tracker_offsets_live = 0;
+            return 0;
         }
+        ctx->tracker_offsets_live = 0;
     }
     if (ctx->tracker_mapping_live) {
         if (ds4_runtime_tracker_unmap_model(
                 ctx->tracker, ctx->mapping_id) != DS4_RUNTIME_STATUS_OK) {
             fprintf(stderr,
                     "ds4: compact Laguna model-map tracker release failed\n");
-            released = 0;
-        } else {
-            ctx->tracker_mapping_live = 0;
+            return 0;
         }
+        ctx->tracker_mapping_live = 0;
     }
-    return released;
+    if (ctx->model_fd >= 0) {
+        if (close(ctx->model_fd) != 0) {
+            fprintf(stderr,
+                    "ds4: compact Laguna model descriptor close failed: %s\n",
+                    strerror(errno));
+            return 0;
+        }
+        ctx->model_fd = -1;
+    }
+    return 1;
 }
 
 static int cuda_laguna_compact_reserve_tracker_ids(
@@ -941,9 +1116,10 @@ static int cuda_laguna_compact_reserve_tracker_ids(
 /* g_laguna_compact_mutex must be held and state must be CREATING. */
 static void cuda_laguna_compact_create_unwind_locked(
         ds4_gpu_laguna_compact *ctx) {
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_RELEASING, std::memory_order_release);
+    ctx->release_attempt_count++;
     if (!cuda_laguna_compact_release_locked(ctx)) {
-        g_laguna_compact_state.store(
-            DS4_LAGUNA_COMPACT_DESTROYING, std::memory_order_release);
         return;
     }
     memset(ctx, 0, sizeof(*ctx));
@@ -953,7 +1129,7 @@ static void cuda_laguna_compact_create_unwind_locked(
 
 #ifdef DS4_TEST_HOOKS
 static void cuda_laguna_compact_pause_creating_if_armed(
-        std::unique_lock<std::mutex> *compact_lock) {
+        std::unique_lock<std::recursive_mutex> *compact_lock) {
     std::unique_lock<std::mutex> pause_lock(
         g_laguna_compact_creating_pause_mutex);
     if (!g_laguna_compact_creating_pause_armed) return;
@@ -984,9 +1160,9 @@ extern "C" int ds4_gpu_laguna_compact_create(
     if (out) *out = NULL;
     if (!out) return 0;
 #ifdef DS4_TEST_HOOKS
-    std::unique_lock<std::mutex> guard(g_laguna_compact_mutex);
+    std::unique_lock<std::recursive_mutex> guard(g_laguna_compact_mutex);
 #else
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
 #endif
     int expected = DS4_LAGUNA_COMPACT_IDLE;
     if (!g_laguna_compact_state.compare_exchange_strong(
@@ -995,9 +1171,7 @@ extern "C" int ds4_gpu_laguna_compact_create(
 
     ds4_gpu_laguna_compact *ctx = &g_laguna_compact_storage;
     memset(ctx, 0, sizeof(*ctx));
-#ifdef DS4_TEST_HOOKS
     ctx->model_fd = -1;
-#endif
     ctx->legacy_full_map_register_bytes_base =
         g_laguna_compact_legacy_full_map_register_bytes.load(
             std::memory_order_relaxed);
@@ -1015,20 +1189,23 @@ extern "C" int ds4_gpu_laguna_compact_create(
 #ifdef DS4_TEST_HOOKS
     cuda_laguna_compact_pause_creating_if_armed(&guard);
 #endif
+    const int owned_fd = fcntl(model_fd, F_DUPFD_CLOEXEC, 0);
     uint64_t static_offset_bytes = 0;
-    if (!cuda_laguna_compact_environment_allowed() ||
+    if (owned_fd < 0 || !cuda_laguna_compact_environment_allowed() ||
         !cuda_laguna_compact_validate(
-            model_fd, model_map, model_size, ledger, plan, tracker,
+            owned_fd, model_map, model_size, model_identity,
+            ledger, plan, tracker,
             &static_offset_bytes)) {
+        if (owned_fd >= 0) (void)close(owned_fd);
         g_laguna_compact_state.store(
             DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
         return 0;
     }
 
-    ctx->model_fd = model_fd;
+    ctx->model_fd = owned_fd;
     ctx->model_map = model_map;
     ctx->model_size = model_size;
-    if (model_identity) ctx->model_identity = *model_identity;
+    ctx->model_identity = *model_identity;
     ctx->ledger = ledger;
     ctx->plan = plan;
     ctx->tracker = tracker;
@@ -1128,47 +1305,77 @@ extern "C" int ds4_gpu_laguna_compact_create(
     return 1;
 }
 
-static int cuda_laguna_compact_destroy_checked(
+static ds4_gpu_laguna_destroy_status cuda_laguna_compact_destroy_checked(
         ds4_gpu_laguna_compact *ctx) {
-    if (!ctx) return 1;
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
-    if (ctx != &g_laguna_compact_storage) return 0;
+    if (!ctx) return DS4_GPU_LAGUNA_DESTROY_OK;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (ctx != &g_laguna_compact_storage) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
     const int state =
         g_laguna_compact_state.load(std::memory_order_relaxed);
-    if (state == DS4_LAGUNA_COMPACT_IDLE) return 1;
+    if (state == DS4_LAGUNA_COMPACT_IDLE) {
+        return DS4_GPU_LAGUNA_DESTROY_OK;
+    }
+    if (state == DS4_LAGUNA_COMPACT_RELEASING ||
+        state == DS4_LAGUNA_COMPACT_CREATING) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
     if (state != DS4_LAGUNA_COMPACT_ACTIVE &&
         state != DS4_LAGUNA_COMPACT_DESTROYING) {
-        return 0;
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
     }
     g_laguna_compact_state.store(
         DS4_LAGUNA_COMPACT_DESTROYING, std::memory_order_release);
     ctx->sync_attempt_count++;
+#ifdef DS4_TEST_HOOKS
+    uint64_t pending =
+        g_laguna_compact_fail_sync_count.load(std::memory_order_relaxed);
+    while (pending != 0) {
+        if (g_laguna_compact_fail_sync_count.compare_exchange_weak(
+                pending, pending - 1u, std::memory_order_relaxed)) {
+            return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+        }
+    }
+#endif
     const cudaError_t sync_error = cudaDeviceSynchronize();
     if (sync_error != cudaSuccess) {
         fprintf(stderr,
                 "ds4: compact Laguna teardown synchronization failed: %s\n",
                 cudaGetErrorString(sync_error));
         (void)cudaGetLastError();
-        return 0;
+        return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
     }
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_RELEASING, std::memory_order_release);
     ctx->release_attempt_count++;
-    if (!cuda_laguna_compact_release_locked(ctx)) return 0;
+    if (!cuda_laguna_compact_release_locked(ctx)) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
     memset(ctx, 0, sizeof(*ctx));
     g_laguna_compact_state.store(
         DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
-    return 1;
+    return DS4_GPU_LAGUNA_DESTROY_OK;
 }
 
 extern "C" ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
         ds4_gpu_laguna_compact *ctx) {
-    return cuda_laguna_compact_destroy_checked(ctx)
-        ? DS4_GPU_LAGUNA_DESTROY_OK
-        : DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+    return cuda_laguna_compact_destroy_checked(ctx);
 }
 
-extern "C" void ds4_gpu_test_laguna_compact_fail_sync_once(void) {}
+extern "C" void ds4_gpu_test_laguna_compact_fail_sync_once(void) {
+#ifdef DS4_TEST_HOOKS
+    g_laguna_compact_fail_sync_count.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
+}
 
-extern "C" void ds4_gpu_test_laguna_compact_fail_release_once(void) {}
+extern "C" void ds4_gpu_test_laguna_compact_fail_release_once(void) {
+#ifdef DS4_TEST_HOOKS
+    g_laguna_compact_fail_release_count.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
+}
 
 #ifdef DS4_TEST_HOOKS
 extern "C" void ds4_gpu_test_laguna_compact_pause_creating_once(void) {
@@ -1267,7 +1474,7 @@ extern "C" int ds4_gpu_test_laguna_compact_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out) {
     if (out) memset(out, 0, sizeof(*out));
     if (!ctx || !out) return 0;
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     const int state =
         g_laguna_compact_state.load(std::memory_order_relaxed);
     return cuda_laguna_compact_snapshot_locked(ctx, out, state);
@@ -1277,7 +1484,7 @@ extern "C" int ds4_gpu_test_laguna_compact_active_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out) {
     if (out) memset(out, 0, sizeof(*out));
     if (!out) return 0;
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     const int state =
         g_laguna_compact_state.load(std::memory_order_relaxed);
     if (state != DS4_LAGUNA_COMPACT_ACTIVE) return 0;
@@ -1290,7 +1497,7 @@ extern "C" int ds4_gpu_test_laguna_compact_nonidle_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out) {
     if (out) memset(out, 0, sizeof(*out));
     if (!out) return 0;
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     const int state =
         g_laguna_compact_state.load(std::memory_order_relaxed);
     if (state == DS4_LAGUNA_COMPACT_IDLE) return 0;
@@ -1316,7 +1523,7 @@ extern "C" int ds4_gpu_test_laguna_compact_lookup(
         uint64_t bytes,
         int expected_device,
         void **out_device_ptr) {
-    std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     if (ctx != &g_laguna_compact_storage) return 0;
     return cuda_laguna_compact_lookup_locked(
         ctx, source_offset, bytes, expected_device, out_device_ptr);
@@ -1448,13 +1655,8 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
-    if (cuda_laguna_compact_route_state(model_map) != 0) {
-        g_laguna_compact_legacy_range_attempts.fetch_add(
-            1u, std::memory_order_relaxed);
-        g_laguna_compact_legacy_range_bytes.fetch_add(
-            bytes, std::memory_order_relaxed);
-        return NULL;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
@@ -1617,10 +1819,6 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
 /* Optional second (support) model map for speculative decoding. The strict
  * multi-tier cache is keyed by source offset only, so support tensors are
  * installed and resolved with a large disjoint offset bias. */
-static const void *g_support_host_base = NULL;
-static uint64_t g_support_host_size = 0;
-static uint64_t g_support_offset_bias = 0;
-
 extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
     int prev = -1;
@@ -1634,6 +1832,8 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
 }
 
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!map || size == 0 || bias == 0) return 0;
     g_support_host_base = map;
     g_support_host_size = size;
@@ -1646,12 +1846,12 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t bytes,
                                             int logical_tier,
                                             const char *label) {
-    const int compact_route = cuda_laguna_compact_route_state(model_map);
+    const int compact_route = cuda_laguna_compact_lookup_route(model_map);
     if (compact_route != 0) {
         if (compact_route < 0 || logical_tier != 0 || g_n_gpus != 1) {
             return NULL;
         }
-        std::lock_guard<std::mutex> guard(g_laguna_compact_mutex);
+        std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
         void *device_ptr = NULL;
         if (g_laguna_compact_state.load(std::memory_order_relaxed) !=
                 DS4_LAGUNA_COMPACT_ACTIVE ||
@@ -2024,13 +2224,8 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
-    if (cuda_laguna_compact_route_state(model_map) != 0) {
-        g_laguna_compact_legacy_range_attempts.fetch_add(
-            1u, std::memory_order_relaxed);
-        g_laguna_compact_legacy_range_bytes.fetch_add(
-            weight_bytes, std::memory_order_relaxed);
-        return NULL;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (g_n_gpus <= 1) {
         auto exact = g_q8_f16_by_offset.find(offset);
         if (exact != g_q8_f16_by_offset.end()) {
@@ -2146,13 +2341,8 @@ static float *cuda_q8_f32_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
-    if (cuda_laguna_compact_route_state(model_map) != 0) {
-        g_laguna_compact_legacy_range_attempts.fetch_add(
-            1u, std::memory_order_relaxed);
-        g_laguna_compact_legacy_range_bytes.fetch_add(
-            weight_bytes, std::memory_order_relaxed);
-        return NULL;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (g_n_gpus <= 1) {
         auto exact = g_q8_f32_by_offset.find(offset);
         if (exact != g_q8_f32_by_offset.end()) {
@@ -2313,6 +2503,8 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 }
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
         getenv("DS4_CUDA_COPY_MODEL") != NULL ||
@@ -2618,6 +2810,8 @@ static int cuda_model_copy_to_device_streamed(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!dst || !model_map || offset > model_size ||
         bytes > model_size - offset) {
         return 0;
@@ -2733,14 +2927,8 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
-    if (g_laguna_compact_state.load(std::memory_order_acquire) !=
-            DS4_LAGUNA_COMPACT_IDLE) {
-        g_laguna_compact_legacy_arena_attempts.fetch_add(
-            1u, std::memory_order_relaxed);
-        g_laguna_compact_legacy_range_bytes.fetch_add(
-            bytes, std::memory_order_relaxed);
-        return NULL;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
@@ -2786,6 +2974,8 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
@@ -2878,11 +3068,8 @@ static const char *cuda_model_range_ptr_from_fd(
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
-    if (cuda_laguna_compact_route_state(model_map) != 0) {
-        g_laguna_compact_legacy_whole_model_copy_bytes.fetch_add(
-            map_size, std::memory_order_relaxed);
-        return 0;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
@@ -3199,8 +3386,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_laguna_compact_state.load(std::memory_order_acquire) !=
             DS4_LAGUNA_COMPACT_IDLE;
     if (compact_cleanup_required) {
-        if (!cuda_laguna_compact_destroy_checked(
-                &g_laguna_compact_storage)) {
+        const ds4_gpu_laguna_destroy_status destroy_status =
+            cuda_laguna_compact_destroy_checked(
+                &g_laguna_compact_storage);
+        if (destroy_status != DS4_GPU_LAGUNA_DESTROY_OK) {
             fprintf(stderr,
                     "ds4: CUDA cleanup retained compact Laguna ownership "
                     "after teardown failure\n");
@@ -3312,6 +3501,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_fd = -1;
+    g_model_fd_host_base = NULL;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
@@ -3319,6 +3509,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_support_host_base = NULL;
+    g_support_host_size = 0;
+    g_support_offset_bias = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -4108,15 +4301,8 @@ extern "C" int ds4_gpu_end_commands(void) {
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
-    if (cuda_laguna_compact_route_state(model_map) != 0) {
-        g_laguna_compact_legacy_full_map_register_bytes.fetch_add(
-            model_size, std::memory_order_relaxed);
-        if (getenv("DS4_CUDA_COPY_MODEL") != NULL) {
-            g_laguna_compact_legacy_whole_model_copy_bytes.fetch_add(
-                model_size, std::memory_order_relaxed);
-        }
-        return 0;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
@@ -4195,6 +4381,8 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 }
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)max_tensor_bytes;
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
@@ -4213,11 +4401,8 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
  * for the host pointer plus cudaHostRegister, but skipping the
  * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
-    if (cuda_laguna_compact_route_state(model_map) != 0) {
-        g_laguna_compact_legacy_full_map_register_bytes.fetch_add(
-            model_size, std::memory_order_relaxed);
-        return 0;
-    }
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
@@ -4359,6 +4544,8 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
 extern "C" int ds4_gpu_device_cache_tensors(int device_id,
                                             const ds4_tensor_range *ranges,
                                             int n_ranges) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 11;
     if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
     if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
     if (n_ranges == 0) return 0;
@@ -4515,6 +4702,8 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
                                                     const ds4_tensor_range *ranges,
                                                     int n_ranges,
                                                     int from_main_map) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 10;
     if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
     if (entry_device_id < 0 || entry_device_id >= DS4_MAX_GPUS) return 1;
     if (n_ranges <= 0 || !ranges) return 2;
@@ -4614,6 +4803,8 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
 
 extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                                     int *out_device_id, void **out_device_ptr) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     int active_device = -1;
     (void)cudaGetDevice(&active_device);
 
@@ -4675,6 +4866,8 @@ extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
 }
 
 extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return -1;
     int d = -1;
     if (!ds4_gpu_lookup_cache(source_offset, bytes, &d, NULL)) return -1;
     return d;
@@ -4698,6 +4891,8 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
                                             uint64_t bytes,
                                             int      expected_device,
                                             void   **out_device_ptr) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (g_cache_ranges.empty()) return 0;
 
     auto it = std::upper_bound(
@@ -4726,6 +4921,8 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
@@ -4762,6 +4959,8 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
@@ -4769,6 +4968,8 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     static int optional_q8_preload_disabled = 0;
@@ -27826,6 +28027,8 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || n_selected == 0 ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
@@ -28112,6 +28315,8 @@ extern "C" void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
 }
 
 extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)max_tensor_bytes;
     if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) {
         return 0;
@@ -28418,6 +28623,8 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
                                                  n_selected);
 }
@@ -28511,6 +28718,8 @@ extern "C" int ds4_gpu_commit_and_wait_selected_readback(
 }
 
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     const int ok = ds4_gpu_set_model_fd(fd);
     if (ok) g_model_fd_host_base = model_map;
     return ok;
@@ -28525,6 +28734,8 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)model_map; (void)model_size;
     (void)gate_offset; (void)up_offset; (void)down_offset;
     (void)gate_expert_bytes; (void)down_expert_bytes;
@@ -28537,6 +28748,8 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
@@ -28563,6 +28776,8 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return;
     cuda_stream_selected_cache_release();
 }
 
@@ -28570,6 +28785,8 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)table; (void)selected_ids; (void)n_selected;
     return 1;
 }
@@ -28579,6 +28796,8 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t *selected_ids,
         uint32_t n_tokens,
         uint32_t n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (n_tokens == 0 || n_selected == 0 ||
         (uint64_t)n_tokens * n_selected > UINT32_MAX) {
         return 0;
@@ -28592,6 +28811,8 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t *expert_ids,
         const uint32_t *expert_priorities,
         uint32_t n_experts) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
     return 1;
 }

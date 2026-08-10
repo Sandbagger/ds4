@@ -2277,6 +2277,13 @@ int ds4_gpu_add3_tensor(
         const ds4_gpu_tensor *c,
         uint32_t                n);
 
+int ds4_gpu_laguna_moe_residual_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *moe,
+        const ds4_gpu_tensor *shared,
+        uint32_t                n);
+
 int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,

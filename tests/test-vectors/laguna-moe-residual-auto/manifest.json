@@ -1,0 +1,57 @@
+{
+  "schema": "laguna-moe-residual-auto-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "capture": {
+    "flash_attention": "AUTO",
+    "layer": 1,
+    "tokens": 22,
+    "token_index": 0,
+    "width": 3072,
+    "residual_capture_directory": "poolside-auto-layer1-retry-1",
+    "moe_capture_directory": "poolside-q4-deep-1",
+    "moe_probe_sha256": "43cfc41d0d5930e060ae7cb3536b13caca11ce505718913834970aee8533a67b",
+    "callbacks": {
+      "residual-token0.f32": "ffn_inp-1",
+      "moe-token0.f32": "ffn_moe_out-1",
+      "shared-token0.f32": "ffn_shexp-1",
+      "expected-token0.f32": "l_out-1"
+    },
+    "non_perturbation": {
+      "routed_output_sha256": "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083",
+      "shared_output_sha256": "14a04388d619381400e5551794423244cc6d735d68df5dab7693d8604df32370",
+      "ffn_output_sha256": "9d4abbb288dc57ecfdb4c30c69f4695f00eefe3a51ccb41e5db004f35013285e",
+      "layer_output_sha256": "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
+      "detail_capture_matches_endpoint_only": true
+    }
+  },
+  "oracle": {
+    "expression": "(moe + shared) + residual",
+    "expected_exact": true,
+    "intended_order_mismatches": 0,
+    "legacy_order": "(residual + moe) + shared",
+    "legacy_order_mismatches": 753,
+    "legacy_first_mismatch": 0
+  },
+  "files": {
+    "residual-token0.f32": {
+      "bytes": 12288,
+      "sha256": "a164ed17c7ad1c051f3a01a2e73b58f9208656970b5eaeb854d311134dfa30e6"
+    },
+    "moe-token0.f32": {
+      "bytes": 12288,
+      "sha256": "a8449f64a6536c8012c43d24a558be01434e37948bff550b20e9654a11bbbfc6"
+    },
+    "shared-token0.f32": {
+      "bytes": 12288,
+      "sha256": "9b9ef36681633aae3897bb6a54f5f2f5fd3877eac035b72c6ab92c06ef132219"
+    },
+    "expected-token0.f32": {
+      "bytes": 12288,
+      "sha256": "0933abacd443f5073def7d27fb8d8040ef98e63c32f59c879eabdc6b06fe78d3"
+    }
+  }
+}

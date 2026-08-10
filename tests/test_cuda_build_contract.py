@@ -136,6 +136,27 @@ LAGUNA_Q4_L2_AUTO_FILES = {
         "c058fcac9dc6a95dbf0b3aa59bbcc84f28ae1f8233ed273d59eecda23a30d0a1",
     ),
 }
+LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE = (
+    ROOT / "tests/test-vectors/laguna-moe-residual-auto"
+)
+LAGUNA_MOE_RESIDUAL_AUTO_FILES = {
+    "residual-token0.f32": (
+        12288,
+        "a164ed17c7ad1c051f3a01a2e73b58f9208656970b5eaeb854d311134dfa30e6",
+    ),
+    "moe-token0.f32": (
+        12288,
+        "a8449f64a6536c8012c43d24a558be01434e37948bff550b20e9654a11bbbfc6",
+    ),
+    "shared-token0.f32": (
+        12288,
+        "9b9ef36681633aae3897bb6a54f5f2f5fd3877eac035b72c6ab92c06ef132219",
+    ),
+    "expected-token0.f32": (
+        12288,
+        "0933abacd443f5073def7d27fb8d8040ef98e63c32f59c879eabdc6b06fe78d3",
+    ),
+}
 
 STANDALONE_CUDA_TARGETS = (
     "tests/cuda_long_context_smoke",
@@ -877,6 +898,141 @@ class CudaBuildContractTest(unittest.TestCase):
             LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
         )
         self.assertIn("run_q4_l2_frozen_case()", kernel_main)
+
+    def test_laguna_moe_residual_auto_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            manifest["schema"], "laguna-moe-residual-auto-fixture/v1"
+        )
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["model"],
+            {
+                "bytes": 68248759648,
+                "sha256": (
+                    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+                ),
+            },
+        )
+        capture = manifest["capture"]
+        self.assertEqual(
+            {key: capture[key] for key in (
+                "flash_attention", "layer", "tokens", "token_index", "width",
+                "residual_capture_directory", "moe_capture_directory",
+                "moe_probe_sha256",
+            )},
+            {
+                "flash_attention": "AUTO",
+                "layer": 1,
+                "tokens": 22,
+                "token_index": 0,
+                "width": 3072,
+                "residual_capture_directory": "poolside-auto-layer1-retry-1",
+                "moe_capture_directory": "poolside-q4-deep-1",
+                "moe_probe_sha256": (
+                    "43cfc41d0d5930e060ae7cb3536b13caca11ce505718913834970aee8533a67b"
+                ),
+            },
+        )
+        self.assertEqual(
+            capture["callbacks"],
+            {
+                "residual-token0.f32": "ffn_inp-1",
+                "moe-token0.f32": "ffn_moe_out-1",
+                "shared-token0.f32": "ffn_shexp-1",
+                "expected-token0.f32": "l_out-1",
+            },
+        )
+        self.assertEqual(
+            capture["non_perturbation"],
+            {
+                "routed_output_sha256": (
+                    "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083"
+                ),
+                "shared_output_sha256": (
+                    "14a04388d619381400e5551794423244cc6d735d68df5dab7693d8604df32370"
+                ),
+                "ffn_output_sha256": (
+                    "9d4abbb288dc57ecfdb4c30c69f4695f00eefe3a51ccb41e5db004f35013285e"
+                ),
+                "layer_output_sha256": (
+                    "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
+                ),
+                "detail_capture_matches_endpoint_only": True,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"],
+            {
+                "expression": "(moe + shared) + residual",
+                "expected_exact": True,
+                "intended_order_mismatches": 0,
+                "legacy_order": "(residual + moe) + shared",
+                "legacy_order_mismatches": 753,
+                "legacy_first_mismatch": 0,
+            },
+        )
+        self.assertEqual(
+            set(manifest["files"]), set(LAGUNA_MOE_RESIDUAL_AUTO_FILES)
+        )
+        self.assertEqual(
+            {path.name for path in LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE.iterdir()},
+            set(LAGUNA_MOE_RESIDUAL_AUTO_FILES) | {"manifest.json"},
+        )
+        for name, (expected_size, expected_sha256) in (
+            LAGUNA_MOE_RESIDUAL_AUTO_FILES.items()
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    manifest["files"][name],
+                    {"bytes": expected_size, "sha256": expected_sha256},
+                )
+                payload = (LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE / name).read_bytes()
+                self.assertEqual(len(payload), expected_size)
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+
+        for required in (
+            '"moe-residual-frozen"',
+            "run_moe_residual_frozen_case",
+            "LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE_DIR",
+            '"residual-token0.f32"',
+            '"moe-token0.f32"',
+            '"shared-token0.f32"',
+            '"expected-token0.f32"',
+        ):
+            self.assertIn(required, LAGUNA_KERNEL_TEST)
+        case_body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_moe_residual_frozen_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", case_body)
+        self.assertIn("cudaDeviceSynchronize()", case_body)
+        self.assertIn("ds4_gpu_tensor_read(", case_body)
+        self.assertIn("actual_bits != expected_bits", case_body)
+        self.assertRegex(case_body, r"width\s*=\s*3072")
+
+        residual_body = function_body(
+            'extern "C" int ds4_gpu_laguna_moe_residual_tensor('
+        )
+        self.assertIn("ds4_gpu_add3_tensor(", residual_body)
+        self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", GPU_HEADER)
+        for function_name in (
+            "static bool laguna_graph_forward_token(",
+            "static bool laguna_graph_forward_batch(",
+        ):
+            graph_body = source_function_body(DS4_SOURCE, function_name, "ds4.c")
+            self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", graph_body)
+            self.assertNotIn("ds4_gpu_add3_tensor(\n                        g->next", graph_body)
+        kernel_main = source_function_body(
+            LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
+        )
+        self.assertIn("run_moe_residual_frozen_case()", kernel_main)
 
     def test_laguna_attention_auto_is_qualified_only_for_gb10(self) -> None:
         body = function_body(

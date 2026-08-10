@@ -48664,11 +48664,12 @@ static bool laguna_graph_forward_token(
                                          1);
             }
             if (ok) {
-                ok = ds4_gpu_add3_tensor(g->next,
-                                         g->after_attn,
-                                         g->ffn_out,
-                                         g->shared_out,
-                                         DS4_N_EMBD) != 0;
+                ok = ds4_gpu_laguna_moe_residual_tensor(
+                        g->next,
+                        g->after_attn,
+                        g->ffn_out,
+                        g->shared_out,
+                        DS4_N_EMBD) != 0;
             }
         }
 
@@ -49166,7 +49167,7 @@ static bool laguna_graph_forward_batch(
             }
             if (ok) {
                 failed_stage = "MoE residual";
-                ok = ds4_gpu_add3_tensor(
+                ok = ds4_gpu_laguna_moe_residual_tensor(
                         g->next,
                         g->after_attn,
                         g->ffn_out,

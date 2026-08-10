@@ -2664,6 +2664,121 @@ cleanup:
     return rc;
 }
 
+#define LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE_DIR \
+    "tests/test-vectors/laguna-moe-residual-auto"
+
+static void *laguna_read_moe_residual_frozen(
+        const char *name, size_t expected_bytes) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s",
+        LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE_DIR, name);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path) ||
+        expected_bytes == 0u) {
+        fprintf(stderr,
+                "moe-residual-frozen: invalid fixture path or size\n");
+        return NULL;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u || sizeof(float) != 4u) {
+        fprintf(stderr,
+                "moe-residual-frozen: little-endian float32 host is required\n");
+        return NULL;
+    }
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        fprintf(stderr, "moe-residual-frozen: cannot open %s\n", path);
+        return NULL;
+    }
+    if (fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr, "moe-residual-frozen: cannot seek %s\n", path);
+        fclose(stream);
+        return NULL;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (size_t)file_bytes != expected_bytes) {
+        fprintf(stderr,
+                "moe-residual-frozen: %s bytes=%ld expected=%zu\n",
+                path, file_bytes, expected_bytes);
+        fclose(stream);
+        return NULL;
+    }
+    rewind(stream);
+    void *data = malloc(expected_bytes);
+    if (!data || fread(data, 1u, expected_bytes, stream) != expected_bytes ||
+        ferror(stream)) {
+        fprintf(stderr, "moe-residual-frozen: cannot read %s\n", path);
+        free(data);
+        fclose(stream);
+        return NULL;
+    }
+    fclose(stream);
+    return data;
+}
+
+static int run_moe_residual_frozen_case(void) {
+    enum { width = 3072 };
+    const size_t bytes = width * sizeof(float);
+    float *residual_input = (float *)laguna_read_moe_residual_frozen(
+        "residual-token0.f32", bytes);
+    float *moe_input = (float *)laguna_read_moe_residual_frozen(
+        "moe-token0.f32", bytes);
+    float *shared_input = (float *)laguna_read_moe_residual_frozen(
+        "shared-token0.f32", bytes);
+    float *expected = (float *)laguna_read_moe_residual_frozen(
+        "expected-token0.f32", bytes);
+    float *actual = (float *)malloc(bytes);
+    ds4_gpu_tensor *residual = NULL;
+    ds4_gpu_tensor *moe = NULL;
+    ds4_gpu_tensor *shared = NULL;
+    ds4_gpu_tensor *out = NULL;
+    int rc = 1;
+    if (!residual_input || !moe_input || !shared_input || !expected ||
+        !actual) {
+        goto cleanup;
+    }
+    residual = ds4_gpu_tensor_alloc(bytes);
+    moe = ds4_gpu_tensor_alloc(bytes);
+    shared = ds4_gpu_tensor_alloc(bytes);
+    out = ds4_gpu_tensor_alloc(bytes);
+    if (!residual || !moe || !shared || !out ||
+        !ds4_gpu_tensor_write(residual, 0, residual_input, bytes) ||
+        !ds4_gpu_tensor_write(moe, 0, moe_input, bytes) ||
+        !ds4_gpu_tensor_write(shared, 0, shared_input, bytes) ||
+        !ds4_gpu_laguna_moe_residual_tensor(
+            out, residual, moe, shared, width) ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        !ds4_gpu_tensor_read(out, 0, actual, bytes)) {
+        fprintf(stderr, "moe-residual-frozen: CUDA execution failed\n");
+        goto cleanup;
+    }
+    for (size_t i = 0; i < width; i++) {
+        uint32_t actual_bits = 0u;
+        uint32_t expected_bits = 0u;
+        memcpy(&actual_bits, &actual[i], sizeof(actual_bits));
+        memcpy(&expected_bits, &expected[i], sizeof(expected_bits));
+        if (actual_bits != expected_bits) {
+            fprintf(stderr,
+                    "moe-residual-frozen: output[%zu] got=%a (0x%08x) "
+                    "expected=%a (0x%08x)\n",
+                    i, actual[i], actual_bits, expected[i], expected_bits);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+cleanup:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(shared);
+    ds4_gpu_tensor_free(moe);
+    ds4_gpu_tensor_free(residual);
+    free(actual);
+    free(expected);
+    free(shared_input);
+    free(moe_input);
+    free(residual_input);
+    return rc;
+}
+
 /* Independent Poolside Q4_K/Q8_1 routed-MoE semantic oracle.  Both
  * quantization boundaries belong here: a float-only reference would test a
  * different kernel.  Small batches use Poolside MMVQ quantization/minimum
@@ -3344,7 +3459,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|routed-moe|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3356,6 +3471,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "router-frozen") != 0 &&
          strcmp(argv[2], "q4-mmq-frozen") != 0 &&
          strcmp(argv[2], "q4-l2-frozen") != 0 &&
+         strcmp(argv[2], "moe-residual-frozen") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
          strcmp(argv[2], "poolside-q8") != 0 &&
          strcmp(argv[2], "all") != 0)) {
@@ -3378,6 +3494,9 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_q4_l2_frozen =
         strcmp(argv[2], "q4-l2-frozen") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_moe_residual_frozen =
+        strcmp(argv[2], "moe-residual-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
@@ -3477,6 +3596,10 @@ int main(int argc, char **argv) {
         rc = 1;
     }
     if (run_q4_l2_frozen && run_q4_l2_frozen_case() != 0) {
+        rc = 1;
+    }
+    if (run_moe_residual_frozen &&
+        run_moe_residual_frozen_case() != 0) {
         rc = 1;
     }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */

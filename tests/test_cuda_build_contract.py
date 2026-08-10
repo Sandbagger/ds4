@@ -66,6 +66,26 @@ LAGUNA_ATTENTION_AUTO_FILES = {
         540672,
         "f44669c93d81bbd22edb7dab4311af71b5880556a5646d3138aae1d5c0e4e3bd",
     ),
+    "layer-01-q-rope.f32": (
+        811008,
+        "788af1e10d67728891ad9ab529d103033db664ce56fad967dd1cebaed5f74236",
+    ),
+    "layer-01-k-rope.f32": (
+        90112,
+        "6129c7273cb32a6baedd77465a817da815255cfbf43c260a3f53536a5363425f",
+    ),
+    "layer-01-v-proj.f32": (
+        90112,
+        "4a46e7ad3b6dc183090a2d3db37aeafb91a7370b01002603c9e7d5590f9e4cda",
+    ),
+    "layer-01-gate-proj.f32": (
+        6336,
+        "a29632741e53c51905152fcf4c0be9fda9c0008c690704a5079d71538b63beb8",
+    ),
+    "layer-01-attn-gated.f32": (
+        811008,
+        "43db94735d75e338303e6632bf5c063070e6f5ab01fa797dd606906e23e7d20c",
+    ),
 }
 
 STANDALONE_CUDA_TARGETS = (
@@ -121,7 +141,7 @@ class CudaBuildContractTest(unittest.TestCase):
         manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["schema"], "laguna-attention-auto-fixture/v2")
+        self.assertEqual(manifest["schema"], "laguna-attention-auto-fixture/v3")
         self.assertEqual(
             manifest["poolside_commit"],
             "04b2b72cb54048ead292884adbe11f284e3ec950",
@@ -169,6 +189,44 @@ class CudaBuildContractTest(unittest.TestCase):
                 "query": "blk.0.attn_q_norm.weight",
                 "key": "blk.0.attn_k_norm.weight",
             },
+        )
+        self.assertEqual(
+            manifest["h72_oracle"]["shape"],
+            {
+                "layer": 1,
+                "tokens": 22,
+                "query_heads": 72,
+                "kv_heads": 8,
+                "head_dim": 128,
+                "position_start": 0,
+                "kv_rows": 256,
+            },
+        )
+        self.assertEqual(
+            manifest["h72_oracle"]["producer_commit"],
+            "551ddb2c128f8e92ef0c0ea8e1b87a5e3f557de3",
+        )
+        self.assertEqual(
+            manifest["h72_oracle"]["determinism"],
+            {"successful_runs": 1},
+        )
+        for limits in (manifest["oracle"], manifest["h72_oracle"]):
+            self.assertEqual(limits["global_max_abs_limit"], 0.0)
+            self.assertEqual(limits["global_rms_limit"], 0.0)
+            self.assertEqual(limits["per_head_max_abs_limit"], 0.0)
+            self.assertEqual(limits["per_head_rms_limit"], 0.0)
+        self.assertEqual(
+            manifest["h72_oracle"]["input_callbacks"],
+            {
+                "layer-01-q-rope.f32": "Qcur_rope-1",
+                "layer-01-k-rope.f32": "Kcur_rope-1",
+                "layer-01-v-proj.f32": "Vcur-1",
+                "layer-01-gate-proj.f32": "attn_gate_proj-1",
+            },
+        )
+        self.assertEqual(
+            manifest["h72_oracle"]["output_callback"],
+            {"layer-01-attn-gated.f32": "attn_gated-1"},
         )
         self.assertEqual(
             manifest["qk_norm_rope"]["public_apis"],
@@ -222,7 +280,9 @@ class CudaBuildContractTest(unittest.TestCase):
             '"prefill-attention-frozen"',
             "run_prefill_attention_frozen_case",
             "run_prefill_attention_frozen_gqa9_case",
-            '"poolside-auto-t22-gqa9-derived"',
+            '"poolside-auto-layer1-t22-gqa9"',
+            '"layer-01-q-rope.f32"',
+            '"layer-01-attn-gated.f32"',
             '"fast-shape-wrap-guard", 0u, 22u, 16u, 48u, 8u',
             "LAGUNA_ATTENTION_AUTO_FIXTURE_DIR",
             "22u, 256u, 48u, 8u",
@@ -231,6 +291,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "poolside-auto-qk-t21",
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
+        self.assertNotIn("gqa9-derived", LAGUNA_KERNEL_TEST)
         for signature in (
             "static int run_prefill_attention_frozen_case(",
             "static int run_prefill_attention_frozen_gqa9_case(",

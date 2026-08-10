@@ -2057,22 +2057,11 @@ cleanup:
     return rc;
 }
 
-/* The Poolside AUTO arithmetic is head-local after GQA selects a KV head.
- * Expand the pinned GQA6 fixture to GQA9 by repeating source heads inside
- * each KV group.  This exercises Laguna's 72-head SWA shape without inventing
- * a second numerical reference. */
 static int run_prefill_attention_frozen_gqa9_case(void) {
     static const laguna_prefill_case c = {
-        "poolside-auto-t22-gqa9-derived", 0u, 22u, 256u, 72u, 8u,
+        "poolside-auto-layer1-t22-gqa9", 0u, 22u, 256u, 72u, 8u,
     };
     const uint32_t head_dim = 128u;
-    const uint32_t source_heads = 48u;
-    const uint32_t source_heads_per_kv = source_heads / c.n_head_kv;
-    const uint32_t heads_per_kv = c.n_head / c.n_head_kv;
-    const uint64_t source_q_count =
-        (uint64_t)c.n_tokens * source_heads * head_dim;
-    const uint64_t source_gate_count =
-        (uint64_t)c.n_tokens * source_heads;
     const uint64_t q_count =
         (uint64_t)c.n_tokens * c.n_head * head_dim;
     const uint64_t kv_count =
@@ -2081,18 +2070,14 @@ static int run_prefill_attention_frozen_gqa9_case(void) {
     const uint64_t cache_count =
         (uint64_t)c.cache_cap * c.n_head_kv * head_dim;
     const uint64_t sentinel_offset =
-        ((uint64_t)20u * c.n_head + 64u) * head_dim;
-    float *source_q = laguna_read_frozen_f32(
-        "layer-00-q-rope.f32", source_q_count);
-    float *source_gate = laguna_read_frozen_f32(
-        "layer-00-gate-proj.f32", source_gate_count);
-    float *source_reference = laguna_read_frozen_f32(
-        "layer-00-attn-gated.f32", source_q_count);
-    float *k_host = laguna_read_frozen_f32("layer-00-k-rope.f32", kv_count);
-    float *v_host = laguna_read_frozen_f32("layer-00-v-proj.f32", kv_count);
-    float *q_host = (float *)malloc((size_t)q_count * sizeof(*q_host));
-    float *gate_host = (float *)malloc((size_t)gate_count * sizeof(*gate_host));
-    float *reference = (float *)malloc((size_t)q_count * sizeof(*reference));
+        ((uint64_t)21u * c.n_head + 71u) * head_dim;
+    float *q_host = laguna_read_frozen_f32("layer-01-q-rope.f32", q_count);
+    float *k_host = laguna_read_frozen_f32("layer-01-k-rope.f32", kv_count);
+    float *v_host = laguna_read_frozen_f32("layer-01-v-proj.f32", kv_count);
+    float *gate_host =
+        laguna_read_frozen_f32("layer-01-gate-proj.f32", gate_count);
+    float *reference =
+        laguna_read_frozen_f32("layer-01-attn-gated.f32", q_count);
     uint16_t *key_initial =
         (uint16_t *)calloc((size_t)cache_count, sizeof(*key_initial));
     uint16_t *value_initial =
@@ -2100,35 +2085,14 @@ static int run_prefill_attention_frozen_gqa9_case(void) {
     laguna_prefill_result actual = {0};
     int rc = 1;
 
-    if (!source_q || !source_gate || !source_reference || !k_host || !v_host ||
-        !q_host || !gate_host || !reference || !key_initial || !value_initial ||
+    if (!q_host || !k_host || !v_host || !gate_host || !reference ||
+        !key_initial || !value_initial ||
         !laguna_prefill_result_init(&actual, q_count, cache_count)) {
         fprintf(stderr, "prefill-attention-frozen-gqa9: fixture setup failed\n");
         goto cleanup;
     }
-    for (uint32_t token = 0; token < c.n_tokens; token++) {
-        for (uint32_t kv_head = 0; kv_head < c.n_head_kv; kv_head++) {
-            for (uint32_t local_head = 0; local_head < heads_per_kv;
-                 local_head++) {
-                const uint32_t source_head =
-                    kv_head * source_heads_per_kv +
-                    local_head % source_heads_per_kv;
-                const uint32_t head = kv_head * heads_per_kv + local_head;
-                const uint64_t source_row =
-                    ((uint64_t)token * source_heads + source_head) * head_dim;
-                const uint64_t row =
-                    ((uint64_t)token * c.n_head + head) * head_dim;
-                memcpy(q_host + row, source_q + source_row,
-                       head_dim * sizeof(*q_host));
-                memcpy(reference + row, source_reference + source_row,
-                       head_dim * sizeof(*reference));
-                gate_host[(uint64_t)token * c.n_head + head] =
-                    source_gate[(uint64_t)token * source_heads + source_head];
-            }
-        }
-    }
     if (laguna_run_prefill_once(
-            &c, "poolside-auto-gqa9-derived", q_host, k_host, v_host,
+            &c, "poolside-auto-layer1-gqa9", q_host, k_host, v_host,
             gate_host, key_initial, value_initial, &actual) != 0) {
         goto cleanup;
     }
@@ -2143,7 +2107,7 @@ static int run_prefill_attention_frozen_gqa9_case(void) {
           1u, (uint32_t)q_count, max_abs_limit, rms_limit },
         { "per-head-gqa9", actual.heads, reference, q_count,
           c.n_head, head_dim, max_abs_limit, rms_limit },
-        { "token20-head64", actual.heads + sentinel_offset,
+        { "token21-head71", actual.heads + sentinel_offset,
           reference + sentinel_offset, head_dim,
           1u, head_dim, max_abs_limit, rms_limit },
     };
@@ -2165,9 +2129,6 @@ cleanup:
     free(q_host);
     free(v_host);
     free(k_host);
-    free(source_reference);
-    free(source_gate);
-    free(source_q);
     return rc;
 }
 

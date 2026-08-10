@@ -1,9 +1,10 @@
 # Laguna Poolside-AUTO attention oracle
 
-This fixture freezes the inputs and output at Laguna layer 0's attention
-boundary for the canonical 22-token short prompt. It separately pins token
-21's projection inputs and norm weights so DS4's fused Q/K RMSNorm+RoPE can be
-tested independently of attention.
+This fixture freezes the inputs and output at Laguna layers 0 and 1's attention
+boundaries for the canonical 22-token short prompt. Layer 0 pins the
+48-query-head GQA6 AUTO path; layer 1 pins the distinct 72-query-head GQA9 AUTO
+path. It separately pins layer 0 token 21's projection inputs and norm weights
+so DS4's fused Q/K RMSNorm+RoPE can be tested independently of attention.
 
 The files are raw, little-endian float32 values in GGML's contiguous order:
 
@@ -16,6 +17,11 @@ The files are raw, little-endian float32 values in GGML's contiguous order:
 - `layer-00-v-proj.f32`: `[1024, 22]`
 - `layer-00-gate-proj.f32`: `[48, 22]`
 - `layer-00-attn-gated.f32`: `[6144, 22]`
+- `layer-01-q-rope.f32`: `[128, 72, 22]`
+- `layer-01-k-rope.f32`: `[128, 8, 22]`
+- `layer-01-v-proj.f32`: `[1024, 22]`
+- `layer-01-gate-proj.f32`: `[72, 22]`
+- `layer-01-attn-gated.f32`: `[9216, 22]`
 
 The capture used Poolside llama.cpp commit
 `04b2b72cb54048ead292884adbe11f284e3ec950`, the pinned Laguna GGUF recorded
@@ -35,8 +41,10 @@ LD_LIBRARY_PATH=/home/will/code/poolside-llama.cpp-laguna/build-c7-diag/bin \
 Two independent AUTO captures produced bit-identical hashes for all 62
 diagnostic files. The full prompt geometry is intentional. On the DGX Spark,
 `Tq=22`, `Hq:Hkv=48:8`, `D=128`, and Poolside's 256-row padded KV view select
-the MMA-F16 `<128, 128, 32, 2>` specialization. Smaller synthetic shapes can
-select another flash-attention kernel and are not an oracle for this boundary.
+the MMA-F16 `<128, 128, 32, 2>` specialization at layer 0. Layer 1's
+`Hq:Hkv=72:8` selects `<128, 128, 32, 1>` and its two-partition reduction.
+Smaller or head-repeated synthetic shapes can select or emulate the wrong
+arithmetic and are not numerical oracles for these boundaries.
 
 The token-21 Q projection is the 24,576-byte range beginning at byte 516,096
 of `layer-00-q-proj.f32`; the K projection is the 4,096-byte range beginning at
@@ -53,8 +61,9 @@ fused public primitive from projection input through RoPE output.
 The kernel test resets the projection tensors and exercises both the paired
 Q/K API and the single-tensor API independently for Q and K.
 
-`tests/test_cuda_laguna_kernels.c --case prefill-attention-frozen` feeds these
-exact Q/K/V/gate bytes to DS4 at `pos0=0` with a 256-row cache, then compares
-the complete gated result, every token/head, and the diagnostic sentinel at
-token 20, head 43. `tests/test_cuda_build_contract.py` verifies every fixture
-size and SHA-256 before the CUDA gate is deployed.
+`tests/test_cuda_laguna_kernels.c --case prefill-attention-frozen` feeds each
+layer's exact Q/K/V/gate bytes to DS4 at `pos0=0` with a 256-row cache, then
+compares the complete gated result, every token/head, and one diagnostic
+sentinel (layer 0 token 20/head 43; layer 1 token 21/head 71).
+`tests/test_cuda_build_contract.py` verifies every fixture size and SHA-256
+before the CUDA gate is deployed.

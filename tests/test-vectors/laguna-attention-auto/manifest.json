@@ -1,5 +1,5 @@
 {
-  "schema": "laguna-attention-auto-fixture/v1",
+  "schema": "laguna-attention-auto-fixture/v2",
   "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
   "ds4_diagnostic_commit": "6138c5d3dd436f5859dad9422ebbffe2c058a182",
   "model": {
@@ -14,6 +14,75 @@
     "head_dim": 128,
     "position_start": 0,
     "kv_rows": 256
+  },
+  "qk_norm_rope": {
+    "shape": {
+      "layer": 0,
+      "token": 21,
+      "query_heads": 48,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "rotary_dim": 64
+    },
+    "parameters": {
+      "position_start": 21,
+      "original_context": 8192,
+      "frequency_base": 500000.0,
+      "frequency_scale": 0.03125,
+      "extension_factor": 1.0,
+      "attention_factor": 1.0,
+      "beta_fast": 32.0,
+      "beta_slow": 1.0,
+      "epsilon": 1e-06
+    },
+    "weight_tensors": {
+      "query": "blk.0.attn_q_norm.weight",
+      "key": "blk.0.attn_k_norm.weight"
+    },
+    "public_apis": [
+      "ds4_gpu_laguna_qk_head_rms_norm_rope_tensor",
+      "ds4_gpu_laguna_head_rms_norm_rope_tensor"
+    ],
+    "inputs": {
+      "query_projection": {
+        "file": "layer-00-q-proj-t21.f32",
+        "capture_file": "layer-00-q-proj.f32",
+        "callback": "Qcur-0",
+        "source_offset": 516096
+      },
+      "key_projection": {
+        "file": "layer-00-k-proj-t21.f32",
+        "capture_file": "layer-00-k-proj.f32",
+        "callback": "Kcur-0",
+        "source_offset": 86016
+      },
+      "query_weight": {
+        "file": "layer-00-q-norm-weight.f32",
+        "tensor": "blk.0.attn_q_norm.weight",
+        "relative_offset": 698729984,
+        "data_offset": 702463840
+      },
+      "key_weight": {
+        "file": "layer-00-k-norm-weight.f32",
+        "tensor": "blk.0.attn_k_norm.weight",
+        "relative_offset": 658609152,
+        "data_offset": 662343008
+      }
+    },
+    "expected_output_slices": {
+      "query": {
+        "file": "layer-00-q-rope.f32",
+        "offset": 516096,
+        "bytes": 24576,
+        "sha256": "a7004aa3b85922043a5a6e1a4036af1d1cd937d3b69c3cb2f85a25e83e9a7303"
+      },
+      "key": {
+        "file": "layer-00-k-rope.f32",
+        "offset": 86016,
+        "bytes": 4096,
+        "sha256": "5e69e125564a5cbae961ca697aceb5b974f3efb3f3bbf21e05dcfc7232ac73a1"
+      }
+    }
   },
   "oracle": {
     "input_callbacks": {
@@ -39,6 +108,22 @@
     "all_62_capture_files_bit_exact": true
   },
   "files": {
+    "layer-00-q-proj-t21.f32": {
+      "bytes": 24576,
+      "sha256": "7650de1eb2539fa059cd61d0888be41e1ce53481ffd0f761d54087fe621329be"
+    },
+    "layer-00-k-proj-t21.f32": {
+      "bytes": 4096,
+      "sha256": "9604b2834c48eb8eb353149da1d4de1faf84c4529d997057aaab058b39fb6b4e"
+    },
+    "layer-00-q-norm-weight.f32": {
+      "bytes": 512,
+      "sha256": "9540bf5aba37eb7141a144324d0ddff69ce1fbf6b62dd6f91627978ed4e82067"
+    },
+    "layer-00-k-norm-weight.f32": {
+      "bytes": 512,
+      "sha256": "d08339e04c733249be70c9356ae8bd273194da9c7ca569943e74e6753caf4868"
+    },
     "layer-00-q-rope.f32": {
       "bytes": 540672,
       "sha256": "ede9c00e83a4ad953900743104178f75af9219c85f66bda8d92d12ef3753c4da"

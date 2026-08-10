@@ -30,6 +30,22 @@ LAGUNA_ATTENTION_AUTO_FIXTURE = (
     ROOT / "tests/test-vectors/laguna-attention-auto"
 )
 LAGUNA_ATTENTION_AUTO_FILES = {
+    "layer-00-q-proj-t21.f32": (
+        24576,
+        "7650de1eb2539fa059cd61d0888be41e1ce53481ffd0f761d54087fe621329be",
+    ),
+    "layer-00-k-proj-t21.f32": (
+        4096,
+        "9604b2834c48eb8eb353149da1d4de1faf84c4529d997057aaab058b39fb6b4e",
+    ),
+    "layer-00-q-norm-weight.f32": (
+        512,
+        "9540bf5aba37eb7141a144324d0ddff69ce1fbf6b62dd6f91627978ed4e82067",
+    ),
+    "layer-00-k-norm-weight.f32": (
+        512,
+        "d08339e04c733249be70c9356ae8bd273194da9c7ca569943e74e6753caf4868",
+    ),
     "layer-00-q-rope.f32": (
         540672,
         "ede9c00e83a4ad953900743104178f75af9219c85f66bda8d92d12ef3753c4da",
@@ -105,7 +121,7 @@ class CudaBuildContractTest(unittest.TestCase):
         manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["schema"], "laguna-attention-auto-fixture/v1")
+        self.assertEqual(manifest["schema"], "laguna-attention-auto-fixture/v2")
         self.assertEqual(
             manifest["poolside_commit"],
             "04b2b72cb54048ead292884adbe11f284e3ec950",
@@ -122,6 +138,73 @@ class CudaBuildContractTest(unittest.TestCase):
                 "kv_rows": 256,
             },
         )
+        self.assertEqual(
+            manifest["qk_norm_rope"]["shape"],
+            {
+                "layer": 0,
+                "token": 21,
+                "query_heads": 48,
+                "kv_heads": 8,
+                "head_dim": 128,
+                "rotary_dim": 64,
+            },
+        )
+        self.assertEqual(
+            manifest["qk_norm_rope"]["parameters"],
+            {
+                "position_start": 21,
+                "original_context": 8192,
+                "frequency_base": 500000.0,
+                "frequency_scale": 0.03125,
+                "extension_factor": 1.0,
+                "attention_factor": 1.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "epsilon": 1e-06,
+            },
+        )
+        self.assertEqual(
+            manifest["qk_norm_rope"]["weight_tensors"],
+            {
+                "query": "blk.0.attn_q_norm.weight",
+                "key": "blk.0.attn_k_norm.weight",
+            },
+        )
+        self.assertEqual(
+            manifest["qk_norm_rope"]["public_apis"],
+            [
+                "ds4_gpu_laguna_qk_head_rms_norm_rope_tensor",
+                "ds4_gpu_laguna_head_rms_norm_rope_tensor",
+            ],
+        )
+        self.assertEqual(
+            manifest["qk_norm_rope"]["expected_output_slices"],
+            {
+                "query": {
+                    "file": "layer-00-q-rope.f32",
+                    "offset": 516096,
+                    "bytes": 24576,
+                    "sha256": "a7004aa3b85922043a5a6e1a4036af1d1cd937d3b69c3cb2f85a25e83e9a7303",
+                },
+                "key": {
+                    "file": "layer-00-k-rope.f32",
+                    "offset": 86016,
+                    "bytes": 4096,
+                    "sha256": "5e69e125564a5cbae961ca697aceb5b974f3efb3f3bbf21e05dcfc7232ac73a1",
+                },
+            },
+        )
+        for output_slice in manifest["qk_norm_rope"][
+            "expected_output_slices"
+        ].values():
+            payload = (LAGUNA_ATTENTION_AUTO_FIXTURE / output_slice["file"]).read_bytes()
+            start = output_slice["offset"]
+            end = start + output_slice["bytes"]
+            self.assertEqual(len(payload[start:end]), output_slice["bytes"])
+            self.assertEqual(
+                hashlib.sha256(payload[start:end]).hexdigest(),
+                output_slice["sha256"],
+            )
         self.assertEqual(set(manifest["files"]), set(LAGUNA_ATTENTION_AUTO_FILES))
         for name, (expected_size, expected_sha256) in (
             LAGUNA_ATTENTION_AUTO_FILES.items()
@@ -146,8 +229,37 @@ class CudaBuildContractTest(unittest.TestCase):
             "5.0e-7f",
             "1.0e-5f",
             '"token20-head43"',
+            "run_qk_norm_rope_frozen_t21_case",
+            "poolside-auto-qk-t21",
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
+        kernel_main = source_function_body(
+            LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
+        )
+        norm_start = kernel_main.index("if (run_norm) {")
+        norm_end = kernel_main.index("if (run_decode", norm_start)
+        self.assertIn(
+            "run_qk_norm_rope_frozen_t21_case()",
+            kernel_main[norm_start:norm_end],
+        )
+        frozen_qk_body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_qk_norm_rope_frozen_t21_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        paired_call = frozen_qk_body.index(
+            "ds4_gpu_laguna_qk_head_rms_norm_rope_tensor("
+        )
+        reset = frozen_qk_body.index("ds4_gpu_tensor_write(q", paired_call)
+        single_call = frozen_qk_body.index(
+            "ds4_gpu_laguna_head_rms_norm_rope_tensor(", reset
+        )
+        self.assertLess(paired_call, reset)
+        self.assertLess(reset, single_call)
+        self.assertEqual(
+            frozen_qk_body.count("ds4_gpu_laguna_head_rms_norm_rope_tensor("),
+            2,
+        )
         for required in (
             "cudaDevAttrComputeCapabilityMajor",
             "compute_major >= 8",

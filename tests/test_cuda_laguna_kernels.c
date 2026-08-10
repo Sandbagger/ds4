@@ -1792,6 +1792,160 @@ static float *laguna_read_frozen_f32(const char *name, uint64_t count) {
     return values;
 }
 
+static float *laguna_frozen_qk_model_map;
+
+static int laguna_frozen_qk_exact(
+        const char *arm, const float *q_actual, const float *q_reference,
+        uint64_t q_count, uint32_t n_q_head, const float *k_actual,
+        const float *k_reference, uint64_t k_count, uint32_t n_k_head,
+        uint32_t head_dim) {
+    const int q_exact =
+        memcmp(q_actual, q_reference, (size_t)q_count * sizeof(float)) == 0;
+    const int k_exact =
+        memcmp(k_actual, k_reference, (size_t)k_count * sizeof(float)) == 0;
+    if (q_exact && k_exact) return 1;
+
+    const laguna_parity_span diagnostics[] = {
+        { "q-global", q_actual, q_reference, q_count,
+          1u, (uint32_t)q_count, 0.0f, 0.0f },
+        { "q-per-head", q_actual, q_reference, q_count,
+          n_q_head, head_dim, 0.0f, 0.0f },
+        { "k-global", k_actual, k_reference, k_count,
+          1u, (uint32_t)k_count, 0.0f, 0.0f },
+        { "k-per-head", k_actual, k_reference, k_count,
+          n_k_head, head_dim, 0.0f, 0.0f },
+    };
+    for (size_t i = 0; i < sizeof(diagnostics) / sizeof(diagnostics[0]); i++) {
+        (void)laguna_parity_spans_within_limits(
+            arm, &diagnostics[i], 1u, 1);
+    }
+    return 0;
+}
+
+static int run_qk_norm_rope_frozen_t21_case(void) {
+    const uint32_t n_tokens = 1u;
+    const uint32_t n_q_head = 48u;
+    const uint32_t n_k_head = 8u;
+    const uint32_t head_dim = 128u;
+    const uint32_t n_rot = 64u;
+    const uint64_t q_count = (uint64_t)n_q_head * head_dim;
+    const uint64_t k_count = (uint64_t)n_k_head * head_dim;
+    const uint64_t q_full_count = 22u * q_count;
+    const uint64_t k_full_count = 22u * k_count;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    float *q_input =
+        laguna_read_frozen_f32("layer-00-q-proj-t21.f32", q_count);
+    float *k_input =
+        laguna_read_frozen_f32("layer-00-k-proj-t21.f32", k_count);
+    float *q_weight =
+        laguna_read_frozen_f32("layer-00-q-norm-weight.f32", head_dim);
+    float *k_weight =
+        laguna_read_frozen_f32("layer-00-k-norm-weight.f32", head_dim);
+    float *q_reference_full =
+        laguna_read_frozen_f32("layer-00-q-rope.f32", q_full_count);
+    float *k_reference_full =
+        laguna_read_frozen_f32("layer-00-k-rope.f32", k_full_count);
+    float *q_actual = (float *)malloc((size_t)q_count * sizeof(*q_actual));
+    float *k_actual = (float *)malloc((size_t)k_count * sizeof(*k_actual));
+    float *model_map = (float *)malloc((size_t)(2u * weight_bytes));
+    ds4_gpu_tensor *q = NULL;
+    ds4_gpu_tensor *k = NULL;
+    int rc = 1;
+
+    if (!q_input || !k_input || !q_weight || !k_weight ||
+        !q_reference_full || !k_reference_full || !q_actual || !k_actual ||
+        !model_map || laguna_frozen_qk_model_map) {
+        fprintf(stderr, "poolside-auto-qk-t21: fixture setup failed\n");
+        goto cleanup;
+    }
+    memcpy(model_map, q_weight, (size_t)weight_bytes);
+    memcpy((char *)model_map + weight_bytes, k_weight, (size_t)weight_bytes);
+    if (!ds4_gpu_set_model_map(model_map, 2u * weight_bytes)) {
+        fprintf(stderr, "poolside-auto-qk-t21: model-map setup failed\n");
+        goto cleanup;
+    }
+    laguna_frozen_qk_model_map = model_map;
+    model_map = NULL;
+
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_input));
+    k = ds4_gpu_tensor_alloc(k_count * sizeof(*k_input));
+    if (!q || !k ||
+        !ds4_gpu_tensor_write(q, 0, q_input, q_count * sizeof(*q_input)) ||
+        !ds4_gpu_tensor_write(k, 0, k_input, k_count * sizeof(*k_input))) {
+        fprintf(stderr, "poolside-auto-qk-t21: tensor setup failed\n");
+        goto cleanup;
+    }
+    const int wrapper_ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+        q, k, laguna_frozen_qk_model_map, 2u * weight_bytes,
+        0u, weight_bytes, n_tokens, n_q_head, n_k_head, head_dim, n_rot,
+        21u, 8192u, 500000.0f, 1.0f / 32.0f, 1.0f, 1.0f,
+        32.0f, 1.0f, 1.0e-6f);
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (!wrapper_ok || sync != cudaSuccess) {
+        fprintf(stderr,
+                "poolside-auto-qk-t21: wrapper=%d sync=%s\n",
+                wrapper_ok, cudaGetErrorString(sync));
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(q, 0, q_actual, q_count * sizeof(*q_actual)) ||
+        !ds4_gpu_tensor_read(k, 0, k_actual, k_count * sizeof(*k_actual))) {
+        fprintf(stderr, "poolside-auto-qk-t21: output read failed\n");
+        goto cleanup;
+    }
+
+    const float *q_reference = q_reference_full + 21u * q_count;
+    const float *k_reference = k_reference_full + 21u * k_count;
+    const int pair_exact = laguna_frozen_qk_exact(
+        "poolside-auto-qk-t21/pair", q_actual, q_reference,
+        q_count, n_q_head, k_actual, k_reference, k_count, n_k_head,
+        head_dim);
+
+    if (!ds4_gpu_tensor_write(q, 0, q_input, q_count * sizeof(*q_input)) ||
+        !ds4_gpu_tensor_write(k, 0, k_input, k_count * sizeof(*k_input))) {
+        fprintf(stderr, "poolside-auto-qk-t21: tensor reset failed\n");
+        goto cleanup;
+    }
+    const int q_wrapper_ok = ds4_gpu_laguna_head_rms_norm_rope_tensor(
+        q, laguna_frozen_qk_model_map, 2u * weight_bytes, 0u,
+        n_tokens, n_q_head, head_dim, n_rot, 21u, 8192u, 500000.0f,
+        1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+    const int k_wrapper_ok = ds4_gpu_laguna_head_rms_norm_rope_tensor(
+        k, laguna_frozen_qk_model_map, 2u * weight_bytes, weight_bytes,
+        n_tokens, n_k_head, head_dim, n_rot, 21u, 8192u, 500000.0f,
+        1.0f / 32.0f, 1.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+    const cudaError_t single_sync = cudaDeviceSynchronize();
+    if (!q_wrapper_ok || !k_wrapper_ok || single_sync != cudaSuccess) {
+        fprintf(stderr,
+                "poolside-auto-qk-t21: single q_wrapper=%d k_wrapper=%d sync=%s\n",
+                q_wrapper_ok, k_wrapper_ok, cudaGetErrorString(single_sync));
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(q, 0, q_actual, q_count * sizeof(*q_actual)) ||
+        !ds4_gpu_tensor_read(k, 0, k_actual, k_count * sizeof(*k_actual))) {
+        fprintf(stderr, "poolside-auto-qk-t21: single output read failed\n");
+        goto cleanup;
+    }
+    const int single_exact = laguna_frozen_qk_exact(
+        "poolside-auto-qk-t21/single", q_actual, q_reference,
+        q_count, n_q_head, k_actual, k_reference, k_count, n_k_head,
+        head_dim);
+    if (pair_exact && single_exact) rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    free(model_map);
+    free(k_actual);
+    free(q_actual);
+    free(k_reference_full);
+    free(q_reference_full);
+    free(k_weight);
+    free(q_weight);
+    free(k_input);
+    free(q_input);
+    return rc;
+}
+
 static int laguna_frozen_cache_matches(
         const laguna_prefill_case *c, const laguna_prefill_result *result,
         const float *k_host, const float *v_host) {
@@ -2875,6 +3029,7 @@ int main(int argc, char **argv) {
         }
         if (run_qk_metric_dilution_case() != 0) rc = 1;
         if (run_grouped_metric_contract_cases() != 0) rc = 1;
+        if (run_qk_norm_rope_frozen_t21_case() != 0) rc = 1;
     }
     if (run_decode && run_decode_attention_cases() != 0) {
         rc = 1;
@@ -2895,6 +3050,7 @@ int main(int argc, char **argv) {
     }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
+    free(laguna_frozen_qk_model_map);
     free(poolside_q8_model);
     free(weights);
     return rc;

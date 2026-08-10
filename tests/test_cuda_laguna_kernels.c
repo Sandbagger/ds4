@@ -99,7 +99,9 @@ static float reference_f16_to_f32(uint16_t value) {
 
 static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     const uint32_t in_dim = 3072u;
-    const uint32_t out_dim = 64u;
+    const uint32_t rounding_rows = 64u;
+    const uint32_t accumulation_rows = 4u;
+    const uint32_t out_dim = rounding_rows + accumulation_rows;
     const uint32_t n_tokens = 22u;
     const uint32_t q8_block = 32u;
     const uint32_t blocks = in_dim / q8_block;
@@ -141,13 +143,35 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     }
 
     const uint16_t unit_scale = reference_f32_to_f16(1.0f);
-    for (uint32_t row = 0; row < out_dim; row++) {
+    for (uint32_t row = 0; row < rounding_rows; row++) {
         for (uint32_t block = 0; block < blocks; block++) {
             unsigned char *weight = model +
                 ((uint64_t)row * blocks + block) * 34u;
             memcpy(weight, &unit_scale, sizeof(unit_scale));
             if (block == 0u) {
                 ((int8_t *)(weight + sizeof(unit_scale)))[1] = 1;
+            }
+        }
+    }
+    static const uint16_t accumulation_scales[] = {
+        0x1800u, 0x1a00u, 0x1c00u, 0x1e00u,
+        0x2000u, 0x2100u, 0x2200u, 0x2300u,
+    };
+    for (uint32_t row = 0; row < accumulation_rows; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            unsigned char *weight = model +
+                ((uint64_t)(rounding_rows + row) * blocks + block) * 34u;
+            const uint16_t scale = accumulation_scales[
+                (row * 5u + block * 3u) %
+                (sizeof(accumulation_scales) /
+                 sizeof(accumulation_scales[0]))];
+            memcpy(weight, &scale, sizeof(scale));
+            int8_t *values = (int8_t *)(weight + sizeof(scale));
+            for (uint32_t i = 0; i < q8_block; i++) {
+                const uint32_t mixed =
+                    (row + 1u) * 97u + (block + 3u) * 53u +
+                    (i + 5u) * 29u + row * block * 7u;
+                values[i] = (int8_t)((int)(mixed % 255u) - 127);
             }
         }
     }
@@ -230,14 +254,77 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
         fprintf(stderr, "poolside-q8: CUDA projection failed\n");
         goto cleanup;
     }
-    for (uint64_t i = 0; i < output_count; i++) {
-        const float error = fabsf(actual[i] - expected);
-        if (!isfinite(actual[i]) || error > tolerance) {
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t row = 0; row < rounding_rows; row++) {
+            const uint64_t index = (uint64_t)token * out_dim + row;
+            const float error = fabsf(actual[index] - expected);
+            if (!isfinite(actual[index]) || error > tolerance) {
+                fprintf(stderr,
+                        "poolside-q8: output[%llu]=%.9g expected=%.9g "
+                        "abs=%.9g tolerance=%.9g\n",
+                        (unsigned long long)index, actual[index], expected,
+                        error, tolerance);
+                goto cleanup;
+            }
+        }
+    }
+
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            float *values = input +
+                (uint64_t)token * in_dim + (uint64_t)block * q8_block;
+            const float amplitude = ldexpf(
+                1.0f + (float)((token + block) & 3u) * 0.125f,
+                -5 + (int)((token * 3u + block) % 5u));
+            values[0] = amplitude;
+            for (uint32_t i = 1; i < q8_block; i++) {
+                const uint32_t mixed =
+                    (token + 2u) * 89u + (block + 1u) * 43u + i * 31u +
+                    token * block * 11u;
+                int q = (int)(mixed % 253u) - 126;
+                if (q == 64 || q == -64) q += 1;
+                values[i] = amplitude * (float)q * 0x1p-7f;
+            }
+        }
+    }
+    if (!ds4_gpu_tensor_write(x, 0, input,
+                              input_count * sizeof(*input)) ||
+        !ds4_gpu_matmul_q8_0_tensor(out, model, model_bytes, 0u,
+                                    in_dim, out_dim, x, n_tokens) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, actual,
+                             output_count * sizeof(*actual))) {
+        fprintf(stderr, "poolside-q8: CUDA accumulation projection failed\n");
+        goto cleanup;
+    }
+    /* Pinned from Poolside llama.cpp 04b2b72 on GB10. Its Q8 MMQ path
+     * rounds weight_scale*dot, then serially FMA-accumulates all 96 blocks.
+     * Distinct rows and tokens also reject layout-permutation accidents. */
+    static const struct {
+        uint32_t token;
+        uint32_t row;
+        uint32_t expected_bits;
+    } accumulation_oracle[] = {
+        { 0u,  0u, 0x40e44667u }, { 0u,  3u, 0xc0d0d4c9u },
+        { 1u,  1u, 0xc0dd3fc5u }, { 7u,  2u, 0xc02262cbu },
+        { 10u, 0u, 0xc17d0fceu }, { 15u, 3u, 0xc0988d8cu },
+        { 20u, 1u, 0xc2166172u }, { 21u, 3u, 0x3fe83381u },
+    };
+    for (size_t i = 0;
+         i < sizeof(accumulation_oracle) / sizeof(accumulation_oracle[0]);
+         i++) {
+        const uint64_t index =
+            (uint64_t)accumulation_oracle[i].token * out_dim +
+            rounding_rows + accumulation_oracle[i].row;
+        uint32_t actual_bits = 0;
+        memcpy(&actual_bits, &actual[index], sizeof(actual_bits));
+        if (actual_bits != accumulation_oracle[i].expected_bits) {
             fprintf(stderr,
-                    "poolside-q8: output[%llu]=%.9g expected=%.9g "
-                    "abs=%.9g tolerance=%.9g\n",
-                    (unsigned long long)i, actual[i], expected, error,
-                    tolerance);
+                    "poolside-q8: accumulation token=%u row=%u "
+                    "got=0x%08x expected=0x%08x\n",
+                    accumulation_oracle[i].token,
+                    accumulation_oracle[i].row,
+                    actual_bits, accumulation_oracle[i].expected_bits);
             goto cleanup;
         }
     }

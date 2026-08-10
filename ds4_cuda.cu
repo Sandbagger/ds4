@@ -24926,15 +24926,6 @@ extern "C" int ds4_gpu_add3_tensor(
     return cuda_ok(cudaGetLastError(), "add3 launch");
 }
 
-extern "C" int ds4_gpu_laguna_moe_residual_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *residual,
-        const ds4_gpu_tensor *moe,
-        const ds4_gpu_tensor *shared,
-        uint32_t                n) {
-    return ds4_gpu_add3_tensor(out, moe, shared, residual, n);
-}
-
 /* Fused decode residual: sum_out = a + b; norm_out = rmsnorm(sum) * w.
  * Single row, one block (two-pass over n with a shared reduction). */
 __global__ static void glm_add_rms_norm_weight_kernel(

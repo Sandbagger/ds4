@@ -1017,12 +1017,10 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("actual_bits != expected_bits", case_body)
         self.assertRegex(case_body, r"width\s*=\s*3072")
 
-        residual_body = function_body(
-            'extern "C" int ds4_gpu_laguna_moe_residual_tensor('
-        )
-        self.assertIn(
-            "ds4_gpu_add3_tensor(out, moe, shared, residual, n)",
-            residual_body,
+        self.assertRegex(
+            GPU_HEADER,
+            r"static inline int ds4_gpu_laguna_moe_residual_tensor\([\s\S]*?"
+            r"return ds4_gpu_add3_tensor\(out, moe, shared, residual, n\);",
         )
         self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", GPU_HEADER)
         for function_name in (

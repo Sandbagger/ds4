@@ -116,6 +116,32 @@ class CudaBuildContractTest(unittest.TestCase):
                 self.assertIn("ds4_cuda.o", prerequisites)
                 self.assertIn("ds4_runtime.o", prerequisites)
 
+    def test_poolside_mmvq_uses_the_active_configured_physical_device(
+        self,
+    ) -> None:
+        body = function_body(
+            'extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor('
+        )
+        n1_prefix, n22_marker, _ = body.partition("n_tok == 22u")
+        self.assertTrue(n22_marker, "missing Poolside n_tok=22 branch")
+        self.assertNotIn("g_n_gpus > 1", n1_prefix)
+        self.assertNotIn(": 0;", n1_prefix)
+        device_guard = re.search(
+            r"if\s*\(logical_tier >= 0 && logical_tier < g_n_gpus\)\s*\{"
+            r"(?P<body>.*?)"
+            r"\n\s*\}",
+            n1_prefix,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(device_guard, "missing logical-tier bounds")
+        guarded = device_guard.group("body")
+        self.assertIn(
+            "g_gpu[logical_tier].device_id", guarded
+        )
+        self.assertIn("cudaGetDevice(&current_device)", guarded)
+        self.assertIn("current_device == physical_device", guarded)
+        self.assertNotIn("cudaSetDevice", n1_prefix)
+
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')
         preamble, separator, _ = body.partition("g_current_logical_tier = -1;")

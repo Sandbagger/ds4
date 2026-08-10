@@ -47,7 +47,13 @@ def read_canonical_f32(path: Path, expected_bytes: int | None) -> tuple[bytes, a
     return payload, values
 
 
-def metrics(reference_path: Path, candidate_path: Path, expected_bytes: int | None) -> dict[str, Any]:
+def metrics(
+    reference_path: Path,
+    candidate_path: Path,
+    expected_bytes: int | None,
+    value_start: int = 0,
+    value_count: int | None = None,
+) -> dict[str, Any]:
     reference_bytes, reference = read_canonical_f32(reference_path, expected_bytes)
     candidate_bytes, candidate = read_canonical_f32(candidate_path, expected_bytes)
     if len(reference) != len(candidate):
@@ -55,6 +61,18 @@ def metrics(reference_path: Path, candidate_path: Path, expected_bytes: int | No
             f"{candidate_path.name}: expected {len(reference) * FLOAT_SIZE} bytes "
             f"to match {reference_path.name}, got {len(candidate) * FLOAT_SIZE}"
         )
+    value_end = len(reference) if value_count is None else value_start + value_count
+    if value_start < 0 or value_end < value_start or value_end > len(reference):
+        raise DiagnosticError(
+            f"{reference_path.name}/{candidate_path.name}: invalid metric slice "
+            f"{value_start}:{value_end} for {len(reference)} floats"
+        )
+    reference = reference[value_start:value_end]
+    candidate = candidate[value_start:value_end]
+    byte_start = value_start * FLOAT_SIZE
+    byte_end = value_end * FLOAT_SIZE
+    reference_bytes = reference_bytes[byte_start:byte_end]
+    candidate_bytes = candidate_bytes[byte_start:byte_end]
 
     reference_sha256 = hashlib.sha256(reference_bytes).hexdigest()
     candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
@@ -129,13 +147,44 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
     embedding = None
     if embedding_pair is not None:
         embedding = metrics(*embedding_pair, LAYER_BYTES)
+        embedding["last_token"] = metrics(
+            *embedding_pair,
+            LAYER_BYTES,
+            value_start=(TOKENS - 1) * WIDTH,
+            value_count=WIDTH,
+        )
 
     layers: list[dict[str, Any]] = []
     for layer in range(LAYER_COUNT):
         name = f"layer-{layer:02d}.f32"
         result = metrics(reference / name, candidate / name, LAYER_BYTES)
+        result["last_token"] = metrics(
+            reference / name,
+            candidate / name,
+            LAYER_BYTES,
+            value_start=(TOKENS - 1) * WIDTH,
+            value_count=WIDTH,
+        )
         result["layer"] = layer
         layers.append(result)
+
+    largest_increase = None
+    previous_stage = "embd"
+    previous_relative_rms = (
+        embedding["last_token"]["relative_rms"] if embedding is not None else 0.0
+    )
+    for result in layers:
+        current_relative_rms = result["last_token"]["relative_rms"]
+        increase = current_relative_rms - previous_relative_rms
+        increase_candidate = {
+            "layer": result["layer"],
+            "previous_stage": previous_stage,
+            "increase": increase,
+        }
+        if largest_increase is None or increase > largest_increase["increase"]:
+            largest_increase = increase_candidate
+        previous_stage = f"l_out-{result['layer']}"
+        previous_relative_rms = current_relative_rms
 
     logits_pair = optional_pair(reference, candidate, "logits.f32")
     logits = None
@@ -160,6 +209,7 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
         "layers": layers,
         "logits": logits,
         "first_divergence": first_divergence,
+        "largest_last_token_relative_rms_increase": largest_increase,
     }
 
 
@@ -187,6 +237,13 @@ def print_table(report: dict[str, Any]) -> None:
         print(f"first_divergence={divergence['stage']}")
     else:
         print(f"first_divergence={divergence['stage']}-{divergence['layer']}")
+    increase = report["largest_last_token_relative_rms_increase"]
+    if increase is not None:
+        print(
+            "largest_last_token_relative_rms_increase="
+            f"layer-{increase['layer']} previous={increase['previous_stage']} "
+            f"delta={increase['increase']:.9g}"
+        )
 
 
 def parse_args() -> argparse.Namespace:

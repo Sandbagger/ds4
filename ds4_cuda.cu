@@ -30436,6 +30436,156 @@ __global__ static void laguna_stage_kv_f16_kernel(
     }
 }
 
+/* Poolside's AUTO flash-attention path crosses two important fp16 boundaries:
+ * Q is scaled after conversion to fp16, and the unnormalised softmax weights
+ * are accumulated with V by fp16 tensor-core MMA.  Keep this small kernel
+ * deliberately limited to the short, first-prefill shape while the scalar
+ * implementation remains the general fallback. */
+__global__ static void laguna_attention_prefill_auto_mma32_kernel(
+        float *heads, const float *q, const __half *staged_key,
+        const __half *staged_value, const float *gate, uint32_t n_tokens,
+        uint32_t n_head, uint32_t n_head_kv, float scale) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    constexpr uint32_t tile_rows = 16u;
+    constexpr uint32_t max_keys = 32u;
+    constexpr uint32_t head_dim = 128u;
+    const uint32_t row0 = blockIdx.x * tile_rows;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 256u || row0 >= n_tokens || head >= n_head) return;
+
+    __shared__ __align__(32) __half q_sh[tile_rows * head_dim];
+    __shared__ __align__(32) __half k_sh[max_keys * head_dim];
+    __shared__ __align__(32) __half p_sh[tile_rows * max_keys];
+    __shared__ __align__(32) __half v_sh[head_dim * max_keys];
+    __shared__ __align__(32) __half out_sh[tile_rows * head_dim];
+    __shared__ __align__(32) float score_sh[tile_rows * max_keys];
+    __shared__ float rowsum_sh[tile_rows];
+
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const __half scale_h = __float2half_rn(scale);
+
+    for (uint32_t i = tid; i < tile_rows * head_dim; i += 256u) {
+        const uint32_t row = row0 + i / head_dim;
+        const uint32_t d = i % head_dim;
+        const float value = row < n_tokens
+            ? q[((uint64_t)row * n_head + head) * head_dim + d]
+            : 0.0f;
+        q_sh[i] = __hmul(__float2half_rn(value), scale_h);
+    }
+    for (uint32_t i = tid; i < max_keys * head_dim; i += 256u) {
+        const uint32_t key = i / head_dim;
+        const uint32_t d = i % head_dim;
+        __half key_value = __float2half_rn(0.0f);
+        __half value_value = __float2half_rn(0.0f);
+        if (key < n_tokens) {
+            const uint64_t source =
+                (uint64_t)key * kv_width + (uint64_t)kv_head * head_dim + d;
+            key_value = staged_key[source];
+            value_value = staged_value[source];
+        }
+        k_sh[i] = key_value;
+        v_sh[(uint64_t)d * max_keys + key] = value_value;
+    }
+    __syncthreads();
+
+    if (warp < 2u) {
+        const uint32_t key0 = warp * 16u;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                       __half, wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                       __half, wmma::col_major> k_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> score_frag;
+        wmma::fill_fragment(score_frag, 0.0f);
+        for (uint32_t d0 = 0; d0 < head_dim; d0 += 16u) {
+            wmma::load_matrix_sync(q_frag, q_sh + d0, head_dim);
+            wmma::load_matrix_sync(
+                    k_frag, k_sh + (uint64_t)key0 * head_dim + d0,
+                    head_dim);
+            wmma::mma_sync(score_frag, q_frag, k_frag, score_frag);
+        }
+        wmma::store_matrix_sync(
+                score_sh + key0, score_frag, max_keys,
+                wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    if (tid < tile_rows) {
+        const uint32_t row = row0 + tid;
+        float sum = 0.0f;
+        if (row < n_tokens) {
+            float max_score = -INFINITY;
+            for (uint32_t key = 0; key <= row; key++) {
+                max_score = fmaxf(max_score,
+                                  score_sh[tid * max_keys + key]);
+            }
+            max_score += 3.0f * 0.6931f;
+            for (uint32_t key = 0; key < max_keys; key++) {
+                float weight = 0.0f;
+                if (key <= row) {
+                    weight = expf(score_sh[tid * max_keys + key] - max_score);
+                    sum += weight;
+                }
+                p_sh[tid * max_keys + key] = __float2half_rn(weight);
+            }
+        } else {
+            for (uint32_t key = 0; key < max_keys; key++) {
+                p_sh[tid * max_keys + key] = __float2half_rn(0.0f);
+            }
+        }
+        rowsum_sh[tid] = sum;
+    }
+    __syncthreads();
+
+    {
+        const uint32_t d0 = warp * 16u;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                       __half, wmma::row_major> p_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                       __half, wmma::col_major> v_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, __half> out_frag;
+        wmma::fill_fragment(out_frag, __float2half_rn(0.0f));
+        for (uint32_t key0 = 0; key0 < max_keys; key0 += 16u) {
+            wmma::load_matrix_sync(p_frag, p_sh + key0, max_keys);
+            wmma::load_matrix_sync(
+                    v_frag, v_sh + (uint64_t)d0 * max_keys + key0,
+                    max_keys);
+            wmma::mma_sync(out_frag, p_frag, v_frag, out_frag);
+        }
+        wmma::store_matrix_sync(
+                out_sh + d0, out_frag, head_dim, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i < tile_rows * head_dim; i += 256u) {
+        const uint32_t local_row = i / head_dim;
+        const uint32_t row = row0 + local_row;
+        const uint32_t d = i % head_dim;
+        if (row < n_tokens) {
+            const float gate_value = gate[(uint64_t)row * n_head + head];
+            const float gate_scale = gate_value > 20.0f
+                ? gate_value : logf(1.0f + expf(gate_value));
+            heads[((uint64_t)row * n_head + head) * head_dim + d] =
+                __half2float(out_sh[i]) / rowsum_sh[local_row] * gate_scale;
+        }
+    }
+#else
+    (void)heads;
+    (void)q;
+    (void)staged_key;
+    (void)staged_value;
+    (void)gate;
+    (void)n_tokens;
+    (void)n_head;
+    (void)n_head_kv;
+    (void)scale;
+#endif
+}
+
 __global__ static void laguna_attention_prefill_gqa_f16_kernel(
         float *heads, const float *q, const __half *key_cache,
         const __half *value_cache, const __half *staged_key,
@@ -30569,6 +30719,12 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         ds4_tensor_device_idx(staged_key) != logical_tier || ds4_tensor_device_idx(staged_value) != logical_tier ||
         ds4_tensor_device_idx(q) != logical_tier || ds4_tensor_device_idx(k) != logical_tier ||
         ds4_tensor_device_idx(v) != logical_tier || ds4_tensor_device_idx(gate) != logical_tier) return 0;
+    int compute_major = 0;
+    const bool auto_mma_eligible =
+        cudaDeviceGetAttribute(
+            &compute_major, cudaDevAttrComputeCapabilityMajor,
+            g_gpu[logical_tier].device_id) == cudaSuccess &&
+        compute_major >= 8;
     int ok = 0;
     WITH_DEVICE(g_gpu[logical_tier].device_id) {
         laguna_stage_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
@@ -30576,12 +30732,24 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (__half *)staged_key->ptr, (__half *)staged_value->ptr, kv_values);
         ok = cuda_ok(cudaGetLastError(), "laguna KV stage launch");
         if (ok) {
-            laguna_attention_prefill_gqa_f16_kernel<<<(unsigned)((uint64_t)n_tokens * n_head), 1>>>(
-                    (float *)heads->ptr, (const float *)q->ptr,
-                    (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
-                    (const __half *)staged_key->ptr, (const __half *)staged_value->ptr,
-                    (const float *)gate->ptr, pos0, n_tokens, cache_cap, n_head,
-                    n_head_kv, head_dim, scale);
+            if (auto_mma_eligible && pos0 == 0u && n_tokens == 22u &&
+                cache_cap >= n_tokens && (n_head == 48u || n_head == 72u) &&
+                n_head_kv == 8u) {
+                const dim3 grid((n_tokens + 15u) / 16u, n_head, 1u);
+                laguna_attention_prefill_auto_mma32_kernel<<<grid, 256>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)staged_key->ptr,
+                        (const __half *)staged_value->ptr,
+                        (const float *)gate->ptr, n_tokens, n_head,
+                        n_head_kv, scale);
+            } else {
+                laguna_attention_prefill_gqa_f16_kernel<<<(unsigned)((uint64_t)n_tokens * n_head), 1>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
+                        (const __half *)staged_key->ptr, (const __half *)staged_value->ptr,
+                        (const float *)gate->ptr, pos0, n_tokens, cache_cap, n_head,
+                        n_head_kv, head_dim, scale);
+            }
             ok = cuda_ok(cudaGetLastError(), "laguna prefill attention launch");
         }
         if (ok) {

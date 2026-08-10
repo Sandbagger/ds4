@@ -30486,11 +30486,14 @@ __global__ static void laguna_attention_prefill_auto_mma32_kernel(
     __shared__ __align__(32) __half out_sh[tile_rows * head_dim];
     __shared__ __align__(32) float score_sh[tile_rows * max_keys];
     __shared__ float rowsum_sh[tile_rows];
+    __shared__ float partition_max_sh[2u * tile_rows];
+    __shared__ float partition_rowsum_sh[2u * tile_rows];
 
     const uint32_t heads_per_kv = n_head / n_head_kv;
     const uint32_t kv_head = head / heads_per_kv;
     const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
     const __half scale_h = __float2half_rn(scale);
+    const bool partitioned_gqa9 = n_head == 72u;
 
     for (uint32_t i = tid; i < tile_rows * head_dim; i += 256u) {
         const uint32_t row = row0 + i / head_dim;
@@ -30541,46 +30544,92 @@ __global__ static void laguna_attention_prefill_auto_mma32_kernel(
         const uint32_t row = row0 + tid;
         float sum = 0.0f;
         if (row < n_tokens) {
-            float max_score = -INFINITY;
-            for (uint32_t key = 0; key <= row; key++) {
-                max_score = fmaxf(max_score,
-                                  score_sh[tid * max_keys + key]);
-            }
-            max_score += 3.0f * 0.6931f;
-            for (uint32_t key = 0; key < max_keys; key++) {
-                float weight = 0.0f;
-                if (key <= row) {
-                    weight = expf(score_sh[tid * max_keys + key] - max_score);
+            if (partitioned_gqa9) {
+                for (uint32_t partition = 0; partition < 2u; partition++) {
+                    const uint32_t key0 = 16u * partition;
+                    float max_score = -FLT_MAX / 2.0f;
+                    for (uint32_t key = key0; key < key0 + 16u; key++) {
+                        if (key <= row) {
+                            const float offset_score = __fadd_rn(
+                                score_sh[tid * max_keys + key],
+                                3.0f * 0.6931f);
+                            max_score = fmaxf(max_score, offset_score);
+                        }
+                    }
+                    float lane_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    for (uint32_t lane_id = 0; lane_id < 4u; lane_id++) {
+                        const uint32_t lane_keys[4] = {
+                            key0 + 2u * lane_id,
+                            key0 + 2u * lane_id + 1u,
+                            key0 + 2u * lane_id + 8u,
+                            key0 + 2u * lane_id + 9u,
+                        };
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            const uint32_t key = lane_keys[i];
+                            float weight = 0.0f;
+                            if (key <= row) {
+                                weight = expf(
+                                    score_sh[tid * max_keys + key] - max_score);
+                            }
+                            score_sh[tid * max_keys + key] = weight;
+                            p_sh[tid * max_keys + key] =
+                                __float2half_rn(weight);
+                            lane_sum[lane_id] = __fadd_rn(
+                                lane_sum[lane_id], weight);
+                        }
+                    }
+                    const float sum02 =
+                        __fadd_rn(lane_sum[0], lane_sum[2]);
+                    const float sum13 =
+                        __fadd_rn(lane_sum[1], lane_sum[3]);
+                    partition_max_sh[partition * tile_rows + tid] = max_score;
+                    partition_rowsum_sh[partition * tile_rows + tid] =
+                        __fadd_rn(sum02, sum13);
                 }
-                score_sh[tid * max_keys + key] = weight;
-                p_sh[tid * max_keys + key] = __float2half_rn(weight);
-            }
-            /* Poolside's 16x16 MMA accumulator distributes each KQ row over
-             * four lanes.  Each lane owns two-key chunks eight keys apart;
-             * the final XOR reduction combines lanes 0+2, 1+3, then both.
-             * Preserve that association because its divisor feeds a Q8
-             * quantization boundary in the following O projection. */
-            float lane_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            for (uint32_t key0 = 0; key0 < max_keys; key0 += 16u) {
-                for (uint32_t lane_id = 0; lane_id < 4u; lane_id++) {
-                    const uint32_t key = key0 + 2u * lane_id;
-                    lane_sum[lane_id] = __fadd_rn(
-                        lane_sum[lane_id],
-                        score_sh[tid * max_keys + key]);
-                    lane_sum[lane_id] = __fadd_rn(
-                        lane_sum[lane_id],
-                        score_sh[tid * max_keys + key + 1u]);
-                    lane_sum[lane_id] = __fadd_rn(
-                        lane_sum[lane_id],
-                        score_sh[tid * max_keys + key + 8u]);
-                    lane_sum[lane_id] = __fadd_rn(
-                        lane_sum[lane_id],
-                        score_sh[tid * max_keys + key + 9u]);
+            } else {
+                float max_score = -INFINITY;
+                for (uint32_t key = 0; key <= row; key++) {
+                    max_score = fmaxf(max_score,
+                                      score_sh[tid * max_keys + key]);
                 }
+                max_score += 3.0f * 0.6931f;
+                for (uint32_t key = 0; key < max_keys; key++) {
+                    float weight = 0.0f;
+                    if (key <= row) {
+                        weight = expf(
+                            score_sh[tid * max_keys + key] - max_score);
+                    }
+                    score_sh[tid * max_keys + key] = weight;
+                    p_sh[tid * max_keys + key] = __float2half_rn(weight);
+                }
+                /* Poolside's 16x16 MMA accumulator distributes each KQ row
+                 * over four lanes.  Each lane owns two-key chunks eight keys
+                 * apart; the final XOR reduction combines lanes 0+2, 1+3,
+                 * then both.  Preserve that association because its divisor
+                 * feeds a Q8 quantization boundary in the following O
+                 * projection. */
+                float lane_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (uint32_t key0 = 0; key0 < max_keys; key0 += 16u) {
+                    for (uint32_t lane_id = 0; lane_id < 4u; lane_id++) {
+                        const uint32_t key = key0 + 2u * lane_id;
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key]);
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key + 1u]);
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key + 8u]);
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key + 9u]);
+                    }
+                }
+                const float sum02 = __fadd_rn(lane_sum[0], lane_sum[2]);
+                const float sum13 = __fadd_rn(lane_sum[1], lane_sum[3]);
+                sum = __fadd_rn(sum02, sum13);
             }
-            const float sum02 = __fadd_rn(lane_sum[0], lane_sum[2]);
-            const float sum13 = __fadd_rn(lane_sum[1], lane_sum[3]);
-            sum = __fadd_rn(sum02, sum13);
         } else {
             for (uint32_t key = 0; key < max_keys; key++) {
                 p_sh[tid * max_keys + key] = __float2half_rn(0.0f);
@@ -30598,7 +30647,8 @@ __global__ static void laguna_attention_prefill_auto_mma32_kernel(
                        __half, wmma::col_major> v_frag;
         wmma::fragment<wmma::accumulator, 16, 16, 16, __half> out_frag;
         wmma::fill_fragment(out_frag, __float2half_rn(0.0f));
-        for (uint32_t key0 = 0; key0 < max_keys; key0 += 16u) {
+        const uint32_t key_stop = partitioned_gqa9 ? 16u : max_keys;
+        for (uint32_t key0 = 0; key0 < key_stop; key0 += 16u) {
             wmma::load_matrix_sync(p_frag, p_sh + key0, max_keys);
             wmma::load_matrix_sync(
                     v_frag, v_sh + (uint64_t)d0 * max_keys + key0,
@@ -30607,6 +30657,16 @@ __global__ static void laguna_attention_prefill_auto_mma32_kernel(
         }
         wmma::store_matrix_sync(
                 out_sh + d0, out_frag, head_dim, wmma::mem_row_major);
+        if (partitioned_gqa9) {
+            wmma::fill_fragment(out_frag, __float2half_rn(0.0f));
+            wmma::load_matrix_sync(p_frag, p_sh + 16u, max_keys);
+            wmma::load_matrix_sync(
+                    v_frag, v_sh + (uint64_t)d0 * max_keys + 16u,
+                    max_keys);
+            wmma::mma_sync(out_frag, p_frag, v_frag, out_frag);
+            wmma::store_matrix_sync(
+                    q_sh + d0, out_frag, head_dim, wmma::mem_row_major);
+        }
     }
     __syncthreads();
 
@@ -30618,8 +30678,28 @@ __global__ static void laguna_attention_prefill_auto_mma32_kernel(
             const float gate_value = gate[(uint64_t)row * n_head + head];
             const float gate_scale = gate_value > 20.0f
                 ? gate_value : logf(1.0f + expf(gate_value));
+            float attention_value;
+            if (partitioned_gqa9) {
+                const float max0 = partition_max_sh[local_row];
+                const float max1 = partition_max_sh[tile_rows + local_row];
+                const float combined_max = fmaxf(max0, max1);
+                const float scale0 = expf(max0 - combined_max);
+                const float scale1 = expf(max1 - combined_max);
+                const float sum0 = __fmul_rn(
+                    scale0, partition_rowsum_sh[local_row]);
+                const float sum1 = __fmul_rn(
+                    scale1, partition_rowsum_sh[tile_rows + local_row]);
+                const float combined_sum = __fadd_rn(sum0, sum1);
+                float numerator = 0.0f;
+                numerator += __half2float(out_sh[i]) * scale0;
+                numerator += __half2float(q_sh[i]) * scale1;
+                attention_value = numerator / combined_sum;
+            } else {
+                attention_value =
+                    __half2float(out_sh[i]) / rowsum_sh[local_row];
+            }
             heads[((uint64_t)row * n_head + head) * head_dim + d] =
-                __half2float(out_sh[i]) / rowsum_sh[local_row] * gate_scale;
+                attention_value * gate_scale;
         }
     }
 #else

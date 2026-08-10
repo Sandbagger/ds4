@@ -28656,7 +28656,6 @@ __global__ static void glm_router_select_parallel_kernel(
     __shared__ float sh_v[256];
     __shared__ int sh_i[256];
     __shared__ float sh_sel_v[256];
-    __shared__ float sh_sum;
 
     float my_v = -1e30f;
     if (tid < n_expert) {
@@ -28664,7 +28663,6 @@ __global__ static void glm_router_select_parallel_kernel(
         probs[tid] = p;
         my_v = p + bias[tid];
     }
-    if (tid == 0u) sh_sum = 0.0f;
     sh_sel_v[tid] = my_v;
     __syncthreads();
 
@@ -28688,16 +28686,26 @@ __global__ static void glm_router_select_parallel_kernel(
             sel[k2] = best;
             const float p = probs[best];
             w[k2] = p;
-            sh_sum += p;
             sh_sel_v[best] = -1e30f;
         }
         __syncthreads();
     }
-    if (tid == 0u) {
-        float sum = sh_sum;
-        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    if (tid < 32u) {
+        float sum = 0.0f;
         for (uint32_t k2 = 0; k2 < n_expert_used; k2++) {
-            w[k2] = w[k2] / sum * expert_weight_scale;
+            if (((uint32_t)sel[k2] & 31u) == tid) {
+                sum += w[k2];
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, (int)mask, 32);
+        }
+        sum = fmaxf(sum, 0x1p-14f);
+        const float inv_sum = 1.0f / sum;
+        for (uint32_t k2 = tid; k2 < n_expert_used; k2 += 32u) {
+            const float normalized = w[k2] * inv_sum;
+            w[k2] = normalized * expert_weight_scale;
         }
     }
 }
@@ -28726,7 +28734,7 @@ __global__ static void glm_router_select_batch_kernel(
     /* top-k over probs+bias, ties by smaller index (matches CPU topk_desc) */
     bool taken[384];
     for (uint32_t i = 0; i < n_expert; i++) taken[i] = false;
-    float sum = 0.0f;
+    float lane_sum[32] = {0.0f};
     for (uint32_t k2 = 0; k2 < n_expert_used; k2++) {
         int best = -1; float bv = -1e30f;
         for (uint32_t i = 0; i < n_expert; i++) {
@@ -28737,11 +28745,18 @@ __global__ static void glm_router_select_batch_kernel(
         taken[best] = true;
         sel[k2] = best;
         w[k2] = probs[best];
-        sum += probs[best];
+        lane_sum[(uint32_t)best & 31u] += probs[best];
     }
-    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (uint32_t step = 16u; step > 0u; step >>= 1u) {
+        for (uint32_t lane = 0; lane < step; lane++) {
+            lane_sum[lane] += lane_sum[lane + step];
+        }
+    }
+    const float sum = fmaxf(lane_sum[0], 0x1p-14f);
+    const float inv_sum = 1.0f / sum;
     for (uint32_t k2 = 0; k2 < n_expert_used; k2++) {
-        w[k2] = w[k2] / sum * expert_weight_scale;
+        const float normalized = w[k2] * inv_sum;
+        w[k2] = normalized * expert_weight_scale;
     }
 }
 

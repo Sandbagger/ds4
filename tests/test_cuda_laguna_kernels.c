@@ -1964,10 +1964,22 @@ static void laguna_reference_routed_moe(
                 mid[row] = laguna_silu(laguna_q4k_q8_1_dot(gate + row, xq)) *
                     laguna_q4k_q8_1_dot(up + row, xq);
             }
+            float square_sum = 0.0f;
+            for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
+                square_sum += mid[row] * mid[row];
+            }
+            float column_l2 = sqrtf(square_sum);
+            if (column_l2 < 1.0e-8f) column_l2 = 1.0e-8f;
+            if (column_l2 > 1.0e30f) column_l2 = 1.0e30f;
+            const float safe_scale = 32768.0f / column_l2;
+            for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
+                mid[row] *= safe_scale;
+            }
             laguna_quantize_q8_1(midq, mid);
             for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
                 out[(uint64_t)token * LAGUNA_MOE_DIM + row] +=
-                    weight * laguna_q4k_q8_1_dot(down + row, midq);
+                    weight * (column_l2 / 32768.0f) *
+                    laguna_q4k_q8_1_dot(down + row, midq);
             }
         }
     }

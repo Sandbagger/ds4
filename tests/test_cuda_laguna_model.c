@@ -886,6 +886,8 @@ int main(void) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
         return 1;
     }
+    const char *diag_dir = getenv("DS4_LAGUNA_DIAG_DIR");
+    const bool diagnostic_mode = diag_dir && diag_dir[0];
     int model_fd = -1;
     bool model_fd_set = false;
     if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
@@ -915,25 +917,28 @@ int main(void) {
     }
 
     bool ok = run_short(engine, &fixtures.cases[0]);
-    if (ok) {
-        ok = run_raw_frontier(
-                engine, "swa-513", "swa-513.prompt", 513, 1024,
-                &fixtures.cases[1], NULL);
+    if (!diagnostic_mode) {
+        if (ok) {
+            ok = run_raw_frontier(
+                    engine, "swa-513", "swa-513.prompt", 513, 1024,
+                    &fixtures.cases[1], NULL);
+        }
+        if (ok) {
+            ok = run_raw_frontier(
+                    engine, "yarn-8193", "yarn-8193.prompt", 8193, 8202,
+                    &fixtures.cases[2], fixtures.continuation);
+        }
+        /* run_raw_frontier frees the 8202-token session before deep allocation. */
+        if (ok) ok = run_deep_exact_context(engine, &fixtures.cases[3]);
+        /* The deep session is freed before either multi-session scenario. */
+        if (ok) ok = run_decode_batch(engine);
+        if (ok) ok = run_mixed_batch(engine);
     }
-    if (ok) {
-        ok = run_raw_frontier(
-                engine, "yarn-8193", "yarn-8193.prompt", 8193, 8202,
-                &fixtures.cases[2], fixtures.continuation);
-    }
-    /* run_raw_frontier frees the 8202-token session before deep allocation. */
-    if (ok) ok = run_deep_exact_context(engine, &fixtures.cases[3]);
-    /* The deep session is freed before either multi-session scenario. */
-    if (ok) ok = run_decode_batch(engine);
-    if (ok) ok = run_mixed_batch(engine);
 
     ds4_engine_close(engine);
     free_fixtures(&fixtures);
     if (!ok) return 1;
+    if (diagnostic_mode) return 0;
     fprintf(stderr,
             "test_cuda_laguna_model PASS oracle=poolside cases=4 vectors=4 continuation=8 "
             "decode_batch=2 mixed=1+2\n");

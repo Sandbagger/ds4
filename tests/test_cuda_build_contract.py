@@ -245,7 +245,21 @@ class CudaBuildContractTest(unittest.TestCase):
         swa_case = main.find('engine, "swa-513"')
         self.assertGreaterEqual(diagnostic_guard, 0)
         self.assertGreater(swa_case, diagnostic_guard)
-        self.assertIn("if (diagnostic_mode) return 0;", main)
+        suite_end = main.find("\n    }\n\n    ds4_engine_close", diagnostic_guard)
+        self.assertGreater(suite_end, swa_case)
+        guarded_suite = main[diagnostic_guard:suite_end]
+        for call in (
+            "run_raw_frontier(",
+            "run_deep_exact_context(",
+            "run_decode_batch(",
+            "run_mixed_batch(",
+        ):
+            self.assertIn(call, guarded_suite)
+        failed = main.find("if (!ok) return 1;")
+        diagnostic_done = main.find("if (diagnostic_mode) return 0;")
+        full_suite_pass = main.find('"test_cuda_laguna_model PASS oracle=poolside')
+        self.assertGreater(diagnostic_done, failed)
+        self.assertGreater(full_suite_pass, diagnostic_done)
 
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')

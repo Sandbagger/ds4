@@ -18,8 +18,13 @@
     },
     "capture_script": {
       "path": "tests/oracle-producers/laguna-c7/capture_poolside_laguna_moe.sh",
-      "bytes": 2208,
-      "sha256": "75b3eca319b4ce2870111ced806df0a324444e99883f52321b5e3ff77660027e"
+      "bytes": 8048,
+      "sha256": "0c820c9f2746d53441c1046d01cd242bf144e8b0ac0e57cd11a522d17a355bfe"
+    },
+    "verifier": {
+      "path": "tests/oracle-producers/laguna-c7/verify_poolside_laguna_moe.py",
+      "bytes": 54988,
+      "sha256": "db62f8443821dfd1dd1c7386457ce53a6786ede43bdb67ed7cbd7376134cb601"
     },
     "tokens": {
       "path": "tests/oracle-producers/laguna-c7/short.tokens.i32",
@@ -33,6 +38,127 @@
     }
   },
   "execution": {
+    "toolchain": {
+      "cmake": {
+        "path": "/usr/bin/cmake",
+        "realpath": "/usr/bin/cmake",
+        "sha256": "05e8a03ddf5a5075139760bcf4fc5bb73112246c5cd796dc85854589cfa502cb",
+        "version": "3.28.3"
+      },
+      "cxx": {
+        "path": "/usr/bin/c++",
+        "realpath": "/usr/bin/aarch64-linux-gnu-g++-13",
+        "sha256": "fc02363794280f404c6ca6f5da1c8fe469be902e9de140d35d8573bb3393f53b",
+        "version": "13.3.0",
+        "target": "aarch64-linux-gnu"
+      },
+      "cuda": {
+        "path": "/usr/local/cuda/bin/nvcc",
+        "realpath": "/usr/local/cuda-13.0/bin/nvcc",
+        "sha256": "fbb111f057786ddd10ba723d993cc7dd43abf978b6baa32fedd3c9d806dc79e1",
+        "version": "13.0.88",
+        "release": "13.0",
+        "build": "cuda_13.0.r13.0/compiler.36424714_0"
+      },
+      "make": {
+        "path": "/usr/bin/gmake",
+        "realpath": "/usr/bin/make",
+        "sha256": "abbecc214fcadef6530d1cc137bde7ceb74cae3f6b992c7d10a8669a7314c7e0",
+        "version": "4.3"
+      }
+    },
+    "generated_recipes": {
+      "CMakeCache.txt": {
+        "normalized_bytes": 50493,
+        "normalized_sha256": "42bb0a751557d3948e838a94417b2d5895c2b9d97f73258a8c1736eddfcdf7f7"
+      },
+      "Makefile": {
+        "normalized_bytes": 40940,
+        "normalized_sha256": "13525b712d239479300975201e45fe94d3431c97debdf59017b678a32f605deb"
+      },
+      "CMakeFiles/Makefile2": {
+        "normalized_bytes": 166721,
+        "normalized_sha256": "b00dcc163f0c2029a700f5064d1fd330bc34b8f2fdd7b06ea9dace487c78c9cc"
+      },
+      "CMakeFiles/Makefile.cmake": {
+        "normalized_bytes": 13717,
+        "normalized_sha256": "a673dc5fd8135e9cc11a1b0f1936fec4337013116c959f558da00572d62ce1f6"
+      },
+      "src/CMakeFiles/llama.dir/build.make": {
+        "normalized_bytes": 261487,
+        "normalized_sha256": "7f78f598d93320951125e730d0dfc644f9a24d7faee807aadabe93cd2dca4cb2"
+      },
+      "src/CMakeFiles/llama.dir/flags.make": {
+        "normalized_bytes": 524,
+        "normalized_sha256": "d15fca142d5f07f5d6e4742f78d6bebd9a57ee5ed5ba5a2ef3f557a4a3467ecc"
+      },
+      "ggml/src/CMakeFiles/ggml.dir/build.make": {
+        "normalized_bytes": 6642,
+        "normalized_sha256": "b13073a9cb49e1438d4a4ae3b80262dce6eb5a50d60aa6d74bd200ac34ba3559"
+      },
+      "ggml/src/CMakeFiles/ggml.dir/flags.make": {
+        "normalized_bytes": 539,
+        "normalized_sha256": "a7ca9091f27f9c8c98ab598169447f01328da0ce91de484c38f0d7f7bd9132ce"
+      },
+      "ggml/src/CMakeFiles/ggml.dir/link.txt": {
+        "normalized_bytes": 389,
+        "normalized_sha256": "f7058e0c7fd0abbac30b276b0f9cc823757499cfe7bba25e228d7e30cadbb9c9"
+      },
+      "ggml/src/CMakeFiles/ggml-base.dir/build.make": {
+        "normalized_bytes": 17792,
+        "normalized_sha256": "1797ff4ba4079b1291b9df1925a11ae81531069c9c9f58f05b2fe9dee02e679b"
+      },
+      "ggml/src/CMakeFiles/ggml-base.dir/flags.make": {
+        "normalized_bytes": 1127,
+        "normalized_sha256": "c6f46c65d943d585294b52599cbff012316654603b84326f4f8b7cc76f133fd7"
+      },
+      "ggml/src/CMakeFiles/ggml-base.dir/link.txt": {
+        "normalized_bytes": 596,
+        "normalized_sha256": "960a99e84054616ad114500c4ec131fcdfdbda9a090657831bc56be715e57885"
+      },
+      "ggml/src/CMakeFiles/ggml-cpu.dir/build.make": {
+        "normalized_bytes": 29390,
+        "normalized_sha256": "0266b57e44f07d4eacaa4ba3317a8b18f6bd1838cce0a0d193ded049c1b66c75"
+      },
+      "ggml/src/CMakeFiles/ggml-cpu.dir/flags.make": {
+        "normalized_bytes": 1293,
+        "normalized_sha256": "f14f27e2a27227c8f8ef4098bc3f6bdc95a3367c365cdedca7a0547d3454bf18"
+      },
+      "ggml/src/CMakeFiles/ggml-cpu.dir/link.txt": {
+        "normalized_bytes": 1007,
+        "normalized_sha256": "c19ebcb7617b1c521a61a0db6255e6726ea85f7bddd7df0600f40491ffdd853d"
+      },
+
+      "src/CMakeFiles/llama.dir/link.txt": {
+        "normalized_bytes": 7512,
+        "normalized_sha256": "87adec14a16996d263489140320dcc78e5ad6f8c032b4d6648c9d2fbd41d717c"
+      },
+      "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/build.make": {
+        "normalized_bytes": 290236,
+        "normalized_sha256": "599e5e782d7c0f8e73c8464ad4beca16277a4d36ebfbf6693d06be6eabbd0ac3"
+      },
+      "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/flags.make": {
+        "normalized_bytes": 735,
+        "normalized_sha256": "6b889101ab32e1bab82b6f3787aa72df75f489e707a57b0e15e7e9ab90f1cb4f"
+      },
+      "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/includes_CUDA.rsp": {
+        "normalized_bytes": 120,
+        "normalized_sha256": "cf57567affcd762a2f970854f259b0ac2e2a9568edb769770269190d07710f71"
+      },
+      "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/objects1.rsp": {
+        "normalized_bytes": 8482,
+        "normalized_sha256": "abaaaefdaba0dada21c22478892d94f278b8d878c2faf7283dc4941d725aafc7"
+      },
+      "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/linkLibs.rsp": {
+        "normalized_bytes": 407,
+        "normalized_sha256": "76af44245dae3a42d87b64e62f08d05a160218c998934d260b78974cec9c1cfd"
+      },
+      "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/link.txt": {
+        "normalized_bytes": 266,
+        "normalized_sha256": "114473590c21a5cd20ca612883cd8efbb644e1f14e484347cb318ed466dce80c"
+      }
+    },
+
     "device": {
       "name": "NVIDIA GB10",
       "compute_capability": "12.1",
@@ -49,15 +175,20 @@
         "-Xcompiler=-fPIC",
         "-use_fast_math",
         "-extended-lambda",
-        "-compress-mode=size"
+        "-compress-mode=size",
+        "-Xcompiler",
+        "-Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -Wno-pedantic"
       ],
       "cxx_flags": ["-include", "cmath", "-O3", "-DNDEBUG"]
     },
     "probe_build": {
-      "compiler": "g++",
+      "compiler": "/usr/bin/c++",
       "flags": ["-std=c++17", "-O2"],
       "libraries": ["llama", "ggml", "ggml-base"],
-      "binary_sha256": "0b4e6a99d414ac86541e59d1b6bb9d9a514893c61da697deb77c2fe30dbf93de"
+      "runtime_library_path": "poolside_build/bin",
+      "elf_runpath": "none",
+      "binary_bytes": 80456,
+      "binary_sha256": "659be562dcdc4b3563d36a559ba121675db33a1c0aeb5338f5f20916d97b7f56"
     }
   },
   "capture": {

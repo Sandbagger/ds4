@@ -8,6 +8,7 @@ import json
 import re
 import struct
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -176,6 +177,171 @@ LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "poolside-l2-callback.patch",
     "probe_poolside_laguna_moe.cpp",
     "short.tokens.i32",
+    "verify_poolside_laguna_moe.py",
+}
+LAGUNA_C7_TOOLCHAIN = {
+    "cmake": {
+        "path": "/usr/bin/cmake",
+        "realpath": "/usr/bin/cmake",
+        "sha256": "05e8a03ddf5a5075139760bcf4fc5bb73112246c5cd796dc85854589cfa502cb",
+        "version": "3.28.3",
+    },
+    "cxx": {
+        "path": "/usr/bin/c++",
+        "realpath": "/usr/bin/aarch64-linux-gnu-g++-13",
+        "sha256": "fc02363794280f404c6ca6f5da1c8fe469be902e9de140d35d8573bb3393f53b",
+        "version": "13.3.0",
+        "target": "aarch64-linux-gnu",
+    },
+    "cuda": {
+        "path": "/usr/local/cuda/bin/nvcc",
+        "realpath": "/usr/local/cuda-13.0/bin/nvcc",
+        "sha256": "fbb111f057786ddd10ba723d993cc7dd43abf978b6baa32fedd3c9d806dc79e1",
+        "version": "13.0.88",
+        "release": "13.0",
+        "build": "cuda_13.0.r13.0/compiler.36424714_0",
+    },
+    "make": {
+        "path": "/usr/bin/gmake",
+        "realpath": "/usr/bin/make",
+        "sha256": "abbecc214fcadef6530d1cc137bde7ceb74cae3f6b992c7d10a8669a7314c7e0",
+        "version": "4.3",
+    },
+}
+LAGUNA_C7_GENERATED_RECIPES = {
+    "CMakeCache.txt": {
+        "normalized_bytes": 50493,
+        "normalized_sha256": (
+            "42bb0a751557d3948e838a94417b2d5895c2b9d97f73258a8c1736eddfcdf7f7"
+        ),
+    },
+    "Makefile": {
+        "normalized_bytes": 40940,
+        "normalized_sha256": (
+            "13525b712d239479300975201e45fe94d3431c97debdf59017b678a32f605deb"
+        ),
+    },
+    "CMakeFiles/Makefile2": {
+        "normalized_bytes": 166721,
+        "normalized_sha256": (
+            "b00dcc163f0c2029a700f5064d1fd330bc34b8f2fdd7b06ea9dace487c78c9cc"
+        ),
+    },
+    "CMakeFiles/Makefile.cmake": {
+        "normalized_bytes": 13717,
+        "normalized_sha256": (
+            "a673dc5fd8135e9cc11a1b0f1936fec4337013116c959f558da00572d62ce1f6"
+        ),
+    },
+    "src/CMakeFiles/llama.dir/build.make": {
+        "normalized_bytes": 261487,
+        "normalized_sha256": (
+            "7f78f598d93320951125e730d0dfc644f9a24d7faee807aadabe93cd2dca4cb2"
+        ),
+    },
+    "src/CMakeFiles/llama.dir/flags.make": {
+        "normalized_bytes": 524,
+        "normalized_sha256": (
+            "d15fca142d5f07f5d6e4742f78d6bebd9a57ee5ed5ba5a2ef3f557a4a3467ecc"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml.dir/build.make": {
+        "normalized_bytes": 6642,
+        "normalized_sha256": (
+            "b13073a9cb49e1438d4a4ae3b80262dce6eb5a50d60aa6d74bd200ac34ba3559"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml.dir/flags.make": {
+        "normalized_bytes": 539,
+        "normalized_sha256": (
+            "a7ca9091f27f9c8c98ab598169447f01328da0ce91de484c38f0d7f7bd9132ce"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml.dir/link.txt": {
+        "normalized_bytes": 389,
+        "normalized_sha256": (
+            "f7058e0c7fd0abbac30b276b0f9cc823757499cfe7bba25e228d7e30cadbb9c9"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml-base.dir/build.make": {
+        "normalized_bytes": 17792,
+        "normalized_sha256": (
+            "1797ff4ba4079b1291b9df1925a11ae81531069c9c9f58f05b2fe9dee02e679b"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml-base.dir/flags.make": {
+        "normalized_bytes": 1127,
+        "normalized_sha256": (
+            "c6f46c65d943d585294b52599cbff012316654603b84326f4f8b7cc76f133fd7"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml-base.dir/link.txt": {
+        "normalized_bytes": 596,
+        "normalized_sha256": (
+            "960a99e84054616ad114500c4ec131fcdfdbda9a090657831bc56be715e57885"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml-cpu.dir/build.make": {
+        "normalized_bytes": 29390,
+        "normalized_sha256": (
+            "0266b57e44f07d4eacaa4ba3317a8b18f6bd1838cce0a0d193ded049c1b66c75"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml-cpu.dir/flags.make": {
+        "normalized_bytes": 1293,
+        "normalized_sha256": (
+            "f14f27e2a27227c8f8ef4098bc3f6bdc95a3367c365cdedca7a0547d3454bf18"
+        ),
+    },
+    "ggml/src/CMakeFiles/ggml-cpu.dir/link.txt": {
+        "normalized_bytes": 1007,
+        "normalized_sha256": (
+            "c19ebcb7617b1c521a61a0db6255e6726ea85f7bddd7df0600f40491ffdd853d"
+        ),
+    },
+
+    "src/CMakeFiles/llama.dir/link.txt": {
+        "normalized_bytes": 7512,
+        "normalized_sha256": (
+            "87adec14a16996d263489140320dcc78e5ad6f8c032b4d6648c9d2fbd41d717c"
+        ),
+    },
+    "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/build.make": {
+        "normalized_bytes": 290236,
+        "normalized_sha256": (
+            "599e5e782d7c0f8e73c8464ad4beca16277a4d36ebfbf6693d06be6eabbd0ac3"
+        ),
+    },
+    "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/flags.make": {
+        "normalized_bytes": 735,
+        "normalized_sha256": (
+            "6b889101ab32e1bab82b6f3787aa72df75f489e707a57b0e15e7e9ab90f1cb4f"
+        ),
+    },
+    "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/includes_CUDA.rsp": {
+        "normalized_bytes": 120,
+        "normalized_sha256": (
+            "cf57567affcd762a2f970854f259b0ac2e2a9568edb769770269190d07710f71"
+        ),
+    },
+    "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/objects1.rsp": {
+        "normalized_bytes": 8482,
+        "normalized_sha256": (
+            "abaaaefdaba0dada21c22478892d94f278b8d878c2faf7283dc4941d725aafc7"
+        ),
+    },
+    "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/linkLibs.rsp": {
+        "normalized_bytes": 407,
+        "normalized_sha256": (
+            "76af44245dae3a42d87b64e62f08d05a160218c998934d260b78974cec9c1cfd"
+        ),
+    },
+    "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/link.txt": {
+        "normalized_bytes": 266,
+        "normalized_sha256": (
+            "114473590c21a5cd20ca612883cd8efbb644e1f14e484347cb318ed466dce80c"
+        ),
+    },
 }
 
 STANDALONE_CUDA_TARGETS = (
@@ -806,13 +972,14 @@ class CudaBuildContractTest(unittest.TestCase):
         producer = manifests[0]["producer"]
         self.assertEqual(
             set(producer),
-            {"probe", "poolside_patch", "capture_script", "tokens"},
+            {"probe", "poolside_patch", "capture_script", "tokens", "verifier"},
         )
         expected_paths = {
             "probe": "probe_poolside_laguna_moe.cpp",
             "poolside_patch": "poolside-l2-callback.patch",
             "capture_script": "capture_poolside_laguna_moe.sh",
             "tokens": "short.tokens.i32",
+            "verifier": "verify_poolside_laguna_moe.py",
         }
         for key, name in expected_paths.items():
             with self.subTest(producer=key):
@@ -861,6 +1028,8 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertEqual(
             manifests[0]["execution"],
             {
+                "toolchain": LAGUNA_C7_TOOLCHAIN,
+                "generated_recipes": LAGUNA_C7_GENERATED_RECIPES,
                 "device": {
                     "name": "NVIDIA GB10",
                     "compute_capability": "12.1",
@@ -878,15 +1047,25 @@ class CudaBuildContractTest(unittest.TestCase):
                         "-use_fast_math",
                         "-extended-lambda",
                         "-compress-mode=size",
+                        "-Xcompiler",
+                        (
+                            "-Wmissing-declarations -Wmissing-noreturn -Wall "
+                            "-Wextra -Wpedantic -Wcast-qual "
+                            "-Wno-unused-function -Wno-array-bounds "
+                            "-Wextra-semi -Wno-pedantic"
+                        ),
                     ],
                     "cxx_flags": ["-include", "cmath", "-O3", "-DNDEBUG"],
                 },
                 "probe_build": {
-                    "compiler": "g++",
+                    "compiler": "/usr/bin/c++",
                     "flags": ["-std=c++17", "-O2"],
                     "libraries": ["llama", "ggml", "ggml-base"],
+                    "runtime_library_path": "poolside_build/bin",
+                    "elf_runpath": "none",
+                    "binary_bytes": 80456,
                     "binary_sha256": (
-                        "0b4e6a99d414ac86541e59d1b6bb9d9a514893c61da697deb77c2fe30dbf93de"
+                        "659be562dcdc4b3563d36a559ba121675db33a1c0aeb5338f5f20916d97b7f56"
                     ),
                 },
             },
@@ -904,13 +1083,94 @@ class CudaBuildContractTest(unittest.TestCase):
         capture_script = (
             LAGUNA_C7_ORACLE_PRODUCER / expected_paths["capture_script"]
         ).read_text(encoding="utf-8")
+        self.assertTrue(capture_script.startswith("#!/bin/bash -p\n"))
         for required in (
-            "04b2b72cb54048ead292884adbe11f284e3ec950",
             "--token-count 22",
             "--token-count 1",
             "apply --check -R",
+            'exec 9<"$model"',
+            "verify_poolside_laguna_moe.py",
+            "preflight",
+            "--model-fd 9",
+            'model_fd_path="/proc/self/fd/9"',
+            "captured",
+            "--capture-root",
+            "--probe-bin",
+            "--target clean",
+            "assert_build_outputs_absent",
+            "rebuild_llama",
+            "/usr/bin/cmake --build",
+            "capture_environment",
+            "assert_capture_environment",
+            "noncanonical capture environment",
+            "/usr/bin/env -i",
+            "/bin/bash -p",
+            "/usr/bin/nvidia-smi",
+            "PATH=/usr/bin:/bin:/usr/local/cuda/bin",
+            'exec 8<>"$continuity_file"',
+            "--continuity-fd 8",
+            "assert_gpu_processes",
+            "run_probe_exclusive",
+            "--query-compute-apps=pid",
+            "LD_LIBRARY_PATH=$poolside_build/bin",
+            "-Wl,-rpath-link,",
+            "/usr/bin/c++",
+            'git -C "$script_dir" rev-parse --show-toplevel',
+            '$repo_root/tests/oracle-producers/laguna-c7',
         ):
             self.assertIn(required, capture_script)
+        self.assertEqual(
+            capture_script.count("run_probe_exclusive capture_environment"), 2
+        )
+        self.assertEqual(capture_script.count("8>&-"), 2)
+        self.assertEqual(capture_script.count('"$verifier" preflight'), 2)
+        self.assertNotIn("--clean-first", capture_script)
+        self.assertNotIn("-Wl,-rpath,", capture_script)
+        self.assertNotIn("status --porcelain", capture_script)
+        self.assertLess(
+            capture_script.index("preflight"),
+            capture_script.index('git -C "$poolside_src" apply "$patch"'),
+        )
+        self.assertLess(
+            capture_script.index("--token-count 1"),
+            capture_script.index("captured"),
+        )
+        verifier = (
+            LAGUNA_C7_ORACLE_PRODUCER / expected_paths["verifier"]
+        ).read_text(encoding="utf-8")
+        self.assertTrue(verifier.startswith("#!/usr/bin/python3\n"))
+        for required in (
+            '"/usr/bin/git"',
+            '"/usr/bin/nvidia-smi"',
+            '"GIT_NO_REPLACE_OBJECTS": "1"',
+            '"GIT_CONFIG_NOSYSTEM": "1"',
+            '"ls-files",\n                "--others"',
+            '"replace", "-l"',
+            '"rev-parse", "--show-toplevel"',
+            '"ls-tree",',
+            '"--stage", "-z"',
+            "Poolside raw tracked tree",
+        ):
+            self.assertIn(required, verifier)
+        self.assertNotIn("dso_sha256", json.dumps(manifests[0]).lower())
+
+    def test_laguna_c7_fail_closed_provenance_suite(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(ROOT / "tests/test_laguna_c7_provenance.py"),
+                "-v",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
     def test_laguna_q4_l2_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_Q4_L2_AUTO_FIXTURE / "manifest.json"
@@ -974,18 +1234,46 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertEqual(
             capture["non_perturbation"],
             {
-                "selected_sha256": (
-                    "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183"
-                ),
-                "weights_sha256": (
-                    "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c"
-                ),
-                "routed_output_sha256": (
-                    "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083"
-                ),
-                "layer_output_sha256": (
-                    "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
-                ),
+                "prefill_128": {
+                    "selected_sha256": (
+                        "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183"
+                    ),
+                    "weights_sha256": (
+                        "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c"
+                    ),
+                    "routed_output_sha256": (
+                        "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083"
+                    ),
+                    "shared_output_sha256": (
+                        "14a04388d619381400e5551794423244cc6d735d68df5dab7693d8604df32370"
+                    ),
+                    "ffn_output_sha256": (
+                        "9d4abbb288dc57ecfdb4c30c69f4695f00eefe3a51ccb41e5db004f35013285e"
+                    ),
+                    "layer_output_sha256": (
+                        "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
+                    ),
+                },
+                "decode_512": {
+                    "selected_sha256": (
+                        "6e9904384286571bb5e428a0cc77308799c142eda49b446253a2536f5eab43cf"
+                    ),
+                    "weights_sha256": (
+                        "5122b2548c3d60ab2b61cbd5195dd3ca0ac91a7c5da1ed9001eebcd88f2a33b2"
+                    ),
+                    "routed_output_sha256": (
+                        "4b716c227cddbb23d1594e3e628fe2513f4a17acbfb6d953d4a9e5841b1091fb"
+                    ),
+                    "shared_output_sha256": (
+                        "b6131ad8bd87e87c3ee0610f7a76a2e43eb3683298327bee9bbe6c333de77a31"
+                    ),
+                    "ffn_output_sha256": (
+                        "f8a2e0ec534227afa478fbbe48630166b65e35ba71ae0ade2103a228a2fadef8"
+                    ),
+                    "layer_output_sha256": (
+                        "bf630915ef3084ada6e9ae38dcea28c08021251551708cb6240fe22dd47e4212"
+                    ),
+                },
                 "consolidated_capture_matches_prior_captures": True,
             },
         )

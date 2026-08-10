@@ -226,13 +226,26 @@ class CudaBuildContractTest(unittest.TestCase):
             '"fast-shape-wrap-guard", 0u, 22u, 16u, 48u, 8u',
             "LAGUNA_ATTENTION_AUTO_FIXTURE_DIR",
             "22u, 256u, 48u, 8u",
-            "5.0e-7f",
-            "1.0e-5f",
             '"token20-head43"',
             "run_qk_norm_rope_frozen_t21_case",
             "poolside-auto-qk-t21",
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
+        for signature in (
+            "static int run_prefill_attention_frozen_case(",
+            "static int run_prefill_attention_frozen_gqa9_case(",
+        ):
+            frozen_attention_body = source_function_body(
+                LAGUNA_KERNEL_TEST, signature, "tests/test_cuda_laguna_kernels.c"
+            )
+            self.assertRegex(
+                frozen_attention_body,
+                r"max_abs_limit\s*=\s*0\.0f",
+            )
+            self.assertRegex(
+                frozen_attention_body,
+                r"rms_limit\s*=\s*0\.0f",
+            )
         kernel_main = source_function_body(
             LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
         )

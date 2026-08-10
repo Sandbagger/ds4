@@ -2024,8 +2024,8 @@ static int run_prefill_attention_frozen_case(void) {
         goto cleanup;
     }
 
-    static const float max_abs_limit = 1.0e-5f;
-    static const float rms_limit = 5.0e-7f;
+    static const float max_abs_limit = 0.0f;
+    static const float rms_limit = 0.0f;
     const laguna_parity_span spans[] = {
         { "global", actual.heads, reference, q_count,
           1u, (uint32_t)q_count, max_abs_limit, rms_limit },
@@ -2136,8 +2136,8 @@ static int run_prefill_attention_frozen_gqa9_case(void) {
         goto cleanup;
     }
 
-    static const float max_abs_limit = 1.0e-5f;
-    static const float rms_limit = 5.0e-7f;
+    static const float max_abs_limit = 0.0f;
+    static const float rms_limit = 0.0f;
     const laguna_parity_span spans[] = {
         { "global-gqa9", actual.heads, reference, q_count,
           1u, (uint32_t)q_count, max_abs_limit, rms_limit },

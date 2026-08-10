@@ -6531,6 +6531,51 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
     }
 }
 
+/* Exact numeric emulation of Poolside llama.cpp 04b2b72's Q8_0 J=24
+ * Stream-K association for K=3072, M=128, N=22 on a 48-SM GB10.  Alignment
+ * leaves twelve non-empty eight-block segments.  The final segment writes
+ * directly; the fixup walks the preceding segments in reverse CUDA-block
+ * order before adding that aggregate to the direct result. */
+__global__ static void matmul_q8_0_preq_poolside_3072x128x22_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t tok = blockIdx.y;
+    if (row >= 128u || tok >= 22u) return;
+
+    const uint64_t blocks = 96u;
+    const unsigned char *wr = w + (uint64_t)row * blocks * 34u;
+    const int8_t *xqr = xq + (uint64_t)tok * blocks * 32u;
+    const float *xsr = xscale + (uint64_t)tok * blocks;
+    float segment[12];
+
+#pragma unroll
+    for (uint32_t s = 0; s < 12u; s++) {
+        float acc = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            const uint32_t b = s * 8u + i;
+            const unsigned char *wb = wr + (uint64_t)b * 34u;
+            const int8_t *wq = (const int8_t *)(wb + 2u);
+            const int8_t *aq = xqr + (uint64_t)b * 32u;
+            const int32_t dot = dot_i8x32_dp4a(wq, aq);
+            const float weighted = __fmul_rn(
+                __half2float(*(const __half *)wb), __int2float_rn(dot));
+            acc = __fmaf_rn(weighted, xsr[b], acc);
+        }
+        segment[s] = acc;
+    }
+
+    float fixup = 0.0f;
+#pragma unroll
+    for (int32_t s = 10; s >= 0; s--) {
+        fixup = __fadd_rn(fixup, segment[s]);
+    }
+    out[(uint64_t)tok * 128u + row] = __fadd_rn(segment[11], fixup);
+}
+
 
 /* ---- INT8 tensor-core exact Q8_0 batch matmul --------------------------
  * Bit-identical replacement for the exact tok2/warp8-family batched Q8_0
@@ -13751,6 +13796,55 @@ extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint64_t              n_tok) {
+    if (out && x && model_map && in_dim == 3072u && out_dim == 128u &&
+        n_tok == 22u) {
+        const uint64_t blocks = 96u;
+        const uint64_t weight_bytes = out_dim * blocks * 34u;
+        if (weight_offset <= model_size &&
+            weight_bytes <= model_size - weight_offset &&
+            x->bytes >= n_tok * in_dim * sizeof(float) &&
+            out->bytes >= n_tok * out_dim * sizeof(float)) {
+            const int logical_tier = ds4_tensor_device_idx(out);
+            const int physical_device =
+                (g_n_gpus > 1 && logical_tier >= 0 &&
+                 logical_tier < g_n_gpus)
+                    ? g_gpu[logical_tier].device_id : 0;
+            int nsm = 0;
+            if (cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount,
+                                       physical_device) == cudaSuccess &&
+                nsm == 48) {
+                const char *wptr = cuda_resolve_weight_ptr(
+                    model_map, weight_offset, weight_bytes, logical_tier,
+                    "laguna_poolside_q8_0");
+                const uint64_t xq_bytes = n_tok * blocks * 32u;
+                const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+                const uint64_t tmp_bytes =
+                    scale_offset + n_tok * blocks * sizeof(float);
+                void *tmp = cuda_tmp_alloc_on(
+                    logical_tier, tmp_bytes, "laguna poolside q8_0 prequant");
+                if (!wptr || !tmp) return 0;
+                int8_t *xq = (int8_t *)tmp;
+                float *xscale = (float *)((char *)tmp + scale_offset);
+                dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+                quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                    xq, xscale, (const float *)x->ptr, in_dim, blocks);
+                if (!cuda_ok(cudaGetLastError(),
+                             "laguna poolside q8_0 quantize launch")) {
+                    return 0;
+                }
+                dim3 grid(((unsigned)out_dim + 255u) / 256u,
+                          (unsigned)n_tok, 1);
+                matmul_q8_0_preq_poolside_3072x128x22_kernel
+                    <<<grid, 256>>>((float *)out->ptr,
+                                    (const unsigned char *)wptr,
+                                    xq,
+                                    xscale);
+                return cuda_ok(cudaGetLastError(),
+                               "laguna poolside q8_0 Stream-K launch");
+            }
+            (void)cudaGetLastError();
+        }
+    }
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size,
                                            weight_offset, in_dim, out_dim,
                                            x, n_tok, "laguna_poolside_q8_0");

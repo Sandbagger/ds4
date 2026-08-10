@@ -50,20 +50,24 @@ def rule_recipe_lines(target: str) -> list[str]:
     return recipe_lines
 
 
-def function_body(signature: str) -> str:
-    start = CUDA_SOURCE.find(signature)
+def source_function_body(source: str, signature: str, source_name: str) -> str:
+    start = source.find(signature)
     if start < 0:
-        raise AssertionError(f"missing CUDA function {signature}")
-    brace = CUDA_SOURCE.find("{", start)
+        raise AssertionError(f"missing {source_name} function {signature}")
+    brace = source.find("{", start)
     depth = 0
-    for index in range(brace, len(CUDA_SOURCE)):
-        if CUDA_SOURCE[index] == "{":
+    for index in range(brace, len(source)):
+        if source[index] == "{":
             depth += 1
-        elif CUDA_SOURCE[index] == "}":
+        elif source[index] == "}":
             depth -= 1
             if depth == 0:
-                return CUDA_SOURCE[brace + 1 : index]
-    raise AssertionError(f"unterminated CUDA function {signature}")
+                return source[brace + 1 : index]
+    raise AssertionError(f"unterminated {source_name} function {signature}")
+
+
+def function_body(signature: str) -> str:
+    return source_function_body(CUDA_SOURCE, signature, "CUDA")
 
 
 class CudaBuildContractTest(unittest.TestCase):
@@ -141,6 +145,37 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cudaGetDevice(&current_device)", guarded)
         self.assertIn("current_device == physical_device", guarded)
         self.assertNotIn("cudaSetDevice", n1_prefix)
+
+    def test_laguna_decode_routes_all_quantized_projections_through_matmul(
+        self,
+    ) -> None:
+        body = source_function_body(
+            DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
+        )
+        self.assertNotIn("ds4_gpu_matmul_q8_0_pair_tensor", body)
+        self.assertNotIn("ds4_gpu_shared_mid_swiglu_q8_0_tensor", body)
+
+        projections = (
+            ("q", "attn_q", "attn_norm"),
+            ("k", "attn_k", "attn_norm"),
+            ("v", "attn_v", "attn_norm"),
+            ("gate", "attn_gate", "attn_norm"),
+            ("ffn_gate", "ffn_gate_shexp", "ffn_norm"),
+            ("ffn_up", "ffn_up_shexp", "ffn_norm"),
+        )
+        for output, weight, input_tensor in projections:
+            with self.subTest(output=output, weight=weight):
+                self.assertRegex(
+                    body,
+                    rf"laguna_graph_matmul\(\s*g->{output},\s*model,"
+                    rf"\s*l->{weight},\s*g->{input_tensor},\s*1\s*\)",
+                )
+
+        self.assertRegex(
+            body,
+            r"ds4_gpu_swiglu_tensor\(\s*g->ffn_mid,\s*g->ffn_gate,"
+            r"\s*g->ffn_up,\s*DS4_N_FF_SHARED,\s*0\.0f,\s*1\.0f\s*\)",
+        )
 
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')

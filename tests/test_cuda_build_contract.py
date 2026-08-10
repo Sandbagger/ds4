@@ -237,6 +237,15 @@ class CudaBuildContractTest(unittest.TestCase):
             diagnostic_branch.find('"short-diag-probed"'),
             "diagnostic environment must be cleared after the probed session",
         )
+        main = source_function_body(
+            LAGUNA_MODEL_TEST, "int main(void)", "tests/test_cuda_laguna_model.c"
+        )
+        self.assertIn("const bool diagnostic_mode", main)
+        diagnostic_guard = main.find("if (!diagnostic_mode) {")
+        swa_case = main.find('engine, "swa-513"')
+        self.assertGreaterEqual(diagnostic_guard, 0)
+        self.assertGreater(swa_case, diagnostic_guard)
+        self.assertIn("if (diagnostic_mode) return 0;", main)
 
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')

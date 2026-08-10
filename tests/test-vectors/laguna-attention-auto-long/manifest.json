@@ -64,10 +64,13 @@
         "layer-00-attn-gated.f32": {"bytes": 12582912, "sha256": "94c62183a1679fd7c3c2c056bc6539c9f9d5118943d4ad986eaaa7bfa28e396e"}
       },
       "extractions": {
+        "layer-00-q-t0-t511-h41-h42.f32": {"source": "layer-00-q-rope.f32", "offset": 20992, "stride": 24576, "segment_bytes": 1024, "segments": 512},
         "layer-00-q-t511-h41-h42.f32": {"source": "layer-00-q-rope.f32", "offset": 12579328, "bytes": 1024},
         "layer-00-k-t0-t511-kv6-kv7.f32": {"source": "layer-00-k-rope.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 512},
         "layer-00-v-t0-t511-kv6-kv7.f32": {"source": "layer-00-v-proj.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 512},
+        "layer-00-gate-t0-t511-h41-h42.f32": {"source": "layer-00-gate-proj.f32", "offset": 164, "stride": 192, "segment_bytes": 8, "segments": 512},
         "layer-00-gate-t511-h41-h42.f32": {"source": "layer-00-gate-proj.f32", "offset": 98276, "bytes": 8},
+        "layer-00-attn-gated-t0-t511-h41-h42.f32": {"source": "layer-00-attn-gated.f32", "offset": 20992, "stride": 24576, "segment_bytes": 1024, "segments": 512},
         "layer-00-attn-gated-t511-h41-h42.f32": {"source": "layer-00-attn-gated.f32", "offset": 12579328, "bytes": 1024}
       }
     },
@@ -108,24 +111,33 @@
         "layer-01-attn-gated.f32": {"bytes": 2359296, "sha256": "6cda68c56a0489ef2654a77a5f8502da66fbb0e7d7103ae3ff2384ec94abe2e7"}
       },
       "extractions": {
+        "layer-01-q-t0-t63-h62-h63.f32": {"source": "layer-01-q-rope.f32", "offset": 31744, "stride": 36864, "segment_bytes": 1024, "segments": 64},
         "layer-01-q-t63-h62-h63.f32": {"source": "layer-01-q-rope.f32", "offset": 2354176, "bytes": 1024},
         "layer-01-k-t0-t63-kv6-kv7.f32": {"source": "layer-01-k-rope.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 64},
         "layer-01-v-t0-t63-kv6-kv7.f32": {"source": "layer-01-v-proj.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 64},
+        "layer-01-gate-t0-t63-h62-h63.f32": {"source": "layer-01-gate-proj.f32", "offset": 248, "stride": 288, "segment_bytes": 8, "segments": 64},
         "layer-01-gate-t63-h62-h63.f32": {"source": "layer-01-gate-proj.f32", "offset": 18392, "bytes": 8},
+        "layer-01-attn-gated-t0-t63-h62-h63.f32": {"source": "layer-01-attn-gated.f32", "offset": 31744, "stride": 36864, "segment_bytes": 1024, "segments": 64},
         "layer-01-attn-gated-t63-h62-h63.f32": {"source": "layer-01-attn-gated.f32", "offset": 2354176, "bytes": 1024}
       }
     }
   },
   "files": {
+    "layer-00-q-t0-t511-h41-h42.f32": {"bytes": 524288, "sha256": "d98807d78d4e0d148aedd54f581ed7e81425b67b0f7b128dfdc98187c8bfe61d"},
     "layer-00-q-t511-h41-h42.f32": {"bytes": 1024, "sha256": "b8a74804089bc9ec554522974f4ace3f9013fc9d9110f9e3d7f2fd784fb85b85"},
     "layer-00-k-t0-t511-kv6-kv7.f32": {"bytes": 524288, "sha256": "55b783cd0b8f132cc48f78b66910a4de717f4943c218f5f912dfd36385a1df30"},
     "layer-00-v-t0-t511-kv6-kv7.f32": {"bytes": 524288, "sha256": "1b4d52270e650a9c48b4e4a19a400248d69d2e9a882919d22a3bb488bcd5ef7d"},
+    "layer-00-gate-t0-t511-h41-h42.f32": {"bytes": 4096, "sha256": "a627e3e419998d4d6453864c832304890dd083e82874a27429876a04df2474b5"},
     "layer-00-gate-t511-h41-h42.f32": {"bytes": 8, "sha256": "16e9f2ecdda135999a02c39a6c2842f8a67478ee0609ceb965882246ab3d7f8e"},
+    "layer-00-attn-gated-t0-t511-h41-h42.f32": {"bytes": 524288, "sha256": "4bb9707b803fe33ddccb819b166f64bed1ad769e2fe51fc09c54537e08ff09e1"},
     "layer-00-attn-gated-t511-h41-h42.f32": {"bytes": 1024, "sha256": "d949848041eff77c39857e653d656a0afeda5b507b08a7b10fee9d66c5d64751"},
+    "layer-01-q-t0-t63-h62-h63.f32": {"bytes": 65536, "sha256": "5be4c0fd5e39a8fbf4a5d39ddd376a724b48f7b4362862a89d79ee3b0efcc386"},
     "layer-01-q-t63-h62-h63.f32": {"bytes": 1024, "sha256": "9272174e440d9d2ab7e3ee496648dc1841d477a418b16aa522bfb48b2042e1d0"},
     "layer-01-k-t0-t63-kv6-kv7.f32": {"bytes": 65536, "sha256": "047eb9e81fe7d25e28a04670425312057e5c12bfd9ec1859e59eb9a0c2a82e65"},
     "layer-01-v-t0-t63-kv6-kv7.f32": {"bytes": 65536, "sha256": "f48f6c8e8edabc923a7de4916553dd2536e688495a71b35b7b4a3254441a8f38"},
+    "layer-01-gate-t0-t63-h62-h63.f32": {"bytes": 512, "sha256": "c558c7129e77cfc9fd09d8387809485e7bb6ad445d9589032df0690dd3b49b3e"},
     "layer-01-gate-t63-h62-h63.f32": {"bytes": 8, "sha256": "187d640f9fcaf5160c0311923561acd794a1c918c505521b138d6661f5fbc106"},
+    "layer-01-attn-gated-t0-t63-h62-h63.f32": {"bytes": 65536, "sha256": "dc4e2ab8e7c9351c65b2d7d536124bc789f0702e2575723ac707267c00cdd9fa"},
     "layer-01-attn-gated-t63-h62-h63.f32": {"bytes": 1024, "sha256": "8973614b1a3ef3b1ca8f9a2e8aa144462d2597f31f7f660f64a7c45114fefb3a"}
   },
   "comparison": {

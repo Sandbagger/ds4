@@ -2213,7 +2213,10 @@ static int run_prefill_attention_long_frozen_case(
     const uint64_t gate_count = (uint64_t)n_tokens * fixture->n_head;
     const uint64_t cache_count =
         (uint64_t)c.cache_cap * n_head_kv * head_dim;
-    const uint64_t selected_q_count = selected_heads * head_dim;
+    const uint64_t selected_q_count =
+        (uint64_t)n_tokens * selected_heads * head_dim;
+    const uint64_t selected_gate_count =
+        (uint64_t)n_tokens * selected_heads;
     const uint64_t selected_kv_count =
         (uint64_t)n_tokens * selected_heads * head_dim;
     float *selected_q = laguna_read_long_frozen_f32(
@@ -2223,7 +2226,7 @@ static int run_prefill_attention_long_frozen_case(
     float *selected_v = laguna_read_long_frozen_f32(
         fixture->v_file, selected_kv_count);
     float *selected_gate = laguna_read_long_frozen_f32(
-        fixture->gate_file, selected_heads);
+        fixture->gate_file, selected_gate_count);
     float *reference = laguna_read_long_frozen_f32(
         fixture->expected_file, selected_q_count);
     float *q_host = (float *)calloc((size_t)q_count, sizeof(*q_host));
@@ -2247,23 +2250,24 @@ static int run_prefill_attention_long_frozen_case(
                 fixture->name);
         goto cleanup;
     }
-    const uint64_t final_q_offset =
-        ((uint64_t)(n_tokens - 1u) * fixture->n_head +
-         fixture->first_q_head) * head_dim;
-    memcpy(q_host + final_q_offset, selected_q,
-           (size_t)selected_q_count * sizeof(*selected_q));
-    memcpy(gate_host +
-               (uint64_t)(n_tokens - 1u) * fixture->n_head +
-               fixture->first_q_head,
-           selected_gate, selected_heads * sizeof(*selected_gate));
     for (uint32_t token = 0; token < n_tokens; token++) {
-        const uint64_t source =
+        const uint64_t q_source =
             (uint64_t)token * selected_heads * head_dim;
-        const uint64_t destination =
+        const uint64_t q_destination =
+            ((uint64_t)token * fixture->n_head + fixture->first_q_head) *
+            head_dim;
+        const uint64_t gate_source = (uint64_t)token * selected_heads;
+        const uint64_t gate_destination =
+            (uint64_t)token * fixture->n_head + fixture->first_q_head;
+        const uint64_t kv_destination =
             ((uint64_t)token * n_head_kv + fixture->first_kv_head) * head_dim;
-        memcpy(k_host + destination, selected_k + source,
+        memcpy(q_host + q_destination, selected_q + q_source,
+               selected_heads * head_dim * sizeof(*selected_q));
+        memcpy(gate_host + gate_destination, selected_gate + gate_source,
+               selected_heads * sizeof(*selected_gate));
+        memcpy(k_host + kv_destination, selected_k + q_source,
                selected_heads * head_dim * sizeof(*selected_k));
-        memcpy(v_host + destination, selected_v + source,
+        memcpy(v_host + kv_destination, selected_v + q_source,
                selected_heads * head_dim * sizeof(*selected_v));
     }
     if (laguna_run_prefill_once(
@@ -2272,13 +2276,27 @@ static int run_prefill_attention_long_frozen_case(
         !laguna_frozen_cache_matches(&c, &actual, k_host, v_host)) {
         goto cleanup;
     }
-    const laguna_parity_span span = {
-        "final-token-gqa-boundary", actual.heads + final_q_offset, reference,
-        selected_q_count, selected_heads, head_dim, 0.0f, 0.0f,
-    };
-    if (!laguna_parity_spans_within_limits(
-            fixture->name, &span, 1u, 1)) {
-        goto cleanup;
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t actual_offset =
+            ((uint64_t)token * fixture->n_head + fixture->first_q_head) *
+            head_dim;
+        const uint64_t reference_offset =
+            (uint64_t)token * selected_heads * head_dim;
+        const laguna_parity_span span = {
+            "causal-row-gqa-boundary", actual.heads + actual_offset,
+            reference + reference_offset, selected_heads * head_dim,
+            selected_heads, head_dim, 0.0f, 0.0f,
+        };
+        if (memcmp(actual.heads + actual_offset,
+                   reference + reference_offset,
+                   selected_heads * head_dim * sizeof(*reference)) != 0) {
+            char case_name[160];
+            snprintf(case_name, sizeof(case_name), "%s/token-%u",
+                     fixture->name, token);
+            (void)laguna_parity_spans_within_limits(
+                case_name, &span, 1u, 1);
+            goto cleanup;
+        }
     }
     rc = 0;
 
@@ -2302,19 +2320,19 @@ static int run_prefill_attention_long_frozen_cases(void) {
     static const laguna_long_attention_frozen_case cases[] = {
         {
             "poolside-auto-layer0-t512-gqa6", 512u, 48u, 41u, 6u,
-            "layer-00-q-t511-h41-h42.f32",
+            "layer-00-q-t0-t511-h41-h42.f32",
             "layer-00-k-t0-t511-kv6-kv7.f32",
             "layer-00-v-t0-t511-kv6-kv7.f32",
-            "layer-00-gate-t511-h41-h42.f32",
-            "layer-00-attn-gated-t511-h41-h42.f32",
+            "layer-00-gate-t0-t511-h41-h42.f32",
+            "layer-00-attn-gated-t0-t511-h41-h42.f32",
         },
         {
             "poolside-auto-layer1-t64-gqa9", 64u, 72u, 62u, 6u,
-            "layer-01-q-t63-h62-h63.f32",
+            "layer-01-q-t0-t63-h62-h63.f32",
             "layer-01-k-t0-t63-kv6-kv7.f32",
             "layer-01-v-t0-t63-kv6-kv7.f32",
-            "layer-01-gate-t63-h62-h63.f32",
-            "layer-01-attn-gated-t63-h62-h63.f32",
+            "layer-01-gate-t0-t63-h62-h63.f32",
+            "layer-01-attn-gated-t0-t63-h62-h63.f32",
         },
     };
     int rc = 0;

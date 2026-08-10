@@ -6,10 +6,11 @@ the 22-token fixture cannot reach:
 - layer 0 uses 512 tokens, GQA6, and eight 64-key FATTN iterations;
 - layer 1 uses 64 tokens and the GQA9 `ncols=64`, `np=1` topology.
 
-Each fixture retains two adjacent query heads that straddle a GQA-to-KV-head
-boundary and the corresponding two KV heads.  Unrelated heads are zero-filled
-by `tests/test_cuda_laguna_kernels.c`; attention is head-independent, so the
-selected outputs remain the exact Poolside outputs.  The public production
+Each fixture retains two adjacent query heads for every query position.  The
+heads straddle a GQA-to-KV-head boundary and retain the corresponding two KV
+heads for every key position.  Unrelated heads are zero-filled by
+`tests/test_cuda_laguna_kernels.c`; attention is head-independent, so every
+selected causal row remains the exact Poolside output.  The public production
 launcher and full 48:8 or 72:8 grid are still exercised.
 
 The 512-token layer-1 callback capture was attempted first but was abandoned
@@ -25,4 +26,3 @@ files.  The source used for each capture was a narrowed derivative of
 `gguf-tools/quality-testing/probe_poolside_laguna_layers.cpp`: it requested only
 `Vcur`, `attn_gate_proj`, `Qcur_rope`, `Kcur_rope`, and `attn_gated`, accepted
 the pinned token prefix, and used the fixed token count recorded per case.
-

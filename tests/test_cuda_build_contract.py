@@ -123,6 +123,30 @@ LAGUNA_Q4_MMQ_AUTO_FILES = {
         "f6ea0e74779aa61d39171891d49c64a373b41aa5f67facf23d7577be79cb5eb6",
     ),
 }
+Q4K_MMVQ_MICROSCOPE_TEST = (
+    ROOT / "tests/test_cuda_q4k_mmvq_microscope.c"
+).read_text(encoding="utf-8")
+Q4K_MMVQ_MICROSCOPE_FIXTURE = (
+    ROOT / "tests/test-vectors/q4k-mmvq-microscope-auto"
+)
+Q4K_MMVQ_MICROSCOPE_FILES = {
+    "input.f32": (
+        12288,
+        "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e",
+    ),
+    "input.q8_1": (
+        3456,
+        "8df5b6ef5738aed267bccb6afd3b0deec21cd44e3a09908e88356cfa24d7de0a",
+    ),
+    "weight-row.q4k": (
+        1728,
+        "b42e00f452c044c1cf8679b5340a9a0738854576ad7aa294076ff4a3ed870fe5",
+    ),
+    "poolside-output.f32": (
+        4,
+        "6bea612b1933fa44f45d2731a553d098ccf4cd5e63a45ddee24f81793606244b",
+    ),
+}
 LAGUNA_Q4_L2_AUTO_FIXTURE = ROOT / "tests/test-vectors/laguna-q4-l2-auto"
 LAGUNA_Q4_L2_AUTO_FILES = {
     "mid-pair0.f32": (
@@ -954,6 +978,110 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn("run_q4_mmq_frozen_case()", kernel_main)
 
+    def test_q4k_mmvq_microscope_is_generic_pinned_and_wired(self) -> None:
+        manifest = json.loads(
+            (Q4K_MMVQ_MICROSCOPE_FIXTURE / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            manifest["schema"], "q4k-mmvq-microscope-fixture/v1"
+        )
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["poolside_sources"],
+            {
+                "ggml/src/ggml-cuda/vecdotq.cuh": (
+                    "69ee2488c89da7e6d31a91d2f33f3312d7c66dbcb60b4c42f154bdf775c4436a"
+                ),
+                "ggml/src/ggml-cuda/mmvq.cu": (
+                    "7dd8df4666d524a749c0e1aafe8f6fb99a3ea565b4a2fc3ce957a406ab3d4776"
+                ),
+                "ggml/src/ggml-cuda/quantize.cu": (
+                    "838cff1fd45ab483f3f86d24f23d997833b4af7a0b945a80f4da0e055def6565"
+                ),
+            },
+        )
+        self.assertEqual(
+            manifest["shape"],
+            {
+                "input_elements": 3072,
+                "q4_k_blocks": 12,
+                "q4_k_block_bytes": 144,
+                "row_bytes": 1728,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"],
+            {
+                "value": -0.10056672245264053,
+                "poolside_float32_bits": "0xbdcdf5ed",
+                "ds4_serial_float32_bits": "0xbdcdf5ef",
+                "quantized_operands_fp64": -0.10056671364048952,
+            },
+        )
+        self.assertEqual(
+            set(manifest["files"]), set(Q4K_MMVQ_MICROSCOPE_FILES)
+        )
+        self.assertEqual(
+            {path.name for path in Q4K_MMVQ_MICROSCOPE_FIXTURE.iterdir()},
+            set(Q4K_MMVQ_MICROSCOPE_FILES) | {"manifest.json"},
+        )
+        for name, (expected_size, expected_sha256) in (
+            Q4K_MMVQ_MICROSCOPE_FILES.items()
+        ):
+            with self.subTest(name=name):
+                payload = (Q4K_MMVQ_MICROSCOPE_FIXTURE / name).read_bytes()
+                self.assertEqual(len(payload), expected_size)
+                self.assertEqual(
+                    hashlib.sha256(payload).hexdigest(), expected_sha256
+                )
+                self.assertEqual(
+                    manifest["files"][name],
+                    {"bytes": expected_size, "sha256": expected_sha256},
+                )
+
+        self.assertNotIn("laguna", Q4K_MMVQ_MICROSCOPE_TEST.lower())
+        for required in (
+            "ds4_gpu_test_q4_k_mmvq_microscope_tensor(",
+            "DS4_SERIAL_EXPECTED_BITS",
+            '"input.q8_1"',
+            "q4_k_q8_1_reference(",
+        ):
+            self.assertIn(required, Q4K_MMVQ_MICROSCOPE_TEST)
+        self.assertIn(
+            "tests/test_cuda_q4k_mmvq_microscope:", MAKEFILE
+        )
+        self.assertIn(
+            "ds4_gpu_test_q4_k_mmvq_microscope_tensor(", GPU_HEADER
+        )
+
+        serial_kernel = function_body(
+            "__global__ static void q4_k_mmvq_serial_microscope_kernel("
+        )
+        self.assertIn("dev_dot_q4_K_q8_1_mmvq_block(", serial_kernel)
+        poolside_kernel = function_body(
+            "__global__ static void q4_k_mmvq_poolside_microscope_kernel("
+        )
+        self.assertRegex(poolside_kernel, r"block\s*\+=\s*8u")
+        self.assertIn("other_warps[3][32]", poolside_kernel)
+        self.assertRegex(
+            poolside_kernel,
+            r"for \(uint32_t offset = 16u; offset > 0u; offset >>= 1u\)",
+        )
+        hook = function_body(
+            'extern "C" int ds4_gpu_test_q4_k_mmvq_microscope_tensor('
+        )
+        self.assertIn("quantize_poolside_q8_1_f32_kernel<<<", hook)
+        self.assertIn("q4_k_mmvq_serial_microscope_kernel<<<1, 1>>>", hook)
+        self.assertIn(
+            "q4_k_mmvq_poolside_microscope_kernel<<<1, dim3(32, 4, 1)>>>",
+            hook,
+        )
+
     def test_laguna_c7_oracle_producer_is_self_contained(self) -> None:
         self.assertEqual(
             {path.name for path in LAGUNA_C7_ORACLE_PRODUCER.iterdir()},
@@ -1764,9 +1892,12 @@ class CudaBuildContractTest(unittest.TestCase):
             r"laguna_graph_diag_checkpoint\(\s*g->cur,\s*n_tokens,"
             r"\s*DS4_N_EMBD,\s*-1,\s*\"embd\"\s*\)",
         )
-        layer_dump = body.find(
-            'laguna_graph_diag_checkpoint(\n                    g->next,\n'
+        layer_dump_match = re.search(
+            r"laguna_graph_diag_checkpoint\(\s*g->next,\s*n_tokens,"
+            r"\s*DS4_N_EMBD,\s*\(int\)il,\s*\"l_out\"\s*\)",
+            body,
         )
+        layer_dump = layer_dump_match.start() if layer_dump_match else -1
         layer_swap = body.find("ds4_gpu_tensor *tmp = g->cur;")
         self.assertGreaterEqual(layer_dump, 0, "missing full layer-output probe")
         self.assertGreater(layer_swap, layer_dump, "probe must precede cur/next swap")
@@ -1808,6 +1939,56 @@ class CudaBuildContractTest(unittest.TestCase):
             "CUDA intentionally reports no active command buffer",
         )
         self.assertIn("ds4_gpu_end_commands()", checkpoint)
+
+    def test_laguna_decode_layer_probe_covers_the_same_boundaries(self) -> None:
+        body = source_function_body(
+            DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
+        )
+        self.assertIn("laguna_graph_diag_detail_layer()", body)
+        self.assertRegex(
+            body,
+            r"laguna_graph_diag_checkpoint\(\s*g->cur,\s*1,"
+            r"\s*DS4_N_EMBD,\s*-1,\s*\"embd\"\s*\)",
+        )
+        for tensor, stage, width in (
+            ("attn_norm", "attn-norm", r"DS4_N_EMBD"),
+            ("q", "q-proj", r"q_dim"),
+            ("k", "k-proj", r"DS4_N_HEAD_KV\s*\*\s*DS4_N_HEAD_DIM"),
+            ("v", "v-proj", r"DS4_N_HEAD_KV\s*\*\s*DS4_N_HEAD_DIM"),
+            ("gate", "gate-proj", r"n_head"),
+            ("q", "q-rope", r"q_dim"),
+            ("k", "k-rope", r"DS4_N_HEAD_KV\s*\*\s*DS4_N_HEAD_DIM"),
+            ("heads", "attn-gated", r"q_dim"),
+            ("attn_out", "attn-o-proj", r"DS4_N_EMBD"),
+            ("after_attn", "ffn-inp", r"DS4_N_EMBD"),
+            ("ffn_norm", "ffn-norm", r"DS4_N_EMBD"),
+            ("router_logits", "router-logits", r"DS4_N_EXPERT"),
+            ("router_selected", "router-selected", r"DS4_N_EXPERT_USED"),
+            ("router_weights", "router-weights", r"DS4_N_EXPERT_USED"),
+            ("ffn_out", "ffn-moe-out", r"DS4_N_EMBD"),
+            ("shared_out", "ffn-shared-out", r"DS4_N_EMBD"),
+            ("ffn_out", "ffn-out", r"DS4_N_EMBD"),
+        ):
+            with self.subTest(stage=stage):
+                self.assertRegex(
+                    body,
+                    rf"laguna_graph_diag_checkpoint\(\s*g->{tensor},\s*1,"
+                    rf"\s*{width},\s*\(int\)il,\s*\"{stage}\"\s*\)",
+                )
+        layer_dump_match = re.search(
+            r"laguna_graph_diag_checkpoint\(\s*g->next,\s*1,"
+            r"\s*DS4_N_EMBD,\s*\(int\)il,\s*\"l_out\"\s*\)",
+            body,
+        )
+        layer_dump = layer_dump_match.start() if layer_dump_match else -1
+        layer_swap = body.find("ds4_gpu_tensor *tmp = g->cur;")
+        self.assertGreaterEqual(layer_dump, 0, "missing decode layer-output probe")
+        self.assertGreater(layer_swap, layer_dump, "probe must precede cur/next swap")
+        self.assertRegex(
+            body,
+            r"laguna_graph_diag_checkpoint\(\s*g->logits,\s*1,"
+            r"\s*DS4_N_VOCAB,\s*-1,\s*\"logits\"\s*\)",
+        )
 
         self.assertIn("DS4_LAGUNA_DIAG_DIR", LAGUNA_MODEL_TEST)
         self.assertIn("memcmp(baseline_logits, probed_logits, VECTOR_BYTES)",

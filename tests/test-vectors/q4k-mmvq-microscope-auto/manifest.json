@@ -1,0 +1,57 @@
+{
+  "schema": "q4k-mmvq-microscope-fixture/v1",
+  "purpose": "Compare reduction orders for one Q4_K row-vector product",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "poolside_sources": {
+    "ggml/src/ggml-cuda/vecdotq.cuh": "69ee2488c89da7e6d31a91d2f33f3312d7c66dbcb60b4c42f154bdf775c4436a",
+    "ggml/src/ggml-cuda/mmvq.cu": "7dd8df4666d524a749c0e1aafe8f6fb99a3ea565b4a2fc3ce957a406ab3d4776",
+    "ggml/src/ggml-cuda/quantize.cu": "838cff1fd45ab483f3f86d24f23d997833b4af7a0b945a80f4da0e055def6565"
+  },
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "origin": {
+    "token": 513,
+    "layer": 1,
+    "projection": "gate",
+    "selected_slot": 0,
+    "expert": 144,
+    "row": 0,
+    "tensor": "blk.1.ffn_gate_exps.weight",
+    "tensor_absolute_model_offset": 1349566304,
+    "row_absolute_model_offset": 1604370272,
+    "activation_callback": "ffn_norm-1",
+    "output_callback": "ffn_moe_gate-1"
+  },
+  "shape": {
+    "input_elements": 3072,
+    "q4_k_blocks": 12,
+    "q4_k_block_bytes": 144,
+    "row_bytes": 1728
+  },
+  "oracle": {
+    "value": -0.10056672245264053,
+    "poolside_float32_bits": "0xbdcdf5ed",
+    "ds4_serial_float32_bits": "0xbdcdf5ef",
+    "quantized_operands_fp64": -0.10056671364048952
+  },
+  "files": {
+    "input.f32": {
+      "bytes": 12288,
+      "sha256": "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e"
+    },
+    "input.q8_1": {
+      "bytes": 3456,
+      "sha256": "8df5b6ef5738aed267bccb6afd3b0deec21cd44e3a09908e88356cfa24d7de0a"
+    },
+    "weight-row.q4k": {
+      "bytes": 1728,
+      "sha256": "b42e00f452c044c1cf8679b5340a9a0738854576ad7aa294076ff4a3ed870fe5"
+    },
+    "poolside-output.f32": {
+      "bytes": 4,
+      "sha256": "6bea612b1933fa44f45d2731a553d098ccf4cd5e63a45ddee24f81793606244b"
+    }
+  }
+}

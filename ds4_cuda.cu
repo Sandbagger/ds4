@@ -27154,6 +27154,170 @@ static __global__ void glm_poolside_q8_1_mmq_quantize_kernel(
 }
 
 #ifdef DS4_TEST_HOOKS
+__device__ __forceinline__ static float
+dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+        const cuda_block_q4_K *weight,
+        const poolside_q8_1_block *input,
+        uint32_t iqs) {
+    const uint32_t q8_offset = 2u * ((iqs / 2u) / 4u);
+    const uint32_t chunk = (iqs / 2u) % 4u;
+    const int32_t *q4 = (const int32_t *)(weight->qs +
+        16u * q8_offset + 4u * chunk);
+    const int32_t v0 = q4[0];
+    const int32_t v1 = q4[4];
+
+    const uint16_t *packed_scales =
+        (const uint16_t *)weight->scales;
+    uint16_t auxiliary[2];
+    const uint32_t j = q8_offset / 2u;
+    if (j < 2u) {
+        auxiliary[0] = packed_scales[j] & 0x3f3fu;
+        auxiliary[1] = packed_scales[j + 2u] & 0x3f3fu;
+    } else {
+        auxiliary[0] =
+            ((packed_scales[j + 2u] >> 0u) & 0x0f0fu) |
+            ((packed_scales[j - 2u] & 0xc0c0u) >> 2u);
+        auxiliary[1] =
+            ((packed_scales[j + 2u] >> 4u) & 0x0f0fu) |
+            ((packed_scales[j] & 0xc0c0u) >> 2u);
+    }
+    const uint8_t *scales = (const uint8_t *)auxiliary;
+    const uint8_t *minimums = scales + 2u;
+
+    float scaled_sum = 0.0f;
+    float minimum_sum = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < 2u; i++) {
+        const int32_t q40 = (v0 >> (4u * i)) & 0x0f0f0f0f;
+        const int32_t q41 = (v1 >> (4u * i)) & 0x0f0f0f0f;
+        const int32_t *q8 =
+            (const int32_t *)input[q8_offset + i].qs + chunk;
+        const int32_t u0 = q8[0];
+        const int32_t u1 = q8[4];
+        const int32_t dot = __dp4a(q41, u1, __dp4a(q40, u0, 0));
+        const int32_t q8_sum = __dp4a(
+            0x01010101, u1, __dp4a(0x01010101, u0, 0));
+        const float d8 = __half2float(input[q8_offset + i].d);
+        scaled_sum += d8 * (dot * scales[i]);
+        minimum_sum += d8 * (q8_sum * minimums[i]);
+    }
+    return dev_f16_to_f32(weight->d) * scaled_sum -
+           dev_f16_to_f32(weight->dmin) * minimum_sum;
+}
+
+__global__ static void q4_k_mmvq_serial_microscope_kernel(
+        float *values,
+        const cuda_block_q4_K *weight_row,
+        const poolside_q8_1_block *input,
+        uint32_t q4_blocks) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    float result = 0.0f;
+    for (uint32_t block = 0; block < q4_blocks; block++) {
+        result = __fadd_rn(
+            result,
+            dev_dot_q4_K_q8_1_mmvq_block(
+                weight_row + block, input + (uint64_t)block * 8u));
+    }
+    values[0] = result;
+}
+
+__global__ static void q4_k_mmvq_poolside_microscope_kernel(
+        float *values,
+        const cuda_block_q4_K *weight_row,
+        const poolside_q8_1_block *input,
+        uint32_t q4_blocks) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    float partial = 0.0f;
+    for (uint32_t block = tid / 16u;
+         block < q4_blocks;
+         block += 8u) {
+        partial += dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+            weight_row + block,
+            input + (uint64_t)block * 8u,
+            2u * (tid % 16u));
+    }
+    values[2u + tid] = partial;
+
+    __shared__ float other_warps[3][32];
+    if (warp > 0u) other_warps[warp - 1u][lane] = partial;
+    __syncthreads();
+    if (warp > 0u) return;
+    partial += other_warps[0][lane];
+    partial += other_warps[1][lane];
+    partial += other_warps[2][lane];
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset, 32);
+    }
+    if (lane == 0u) values[1] = partial;
+}
+
+extern "C" int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
+        ds4_gpu_tensor *values,
+        ds4_gpu_tensor *quantized_input,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements) {
+    if (!values || !quantized_input || !weight_row || !activation ||
+        !values->ptr || !quantized_input->ptr || !weight_row->ptr ||
+        !activation->ptr || input_elements == 0u ||
+        (input_elements & 255u) != 0u) {
+        return 0;
+    }
+    const uint32_t q4_blocks = input_elements / 256u;
+    const uint32_t q8_blocks = input_elements / 32u;
+    const uint64_t row_bytes =
+        (uint64_t)q4_blocks * sizeof(cuda_block_q4_K);
+    const uint64_t q8_bytes =
+        (uint64_t)q8_blocks * sizeof(poolside_q8_1_block);
+    if (values->bytes < 130u * sizeof(float) ||
+        quantized_input->bytes < q8_bytes ||
+        weight_row->bytes < row_bytes ||
+        activation->bytes < (uint64_t)input_elements * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(values);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(quantized_input) != tier ||
+        ds4_tensor_device_idx(weight_row) != tier ||
+        ds4_tensor_device_idx(activation) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "Q4_K MMVQ microscope get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    quantize_poolside_q8_1_f32_kernel<<<
+        (input_elements + 255u) / 256u, 256>>>(
+            (poolside_q8_1_block *)quantized_input->ptr,
+            (const float *)activation->ptr,
+            input_elements);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Q4_K MMVQ microscope quantize")) {
+        return 0;
+    }
+    q4_k_mmvq_serial_microscope_kernel<<<1, 1>>>(
+        (float *)values->ptr,
+        (const cuda_block_q4_K *)weight_row->ptr,
+        (const poolside_q8_1_block *)quantized_input->ptr,
+        q4_blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Q4_K MMVQ serial microscope")) {
+        return 0;
+    }
+    q4_k_mmvq_poolside_microscope_kernel<<<1, dim3(32, 4, 1)>>>(
+        (float *)values->ptr,
+        (const cuda_block_q4_K *)weight_row->ptr,
+        (const poolside_q8_1_block *)quantized_input->ptr,
+        q4_blocks);
+    return cuda_ok(cudaGetLastError(),
+                   "Q4_K MMVQ Poolside microscope");
+}
+
 __global__ static void glm_poolside_q4_mmq_gate_up_test_kernel(
         float *out,
         const cuda_block_q4_K *gate_row,

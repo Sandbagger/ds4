@@ -197,6 +197,12 @@ int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
         const ds4_gpu_tensor *up_row,
         const ds4_gpu_tensor *input,
         uint32_t input_elements);
+int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
+        ds4_gpu_tensor *values,
+        ds4_gpu_tensor *quantized_input,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements);
 int ds4_gpu_test_glm_poolside_q4_l2_tensor(
         ds4_gpu_tensor *mid,
         ds4_gpu_tensor *column_l2,

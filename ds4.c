@@ -48383,6 +48383,9 @@ static bool laguna_graph_forward_token(
         return false;
     }
 
+    const int detail_layer = laguna_graph_diag_detail_layer();
+    if (detail_layer < 0) return false;
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -48393,6 +48396,10 @@ static bool laguna_graph_forward_token(
                                               DS4_N_VOCAB,
                                               (uint32_t)token,
                                               DS4_N_EMBD) != 0;
+    }
+    if (ok) {
+        ok = laguna_graph_diag_checkpoint(
+                g->cur, 1, DS4_N_EMBD, -1, "embd");
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -48422,6 +48429,10 @@ static bool laguna_graph_forward_token(
                                              l->attn_norm->abs_offset,
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
+        if (ok && il == (uint32_t)detail_layer) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->attn_norm, 1, DS4_N_EMBD, (int)il, "attn-norm");
+        }
         if (ok) {
             if (l->attn_q->type == DS4_TENSOR_F16) {
                 ok = ds4_gpu_laguna_qkvg_f16_tensor(
@@ -48463,6 +48474,22 @@ static bool laguna_graph_forward_token(
                                          1);
             }
         }
+        if (ok && il == (uint32_t)detail_layer) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->q, 1, q_dim, (int)il, "q-proj") &&
+                 laguna_graph_diag_checkpoint(
+                    g->k, 1,
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                    (int)il,
+                    "k-proj") &&
+                 laguna_graph_diag_checkpoint(
+                    g->v, 1,
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                    (int)il,
+                    "v-proj") &&
+                 laguna_graph_diag_checkpoint(
+                    g->gate, 1, n_head, (int)il, "gate-proj");
+        }
         if (ok) {
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
                     g->q,
@@ -48486,6 +48513,15 @@ static bool laguna_graph_forward_token(
                     beta_slow,
                     DS4_RMS_EPS) != 0;
         }
+        if (ok && il == (uint32_t)detail_layer) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->q, 1, q_dim, (int)il, "q-rope") &&
+                 laguna_graph_diag_checkpoint(
+                    g->k, 1,
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
+                    (int)il,
+                    "k-rope");
+        }
         uint32_t key_count = pos + 1u;
         if (key_count > g->cache_cap[il]) key_count = g->cache_cap[il];
         const uint32_t key_start = pos + 1u - key_count;
@@ -48507,6 +48543,10 @@ static bool laguna_graph_forward_token(
                     DS4_N_HEAD_DIM,
                     1.0f / sqrtf((float)DS4_N_HEAD_DIM)) != 0;
         }
+        if (ok && il == (uint32_t)detail_layer) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->heads, 1, q_dim, (int)il, "attn-gated");
+        }
         if (ok) {
             if (l->attn_output->type == DS4_TENSOR_F16) {
                 ok = ds4_gpu_laguna_attn_output_residual_f16_tensor(
@@ -48523,12 +48563,26 @@ static bool laguna_graph_forward_token(
                                          model,
                                          l->attn_output,
                                          g->heads,
-                                         1) &&
-                     ds4_gpu_add_tensor(g->after_attn,
-                                        g->cur,
-                                        g->attn_out,
-                                        DS4_N_EMBD) != 0;
+                                         1);
+                if (ok && il == (uint32_t)detail_layer) {
+                    ok = laguna_graph_diag_checkpoint(
+                            g->attn_out,
+                            1,
+                            DS4_N_EMBD,
+                            (int)il,
+                            "attn-o-proj");
+                }
+                if (ok) {
+                    ok = ds4_gpu_add_tensor(g->after_attn,
+                                            g->cur,
+                                            g->attn_out,
+                                            DS4_N_EMBD) != 0;
+                }
             }
+        }
+        if (ok && il == (uint32_t)detail_layer) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->after_attn, 1, DS4_N_EMBD, (int)il, "ffn-inp");
         }
         if (ok) {
             ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm,
@@ -48538,6 +48592,10 @@ static bool laguna_graph_forward_token(
                                                  l->ffn_norm->abs_offset,
                                                  DS4_N_EMBD,
                                                  DS4_RMS_EPS) != 0;
+        }
+        if (ok && il == (uint32_t)detail_layer) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->ffn_norm, 1, DS4_N_EMBD, (int)il, "ffn-norm");
         }
 
         if (ok && il < DS4_N_LEADING_DENSE) {
@@ -48566,6 +48624,10 @@ static bool laguna_graph_forward_token(
                                          g->ffn_mid,
                                          1);
             }
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = laguna_graph_diag_checkpoint(
+                        g->ffn_out, 1, DS4_N_EMBD, (int)il, "ffn-out");
+            }
             if (ok) {
                 ok = ds4_gpu_add_tensor(g->next,
                                         g->after_attn,
@@ -48581,6 +48643,14 @@ static bool laguna_graph_forward_token(
                                             DS4_N_EXPERT,
                                             g->ffn_norm,
                                             1) != 0;
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = laguna_graph_diag_checkpoint(
+                        g->router_logits,
+                        1,
+                        DS4_N_EXPERT,
+                        (int)il,
+                        "router-logits");
+            }
             if (ok) {
                 ok = ds4_gpu_glm_router_select_tensor(
                         g->router_selected,
@@ -48593,6 +48663,20 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT,
                         DS4_N_EXPERT_USED,
                         DS4_EXPERT_WEIGHT_SCALE) != 0;
+            }
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = laguna_graph_diag_checkpoint(
+                        g->router_selected,
+                        1,
+                        DS4_N_EXPERT_USED,
+                        (int)il,
+                        "router-selected") &&
+                     laguna_graph_diag_checkpoint(
+                        g->router_weights,
+                        1,
+                        DS4_N_EXPERT_USED,
+                        (int)il,
+                        "router-weights");
             }
 
             const uint64_t gate_row_bytes =
@@ -48636,6 +48720,14 @@ static bool laguna_graph_forward_token(
                         g->ffn_norm,
                         true) != 0;
             }
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = laguna_graph_diag_checkpoint(
+                        g->ffn_out,
+                        1,
+                        DS4_N_EMBD,
+                        (int)il,
+                        "ffn-moe-out");
+            }
             if (ok) {
                 ok = laguna_graph_matmul(g->ffn_gate,
                                          model,
@@ -48663,6 +48755,24 @@ static bool laguna_graph_forward_token(
                                          g->ffn_mid,
                                          1);
             }
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = laguna_graph_diag_checkpoint(
+                        g->shared_out,
+                        1,
+                        DS4_N_EMBD,
+                        (int)il,
+                        "ffn-shared-out");
+            }
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = ds4_gpu_add_tensor(g->attn_out,
+                                        g->ffn_out,
+                                        g->shared_out,
+                                        DS4_N_EMBD) != 0;
+            }
+            if (ok && il == (uint32_t)detail_layer) {
+                ok = laguna_graph_diag_checkpoint(
+                        g->attn_out, 1, DS4_N_EMBD, (int)il, "ffn-out");
+            }
             if (ok) {
                 ok = ds4_gpu_laguna_moe_residual_tensor(
                         g->next,
@@ -48673,6 +48783,10 @@ static bool laguna_graph_forward_token(
             }
         }
 
+        if (ok) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->next, 1, DS4_N_EMBD, (int)il, "l_out");
+        }
         if (ok) {
             ds4_gpu_tensor *tmp = g->cur;
             g->cur = g->next;
@@ -48694,6 +48808,10 @@ static bool laguna_graph_forward_token(
                                      weights->output,
                                      g->output_norm,
                                      1);
+        }
+        if (ok) {
+            ok = laguna_graph_diag_checkpoint(
+                    g->logits, 1, DS4_N_VOCAB, -1, "logits");
         }
     }
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;

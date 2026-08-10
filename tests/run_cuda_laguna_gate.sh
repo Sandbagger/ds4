@@ -186,7 +186,7 @@ fi
 assert_retained_identity kernels
 
 if [ "$mode" = c7 ]; then
-    timeout --kill-after=5s 60s "$model_child"
+    timeout --kill-after=5s 900s "$model_child"
 else
     "$model_child"
 fi

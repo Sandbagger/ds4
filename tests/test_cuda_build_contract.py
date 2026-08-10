@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import struct
 import subprocess
 import unittest
 from pathlib import Path
@@ -156,6 +157,13 @@ LAGUNA_MOE_RESIDUAL_AUTO_FILES = {
         12288,
         "0933abacd443f5073def7d27fb8d8040ef98e63c32f59c879eabdc6b06fe78d3",
     ),
+}
+LAGUNA_C7_ORACLE_PRODUCER = ROOT / "tests/oracle-producers/laguna-c7"
+LAGUNA_C7_ORACLE_PRODUCER_FILES = {
+    "capture_poolside_laguna_moe.sh",
+    "poolside-l2-callback.patch",
+    "probe_poolside_laguna_moe.cpp",
+    "short.tokens.i32",
 }
 
 STANDALONE_CUDA_TARGETS = (
@@ -768,6 +776,80 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn("run_q4_mmq_frozen_case()", kernel_main)
 
+    def test_laguna_c7_oracle_producer_is_self_contained(self) -> None:
+        self.assertEqual(
+            {path.name for path in LAGUNA_C7_ORACLE_PRODUCER.iterdir()},
+            LAGUNA_C7_ORACLE_PRODUCER_FILES,
+        )
+        manifests = [
+            json.loads(
+                (fixture / "manifest.json").read_text(encoding="utf-8")
+            )
+            for fixture in (
+                LAGUNA_Q4_L2_AUTO_FIXTURE,
+                LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE,
+            )
+        ]
+        self.assertEqual(manifests[0]["producer"], manifests[1]["producer"])
+        producer = manifests[0]["producer"]
+        self.assertEqual(
+            set(producer),
+            {"probe", "poolside_patch", "capture_script", "tokens"},
+        )
+        expected_paths = {
+            "probe": "probe_poolside_laguna_moe.cpp",
+            "poolside_patch": "poolside-l2-callback.patch",
+            "capture_script": "capture_poolside_laguna_moe.sh",
+            "tokens": "short.tokens.i32",
+        }
+        for key, name in expected_paths.items():
+            with self.subTest(producer=key):
+                entry = producer[key]
+                self.assertEqual(
+                    entry["path"], f"tests/oracle-producers/laguna-c7/{name}"
+                )
+                payload = (LAGUNA_C7_ORACLE_PRODUCER / name).read_bytes()
+                self.assertEqual(entry["bytes"], len(payload))
+                self.assertEqual(
+                    entry["sha256"], hashlib.sha256(payload).hexdigest()
+                )
+        self.assertEqual(
+            producer["poolside_patch"]["sha256"],
+            "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6",
+        )
+        self.assertEqual(
+            producer["tokens"]["sha256"],
+            "900e6342be5dc175a4fc13fafbf0fb380eaac5824079cf4a2db69b4d0a777fa8",
+        )
+        token_bytes = (LAGUNA_C7_ORACLE_PRODUCER / "short.tokens.i32").read_bytes()
+        self.assertEqual(
+            struct.unpack("<22i", token_bytes),
+            (
+                2, 97, 1437, 99, 53225, 3203, 330, 10068, 3612, 31063, 81,
+                365, 1161, 15631, 83, 268, 532, 1437, 99, 268, 23, 19,
+            ),
+        )
+        probe = (LAGUNA_C7_ORACLE_PRODUCER / expected_paths["probe"]).read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "--token-count",
+            '"ffn_inp"',
+            '"ffn_moe_col_l2"',
+            '"ffn_moe_down_input"',
+        ):
+            self.assertIn(required, probe)
+        capture_script = (
+            LAGUNA_C7_ORACLE_PRODUCER / expected_paths["capture_script"]
+        ).read_text(encoding="utf-8")
+        for required in (
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+            "--token-count 22",
+            "--token-count 1",
+            "git apply --check -R",
+        ):
+            self.assertIn(required, capture_script)
+
     def test_laguna_q4_l2_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_Q4_L2_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -864,6 +946,9 @@ class CudaBuildContractTest(unittest.TestCase):
         for required in (
             '"q4-l2-frozen"',
             "run_q4_l2_frozen_case",
+            "run_q4_l2_frozen_topology_case",
+            '"prefill-128"',
+            '"decode-512"',
             "LAGUNA_Q4_L2_AUTO_FIXTURE_DIR",
             '"mid-pair0.f32"',
             '"expected-col-l2-pair0.f32"',
@@ -881,12 +966,42 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("actual_bits != expected_bits", case_body)
         self.assertRegex(case_body, r"expert_mid_dim\s*=\s*1024")
 
+        selector_body = function_body(
+            "static uint32_t glm_poolside_q4_l2_thread_count("
+        )
+        self.assertRegex(selector_body, r"uint32_t\s+threads\s*=\s*512u")
+        self.assertRegex(
+            selector_body,
+            r"pair_count\s*/\s*multiprocessors\s*>=\s*2u",
+        )
+        self.assertIn("expert_mid_dim < 1024u ? 32u : 128u", selector_body)
+
         hook_body = function_body(
             'extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor('
         )
         self.assertRegex(
             hook_body,
-            r"glm_poolside_q4_l2_rescale_kernel<<<\s*\(uint32_t\)pair_count,\s*128u\s*>>>",
+            r"glm_poolside_q4_l2_thread_count\(\s*expert_mid_dim,\s*"
+            r"topology_pair_count,\s*\(uint32_t\)multiprocessors\s*\)",
+        )
+        self.assertRegex(
+            hook_body,
+            r"glm_poolside_q4_l2_rescale_kernel<<<\s*"
+            r"\(uint32_t\)pair_count,\s*l2_threads\s*>>>",
+        )
+        production_body = function_body(
+            "static int glm_poolside_routed_moe_q4_launch("
+        )
+        self.assertRegex(
+            production_body,
+            r"l2_threads\s*=\s*glm_poolside_q4_l2_thread_count\(\s*"
+            r"expert_mid_dim,\s*pair_count,\s*"
+            r"\(uint32_t\)multiprocessors\s*\)",
+        )
+        self.assertRegex(
+            production_body,
+            r"glm_poolside_q4_l2_rescale_kernel<<<\s*"
+            r"\(uint32_t\)pair_count,\s*l2_threads\s*>>>",
         )
         l2_body = function_body(
             "__global__ static void glm_poolside_q4_l2_rescale_kernel("

@@ -1848,16 +1848,18 @@ static int run_prefill_attention_cases(void) {
     return rc;
 }
 
-/* Independent Q4_K/Q8_K routed-MoE oracle.  Both quantization boundaries
- * belong here: a float-only reference would be testing a different kernel. */
+/* Independent Poolside Q4_K/Q8_1 routed-MoE oracle.  Both quantization
+ * boundaries belong here: a float-only reference would test a different
+ * kernel.  Poolside applies router weights after the down projection. */
 #define LAGUNA_QK_K 256u
+#define LAGUNA_QK8_1 32u
 #define LAGUNA_MOE_DIM 256u
 #define LAGUNA_MOE_EXPERTS 16u
 #define LAGUNA_MOE_USED 10u
 #define LAGUNA_MOE_GUARD 8u
 
 typedef struct { uint16_t d, dmin; uint8_t scales[12]; uint8_t qs[LAGUNA_QK_K / 2u]; } laguna_q4k_block;
-typedef struct { float d; int8_t qs[LAGUNA_QK_K]; int16_t bsums[LAGUNA_QK_K / 16u]; } laguna_q8k_block;
+typedef struct { uint16_t d, s; int8_t qs[LAGUNA_QK8_1]; } laguna_q8_1_block;
 typedef struct { ds4_gpu_tensor *base, *view; float *host; uint32_t count; } laguna_guarded_output;
 typedef struct {
     uint64_t gate_offset, up_offset, down_offset;
@@ -1873,36 +1875,44 @@ static void laguna_q4k_scale_min(uint32_t group, const uint8_t *scales, uint8_t 
            *minimum = (scales[group + 4u] >> 4u) | ((scales[group] >> 6u) << 4u); }
 }
 
-static void laguna_quantize_q8k(laguna_q8k_block *out, const float *in) {
-    uint32_t max_i = 0;
-    for (uint32_t i = 1; i < LAGUNA_QK_K; i++) if (fabsf(in[i]) > fabsf(in[max_i])) max_i = i;
-    const float maxv = in[max_i];
-    if (maxv == 0.0f) { memset(out, 0, sizeof(*out)); return; }
-    const float inverse_scale = -127.0f / maxv;
-    for (uint32_t i = 0; i < LAGUNA_QK_K; i++) {
-        long q = lrintf(inverse_scale * in[i]);
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        out->qs[i] = (int8_t)q;
+static void laguna_quantize_q8_1(laguna_q8_1_block *out, const float *in) {
+    for (uint32_t block = 0; block < LAGUNA_QK_K / LAGUNA_QK8_1; block++) {
+        const float *row = in + block * LAGUNA_QK8_1;
+        float amax = 0.0f;
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
+            amax = fmaxf(amax, fabsf(row[i]));
+            sum += row[i];
+        }
+        const float scale = amax / 127.0f;
+        const float inverse_scale = scale == 0.0f ? 0.0f : 1.0f / scale;
+        for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
+            out[block].qs[i] = (int8_t)roundf(row[i] * inverse_scale);
+        }
+        out[block].d = reference_f32_to_f16(scale);
+        out[block].s = reference_f32_to_f16(sum);
     }
-    for (uint32_t group = 0; group < LAGUNA_QK_K / 16u; group++) {
-        int sum = 0; for (uint32_t i = 0; i < 16u; i++) sum += out->qs[group * 16u + i];
-        out->bsums[group] = (int16_t)sum;
-    }
-    out->d = 1.0f / inverse_scale;
 }
 
-static float laguna_q4k_q8k_dot(const laguna_q4k_block *weights, const laguna_q8k_block *input) {
-    int isum = 0, sum_min = 0;
+static float laguna_q4k_q8_1_dot(
+        const laguna_q4k_block *weights,
+        const laguna_q8_1_block *input) {
+    float scaled_sum = 0.0f;
+    float minimum_sum = 0.0f;
     for (uint32_t group = 0; group < LAGUNA_QK_K / 32u; group++) {
         uint8_t scale, minimum;
         laguna_q4k_scale_min(group, weights->scales, &scale, &minimum);
-        sum_min += (int)minimum * ((int)input->bsums[group * 2u] + (int)input->bsums[group * 2u + 1u]);
+        int integer_sum = 0;
         const uint32_t byte_offset = (group >> 1u) * 32u, shift = (group & 1u) * 4u;
         for (uint32_t i = 0; i < 32u; i++)
-            isum += (int)scale * (int)((weights->qs[byte_offset + i] >> shift) & 0x0fu) * (int)input->qs[group * 32u + i];
+            integer_sum += (int)((weights->qs[byte_offset + i] >> shift) & 0x0fu) *
+                (int)input[group].qs[i];
+        scaled_sum += reference_f16_to_f32(input[group].d) *
+            (float)((int)scale * integer_sum);
+        minimum_sum += reference_f16_to_f32(input[group].s) * (float)minimum;
     }
-    return input->d * reference_f16_to_f32(weights->d) * (float)isum - input->d * reference_f16_to_f32(weights->dmin) * (float)sum_min;
+    return reference_f16_to_f32(weights->d) * scaled_sum -
+        reference_f16_to_f32(weights->dmin) * minimum_sum;
 }
 
 static void laguna_encode_q4k(laguna_q4k_block *out, uint32_t seed, float scale) {
@@ -1939,8 +1949,10 @@ static void laguna_reference_routed_moe(
     const laguna_q4k_block *routed_up = (const laguna_q4k_block *)(model + routed->up_offset);
     const laguna_q4k_block *routed_down = (const laguna_q4k_block *)(model + routed->down_offset);
     for (uint32_t token = 0; token < n_tokens; token++) {
-        laguna_q8k_block xq, midq; float mid[LAGUNA_MOE_DIM];
-        laguna_quantize_q8k(&xq, x + (uint64_t)token * LAGUNA_MOE_DIM);
+        laguna_q8_1_block xq[LAGUNA_QK_K / LAGUNA_QK8_1];
+        laguna_q8_1_block midq[LAGUNA_QK_K / LAGUNA_QK8_1];
+        float mid[LAGUNA_MOE_DIM];
+        laguna_quantize_q8_1(xq, x + (uint64_t)token * LAGUNA_MOE_DIM);
         memset(out + (uint64_t)token * LAGUNA_MOE_DIM, 0, LAGUNA_MOE_DIM * sizeof(*out));
         for (uint32_t slot = 0; slot < LAGUNA_MOE_USED; slot++) {
             const uint32_t expert = (uint32_t)selected[(uint64_t)token * LAGUNA_MOE_USED + slot];
@@ -1949,11 +1961,14 @@ static void laguna_reference_routed_moe(
             const laguna_q4k_block *up = routed_up + (uint64_t)expert * LAGUNA_MOE_DIM;
             const laguna_q4k_block *down = routed_down + (uint64_t)expert * LAGUNA_MOE_DIM;
             for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
-                mid[row] = weight * laguna_silu(laguna_q4k_q8k_dot(gate + row, &xq)) *
-                    laguna_q4k_q8k_dot(up + row, &xq);
+                mid[row] = laguna_silu(laguna_q4k_q8_1_dot(gate + row, xq)) *
+                    laguna_q4k_q8_1_dot(up + row, xq);
             }
-            laguna_quantize_q8k(&midq, mid);
-            for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) out[(uint64_t)token * LAGUNA_MOE_DIM + row] += laguna_q4k_q8k_dot(down + row, &midq);
+            laguna_quantize_q8_1(midq, mid);
+            for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
+                out[(uint64_t)token * LAGUNA_MOE_DIM + row] +=
+                    weight * laguna_q4k_q8_1_dot(down + row, midq);
+            }
         }
     }
 }

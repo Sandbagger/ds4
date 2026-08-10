@@ -59,7 +59,8 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
 
             one_layer = struct.pack("<f", 1.0) * VALUES_PER_LAYER
             changed_layer = bytearray(one_layer)
-            struct.pack_into("<f", changed_layer, 0, 2.0)
+            last_token_offset = (TOKENS - 1) * WIDTH * 4
+            struct.pack_into("<f", changed_layer, last_token_offset, 2.0)
 
             for layer in range(LAYERS):
                 name = f"layer-{layer:02d}.f32"
@@ -103,6 +104,18 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             self.assertEqual(changed["max_abs"], 1.0)
             self.assertLess(changed["cosine"], 1.0)
             self.assertFalse(changed["exact_hash"])
+            self.assertAlmostEqual(
+                changed["last_token"]["rms"],
+                1.0 / math.sqrt(WIDTH),
+                places=12,
+            )
+            self.assertEqual(
+                report["largest_last_token_relative_rms_increase"]["layer"], 7
+            )
+            self.assertEqual(
+                report["largest_last_token_relative_rms_increase"]["previous_stage"],
+                "l_out-6",
+            )
 
             for layer in report["layers"][:7] + report["layers"][8:]:
                 self.assertEqual(layer["rms"], 0.0)
@@ -110,6 +123,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
                 self.assertEqual(layer["max_abs"], 0.0)
                 self.assertEqual(layer["cosine"], 1.0)
                 self.assertTrue(layer["exact_hash"])
+                self.assertEqual(layer["last_token"]["rms"], 0.0)
 
     def test_comparator_rejects_noncanonical_layer_size(self):
         self.assertTrue(COMPARATOR.is_file(), f"missing comparator: {COMPARATOR}")

@@ -91,6 +91,15 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         )
         self.assertIn("laguna_graph_diag_detail_layer", ds4_source)
         self.assertIn("il == (uint32_t)detail_layer", ds4_source)
+        self.assertRegex(
+            ds4_source,
+            r'(?s)MoE FFN sum diagnostic";\s*'
+            r"ok = ds4_gpu_add_tensor\(\s*g->attn_out,\s*g->ffn_out,\s*"
+            r"g->shared_out,.*?"
+            r'ffn-out diagnostic";\s*'
+            r"ok = laguna_graph_diag_checkpoint\(\s*g->attn_out,.*?"
+            r'"ffn-out"\);',
+        )
 
     def test_comparator_reports_every_layer_and_the_first_exact_divergence(self):
         self.assertTrue(COMPARATOR.is_file(), f"missing comparator: {COMPARATOR}")

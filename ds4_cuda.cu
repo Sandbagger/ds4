@@ -18112,6 +18112,55 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
+/* Algebraic Q4_K x Q8_1 block dot used by Poolside's two CUDA batch modes.
+ * MMVQ reconstructs each minimum term from d*sum(q); MMQ consumes the
+ * independently rounded half-precision sum stored beside each 32-value
+ * group.  Keeping the distinction here prevents the resident decode path
+ * from silently inheriting prompt-only MMQ arithmetic. */
+__device__ static float dev_dot_q4_K_q8_1_block(
+        const cuda_block_q4_K *x,
+        const poolside_q8_1_block *y,
+        bool mmq) {
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    float scaled_sum = 0.0f;
+    float minimum_sum = 0.0f;
+#pragma unroll
+    for (uint32_t group = 0; group < 8u; group++) {
+        uint8_t scale = 0;
+        uint8_t minimum = 0;
+        dev_q4_K_get_scale_min(group, x->scales, &scale, &minimum);
+        const uint32_t byte_offset = (group >> 1u) * 32u;
+        const int shift = (group & 1u) ? 4 : 0;
+        const int32_t integer_dot = dev_dot_q4_32(
+            x->qs + byte_offset, y[group].qs, shift);
+        const float d8 = __half2float(y[group].d);
+        scaled_sum = __fadd_rn(
+            scaled_sum,
+            __fmul_rn(d8, __int2float_rn((int32_t)scale * integer_dot)));
+        float minimum_term = 0.0f;
+        if (mmq) {
+            minimum_term = __fmul_rn(
+                __half2float(y[group].s), (float)minimum);
+        } else {
+            int32_t quantized_sum = 0;
+#pragma unroll
+            for (uint32_t i = 0; i < 32u; i += 4u) {
+                quantized_sum = __dp4a(
+                    0x01010101,
+                    *(const int32_t *)(y[group].qs + i),
+                    quantized_sum);
+            }
+            minimum_term = __fmul_rn(
+                d8,
+                __int2float_rn(quantized_sum * (int32_t)minimum));
+        }
+        minimum_sum = __fadd_rn(minimum_sum, minimum_term);
+    }
+    return __fsub_rn(__fmul_rn(xd, scaled_sum),
+                     __fmul_rn(xmin, minimum_sum));
+}
+
 /* Vector-load variant of dev_dot_q4_K_q8_K_block: loads the whole 144-byte
  * Q4_K block with nine 16B loads (requires a 16B-aligned tensor base; block
  * stride 144 and row strides are 16B multiples), then computes the exact same
@@ -27028,6 +27077,478 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
                              0.0f, x, layer_index, n_tokens, 0, 0);
 }
 
+/* Poolside's Q4_K MUL_MAT_ID changes activation quantization at its GB10
+ * MMVQ/MMQ boundary.  The existing full-warp quantizer above covers MMVQ.
+ * This kernel covers MMQ while retaining the ordinary 36-byte Q8_1 layout
+ * consumed by the correctness-first resident kernels below.  Eight lanes
+ * jointly quantize one 32-value group, matching Poolside's float4 load and
+ * reciprocal-first arithmetic. */
+__launch_bounds__(256, 1)
+static __global__ void glm_poolside_q8_1_mmq_quantize_kernel(
+        poolside_q8_1_block *out,
+        const float *input,
+        uint64_t group_count) {
+    const uint32_t lane8 = threadIdx.x & 7u;
+    const uint64_t group =
+        (uint64_t)blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (group >= group_count) return;
+
+    const float4 values = ((const float4 *)(input + group * 32u))[lane8];
+    float amax = fabsf(values.x);
+    amax = fmaxf(amax, fabsf(values.y));
+    amax = fmaxf(amax, fabsf(values.z));
+    amax = fmaxf(amax, fabsf(values.w));
+    float sum = __fadd_rn(values.x, values.y);
+    sum = __fadd_rn(sum, values.z);
+    sum = __fadd_rn(sum, values.w);
+    const uint32_t mask = __activemask();
+#pragma unroll
+    for (uint32_t offset = 4u; offset > 0u; offset >>= 1u) {
+        amax = fmaxf(
+            amax, __shfl_xor_sync(mask, amax, offset, 32));
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(mask, sum, offset, 32));
+    }
+
+    const float inverse_scale = amax == 0.0f ? 0.0f : 127.0f / amax;
+    char4 quantized;
+    quantized.x = (signed char)roundf(values.x * inverse_scale);
+    quantized.y = (signed char)roundf(values.y * inverse_scale);
+    quantized.z = (signed char)roundf(values.z * inverse_scale);
+    quantized.w = (signed char)roundf(values.w * inverse_scale);
+    *(char4 *)(out[group].qs + lane8 * 4u) = quantized;
+    if (lane8 == 0u) {
+        const float scale = inverse_scale == 0.0f ? 0.0f :
+            1.0f / inverse_scale;
+        out[group].d = __float2half_rn(scale);
+        out[group].s = __float2half_rn(sum);
+    }
+}
+
+__global__ static void glm_poolside_q4_gate_up_kernel(
+        float *mid,
+        const char *gate_base,
+        const char *up_base,
+        const poolside_q8_1_block *input_q8,
+        const int32_t *selected,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t input_q4_blocks,
+        uint32_t input_q8_groups,
+        uint32_t expert_mid_dim,
+        uint32_t mid_token_stride,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        bool mmq) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (row >= expert_mid_dim || slot >= n_expert || token >= n_tokens) {
+        return;
+    }
+    const uint64_t pair = (uint64_t)token * n_expert + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) return;
+
+    const cuda_block_q4_K *gate_row =
+        (const cuda_block_q4_K *)(gate_base +
+            (uint64_t)(uint32_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *up_row =
+        (const cuda_block_q4_K *)(up_base +
+            (uint64_t)(uint32_t)expert * up_expert_bytes +
+            (uint64_t)row * up_row_bytes);
+    const poolside_q8_1_block *input_row =
+        input_q8 + (uint64_t)token * input_q8_groups;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t block = 0; block < input_q4_blocks; block++) {
+        gate = __fadd_rn(gate, dev_dot_q4_K_q8_1_block(
+            gate_row + block, input_row + (uint64_t)block * 8u, mmq));
+        up = __fadd_rn(up, dev_dot_q4_K_q8_1_block(
+            up_row + block, input_row + (uint64_t)block * 8u, mmq));
+    }
+    const float activated = gate / (1.0f + expf(-gate));
+    mid[(uint64_t)token * mid_token_stride +
+        (uint64_t)slot * expert_mid_dim + row] =
+        __fmul_rn(activated, up);
+}
+
+/* Match Poolside's separate SQR -> SUM_ROWS -> SQRT/CLAMP -> MUL/DIV graph
+ * without materializing a second full-size float tensor.  __fmul_rn rounds
+ * each square before it enters the same eight-stream reduction topology used
+ * by reduce_rows_f32. */
+__global__ static void glm_poolside_q4_l2_rescale_kernel(
+        float *mid,
+        float *column_l2,
+        uint32_t expert_mid_dim,
+        uint64_t pair_count) {
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const uint32_t column = threadIdx.x;
+    float partials[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+    };
+    uint32_t index = column;
+    while (index < expert_mid_dim) {
+        float values[8];
+#pragma unroll
+        for (uint32_t item = 0; item < 8u; item++) {
+            if (index < expert_mid_dim) {
+                const float value =
+                    mid[pair * expert_mid_dim + index];
+                values[item] = __fmul_rn(value, value);
+            } else {
+                values[item] = 0.0f;
+            }
+            index += blockDim.x;
+        }
+#pragma unroll
+        for (uint32_t item = 0; item < 8u; item++) {
+            partials[item] = __fadd_rn(partials[item], values[item]);
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t item = 0; item < 8u; item++) {
+        sum = __fadd_rn(sum, partials[item]);
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(0xffffffffu, sum, offset, 32));
+    }
+
+    __shared__ float warp_values[32];
+    const uint32_t lane = column & 31u;
+    const uint32_t warp = column >> 5u;
+    if (lane == 0u) warp_values[warp] = sum;
+    __syncthreads();
+    sum = lane < (blockDim.x >> 5u) ? warp_values[lane] : 0.0f;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(0xffffffffu, sum, offset, 32));
+    }
+    if (column == 0u) {
+        float l2 = sqrtf(sum);
+        l2 = fminf(1.0e30f, fmaxf(1.0e-8f, l2));
+        column_l2[pair] = l2;
+        warp_values[0] = l2;
+    }
+    __syncthreads();
+    const float l2 = warp_values[0];
+    for (uint32_t i = column; i < expert_mid_dim; i += blockDim.x) {
+        const uint64_t offset = pair * expert_mid_dim + i;
+        mid[offset] = __fdiv_rn(
+            __fmul_rn(mid[offset], 32768.0f), l2);
+    }
+}
+
+__global__ static void glm_poolside_q4_down_kernel(
+        float *out,
+        const char *down_base,
+        const poolside_q8_1_block *mid_q8,
+        const float *column_l2,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t mid_q4_blocks,
+        uint32_t mid_q8_groups,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        bool mmq) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tokens) return;
+    float output = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)token * n_expert + slot;
+        const int32_t expert = selected[pair];
+        if (expert < 0 || (uint32_t)expert >= n_total_expert) continue;
+        const cuda_block_q4_K *down_row =
+            (const cuda_block_q4_K *)(down_base +
+                (uint64_t)(uint32_t)expert * down_expert_bytes +
+                (uint64_t)row * down_row_bytes);
+        const poolside_q8_1_block *mid_row =
+            mid_q8 + pair * mid_q8_groups;
+        float expert_value = 0.0f;
+        for (uint32_t block = 0; block < mid_q4_blocks; block++) {
+            expert_value = __fadd_rn(
+                expert_value,
+                dev_dot_q4_K_q8_1_block(
+                    down_row + block,
+                    mid_row + (uint64_t)block * 8u,
+                    mmq));
+        }
+        expert_value = __fmul_rn(expert_value, column_l2[pair]);
+        expert_value = __fmul_rn(expert_value, 1.0f / 32768.0f);
+        expert_value = __fmul_rn(expert_value, weights[pair]);
+        output = __fadd_rn(output, expert_value);
+    }
+    out[(uint64_t)token * out_dim + row] = output;
+}
+
+/* Correctness-first resident Q4_K routed path.  DS4 serializes Laguna's
+ * resident graph, so these lazily grown per-device buffers cannot overlap
+ * another call on the same tier.  The later compact/streaming path owns a
+ * separate bounded allocation plan and does not enter this helper. */
+static int glm_poolside_routed_moe_q4_launch(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        const ds4_gpu_tensor *input,
+        uint32_t              n_tokens,
+        uint32_t              mid_token_stride) {
+    if (!out || !mid || !selected || !weights || !input || !model_map ||
+        !out->ptr || !mid->ptr || !selected->ptr || !weights->ptr ||
+        !input->ptr || n_tokens == 0u || n_expert == 0u ||
+        n_total_expert == 0u || expert_in_dim == 0u ||
+        expert_mid_dim == 0u || out_dim == 0u ||
+        (expert_in_dim & 255u) != 0u ||
+        (expert_mid_dim & 255u) != 0u ||
+        n_tokens > 65535u || n_expert > 65535u) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(mid) != tier ||
+        ds4_tensor_device_idx(selected) != tier ||
+        ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(input) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "glm Poolside routed moe get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+
+    const uint64_t input_q4_blocks = expert_in_dim / 256u;
+    const uint64_t mid_q4_blocks = expert_mid_dim / 256u;
+    const uint64_t input_q8_groups = expert_in_dim / 32u;
+    const uint64_t mid_q8_groups = expert_mid_dim / 32u;
+    const uint64_t required_gate_row =
+        input_q4_blocks * sizeof(cuda_block_q4_K);
+    const uint64_t required_down_row =
+        mid_q4_blocks * sizeof(cuda_block_q4_K);
+    if (gate_row_bytes < required_gate_row ||
+        up_row_bytes < required_gate_row ||
+        down_row_bytes < required_down_row ||
+        (uint64_t)expert_mid_dim > UINT64_MAX / gate_row_bytes ||
+        (uint64_t)expert_mid_dim > UINT64_MAX / up_row_bytes ||
+        (uint64_t)out_dim > UINT64_MAX / down_row_bytes ||
+        gate_expert_bytes < (uint64_t)expert_mid_dim * gate_row_bytes ||
+        up_expert_bytes < (uint64_t)expert_mid_dim * up_row_bytes ||
+        down_expert_bytes < (uint64_t)out_dim * down_row_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / up_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
+        return 0;
+    }
+    const uint64_t gate_bytes =
+        (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t up_bytes =
+        (uint64_t)n_total_expert * up_expert_bytes;
+    const uint64_t down_bytes =
+        (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || up_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset) {
+        return 0;
+    }
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    const uint64_t expected_mid_stride =
+        (uint64_t)n_expert * expert_mid_dim;
+    if (pair_count > UINT32_MAX || expected_mid_stride > UINT32_MAX ||
+        mid_token_stride != expected_mid_stride ||
+        (uint64_t)n_tokens > UINT64_MAX / expert_in_dim ||
+        pair_count > UINT64_MAX / expert_mid_dim ||
+        (uint64_t)n_tokens > UINT64_MAX / out_dim) {
+        return 0;
+    }
+    const uint64_t input_values = (uint64_t)n_tokens * expert_in_dim;
+    const uint64_t mid_values = pair_count * expert_mid_dim;
+    const uint64_t output_values = (uint64_t)n_tokens * out_dim;
+    const uint64_t output_grid_x = ((uint64_t)out_dim + 255u) / 256u;
+    const bool mmq = n_tokens > 8u;
+    if ((mmq && ((((uintptr_t)input->ptr) & 15u) != 0u ||
+                 (((uintptr_t)mid->ptr) & 15u) != 0u)) ||
+        input_values > UINT32_MAX ||
+        input_values > UINT64_MAX / sizeof(float) ||
+        mid_values > UINT32_MAX ||
+        mid_values > UINT64_MAX / sizeof(float) ||
+        output_values > UINT64_MAX / sizeof(float) ||
+        output_grid_x > UINT32_MAX ||
+        pair_count > UINT64_MAX / sizeof(int32_t) ||
+        input->bytes < input_values * sizeof(float) ||
+        mid->bytes < mid_values * sizeof(float) ||
+        out->bytes < output_values * sizeof(float) ||
+        selected->bytes < pair_count * sizeof(int32_t) ||
+        weights->bytes < pair_count * sizeof(float)) {
+        return 0;
+    }
+
+    const uint64_t input_group_count =
+        (uint64_t)n_tokens * input_q8_groups;
+    const uint64_t mid_group_count = pair_count * mid_q8_groups;
+    if (input_group_count > UINT64_MAX / sizeof(poolside_q8_1_block) ||
+        mid_group_count > UINT64_MAX / sizeof(poolside_q8_1_block) ||
+        pair_count > UINT64_MAX / sizeof(float) ||
+        (input_group_count + 31u) / 32u > UINT32_MAX ||
+        (mid_group_count + 31u) / 32u > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t input_q8_bytes =
+        input_group_count * sizeof(poolside_q8_1_block);
+    const uint64_t mid_q8_bytes =
+        mid_group_count * sizeof(poolside_q8_1_block);
+    const uint64_t l2_bytes = pair_count * sizeof(float);
+    static ds4_gpu_tensor *input_q8_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *mid_q8_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *l2_scratch[DS4_MAX_GPUS] = {0};
+    if (!input_q8_scratch[tier] ||
+        input_q8_scratch[tier]->bytes < input_q8_bytes) {
+        ds4_gpu_tensor_free(input_q8_scratch[tier]);
+        input_q8_scratch[tier] =
+            ds4_gpu_tensor_alloc_ptr_on(tier, input_q8_bytes);
+    }
+    if (!mid_q8_scratch[tier] ||
+        mid_q8_scratch[tier]->bytes < mid_q8_bytes) {
+        ds4_gpu_tensor_free(mid_q8_scratch[tier]);
+        mid_q8_scratch[tier] =
+            ds4_gpu_tensor_alloc_ptr_on(tier, mid_q8_bytes);
+    }
+    if (!l2_scratch[tier] || l2_scratch[tier]->bytes < l2_bytes) {
+        ds4_gpu_tensor_free(l2_scratch[tier]);
+        l2_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, l2_bytes);
+    }
+    if (!input_q8_scratch[tier] || !mid_q8_scratch[tier] ||
+        !l2_scratch[tier]) {
+        return 0;
+    }
+
+    const char *gate = cuda_resolve_weight_ptr(
+        model_map, gate_offset, gate_bytes, tier,
+        "laguna_poolside_gate_exps");
+    const char *up = cuda_resolve_weight_ptr(
+        model_map, up_offset, up_bytes, tier,
+        "laguna_poolside_up_exps");
+    const char *down = cuda_resolve_weight_ptr(
+        model_map, down_offset, down_bytes, tier,
+        "laguna_poolside_down_exps");
+    if (!gate || !up || !down) return 0;
+
+    poolside_q8_1_block *input_q8 =
+        (poolside_q8_1_block *)input_q8_scratch[tier]->ptr;
+    poolside_q8_1_block *mid_q8 =
+        (poolside_q8_1_block *)mid_q8_scratch[tier]->ptr;
+    if (mmq) {
+        glm_poolside_q8_1_mmq_quantize_kernel<<<
+            (uint32_t)((input_group_count + 31u) / 32u), 256>>>(
+                input_q8, (const float *)input->ptr,
+                input_group_count);
+    } else {
+        quantize_poolside_q8_1_f32_kernel<<<
+            (uint32_t)((input_values + 255u) / 256u), 256>>>(
+                input_q8, (const float *)input->ptr,
+                (uint32_t)input_values);
+    }
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe input quantize")) {
+        return 0;
+    }
+
+    const dim3 gate_grid(
+        (expert_mid_dim + 255u) / 256u, n_expert, n_tokens);
+    glm_poolside_q4_gate_up_kernel<<<gate_grid, 256>>>(
+        (float *)mid->ptr, gate, up, input_q8,
+        (const int32_t *)selected->ptr,
+        gate_expert_bytes, gate_row_bytes,
+        up_expert_bytes, up_row_bytes,
+        (uint32_t)input_q4_blocks, (uint32_t)input_q8_groups,
+        expert_mid_dim, mid_token_stride, n_total_expert,
+        n_expert, n_tokens, mmq);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe gate up")) {
+        return 0;
+    }
+
+    int multiprocessors = 0;
+    if (!cuda_ok(cudaDeviceGetAttribute(
+            &multiprocessors, cudaDevAttrMultiProcessorCount,
+            current_device),
+            "glm Poolside routed moe multiprocessor count") ||
+        multiprocessors <= 0) {
+        return 0;
+    }
+    uint32_t l2_threads = 512u;
+    if (pair_count / (uint32_t)multiprocessors >= 2u) {
+        l2_threads = expert_mid_dim < 1024u ? 32u : 128u;
+    }
+    glm_poolside_q4_l2_rescale_kernel<<<
+        (uint32_t)pair_count, l2_threads>>>(
+            (float *)mid->ptr, (float *)l2_scratch[tier]->ptr,
+            expert_mid_dim, pair_count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe L2 rescale")) {
+        return 0;
+    }
+
+    if (mmq) {
+        glm_poolside_q8_1_mmq_quantize_kernel<<<
+            (uint32_t)((mid_group_count + 31u) / 32u), 256>>>(
+                mid_q8, (const float *)mid->ptr,
+                mid_group_count);
+    } else {
+        quantize_poolside_q8_1_f32_kernel<<<
+            (uint32_t)((mid_values + 255u) / 256u), 256>>>(
+                mid_q8, (const float *)mid->ptr,
+                (uint32_t)mid_values);
+    }
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe mid quantize")) {
+        return 0;
+    }
+
+    const dim3 down_grid((uint32_t)output_grid_x, n_tokens, 1u);
+    glm_poolside_q4_down_kernel<<<down_grid, 256>>>(
+        (float *)out->ptr, down, mid_q8,
+        (const float *)l2_scratch[tier]->ptr,
+        (const int32_t *)selected->ptr,
+        (const float *)weights->ptr,
+        down_expert_bytes, down_row_bytes,
+        (uint32_t)mid_q4_blocks, (uint32_t)mid_q8_groups,
+        out_dim, n_total_expert, n_expert, n_tokens, mmq);
+    return cuda_ok(cudaGetLastError(),
+                   "glm Poolside routed moe down");
+}
+
 /* Scalar-correct GLM routed MoE (q2_K experts): per (token, slot) block
  * quantizes nothing - dots q2_K rows against a q8_K-quantized activation
  * staged in shared memory. Grid: (n_tokens, n_expert). Mid buffer holds
@@ -27743,16 +28264,15 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                     n_total_expert)) {
             return 0;
         }
-        return ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
+        return glm_poolside_routed_moe_q4_launch(
                 out, mid, model_map, model_size,
                 gate_offset, up_offset, down_offset,
-                gate_type, up_type, down_type,
                 gate_expert_bytes, gate_row_bytes,
                 up_expert_bytes, up_row_bytes,
                 down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim,
                 selected, weights, n_total_expert, n_expert,
-                layer_index, x, n_tokens, mid_token_stride);
+                x, n_tokens, mid_token_stride);
     }
     if (gate_type != 10u || up_type != 10u || down_type != 10u) {
         fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",

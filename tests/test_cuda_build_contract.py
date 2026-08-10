@@ -199,6 +199,13 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn(
             "(uint64_t)n_tokens * width * sizeof(float)", DS4_SOURCE
         )
+        self.assertIn('"%s/layer-%02d.f32"', DS4_SOURCE)
+        self.assertNotIn('"%s/layer-%02d-%s.f32"', DS4_SOURCE)
+        self.assertRegex(
+            body,
+            r"laguna_graph_diag_checkpoint\(\s*g->logits,\s*1,"
+            r"\s*DS4_N_VOCAB,\s*-1,\s*\"logits\"\s*\)",
+        )
         checkpoint = source_function_body(
             DS4_SOURCE, "static bool laguna_graph_diag_checkpoint(", "ds4.c"
         )
@@ -211,6 +218,15 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("DS4_LAGUNA_DIAG_DIR", LAGUNA_MODEL_TEST)
         self.assertIn("memcmp(baseline_logits, probed_logits, VECTOR_BYTES)",
                       LAGUNA_MODEL_TEST)
+        self.assertIn("short-layer-diag PASS files=50", LAGUNA_MODEL_TEST)
+        run_short = source_function_body(
+            LAGUNA_MODEL_TEST, "static bool run_short(",
+            "tests/test_cuda_laguna_model.c"
+        )
+        diagnostic_branch = run_short.split(
+            'const char *diag_dir_env = getenv("DS4_LAGUNA_DIAG_DIR");', 1
+        )[1].split("ds4_session *session = NULL;", 1)[0]
+        self.assertNotIn("compare_session_oracle", diagnostic_branch)
 
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')

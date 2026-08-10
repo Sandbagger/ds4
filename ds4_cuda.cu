@@ -7048,6 +7048,48 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+__device__ __forceinline__ static float poolside_warp_sum_f32(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+    }
+    return value;
+}
+
+/* Poolside llama.cpp 04b2b72 launches its fused weighted RMSNorm with 1024
+ * threads for widths >= 1024. Laguna's 3072-wide norms feed Q8 activation
+ * quantization, where a one-ULP reduction difference can cross a rounding
+ * boundary, so preserve Poolside's two-stage XOR tree and multiply order. */
+__global__ static void rms_norm_weight_poolside3072_kernel(
+        float *out,
+        const float *x,
+        const float *w,
+        uint32_t rows,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const float *xr = x + (uint64_t)row * 3072u;
+    float *orow = out + (uint64_t)row * 3072u;
+    float sum = 0.0f;
+    for (uint32_t col = tid; col < 3072u; col += 1024u) {
+        const float value = xr[col];
+        sum += value * value;
+    }
+    sum = poolside_warp_sum_f32(sum);
+    __shared__ float warp_sums[32];
+    if (lane == 0u) warp_sums[warp] = sum;
+    __syncthreads();
+    sum = warp_sums[lane];
+    sum = poolside_warp_sum_f32(sum);
+    const float scale = rsqrtf(sum / 3072.0f + eps);
+    for (uint32_t col = tid; col < 3072u; col += 1024u) {
+        orow[col] = scale * xr[col] * w[col];
+    }
+}
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -15002,7 +15044,13 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    if (n == 3072u) {
+        rms_norm_weight_poolside3072_kernel<<<1, 1024>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, 1u, eps);
+    } else {
+        rms_norm_weight_kernel<<<1, 256>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, n, 1u, eps);
+    }
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -15014,7 +15062,13 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    if (n == 3072u) {
+        rms_norm_weight_poolside3072_kernel<<<rows, 1024>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, rows, eps);
+    } else {
+        rms_norm_weight_kernel<<<rows, 256>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    }
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(

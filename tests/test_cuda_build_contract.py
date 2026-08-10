@@ -1020,7 +1020,10 @@ class CudaBuildContractTest(unittest.TestCase):
         residual_body = function_body(
             'extern "C" int ds4_gpu_laguna_moe_residual_tensor('
         )
-        self.assertIn("ds4_gpu_add3_tensor(", residual_body)
+        self.assertIn(
+            "ds4_gpu_add3_tensor(out, moe, shared, residual, n)",
+            residual_body,
+        )
         self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", GPU_HEADER)
         for function_name in (
             "static bool laguna_graph_forward_token(",

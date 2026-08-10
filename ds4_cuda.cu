@@ -24932,7 +24932,7 @@ extern "C" int ds4_gpu_laguna_moe_residual_tensor(
         const ds4_gpu_tensor *moe,
         const ds4_gpu_tensor *shared,
         uint32_t                n) {
-    return ds4_gpu_add3_tensor(out, residual, moe, shared, n);
+    return ds4_gpu_add3_tensor(out, moe, shared, residual, n);
 }
 
 /* Fused decode residual: sum_out = a + b; norm_out = rmsnorm(sum) * w.

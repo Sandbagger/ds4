@@ -136,6 +136,18 @@ LAGUNA_Q4_L2_AUTO_FILES = {
         4096,
         "c058fcac9dc6a95dbf0b3aa59bbcc84f28ae1f8233ed273d59eecda23a30d0a1",
     ),
+    "mid-decode.f32": (
+        40960,
+        "c43a2d48c6931726245e9a91f31cc669dd2786a3a2970626e904f48b5bc5567e",
+    ),
+    "expected-col-l2-decode.f32": (
+        40,
+        "c84da10d5bb0cf015e07a441824fb1223261ee44320ef2be3d5936e1f5bc8086",
+    ),
+    "expected-down-input-decode.f32": (
+        40960,
+        "22a986deadc4750a1760fbc72f58f233ceab87816697c97289f80688ea24e69a",
+    ),
 }
 LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE = (
     ROOT / "tests/test-vectors/laguna-moe-residual-auto"
@@ -808,6 +820,9 @@ class CudaBuildContractTest(unittest.TestCase):
                 self.assertEqual(
                     entry["path"], f"tests/oracle-producers/laguna-c7/{name}"
                 )
+                producer_path = Path(entry["path"])
+                self.assertFalse(producer_path.is_absolute())
+                self.assertNotIn("..", producer_path.parts)
                 payload = (LAGUNA_C7_ORACLE_PRODUCER / name).read_bytes()
                 self.assertEqual(entry["bytes"], len(payload))
                 self.assertEqual(
@@ -829,6 +844,53 @@ class CudaBuildContractTest(unittest.TestCase):
                 365, 1161, 15631, 83, 268, 532, 1437, 99, 268, 23, 19,
             ),
         )
+        self.assertEqual(producer["tokens"]["format"], "little-endian-int32")
+        self.assertEqual(producer["tokens"]["count"], 22)
+        self.assertEqual(
+            producer["tokens"]["ids"], list(struct.unpack("<22i", token_bytes))
+        )
+        self.assertEqual(
+            producer["tokens"]["prompt_sha256"],
+            "e3dc84f54d1afb86e11f782bb9d19715340855df5ef602cde682768008aef74d",
+        )
+        self.assertEqual(
+            producer["tokens"]["tokenizer_runtime_commit"],
+            "15c9b92502fed6bc26842e98d11a6347caadb08e",
+        )
+        self.assertEqual(manifests[0]["execution"], manifests[1]["execution"])
+        self.assertEqual(
+            manifests[0]["execution"],
+            {
+                "device": {
+                    "name": "NVIDIA GB10",
+                    "compute_capability": "12.1",
+                    "multiprocessors": 48,
+                },
+                "poolside_build": {
+                    "cmake_build_type": "Release",
+                    "ggml_cuda": True,
+                    "ggml_cuda_fa_all_quants": False,
+                    "ggml_cuda_force_cublas": False,
+                    "cuda_flags": [
+                        "-std=c++17",
+                        "--generate-code=arch=compute_121a,code=[sm_121a]",
+                        "-Xcompiler=-fPIC",
+                        "-use_fast_math",
+                        "-extended-lambda",
+                        "-compress-mode=size",
+                    ],
+                    "cxx_flags": ["-include", "cmath", "-O3", "-DNDEBUG"],
+                },
+                "probe_build": {
+                    "compiler": "g++",
+                    "flags": ["-std=c++17", "-O2"],
+                    "libraries": ["llama", "ggml", "ggml-base"],
+                    "binary_sha256": (
+                        "0b4e6a99d414ac86541e59d1b6bb9d9a514893c61da697deb77c2fe30dbf93de"
+                    ),
+                },
+            },
+        )
         probe = (LAGUNA_C7_ORACLE_PRODUCER / expected_paths["probe"]).read_text(
             encoding="utf-8"
         )
@@ -846,7 +908,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "04b2b72cb54048ead292884adbe11f284e3ec950",
             "--token-count 22",
             "--token-count 1",
-            "git apply --check -R",
+            "apply --check -R",
         ):
             self.assertIn(required, capture_script)
 
@@ -854,7 +916,7 @@ class CudaBuildContractTest(unittest.TestCase):
         manifest_path = LAGUNA_Q4_L2_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["schema"], "laguna-q4-l2-auto-fixture/v1")
+        self.assertEqual(manifest["schema"], "laguna-q4-l2-auto-fixture/v2")
         self.assertEqual(
             manifest["poolside_commit"],
             "04b2b72cb54048ead292884adbe11f284e3ec950",
@@ -871,33 +933,42 @@ class CudaBuildContractTest(unittest.TestCase):
         capture = manifest["capture"]
         self.assertEqual(
             {key: capture[key] for key in (
-                "flash_attention", "layer", "tokens", "token_index", "slot",
-                "expert_mid_dim", "pair_count", "production_l2_threads",
-                "probe_sha256", "poolside_callback_patch_sha256",
+                "flash_attention", "layer", "expert_mid_dim"
             )},
             {
                 "flash_attention": "AUTO",
                 "layer": 1,
-                "tokens": 22,
-                "token_index": 0,
-                "slot": 0,
                 "expert_mid_dim": 1024,
-                "pair_count": 220,
-                "production_l2_threads": 128,
-                "probe_sha256": (
-                    "3443de0df29bc90fc9c37183e6c0e20d1de0625f562f29bbd9b63ef441389f4e"
-                ),
-                "poolside_callback_patch_sha256": (
-                    "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6"
-                ),
             },
         )
         self.assertEqual(
-            capture["callbacks"],
+            capture["prefill_128"],
             {
-                "mid-pair0.f32": "ffn_moe_swiglu-1",
-                "expected-col-l2-pair0.f32": "ffn_moe_col_l2-1",
-                "expected-down-input-pair0.f32": "ffn_moe_down_input-1",
+                "capture_directory": "poolside-c7-moe-auto-22",
+                "tokens": 22,
+                "pair_count": 220,
+                "fixture_pair_count": 1,
+                "production_l2_threads": 128,
+                "callbacks": {
+                    "mid-pair0.f32": "ffn_moe_swiglu-1",
+                    "expected-col-l2-pair0.f32": "ffn_moe_col_l2-1",
+                    "expected-down-input-pair0.f32": "ffn_moe_down_input-1",
+                },
+            },
+        )
+        self.assertEqual(
+            capture["decode_512"],
+            {
+                "capture_directory": "poolside-c7-moe-auto-1",
+                "tokens": 1,
+                "pair_count": 10,
+                "fixture_pair_count": 10,
+                "production_l2_threads": 512,
+                "callbacks": {
+                    "mid-decode.f32": "ffn_moe_swiglu-1",
+                    "expected-col-l2-decode.f32": "ffn_moe_col_l2-1",
+                    "expected-down-input-decode.f32": "ffn_moe_down_input-1",
+                },
             },
         )
         self.assertEqual(
@@ -915,7 +986,7 @@ class CudaBuildContractTest(unittest.TestCase):
                 "layer_output_sha256": (
                     "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
                 ),
-                "detail_capture_matches_prior_deep_capture": True,
+                "consolidated_capture_matches_prior_captures": True,
             },
         )
         self.assertEqual(
@@ -923,9 +994,59 @@ class CudaBuildContractTest(unittest.TestCase):
             {
                 "column_l2_exact": True,
                 "down_input_exact": True,
-                "reduction_topology": "128-thread production SUM_ROWS tree",
+                "reduction_topologies": {
+                    "prefill_128": "128-thread production SUM_ROWS tree",
+                    "decode_512": "512-thread production SUM_ROWS tree",
+                },
             },
         )
+        expected_extractions = {
+            "mid-pair0.f32": (
+                "poolside-c7-moe-auto-22", "layer-01-ffn-moe-swiglu.f32",
+                901120, "35883cb5da611931117b5d14c5a88f9dab49035d8656bbddb43cba1b914f8015",
+            ),
+            "expected-col-l2-pair0.f32": (
+                "poolside-c7-moe-auto-22", "layer-01-ffn-moe-col-l2.f32",
+                880, "98274d2ad38f471b41660c11d48a21ef0704d021886d225567bc2b9e93549848",
+            ),
+            "expected-down-input-pair0.f32": (
+                "poolside-c7-moe-auto-22", "layer-01-ffn-moe-down-input.f32",
+                901120, "ff55f3b3e49034a667b30f105ea9e16306c659a7fd2115448c183c72930ffc84",
+            ),
+            "mid-decode.f32": (
+                "poolside-c7-moe-auto-1", "layer-01-ffn-moe-swiglu.f32",
+                40960, "c43a2d48c6931726245e9a91f31cc669dd2786a3a2970626e904f48b5bc5567e",
+            ),
+            "expected-col-l2-decode.f32": (
+                "poolside-c7-moe-auto-1", "layer-01-ffn-moe-col-l2.f32",
+                40, "c84da10d5bb0cf015e07a441824fb1223261ee44320ef2be3d5936e1f5bc8086",
+            ),
+            "expected-down-input-decode.f32": (
+                "poolside-c7-moe-auto-1", "layer-01-ffn-moe-down-input.f32",
+                40960, "22a986deadc4750a1760fbc72f58f233ceab87816697c97289f80688ea24e69a",
+            ),
+        }
+        self.assertEqual(set(manifest["extractions"]), set(expected_extractions))
+        for name, (directory, source, source_bytes, source_sha256) in (
+            expected_extractions.items()
+        ):
+            with self.subTest(extraction=name):
+                extraction = manifest["extractions"][name]
+                self.assertEqual(
+                    {key: extraction[key] for key in (
+                        "capture_directory", "source", "source_bytes",
+                        "source_sha256", "offset", "bytes", "producer",
+                    )},
+                    {
+                        "capture_directory": directory,
+                        "source": source,
+                        "source_bytes": source_bytes,
+                        "source_sha256": source_sha256,
+                        "offset": 0,
+                        "bytes": LAGUNA_Q4_L2_AUTO_FILES[name][0],
+                        "producer": "probe",
+                    },
+                )
         self.assertEqual(set(manifest["files"]), set(LAGUNA_Q4_L2_AUTO_FILES))
         self.assertEqual(
             {path.name for path in LAGUNA_Q4_L2_AUTO_FIXTURE.iterdir()},
@@ -953,11 +1074,14 @@ class CudaBuildContractTest(unittest.TestCase):
             '"mid-pair0.f32"',
             '"expected-col-l2-pair0.f32"',
             '"expected-down-input-pair0.f32"',
+            '"mid-decode.f32"',
+            '"expected-col-l2-decode.f32"',
+            '"expected-down-input-decode.f32"',
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
         case_body = source_function_body(
             LAGUNA_KERNEL_TEST,
-            "static int run_q4_l2_frozen_case(",
+            "static int run_q4_l2_frozen_topology_case(",
             "tests/test_cuda_laguna_kernels.c",
         )
         self.assertIn("ds4_gpu_test_glm_poolside_q4_l2_tensor(", case_body)
@@ -965,6 +1089,16 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertGreaterEqual(case_body.count("ds4_gpu_tensor_read("), 2)
         self.assertIn("actual_bits != expected_bits", case_body)
         self.assertRegex(case_body, r"expert_mid_dim\s*=\s*1024")
+        wrapper_body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_q4_l2_frozen_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertEqual(
+            wrapper_body.count("run_q4_l2_frozen_topology_case("), 2
+        )
+        self.assertRegex(wrapper_body, r'"prefill-128"[\s\S]*?1u,\s*220u')
+        self.assertRegex(wrapper_body, r'"decode-512"[\s\S]*?10u,\s*10u')
 
         selector_body = function_body(
             "static uint32_t glm_poolside_q4_l2_thread_count("
@@ -1019,7 +1153,7 @@ class CudaBuildContractTest(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertEqual(
-            manifest["schema"], "laguna-moe-residual-auto-fixture/v1"
+            manifest["schema"], "laguna-moe-residual-auto-fixture/v2"
         )
         self.assertEqual(
             manifest["poolside_commit"],
@@ -1038,8 +1172,7 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertEqual(
             {key: capture[key] for key in (
                 "flash_attention", "layer", "tokens", "token_index", "width",
-                "residual_capture_directory", "moe_capture_directory",
-                "moe_probe_sha256",
+                "capture_directory",
             )},
             {
                 "flash_attention": "AUTO",
@@ -1047,11 +1180,7 @@ class CudaBuildContractTest(unittest.TestCase):
                 "tokens": 22,
                 "token_index": 0,
                 "width": 3072,
-                "residual_capture_directory": "poolside-auto-layer1-retry-1",
-                "moe_capture_directory": "poolside-q4-deep-1",
-                "moe_probe_sha256": (
-                    "43cfc41d0d5930e060ae7cb3536b13caca11ce505718913834970aee8533a67b"
-                ),
+                "capture_directory": "poolside-c7-moe-auto-22",
             },
         )
         self.assertEqual(
@@ -1078,7 +1207,7 @@ class CudaBuildContractTest(unittest.TestCase):
                 "layer_output_sha256": (
                     "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
                 ),
-                "detail_capture_matches_endpoint_only": True,
+                "consolidated_capture_matches_prior_captures": True,
             },
         )
         self.assertEqual(
@@ -1092,6 +1221,43 @@ class CudaBuildContractTest(unittest.TestCase):
                 "legacy_first_mismatch": 0,
             },
         )
+        expected_extractions = {
+            "residual-token0.f32": (
+                "layer-01-ffn-inp.f32",
+                "2c6d314aeea3587bd0e5eed8b2056830bbf976a3a4afe59dc1ff46a2434e4abc",
+            ),
+            "moe-token0.f32": (
+                "layer-01-ffn-moe-out.f32",
+                "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083",
+            ),
+            "shared-token0.f32": (
+                "layer-01-ffn-shared-out.f32",
+                "14a04388d619381400e5551794423244cc6d735d68df5dab7693d8604df32370",
+            ),
+            "expected-token0.f32": (
+                "layer-01.f32",
+                "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
+            ),
+        }
+        self.assertEqual(set(manifest["extractions"]), set(expected_extractions))
+        for name, (source, source_sha256) in expected_extractions.items():
+            with self.subTest(extraction=name):
+                extraction = manifest["extractions"][name]
+                self.assertEqual(
+                    {key: extraction[key] for key in (
+                        "capture_directory", "source", "source_bytes",
+                        "source_sha256", "offset", "bytes", "producer",
+                    )},
+                    {
+                        "capture_directory": "poolside-c7-moe-auto-22",
+                        "source": source,
+                        "source_bytes": 270336,
+                        "source_sha256": source_sha256,
+                        "offset": 0,
+                        "bytes": LAGUNA_MOE_RESIDUAL_AUTO_FILES[name][0],
+                        "producer": "probe",
+                    },
+                )
         self.assertEqual(
             set(manifest["files"]), set(LAGUNA_MOE_RESIDUAL_AUTO_FILES)
         )

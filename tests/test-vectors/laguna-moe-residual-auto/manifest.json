@@ -1,9 +1,64 @@
 {
-  "schema": "laguna-moe-residual-auto-fixture/v1",
+  "schema": "laguna-moe-residual-auto-fixture/v2",
   "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
   "model": {
     "bytes": 68248759648,
     "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "producer": {
+    "probe": {
+      "path": "tests/oracle-producers/laguna-c7/probe_poolside_laguna_moe.cpp",
+      "bytes": 26497,
+      "sha256": "6abcdb504c7a4afb6a22757f12ea1d677bc8ee171ac517aab7ee77b4ba695952"
+    },
+    "poolside_patch": {
+      "path": "tests/oracle-producers/laguna-c7/poolside-l2-callback.patch",
+      "bytes": 904,
+      "sha256": "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6"
+    },
+    "capture_script": {
+      "path": "tests/oracle-producers/laguna-c7/capture_poolside_laguna_moe.sh",
+      "bytes": 2208,
+      "sha256": "75b3eca319b4ce2870111ced806df0a324444e99883f52321b5e3ff77660027e"
+    },
+    "tokens": {
+      "path": "tests/oracle-producers/laguna-c7/short.tokens.i32",
+      "format": "little-endian-int32",
+      "count": 22,
+      "bytes": 88,
+      "sha256": "900e6342be5dc175a4fc13fafbf0fb380eaac5824079cf4a2db69b4d0a777fa8",
+      "prompt_sha256": "e3dc84f54d1afb86e11f782bb9d19715340855df5ef602cde682768008aef74d",
+      "tokenizer_runtime_commit": "15c9b92502fed6bc26842e98d11a6347caadb08e",
+      "ids": [2, 97, 1437, 99, 53225, 3203, 330, 10068, 3612, 31063, 81, 365, 1161, 15631, 83, 268, 532, 1437, 99, 268, 23, 19]
+    }
+  },
+  "execution": {
+    "device": {
+      "name": "NVIDIA GB10",
+      "compute_capability": "12.1",
+      "multiprocessors": 48
+    },
+    "poolside_build": {
+      "cmake_build_type": "Release",
+      "ggml_cuda": true,
+      "ggml_cuda_fa_all_quants": false,
+      "ggml_cuda_force_cublas": false,
+      "cuda_flags": [
+        "-std=c++17",
+        "--generate-code=arch=compute_121a,code=[sm_121a]",
+        "-Xcompiler=-fPIC",
+        "-use_fast_math",
+        "-extended-lambda",
+        "-compress-mode=size"
+      ],
+      "cxx_flags": ["-include", "cmath", "-O3", "-DNDEBUG"]
+    },
+    "probe_build": {
+      "compiler": "g++",
+      "flags": ["-std=c++17", "-O2"],
+      "libraries": ["llama", "ggml", "ggml-base"],
+      "binary_sha256": "0b4e6a99d414ac86541e59d1b6bb9d9a514893c61da697deb77c2fe30dbf93de"
+    }
   },
   "capture": {
     "flash_attention": "AUTO",
@@ -11,9 +66,7 @@
     "tokens": 22,
     "token_index": 0,
     "width": 3072,
-    "residual_capture_directory": "poolside-auto-layer1-retry-1",
-    "moe_capture_directory": "poolside-q4-deep-1",
-    "moe_probe_sha256": "43cfc41d0d5930e060ae7cb3536b13caca11ce505718913834970aee8533a67b",
+    "capture_directory": "poolside-c7-moe-auto-22",
     "callbacks": {
       "residual-token0.f32": "ffn_inp-1",
       "moe-token0.f32": "ffn_moe_out-1",
@@ -25,7 +78,7 @@
       "shared_output_sha256": "14a04388d619381400e5551794423244cc6d735d68df5dab7693d8604df32370",
       "ffn_output_sha256": "9d4abbb288dc57ecfdb4c30c69f4695f00eefe3a51ccb41e5db004f35013285e",
       "layer_output_sha256": "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
-      "detail_capture_matches_endpoint_only": true
+      "consolidated_capture_matches_prior_captures": true
     }
   },
   "oracle": {
@@ -36,22 +89,48 @@
     "legacy_order_mismatches": 753,
     "legacy_first_mismatch": 0
   },
-  "files": {
+  "extractions": {
     "residual-token0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01-ffn-inp.f32",
+      "source_bytes": 270336,
+      "source_sha256": "2c6d314aeea3587bd0e5eed8b2056830bbf976a3a4afe59dc1ff46a2434e4abc",
+      "offset": 0,
       "bytes": 12288,
-      "sha256": "a164ed17c7ad1c051f3a01a2e73b58f9208656970b5eaeb854d311134dfa30e6"
+      "producer": "probe"
     },
     "moe-token0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01-ffn-moe-out.f32",
+      "source_bytes": 270336,
+      "source_sha256": "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083",
+      "offset": 0,
       "bytes": 12288,
-      "sha256": "a8449f64a6536c8012c43d24a558be01434e37948bff550b20e9654a11bbbfc6"
+      "producer": "probe"
     },
     "shared-token0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01-ffn-shared-out.f32",
+      "source_bytes": 270336,
+      "source_sha256": "14a04388d619381400e5551794423244cc6d735d68df5dab7693d8604df32370",
+      "offset": 0,
       "bytes": 12288,
-      "sha256": "9b9ef36681633aae3897bb6a54f5f2f5fd3877eac035b72c6ab92c06ef132219"
+      "producer": "probe"
     },
     "expected-token0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01.f32",
+      "source_bytes": 270336,
+      "source_sha256": "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
+      "offset": 0,
       "bytes": 12288,
-      "sha256": "0933abacd443f5073def7d27fb8d8040ef98e63c32f59c879eabdc6b06fe78d3"
+      "producer": "probe"
     }
+  },
+  "files": {
+    "residual-token0.f32": {"bytes": 12288, "sha256": "a164ed17c7ad1c051f3a01a2e73b58f9208656970b5eaeb854d311134dfa30e6"},
+    "moe-token0.f32": {"bytes": 12288, "sha256": "a8449f64a6536c8012c43d24a558be01434e37948bff550b20e9654a11bbbfc6"},
+    "shared-token0.f32": {"bytes": 12288, "sha256": "9b9ef36681633aae3897bb6a54f5f2f5fd3877eac035b72c6ab92c06ef132219"},
+    "expected-token0.f32": {"bytes": 12288, "sha256": "0933abacd443f5073def7d27fb8d8040ef98e63c32f59c879eabdc6b06fe78d3"}
   }
 }

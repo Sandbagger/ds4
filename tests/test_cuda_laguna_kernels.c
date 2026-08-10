@@ -2598,57 +2598,70 @@ static void *laguna_read_q4_l2_frozen(
     return data;
 }
 
-static int run_q4_l2_frozen_case(void) {
+static int run_q4_l2_frozen_topology_case(
+        const char *label,
+        const char *mid_name,
+        const char *column_l2_name,
+        const char *down_input_name,
+        uint64_t fixture_pair_count,
+        uint64_t topology_pair_count) {
     enum { expert_mid_dim = 1024 };
-    const size_t mid_bytes = expert_mid_dim * sizeof(float);
+    const uint64_t mid_values = fixture_pair_count * expert_mid_dim;
+    const size_t mid_bytes = (size_t)mid_values * sizeof(float);
+    const size_t column_l2_bytes =
+        (size_t)fixture_pair_count * sizeof(float);
     float *mid_input = (float *)laguna_read_q4_l2_frozen(
-        "mid-pair0.f32", mid_bytes);
+        mid_name, mid_bytes);
     float *column_l2_expected = (float *)laguna_read_q4_l2_frozen(
-        "expected-col-l2-pair0.f32", sizeof(float));
+        column_l2_name, column_l2_bytes);
     float *down_input_expected = (float *)laguna_read_q4_l2_frozen(
-        "expected-down-input-pair0.f32", mid_bytes);
+        down_input_name, mid_bytes);
     float *down_input_actual = (float *)malloc(mid_bytes);
+    float *column_l2_actual = (float *)malloc(column_l2_bytes);
     ds4_gpu_tensor *mid = NULL;
     ds4_gpu_tensor *column_l2 = NULL;
-    float column_l2_actual = 0.0f;
     int rc = 1;
     if (!mid_input || !column_l2_expected || !down_input_expected ||
-        !down_input_actual) {
+        !down_input_actual || !column_l2_actual) {
         goto cleanup;
     }
     mid = ds4_gpu_tensor_alloc(mid_bytes);
-    column_l2 = ds4_gpu_tensor_alloc(sizeof(float));
+    column_l2 = ds4_gpu_tensor_alloc(column_l2_bytes);
     if (!mid || !column_l2 ||
         !ds4_gpu_tensor_write(mid, 0, mid_input, mid_bytes) ||
         !ds4_gpu_test_glm_poolside_q4_l2_tensor(
-            mid, column_l2, expert_mid_dim, 1u) ||
+            mid, column_l2, expert_mid_dim,
+            fixture_pair_count, topology_pair_count) ||
         cudaDeviceSynchronize() != cudaSuccess ||
         !ds4_gpu_tensor_read(
-            column_l2, 0, &column_l2_actual, sizeof(column_l2_actual)) ||
+            column_l2, 0, column_l2_actual, column_l2_bytes) ||
         !ds4_gpu_tensor_read(mid, 0, down_input_actual, mid_bytes)) {
-        fprintf(stderr, "q4-l2-frozen: CUDA execution failed\n");
+        fprintf(stderr, "q4-l2-frozen/%s: CUDA execution failed\n", label);
         goto cleanup;
     }
     uint32_t actual_bits = 0u;
     uint32_t expected_bits = 0u;
-    memcpy(&actual_bits, &column_l2_actual, sizeof(actual_bits));
-    memcpy(&expected_bits, column_l2_expected, sizeof(expected_bits));
-    if (actual_bits != expected_bits) {
-        fprintf(stderr,
-                "q4-l2-frozen: column-l2 got=%a (0x%08x) "
-                "expected=%a (0x%08x)\n",
-                column_l2_actual, actual_bits,
-                column_l2_expected[0], expected_bits);
-        goto cleanup;
+    for (uint64_t pair = 0; pair < fixture_pair_count; pair++) {
+        memcpy(&actual_bits, &column_l2_actual[pair], sizeof(actual_bits));
+        memcpy(&expected_bits, &column_l2_expected[pair], sizeof(expected_bits));
+        if (actual_bits != expected_bits) {
+            fprintf(stderr,
+                    "q4-l2-frozen/%s: column-l2[%llu] got=%a (0x%08x) "
+                    "expected=%a (0x%08x)\n",
+                    label, (unsigned long long)pair,
+                    column_l2_actual[pair], actual_bits,
+                    column_l2_expected[pair], expected_bits);
+            goto cleanup;
+        }
     }
-    for (size_t i = 0; i < expert_mid_dim; i++) {
+    for (uint64_t i = 0; i < mid_values; i++) {
         memcpy(&actual_bits, &down_input_actual[i], sizeof(actual_bits));
         memcpy(&expected_bits, &down_input_expected[i], sizeof(expected_bits));
         if (actual_bits != expected_bits) {
             fprintf(stderr,
-                    "q4-l2-frozen: down-input[%zu] got=%a (0x%08x) "
+                    "q4-l2-frozen/%s: down-input[%zu] got=%a (0x%08x) "
                     "expected=%a (0x%08x)\n",
-                    i, down_input_actual[i], actual_bits,
+                    label, (size_t)i, down_input_actual[i], actual_bits,
                     down_input_expected[i], expected_bits);
             goto cleanup;
         }
@@ -2657,11 +2670,31 @@ static int run_q4_l2_frozen_case(void) {
 cleanup:
     ds4_gpu_tensor_free(column_l2);
     ds4_gpu_tensor_free(mid);
+    free(column_l2_actual);
     free(down_input_actual);
     free(down_input_expected);
     free(column_l2_expected);
     free(mid_input);
     return rc;
+}
+
+static int run_q4_l2_frozen_case(void) {
+    if (run_q4_l2_frozen_topology_case(
+            "prefill-128",
+            "mid-pair0.f32",
+            "expected-col-l2-pair0.f32",
+            "expected-down-input-pair0.f32",
+            1u,
+            220u) != 0) {
+        return 1;
+    }
+    return run_q4_l2_frozen_topology_case(
+        "decode-512",
+        "mid-decode.f32",
+        "expected-col-l2-decode.f32",
+        "expected-down-input-decode.f32",
+        10u,
+        10u);
 }
 
 #define LAGUNA_MOE_RESIDUAL_AUTO_FIXTURE_DIR \

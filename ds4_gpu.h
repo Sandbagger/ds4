@@ -201,7 +201,8 @@ int ds4_gpu_test_glm_poolside_q4_l2_tensor(
         ds4_gpu_tensor *mid,
         ds4_gpu_tensor *column_l2,
         uint32_t expert_mid_dim,
-        uint64_t pair_count);
+        uint64_t pair_count,
+        uint64_t topology_pair_count);
 #endif
 
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);

@@ -27292,6 +27292,17 @@ __global__ static void glm_poolside_q4_gate_up_kernel(
         __fmul_rn(activated, up);
 }
 
+static uint32_t glm_poolside_q4_l2_thread_count(
+        uint32_t expert_mid_dim,
+        uint64_t pair_count,
+        uint32_t multiprocessors) {
+    uint32_t threads = 512u;
+    if (multiprocessors > 0u && pair_count / multiprocessors >= 2u) {
+        threads = expert_mid_dim < 1024u ? 32u : 128u;
+    }
+    return threads;
+}
+
 /* Match Poolside's separate SQR -> SUM_ROWS -> SQRT/CLAMP -> MUL/DIV graph
  * without materializing a second full-size float tensor.  __fmul_rn rounds
  * each square before it enters the same eight-stream reduction topology used
@@ -27368,9 +27379,11 @@ extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor(
         ds4_gpu_tensor *mid,
         ds4_gpu_tensor *column_l2,
         uint32_t expert_mid_dim,
-        uint64_t pair_count) {
+        uint64_t pair_count,
+        uint64_t topology_pair_count) {
     if (!mid || !column_l2 || !mid->ptr || !column_l2->ptr ||
         expert_mid_dim != 1024u || pair_count == 0u ||
+        topology_pair_count == 0u ||
         pair_count > (uint64_t)INT_MAX ||
         (((uintptr_t)mid->ptr) & (sizeof(float) - 1u)) != 0u ||
         (((uintptr_t)column_l2->ptr) & (sizeof(float) - 1u)) != 0u ||
@@ -27395,11 +27408,18 @@ extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor(
         current_device != g_gpu[tier].device_id) {
         return 0;
     }
-    /* The real 22-token layer has 220 pairs on GB10 and therefore uses
-     * Poolside's 128-thread SUM_ROWS topology.  Keep that topology when the
-     * frozen test isolates pair zero instead of reselecting from pair_count. */
+    int multiprocessors = 0;
+    if (!cuda_ok(cudaDeviceGetAttribute(
+            &multiprocessors, cudaDevAttrMultiProcessorCount,
+            current_device),
+            "test Poolside Q4 L2 multiprocessor count") ||
+        multiprocessors <= 0) {
+        return 0;
+    }
+    const uint32_t l2_threads = glm_poolside_q4_l2_thread_count(
+        expert_mid_dim, topology_pair_count, (uint32_t)multiprocessors);
     glm_poolside_q4_l2_rescale_kernel<<<
-        (uint32_t)pair_count, 128u>>>(
+        (uint32_t)pair_count, l2_threads>>>(
             (float *)mid->ptr, (float *)column_l2->ptr,
             expert_mid_dim, pair_count);
     return cuda_ok(cudaGetLastError(), "test Poolside Q4 L2 rescale");
@@ -27669,10 +27689,8 @@ static int glm_poolside_routed_moe_q4_launch(
         multiprocessors <= 0) {
         return 0;
     }
-    uint32_t l2_threads = 512u;
-    if (pair_count / (uint32_t)multiprocessors >= 2u) {
-        l2_threads = expert_mid_dim < 1024u ? 32u : 128u;
-    }
+    const uint32_t l2_threads = glm_poolside_q4_l2_thread_count(
+        expert_mid_dim, pair_count, (uint32_t)multiprocessors);
     glm_poolside_q4_l2_rescale_kernel<<<
         (uint32_t)pair_count, l2_threads>>>(
             (float *)mid->ptr, (float *)l2_scratch[tier]->ptr,

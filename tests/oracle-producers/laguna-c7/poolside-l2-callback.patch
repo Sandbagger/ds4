@@ -1,0 +1,14 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1d50d0b..9db995f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2103,7 +2103,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     const float f16_safe = 32768.0f; // stay well under the f16 max of 65504
+     ggml_tensor * col_l2 = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur))); // [1, n_expert_used, n_tokens]
+     col_l2 = ggml_clamp(ctx0, col_l2, 1e-8f, 1e30f); // guard empty columns against div-by-zero
++    cb(col_l2, "ffn_moe_col_l2", il);
+     ggml_tensor * cur_s = ggml_div(ctx0, ggml_scale(ctx0, cur, f16_safe), col_l2);
++    cb(cur_s, "ffn_moe_down_input", il);
+     experts = build_lora_mm_id(down_exps, cur_s, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     experts = ggml_scale(ctx0, ggml_mul(ctx0, experts, col_l2), 1.0f/f16_safe);
+     cb(experts, "ffn_moe_down", il);

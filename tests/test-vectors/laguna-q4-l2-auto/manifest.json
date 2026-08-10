@@ -1,63 +1,171 @@
 {
-  "schema": "laguna-q4-l2-auto-fixture/v1",
+  "schema": "laguna-q4-l2-auto-fixture/v2",
   "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
   "model": {
     "bytes": 68248759648,
     "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
   },
+  "producer": {
+    "probe": {
+      "path": "tests/oracle-producers/laguna-c7/probe_poolside_laguna_moe.cpp",
+      "bytes": 26497,
+      "sha256": "6abcdb504c7a4afb6a22757f12ea1d677bc8ee171ac517aab7ee77b4ba695952"
+    },
+    "poolside_patch": {
+      "path": "tests/oracle-producers/laguna-c7/poolside-l2-callback.patch",
+      "bytes": 904,
+      "sha256": "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6"
+    },
+    "capture_script": {
+      "path": "tests/oracle-producers/laguna-c7/capture_poolside_laguna_moe.sh",
+      "bytes": 2208,
+      "sha256": "75b3eca319b4ce2870111ced806df0a324444e99883f52321b5e3ff77660027e"
+    },
+    "tokens": {
+      "path": "tests/oracle-producers/laguna-c7/short.tokens.i32",
+      "format": "little-endian-int32",
+      "count": 22,
+      "bytes": 88,
+      "sha256": "900e6342be5dc175a4fc13fafbf0fb380eaac5824079cf4a2db69b4d0a777fa8",
+      "prompt_sha256": "e3dc84f54d1afb86e11f782bb9d19715340855df5ef602cde682768008aef74d",
+      "tokenizer_runtime_commit": "15c9b92502fed6bc26842e98d11a6347caadb08e",
+      "ids": [2, 97, 1437, 99, 53225, 3203, 330, 10068, 3612, 31063, 81, 365, 1161, 15631, 83, 268, 532, 1437, 99, 268, 23, 19]
+    }
+  },
+  "execution": {
+    "device": {
+      "name": "NVIDIA GB10",
+      "compute_capability": "12.1",
+      "multiprocessors": 48
+    },
+    "poolside_build": {
+      "cmake_build_type": "Release",
+      "ggml_cuda": true,
+      "ggml_cuda_fa_all_quants": false,
+      "ggml_cuda_force_cublas": false,
+      "cuda_flags": [
+        "-std=c++17",
+        "--generate-code=arch=compute_121a,code=[sm_121a]",
+        "-Xcompiler=-fPIC",
+        "-use_fast_math",
+        "-extended-lambda",
+        "-compress-mode=size"
+      ],
+      "cxx_flags": ["-include", "cmath", "-O3", "-DNDEBUG"]
+    },
+    "probe_build": {
+      "compiler": "g++",
+      "flags": ["-std=c++17", "-O2"],
+      "libraries": ["llama", "ggml", "ggml-base"],
+      "binary_sha256": "0b4e6a99d414ac86541e59d1b6bb9d9a514893c61da697deb77c2fe30dbf93de"
+    }
+  },
   "capture": {
     "flash_attention": "AUTO",
     "layer": 1,
-    "tokens": 22,
-    "token_index": 0,
-    "slot": 0,
     "expert_mid_dim": 1024,
-    "pair_count": 220,
-    "production_l2_threads": 128,
-    "probe_sha256": "3443de0df29bc90fc9c37183e6c0e20d1de0625f562f29bbd9b63ef441389f4e",
-    "poolside_callback_patch_sha256": "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6",
-    "callbacks": {
-      "mid-pair0.f32": "ffn_moe_swiglu-1",
-      "expected-col-l2-pair0.f32": "ffn_moe_col_l2-1",
-      "expected-down-input-pair0.f32": "ffn_moe_down_input-1"
+    "prefill_128": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "tokens": 22,
+      "pair_count": 220,
+      "fixture_pair_count": 1,
+      "production_l2_threads": 128,
+      "callbacks": {
+        "mid-pair0.f32": "ffn_moe_swiglu-1",
+        "expected-col-l2-pair0.f32": "ffn_moe_col_l2-1",
+        "expected-down-input-pair0.f32": "ffn_moe_down_input-1"
+      }
+    },
+    "decode_512": {
+      "capture_directory": "poolside-c7-moe-auto-1",
+      "tokens": 1,
+      "pair_count": 10,
+      "fixture_pair_count": 10,
+      "production_l2_threads": 512,
+      "callbacks": {
+        "mid-decode.f32": "ffn_moe_swiglu-1",
+        "expected-col-l2-decode.f32": "ffn_moe_col_l2-1",
+        "expected-down-input-decode.f32": "ffn_moe_down_input-1"
+      }
     },
     "non_perturbation": {
       "selected_sha256": "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183",
       "weights_sha256": "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c",
       "routed_output_sha256": "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083",
       "layer_output_sha256": "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
-      "detail_capture_matches_prior_deep_capture": true
+      "consolidated_capture_matches_prior_captures": true
     }
-  },
-  "cuda": {
-    "device": "NVIDIA GB10",
-    "compute_capability": "12.1",
-    "flags": [
-      "-std=c++17",
-      "-O3",
-      "-use_fast_math",
-      "--generate-code=arch=compute_121a,code=[sm_121a]",
-      "-extended-lambda",
-      "-compress-mode=size"
-    ]
   },
   "oracle": {
     "column_l2_exact": true,
     "down_input_exact": true,
-    "reduction_topology": "128-thread production SUM_ROWS tree"
+    "reduction_topologies": {
+      "prefill_128": "128-thread production SUM_ROWS tree",
+      "decode_512": "512-thread production SUM_ROWS tree"
+    }
   },
-  "files": {
+  "extractions": {
     "mid-pair0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01-ffn-moe-swiglu.f32",
+      "source_bytes": 901120,
+      "source_sha256": "35883cb5da611931117b5d14c5a88f9dab49035d8656bbddb43cba1b914f8015",
+      "offset": 0,
       "bytes": 4096,
-      "sha256": "803af6831f6c89df4bac4d788821aded26edd61e4742f1929d3e5feaf30fdece"
+      "producer": "probe"
     },
     "expected-col-l2-pair0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01-ffn-moe-col-l2.f32",
+      "source_bytes": 880,
+      "source_sha256": "98274d2ad38f471b41660c11d48a21ef0704d021886d225567bc2b9e93549848",
+      "offset": 0,
       "bytes": 4,
-      "sha256": "7288027f7f191e69e6832ec1bc80ff2da99012560990cfc888032496fdd35778"
+      "producer": "probe"
     },
     "expected-down-input-pair0.f32": {
+      "capture_directory": "poolside-c7-moe-auto-22",
+      "source": "layer-01-ffn-moe-down-input.f32",
+      "source_bytes": 901120,
+      "source_sha256": "ff55f3b3e49034a667b30f105ea9e16306c659a7fd2115448c183c72930ffc84",
+      "offset": 0,
       "bytes": 4096,
-      "sha256": "c058fcac9dc6a95dbf0b3aa59bbcc84f28ae1f8233ed273d59eecda23a30d0a1"
+      "producer": "probe"
+    },
+    "mid-decode.f32": {
+      "capture_directory": "poolside-c7-moe-auto-1",
+      "source": "layer-01-ffn-moe-swiglu.f32",
+      "source_bytes": 40960,
+      "source_sha256": "c43a2d48c6931726245e9a91f31cc669dd2786a3a2970626e904f48b5bc5567e",
+      "offset": 0,
+      "bytes": 40960,
+      "producer": "probe"
+    },
+    "expected-col-l2-decode.f32": {
+      "capture_directory": "poolside-c7-moe-auto-1",
+      "source": "layer-01-ffn-moe-col-l2.f32",
+      "source_bytes": 40,
+      "source_sha256": "c84da10d5bb0cf015e07a441824fb1223261ee44320ef2be3d5936e1f5bc8086",
+      "offset": 0,
+      "bytes": 40,
+      "producer": "probe"
+    },
+    "expected-down-input-decode.f32": {
+      "capture_directory": "poolside-c7-moe-auto-1",
+      "source": "layer-01-ffn-moe-down-input.f32",
+      "source_bytes": 40960,
+      "source_sha256": "22a986deadc4750a1760fbc72f58f233ceab87816697c97289f80688ea24e69a",
+      "offset": 0,
+      "bytes": 40960,
+      "producer": "probe"
     }
+  },
+  "files": {
+    "mid-pair0.f32": {"bytes": 4096, "sha256": "803af6831f6c89df4bac4d788821aded26edd61e4742f1929d3e5feaf30fdece"},
+    "expected-col-l2-pair0.f32": {"bytes": 4, "sha256": "7288027f7f191e69e6832ec1bc80ff2da99012560990cfc888032496fdd35778"},
+    "expected-down-input-pair0.f32": {"bytes": 4096, "sha256": "c058fcac9dc6a95dbf0b3aa59bbcc84f28ae1f8233ed273d59eecda23a30d0a1"},
+    "mid-decode.f32": {"bytes": 40960, "sha256": "c43a2d48c6931726245e9a91f31cc669dd2786a3a2970626e904f48b5bc5567e"},
+    "expected-col-l2-decode.f32": {"bytes": 40, "sha256": "c84da10d5bb0cf015e07a441824fb1223261ee44320ef2be3d5936e1f5bc8086"},
+    "expected-down-input-decode.f32": {"bytes": 40960, "sha256": "22a986deadc4750a1760fbc72f58f233ceab87816697c97289f80688ea24e69a"}
   }
 }

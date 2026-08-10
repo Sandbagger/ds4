@@ -346,6 +346,56 @@ static bool run_short(ds4_engine *engine, const oracle_case *fixture) {
     ds4_tokens tokens = {0};
     ds4_encode_chat_prompt(engine, "", text, DS4_THINK_NONE, &tokens);
     free(text);
+
+    const char *diag_dir_env = getenv("DS4_LAGUNA_DIAG_DIR");
+    if (diag_dir_env && diag_dir_env[0]) {
+        char *diag_dir = strdup(diag_dir_env);
+        float *baseline_logits = malloc(VECTOR_BYTES);
+        float *probed_logits = malloc(VECTOR_BYTES);
+        ds4_session *baseline = NULL;
+        ds4_session *probed = NULL;
+        bool ok = diag_dir && baseline_logits && probed_logits;
+        if (ok && unsetenv("DS4_LAGUNA_DIAG_DIR") != 0) {
+            ok = fail_message("disable Laguna layer diagnostic", NULL);
+        }
+        if (ok) {
+            ok = create_and_sync(
+                    engine, &tokens, 1024, &baseline, "short-diag-baseline");
+        }
+        if (ok && ds4_session_copy_logits(
+                baseline, baseline_logits, LAGUNA_VOCAB) != LAGUNA_VOCAB) {
+            ok = fail_message("copy baseline diagnostic logits", NULL);
+        }
+        if (diag_dir && setenv("DS4_LAGUNA_DIAG_DIR", diag_dir, 1) != 0) {
+            ok = fail_message("enable Laguna layer diagnostic", NULL);
+        }
+        if (ok) {
+            ok = create_and_sync(
+                    engine, &tokens, 1024, &probed, "short-diag-probed");
+        }
+        if (ok && ds4_session_copy_logits(
+                probed, probed_logits, LAGUNA_VOCAB) != LAGUNA_VOCAB) {
+            ok = fail_message("copy probed diagnostic logits", NULL);
+        }
+        if (ok && memcmp(baseline_logits, probed_logits, VECTOR_BYTES) != 0) {
+            ok = fail_message("Laguna layer diagnostic perturbed logits", NULL);
+        }
+        if (ok) {
+            ok = compare_session_oracle(probed, fixture, "short-layer-diag");
+        }
+        if (ok) {
+            fprintf(stderr,
+                    "short-layer-diag PASS files=49 nonperturbing=bit-exact\n");
+        }
+        ds4_session_free(probed);
+        ds4_session_free(baseline);
+        free(probed_logits);
+        free(baseline_logits);
+        free(diag_dir);
+        ds4_tokens_free(&tokens);
+        return ok;
+    }
+
     ds4_session *session = NULL;
     const bool synced = create_and_sync(
             engine, &tokens, 1024, &session, "short");

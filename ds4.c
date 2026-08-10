@@ -48250,6 +48250,99 @@ static bool laguna_graph_matmul(
                                        n_tokens) != 0;
 }
 
+#ifdef DS4_TEST_HOOKS
+static bool laguna_graph_diag_dump_tensor(
+        const ds4_gpu_tensor *tensor,
+        uint32_t              n_tokens,
+        uint64_t              width,
+        int                   layer,
+        const char           *stage) {
+    const char *dir = getenv("DS4_LAGUNA_DIAG_DIR");
+    if (!dir || !dir[0]) return true;
+    if (!tensor || !stage || n_tokens == 0 || width == 0 ||
+        width > UINT64_MAX / n_tokens / sizeof(float)) {
+        return false;
+    }
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "ds4: Laguna diagnostic mkdir %s: %s\n",
+                dir, strerror(errno));
+        return false;
+    }
+
+    char path[PATH_MAX];
+    const int path_len = layer < 0 ?
+        snprintf(path, sizeof(path), "%s/%s.f32", dir, stage) :
+        snprintf(path, sizeof(path), "%s/layer-%02d-%s.f32",
+                 dir, layer, stage);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+        fprintf(stderr, "ds4: Laguna diagnostic path is too long\n");
+        return false;
+    }
+
+    const uint64_t bytes = (uint64_t)n_tokens * width * sizeof(float);
+    void *data = xmalloc((size_t)bytes);
+    bool ok = ds4_gpu_tensor_read(tensor, 0, data, bytes) != 0;
+    int fd = -1;
+    if (ok) {
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            fprintf(stderr, "ds4: Laguna diagnostic create %s: %s\n",
+                    path, strerror(errno));
+            ok = false;
+        }
+    }
+    const unsigned char *cursor = data;
+    uint64_t remaining = bytes;
+    while (ok && remaining > 0) {
+        const size_t chunk = remaining > (uint64_t)SSIZE_MAX ?
+            (size_t)SSIZE_MAX : (size_t)remaining;
+        const ssize_t written = write(fd, cursor, chunk);
+        if (written <= 0) {
+            fprintf(stderr, "ds4: Laguna diagnostic write %s: %s\n",
+                    path, strerror(errno));
+            ok = false;
+            break;
+        }
+        cursor += written;
+        remaining -= (uint64_t)written;
+    }
+    if (fd >= 0 && close(fd) != 0) ok = false;
+    free(data);
+    return ok;
+}
+
+static bool laguna_graph_diag_checkpoint(
+        const ds4_gpu_tensor *tensor,
+        uint32_t              n_tokens,
+        uint64_t              width,
+        int                   layer,
+        const char           *stage) {
+    const char *dir = getenv("DS4_LAGUNA_DIAG_DIR");
+    if (!dir || !dir[0]) return true;
+    if (!ds4_gpu_commands_active() || ds4_gpu_end_commands() == 0) {
+        return false;
+    }
+    const bool dumped = laguna_graph_diag_dump_tensor(
+            tensor, n_tokens, width, layer, stage);
+    const bool resumed = ds4_gpu_begin_commands() != 0;
+    return dumped && resumed;
+}
+#else
+static bool laguna_graph_diag_checkpoint(
+        const ds4_gpu_tensor *tensor,
+        uint32_t              n_tokens,
+        uint64_t              width,
+        int                   layer,
+        const char           *stage) {
+    (void)tensor;
+    (void)n_tokens;
+    (void)width;
+    (void)layer;
+    (void)stage;
+    return true;
+}
+#endif
+
 static bool laguna_graph_forward_token(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
@@ -48657,6 +48750,8 @@ static bool laguna_graph_forward_batch(
      * reflects GPU work that has actually completed.  Tiny suffixes keep the
      * lower-overhead single-command path. */
     const bool live_progress = display_progress != NULL && n_tokens >= 32u;
+    uint32_t completed_layers = 0;
+    const char *failed_stage = "embedding";
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_tokens_quant_tensor(g->cur,
@@ -48669,9 +48764,12 @@ static bool laguna_graph_forward_batch(
                                                 n_tokens,
                                                 DS4_N_EMBD) != 0;
     }
+    if (ok) {
+        failed_stage = "embedding diagnostic";
+        ok = laguna_graph_diag_checkpoint(
+                g->cur, n_tokens, DS4_N_EMBD, -1, "embd");
+    }
 
-    uint32_t completed_layers = 0;
-    const char *failed_stage = "embedding";
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         const uint32_t n_head = ds4_layer_head_count(il);
@@ -48966,6 +49064,15 @@ static bool laguna_graph_forward_batch(
             }
         }
 
+        if (ok) {
+            failed_stage = "layer diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->next,
+                    n_tokens,
+                    DS4_N_EMBD,
+                    (int)il,
+                    "l_out");
+        }
         if (ok) {
             ds4_gpu_tensor *tmp = g->cur;
             g->cur = g->next;

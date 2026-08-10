@@ -38,14 +38,26 @@ struct Options {
     fs::path tokens;
     fs::path out;
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    int detail_layer = 0;
 };
 
 static void usage(FILE *stream, const char *program) {
     std::fprintf(
         stream,
         "Usage: %s --model MODEL --tokens TOKENS.i32 --out DIR "
-        "[--flash-attn auto|disabled]\n",
+        "[--flash-attn auto|disabled] [--detail-layer 0|1]\n",
         program);
+}
+
+static int parse_detail_layer(const std::string &value) {
+    errno = 0;
+    char *end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || *end != '\0' ||
+        parsed < 0 || parsed > 1) {
+        fail("--detail-layer must be 0 or 1");
+    }
+    return static_cast<int>(parsed);
 }
 
 static Options parse_options(int argc, char **argv) {
@@ -59,6 +71,7 @@ static Options parse_options(int argc, char **argv) {
     bool have_tokens = false;
     bool have_out = false;
     bool have_flash_attn = false;
+    bool have_detail_layer = false;
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc) {
             fail(std::string("missing value for ") + argv[i]);
@@ -83,6 +96,9 @@ static Options parse_options(int argc, char **argv) {
                 fail("--flash-attn must be auto or disabled");
             }
             have_flash_attn = true;
+        } else if (flag == "--detail-layer" && !have_detail_layer) {
+            options.detail_layer = parse_detail_layer(value);
+            have_detail_layer = true;
         } else {
             fail("unknown or duplicate argument: " + flag);
         }
@@ -166,38 +182,70 @@ static void write_f32_little_endian(const fs::path &path, const std::vector<floa
     }
 }
 
-struct Layer0Target {
-    const char *callback;
-    const char *filename;
+enum class DetailLayout { fixed, query_flat, query_gate, query_rope };
+
+struct DetailTarget {
+    const char *callback_base;
+    const char *stage;
+    DetailLayout layout;
     int64_t ne0;
     int64_t ne1;
     int64_t ne2;
 };
 
-static constexpr std::array<Layer0Target, 12> kLayer0Targets = {{
-    {"attn_norm-0", "layer-00-attn-norm.f32", 3072, 22, 1},
-    {"Qcur-0", "layer-00-q-proj.f32", 6144, 22, 1},
-    {"Kcur-0", "layer-00-k-proj.f32", 1024, 22, 1},
-    {"Vcur-0", "layer-00-v-proj.f32", 1024, 22, 1},
-    {"attn_gate_proj-0", "layer-00-gate-proj.f32", 48, 22, 1},
-    {"Qcur_rope-0", "layer-00-q-rope.f32", 128, 48, 22},
-    {"Kcur_rope-0", "layer-00-k-rope.f32", 128, 8, 22},
-    {"attn_gated-0", "layer-00-attn-gated.f32", 6144, 22, 1},
-    {"attn_o_proj-0", "layer-00-attn-o-proj.f32", 3072, 22, 1},
-    {"ffn_inp-0", "layer-00-ffn-inp.f32", 3072, 22, 1},
-    {"ffn_norm-0", "layer-00-ffn-norm.f32", 3072, 22, 1},
-    {"ffn_out-0", "layer-00-ffn-out.f32", 3072, 22, 1},
+static constexpr std::array<DetailTarget, 12> kDetailTargets = {{
+    {"attn_norm", "attn-norm", DetailLayout::fixed, 3072, 22, 1},
+    {"Qcur", "q-proj", DetailLayout::query_flat, 0, 0, 0},
+    {"Kcur", "k-proj", DetailLayout::fixed, 1024, 22, 1},
+    {"Vcur", "v-proj", DetailLayout::fixed, 1024, 22, 1},
+    {"attn_gate_proj", "gate-proj", DetailLayout::query_gate, 0, 0, 0},
+    {"Qcur_rope", "q-rope", DetailLayout::query_rope, 0, 0, 0},
+    {"Kcur_rope", "k-rope", DetailLayout::fixed, 128, 8, 22},
+    {"attn_gated", "attn-gated", DetailLayout::query_flat, 0, 0, 0},
+    {"attn_o_proj", "attn-o-proj", DetailLayout::fixed, 3072, 22, 1},
+    {"ffn_inp", "ffn-inp", DetailLayout::fixed, 3072, 22, 1},
+    {"ffn_norm", "ffn-norm", DetailLayout::fixed, 3072, 22, 1},
+    {"ffn_out", "ffn-out", DetailLayout::fixed, 3072, 22, 1},
 }};
 
-enum class TargetKind { none, embedding, layer, layer0, logits };
+struct DetailShape {
+    int64_t ne0;
+    int64_t ne1;
+    int64_t ne2;
+};
+
+static int detail_head_count(int detail_layer) {
+    return detail_layer == 0 ? 48 : 72;
+}
+
+static DetailShape detail_shape(const DetailTarget &target, int detail_layer) {
+    const int heads = detail_head_count(detail_layer);
+    switch (target.layout) {
+        case DetailLayout::fixed:
+            return {target.ne0, target.ne1, target.ne2};
+        case DetailLayout::query_flat:
+            return {heads * 128, kTokens, 1};
+        case DetailLayout::query_gate:
+            return {heads, kTokens, 1};
+        case DetailLayout::query_rope:
+            return {128, heads, kTokens};
+    }
+    fail("unknown detail-layer tensor layout");
+}
+
+enum class TargetKind { none, embedding, layer, detail, logits };
 
 struct Target {
     TargetKind kind = TargetKind::none;
     int layer = -1;
-    int layer0_target = -1;
+    int detail_target = -1;
 };
 
-static Target classify_target(const ggml_tensor *tensor) {
+static std::string detail_callback(const DetailTarget &target, int layer) {
+    return std::string(target.callback_base) + "-" + std::to_string(layer);
+}
+
+static Target classify_target(const ggml_tensor *tensor, int detail_layer) {
     const char *name = tensor->name;
     if (std::strcmp(name, "embd") == 0) {
         return {TargetKind::embedding, -1};
@@ -210,12 +258,14 @@ static Target classify_target(const ggml_tensor *tensor) {
     if (std::strcmp(name, "result_output") == 0) {
         return {TargetKind::logits, -1};
     }
-    for (size_t index = 0; index < kLayer0Targets.size(); index++) {
-        const Layer0Target &checkpoint = kLayer0Targets[index];
-        if (std::strcmp(name, checkpoint.callback) == 0 &&
-            tensor->ne[0] == checkpoint.ne0 && tensor->ne[1] == checkpoint.ne1 &&
-            tensor->ne[2] == checkpoint.ne2 && tensor->ne[3] == 1) {
-            return {TargetKind::layer0, 0, static_cast<int>(index)};
+    for (size_t index = 0; index < kDetailTargets.size(); index++) {
+        const DetailTarget &checkpoint = kDetailTargets[index];
+        const DetailShape shape = detail_shape(checkpoint, detail_layer);
+        const std::string callback = detail_callback(checkpoint, detail_layer);
+        if (callback == name &&
+            tensor->ne[0] == shape.ne0 && tensor->ne[1] == shape.ne1 &&
+            tensor->ne[2] == shape.ne2 && tensor->ne[3] == 1) {
+            return {TargetKind::detail, detail_layer, static_cast<int>(index)};
         }
     }
 
@@ -244,9 +294,10 @@ static Target classify_target(const ggml_tensor *tensor) {
 struct ProbeState {
     fs::path out;
     int n_vocab = 0;
+    int detail_layer = 0;
     bool embedding_seen = false;
     std::array<bool, kLayers> layer_seen{};
-    std::array<bool, kLayer0Targets.size()> layer0_seen{};
+    std::array<bool, kDetailTargets.size()> detail_seen{};
     bool logits_seen = false;
     std::string error;
 };
@@ -281,19 +332,22 @@ static std::vector<float> copy_exact_tensor(
     return values;
 }
 
-static std::vector<float> copy_layer0_tensor(
+static std::vector<float> copy_detail_tensor(
         const ggml_tensor *tensor,
-        const Layer0Target &checkpoint) {
-    validate_f32_contiguous(tensor, checkpoint.callback);
-    if (tensor->ne[0] != checkpoint.ne0 || tensor->ne[1] != checkpoint.ne1 ||
-        tensor->ne[2] != checkpoint.ne2 || tensor->ne[3] != 1) {
-        fail(std::string(checkpoint.callback) + " has a noncanonical shape");
+        const DetailTarget &checkpoint,
+        int detail_layer,
+        const std::string &callback) {
+    const DetailShape shape = detail_shape(checkpoint, detail_layer);
+    validate_f32_contiguous(tensor, callback);
+    if (tensor->ne[0] != shape.ne0 || tensor->ne[1] != shape.ne1 ||
+        tensor->ne[2] != shape.ne2 || tensor->ne[3] != 1) {
+        fail(callback + " has a noncanonical shape");
     }
-    const size_t count = static_cast<size_t>(checkpoint.ne0) *
-                         static_cast<size_t>(checkpoint.ne1) *
-                         static_cast<size_t>(checkpoint.ne2);
+    const size_t count = static_cast<size_t>(shape.ne0) *
+                         static_cast<size_t>(shape.ne1) *
+                         static_cast<size_t>(shape.ne2);
     if (ggml_nbytes(tensor) != count * sizeof(float)) {
-        fail(std::string(checkpoint.callback) + " has a noncanonical byte count");
+        fail(callback + " has a noncanonical byte count");
     }
     std::vector<float> values(count);
     ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
@@ -326,19 +380,25 @@ static void capture_target(ProbeState &state, ggml_tensor *tensor, Target target
             write_f32_little_endian(state.out / filename, values);
             break;
         }
-        case TargetKind::layer0: {
-            const size_t index = static_cast<size_t>(target.layer0_target);
-            if (index >= kLayer0Targets.size()) {
-                fail("invalid layer-0 diagnostic target");
+        case TargetKind::detail: {
+            const size_t index = static_cast<size_t>(target.detail_target);
+            if (index >= kDetailTargets.size()) {
+                fail("invalid detail-layer diagnostic target");
             }
-            const Layer0Target &checkpoint = kLayer0Targets[index];
-            if (state.layer0_seen[index]) {
-                fail("duplicate " + std::string(checkpoint.callback) + " callback");
+            const DetailTarget &checkpoint = kDetailTargets[index];
+            const std::string callback =
+                detail_callback(checkpoint, state.detail_layer);
+            if (state.detail_seen[index]) {
+                fail("duplicate " + callback + " callback");
             }
-            state.layer0_seen[index] = true;
+            state.detail_seen[index] = true;
             const std::vector<float> values =
-                copy_layer0_tensor(tensor, checkpoint);
-            write_f32_little_endian(state.out / checkpoint.filename, values);
+                copy_detail_tensor(
+                    tensor, checkpoint, state.detail_layer, callback);
+            char filename[64];
+            std::snprintf(filename, sizeof(filename), "layer-%02d-%s.f32",
+                          state.detail_layer, checkpoint.stage);
+            write_f32_little_endian(state.out / filename, values);
             break;
         }
         case TargetKind::logits: {
@@ -358,7 +418,7 @@ static void capture_target(ProbeState &state, ggml_tensor *tensor, Target target
 
 static bool probe_callback(ggml_tensor *tensor, bool ask, void *user_data) {
     auto &state = *static_cast<ProbeState *>(user_data);
-    const Target target = classify_target(tensor);
+    const Target target = classify_target(tensor, state.detail_layer);
     if (ask) {
         return target.kind != TargetKind::none && state.error.empty();
     }
@@ -387,9 +447,9 @@ static void require_complete_capture(const ProbeState &state) {
             fail("l_out callback was not observed for layer " + std::to_string(layer));
         }
     }
-    for (size_t index = 0; index < kLayer0Targets.size(); index++) {
-        if (!state.layer0_seen[index]) {
-            fail(std::string(kLayer0Targets[index].callback) +
+    for (size_t index = 0; index < kDetailTargets.size(); index++) {
+        if (!state.detail_seen[index]) {
+            fail(detail_callback(kDetailTargets[index], state.detail_layer) +
                  " callback was not observed");
         }
     }
@@ -491,6 +551,7 @@ int main(int argc, char **argv) {
             ProbeState state;
             state.out = options.out;
             state.n_vocab = n_vocab;
+            state.detail_layer = options.detail_layer;
 
             llama_context_params context_params = llama_context_default_params();
             context_params.n_ctx = 1024;
@@ -515,9 +576,16 @@ int main(int argc, char **argv) {
 
         llama_backend_free();
         backend_initialized = false;
-        std::printf("embedding=embd.f32\nlayer0_checkpoints=12\nlayers=48\n"
-                    "logits=logits.f32\nout=%s\n",
-                    options.out.c_str());
+        if (options.detail_layer == 0) {
+            std::printf("embedding=embd.f32\nlayer0_checkpoints=12\nlayers=48\n"
+                        "logits=logits.f32\nout=%s\n",
+                        options.out.c_str());
+        } else {
+            std::printf("embedding=embd.f32\ndetail_layer=%d\n"
+                        "detail_checkpoints=12\nlayers=48\n"
+                        "logits=logits.f32\nout=%s\n",
+                        options.detail_layer, options.out.c_str());
+        }
         return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "probe_poolside_laguna_layers: %s\n", error.what());

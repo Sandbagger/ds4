@@ -48251,6 +48251,25 @@ static bool laguna_graph_matmul(
 }
 
 #ifdef DS4_TEST_HOOKS
+static int laguna_graph_diag_detail_layer(void) {
+    const char *dir = getenv("DS4_LAGUNA_DIAG_DIR");
+    if (!dir || !dir[0]) return 0;
+
+    const char *value = getenv("DS4_LAGUNA_DIAG_LAYER");
+    if (!value || !value[0]) return 0;
+
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < 0 || parsed > 1) {
+        fprintf(stderr,
+                "ds4: DS4_LAGUNA_DIAG_LAYER must be 0 or 1\n");
+        return -1;
+    }
+    return (int)parsed;
+}
+
 static bool laguna_graph_diag_dump_tensor(
         const ds4_gpu_tensor *tensor,
         uint32_t              n_tokens,
@@ -48333,6 +48352,10 @@ static bool laguna_graph_diag_checkpoint(
     return dumped && resumed;
 }
 #else
+static int laguna_graph_diag_detail_layer(void) {
+    return 0;
+}
+
 static bool laguna_graph_diag_checkpoint(
         const ds4_gpu_tensor *tensor,
         uint32_t              n_tokens,
@@ -48720,6 +48743,8 @@ static bool laguna_graph_forward_batch(
         n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
         return false;
     }
+    const int detail_layer = laguna_graph_diag_detail_layer();
+    if (detail_layer < 0) return false;
 
     uint32_t *token_ids = xmalloc((size_t)n_tokens * sizeof(*token_ids));
     for (uint32_t i = 0; i < n_tokens; i++) {
@@ -48801,10 +48826,10 @@ static bool laguna_graph_forward_batch(
                 DS4_N_EMBD,
                 n_tokens,
                 DS4_RMS_EPS) != 0;
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "attn-norm diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->attn_norm, n_tokens, DS4_N_EMBD, 0, "attn-norm");
+                    g->attn_norm, n_tokens, DS4_N_EMBD, (int)il, "attn-norm");
         }
         if (ok) {
             failed_stage = "Q projection";
@@ -48835,27 +48860,27 @@ static bool laguna_graph_forward_batch(
                                      g->attn_norm,
                                      n_tokens);
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "q-proj diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->q, n_tokens, n_head * DS4_N_HEAD_DIM, 0, "q-proj");
+                    g->q, n_tokens, n_head * DS4_N_HEAD_DIM, (int)il, "q-proj");
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "k-proj diagnostic";
             ok = laguna_graph_diag_checkpoint(
                     g->k, n_tokens,
-                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0, "k-proj");
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, (int)il, "k-proj");
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "v-proj diagnostic";
             ok = laguna_graph_diag_checkpoint(
                     g->v, n_tokens,
-                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0, "v-proj");
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, (int)il, "v-proj");
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "gate-proj diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->gate, n_tokens, n_head, 0, "gate-proj");
+                    g->gate, n_tokens, n_head, (int)il, "gate-proj");
         }
         if (ok) {
             failed_stage = "Q norm/RoPE";
@@ -48878,10 +48903,10 @@ static bool laguna_graph_forward_batch(
                     beta_slow,
                     DS4_RMS_EPS) != 0;
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "q-rope diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->q, n_tokens, n_head * DS4_N_HEAD_DIM, 0, "q-rope");
+                    g->q, n_tokens, n_head * DS4_N_HEAD_DIM, (int)il, "q-rope");
         }
         if (ok) {
             failed_stage = "K norm/RoPE";
@@ -48904,11 +48929,11 @@ static bool laguna_graph_forward_batch(
                     beta_slow,
                     DS4_RMS_EPS) != 0;
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "k-rope diagnostic";
             ok = laguna_graph_diag_checkpoint(
                     g->k, n_tokens,
-                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0, "k-rope");
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, (int)il, "k-rope");
         }
         if (ok) {
             failed_stage = "causal attention";
@@ -48930,11 +48955,11 @@ static bool laguna_graph_forward_batch(
                     DS4_N_HEAD_DIM,
                     1.0f / sqrtf((float)DS4_N_HEAD_DIM)) != 0;
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "attn-gated diagnostic";
             ok = laguna_graph_diag_checkpoint(
                     g->heads, n_tokens,
-                    n_head * DS4_N_HEAD_DIM, 0, "attn-gated");
+                    n_head * DS4_N_HEAD_DIM, (int)il, "attn-gated");
         }
         if (ok) {
             failed_stage = "attention output projection";
@@ -48944,10 +48969,10 @@ static bool laguna_graph_forward_batch(
                                      g->heads,
                                      n_tokens);
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "attn-o-proj diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->attn_out, n_tokens, DS4_N_EMBD, 0, "attn-o-proj");
+                    g->attn_out, n_tokens, DS4_N_EMBD, (int)il, "attn-o-proj");
         }
         if (ok) {
             failed_stage = "attention residual";
@@ -48956,10 +48981,10 @@ static bool laguna_graph_forward_batch(
                                     g->attn_out,
                                     (uint64_t)n_tokens * DS4_N_EMBD) != 0;
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "ffn-inp diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->after_attn, n_tokens, DS4_N_EMBD, 0, "ffn-inp");
+                    g->after_attn, n_tokens, DS4_N_EMBD, (int)il, "ffn-inp");
         }
         if (ok) {
             failed_stage = "FFN norm";
@@ -48973,10 +48998,10 @@ static bool laguna_graph_forward_batch(
                     n_tokens,
                     DS4_RMS_EPS) != 0;
         }
-        if (ok && il == 0) {
+        if (ok && il == (uint32_t)detail_layer) {
             failed_stage = "ffn-norm diagnostic";
             ok = laguna_graph_diag_checkpoint(
-                    g->ffn_norm, n_tokens, DS4_N_EMBD, 0, "ffn-norm");
+                    g->ffn_norm, n_tokens, DS4_N_EMBD, (int)il, "ffn-norm");
         }
 
         if (ok && il < DS4_N_LEADING_DENSE) {
@@ -49009,10 +49034,10 @@ static bool laguna_graph_forward_batch(
                                          g->ffn_mid,
                                          n_tokens);
             }
-            if (ok && il == 0) {
+            if (ok && il == (uint32_t)detail_layer) {
                 failed_stage = "ffn-out diagnostic";
                 ok = laguna_graph_diag_checkpoint(
-                        g->ffn_out, n_tokens, DS4_N_EMBD, 0, "ffn-out");
+                        g->ffn_out, n_tokens, DS4_N_EMBD, (int)il, "ffn-out");
             }
             if (ok) {
                 failed_stage = "dense FFN residual";
@@ -49121,6 +49146,23 @@ static bool laguna_graph_forward_batch(
                                          l->ffn_down_shexp,
                                          g->ffn_mid,
                                          n_tokens);
+            }
+            if (ok && il == (uint32_t)detail_layer) {
+                failed_stage = "MoE FFN sum diagnostic";
+                ok = ds4_gpu_add_tensor(
+                        g->attn_out,
+                        g->ffn_out,
+                        g->shared_out,
+                        (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+            }
+            if (ok && il == (uint32_t)detail_layer) {
+                failed_stage = "ffn-out diagnostic";
+                ok = laguna_graph_diag_checkpoint(
+                        g->attn_out,
+                        n_tokens,
+                        DS4_N_EMBD,
+                        (int)il,
+                        "ffn-out");
             }
             if (ok) {
                 failed_stage = "MoE residual";

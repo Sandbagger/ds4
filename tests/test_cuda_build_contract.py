@@ -140,6 +140,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "run_prefill_attention_frozen_case",
             "run_prefill_attention_frozen_gqa9_case",
             '"poolside-auto-t22-gqa9-derived"',
+            '"fast-shape-wrap-guard", 0u, 22u, 16u, 48u, 8u',
             "LAGUNA_ATTENTION_AUTO_FIXTURE_DIR",
             "22u, 256u, 48u, 8u",
             "5.0e-7f",
@@ -147,6 +148,12 @@ class CudaBuildContractTest(unittest.TestCase):
             '"token20-head43"',
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
+        for required in (
+            "cudaDevAttrComputeCapabilityMajor",
+            "compute_major >= 8",
+            "cache_cap >= n_tokens",
+        ):
+            self.assertIn(required, CUDA_SOURCE)
 
     def test_laguna_stream_links_cuda_lifecycle_test_hooks(self) -> None:
         hook_object = "tests/ds4_cuda_laguna_stream_test_hooks.o"
@@ -257,6 +264,8 @@ class CudaBuildContractTest(unittest.TestCase):
     def test_laguna_batch_layer_probe_is_test_only_and_nonperturbing(self) -> None:
         self.assertIn("#ifdef DS4_TEST_HOOKS", DS4_SOURCE)
         self.assertIn("DS4_LAGUNA_DIAG_DIR", DS4_SOURCE)
+        self.assertIn("DS4_LAGUNA_DIAG_LAYER", DS4_SOURCE)
+        self.assertIn("laguna_graph_diag_detail_layer", DS4_SOURCE)
         self.assertIn("laguna_graph_diag_dump_tensor", DS4_SOURCE)
 
         body = source_function_body(
@@ -294,9 +303,9 @@ class CudaBuildContractTest(unittest.TestCase):
         ):
             self.assertRegex(
                 body,
-                rf"if \(ok && il == 0\) \{{\s*failed_stage = \"{stage} diagnostic\";"
+                rf"if \(ok && il == \(uint32_t\)detail_layer\) \{{\s*failed_stage = \"{stage} diagnostic\";"
                 rf"\s*ok = laguna_graph_diag_checkpoint\(\s*g->{tensor},"
-                rf"\s*n_tokens,\s*{width},\s*0,\s*\"{stage}\"\s*\);",
+                rf"\s*n_tokens,\s*{width},\s*\(int\)il,\s*\"{stage}\"\s*\);",
             )
         self.assertRegex(
             body,

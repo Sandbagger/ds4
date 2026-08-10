@@ -2108,6 +2108,7 @@ static int run_prefill_attention_cases(void) {
     static const laguna_prefill_case cases[] = {
         { "global-one", 0u, 1u, 16u, 48u, 8u },
         { "global-three", 0u, 3u, 16u, 48u, 8u },
+        { "fast-shape-wrap-guard", 0u, 22u, 16u, 48u, 8u },
         { "resumed-global", 3u, 2u, 16u, 48u, 8u },
         { "swa-512-crossing", 509u, 4u, 512u, 72u, 8u },
         { "multi-wrap-4", 0u, 9u, 4u, 48u, 8u },

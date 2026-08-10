@@ -18,6 +18,7 @@ TOKENS = 22
 LAYERS = 48
 VALUES_PER_LAYER = WIDTH * TOKENS
 BYTES_PER_LAYER = VALUES_PER_LAYER * 4
+LAYER0_STAGES = ("attn-o-proj", "ffn-inp", "ffn-norm", "ffn-out")
 
 
 class PoolsideLayerDiagnosticsTest(unittest.TestCase):
@@ -51,6 +52,10 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         self.assertRegex(source, r"kWidth\s*=\s*3072")
         self.assertRegex(source, r"kTokens\s*=\s*22")
         self.assertRegex(source, r"kLayers\s*=\s*48")
+        for stage in LAYER0_STAGES:
+            callback = stage.replace("-", "_") + "-0"
+            self.assertIn(f'"{callback}"', source)
+            self.assertIn(f'"layer-00-{stage}.f32"', source)
 
     def test_comparator_reports_every_layer_and_the_first_exact_divergence(self):
         self.assertTrue(COMPARATOR.is_file(), f"missing comparator: {COMPARATOR}")
@@ -75,6 +80,11 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
 
             (reference / "embd.f32").write_bytes(one_layer)
             (candidate / "embd.f32").write_bytes(one_layer)
+            for stage in LAYER0_STAGES:
+                name = f"layer-00-{stage}.f32"
+                (reference / name).write_bytes(one_layer)
+                candidate_bytes = changed_layer if stage == "ffn-out" else one_layer
+                (candidate / name).write_bytes(candidate_bytes)
 
             result = subprocess.run(
                 [
@@ -99,7 +109,15 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             self.assertTrue(report["embedding"]["exact_hash"])
             self.assertEqual(
                 report["first_divergence"],
-                {"stage": "l_out", "layer": 7},
+                {"stage": "ffn-out", "layer": 0},
+            )
+            self.assertEqual(
+                list(report["layer0_checkpoints"]), list(LAYER0_STAGES)
+            )
+            for stage in LAYER0_STAGES[:-1]:
+                self.assertTrue(report["layer0_checkpoints"][stage]["exact_hash"])
+            self.assertFalse(
+                report["layer0_checkpoints"]["ffn-out"]["exact_hash"]
             )
 
             changed = report["layers"][7]

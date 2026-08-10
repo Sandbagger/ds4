@@ -377,6 +377,9 @@ static bool run_short(ds4_engine *engine, const oracle_case *fixture) {
                 probed, probed_logits, LAGUNA_VOCAB) != LAGUNA_VOCAB) {
             ok = fail_message("copy probed diagnostic logits", NULL);
         }
+        if (unsetenv("DS4_LAGUNA_DIAG_DIR") != 0) {
+            ok = fail_message("consume Laguna layer diagnostic", NULL);
+        }
         if (ok && memcmp(baseline_logits, probed_logits, VECTOR_BYTES) != 0) {
             ok = fail_message("Laguna layer diagnostic perturbed logits", NULL);
         }

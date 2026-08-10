@@ -1934,9 +1934,17 @@ static float laguna_q4k_q8_1_dot(
 }
 
 static void laguna_encode_q4k(laguna_q4k_block *out, uint32_t seed, float scale) {
-    memset(out, 0, sizeof(*out)); out->d = reference_f32_to_f16(scale);
-    for (uint32_t group = 0; group < 4u; group++) out->scales[group] = 1u;
-    for (uint32_t group = 4u; group < 8u; group++) out->scales[group + 4u] = 1u;
+    memset(out, 0, sizeof(*out));
+    out->d = reference_f32_to_f16(scale);
+    out->dmin = reference_f32_to_f16(
+        scale * (seed % 13u == 0u ? 3.5f : 0.15f));
+    for (uint32_t group = 0; group < 4u; group++) {
+        out->scales[group] = 1u;
+        out->scales[group + 4u] = 1u;
+    }
+    for (uint32_t group = 4u; group < 8u; group++) {
+        out->scales[group + 4u] = 0x11u;
+    }
     for (uint32_t group = 0; group < 8u; group++) {
         const uint32_t byte_offset = (group >> 1u) * 32u, shift = (group & 1u) * 4u;
         for (uint32_t i = 0; i < 32u; i++) {

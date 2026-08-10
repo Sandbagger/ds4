@@ -227,6 +227,16 @@ class CudaBuildContractTest(unittest.TestCase):
             'const char *diag_dir_env = getenv("DS4_LAGUNA_DIAG_DIR");', 1
         )[1].split("ds4_session *session = NULL;", 1)[0]
         self.assertNotIn("compare_session_oracle", diagnostic_branch)
+        self.assertEqual(
+            diagnostic_branch.count('unsetenv("DS4_LAGUNA_DIAG_DIR")'),
+            2,
+            "short diagnostic must consume its environment before later model cases",
+        )
+        self.assertGreater(
+            diagnostic_branch.rfind('unsetenv("DS4_LAGUNA_DIAG_DIR")'),
+            diagnostic_branch.find('"short-diag-probed"'),
+            "diagnostic environment must be cleared after the probed session",
+        )
 
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')

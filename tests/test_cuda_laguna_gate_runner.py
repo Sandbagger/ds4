@@ -736,7 +736,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 "the retained descriptor must be the only reference to original bytes",
             )
 
-    def test_c7_budgets_the_verifier_separately_from_cuda_children(self) -> None:
+    def test_c7_budgets_long_running_children_separately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temporary_root = Path(tmp)
             environment, staged_runner, _, _, _, _ = self.stage_c7_fixture(
@@ -765,7 +765,14 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 Path(verifier["command"][1]).name,
                 "compare_laguna_logits.py",
             )
+            model = next(
+                record for record in records if record["selector"] == "model"
+            )
+            self.assertEqual(model["kill_after"], "5s")
+            self.assertEqual(model["duration"], "900s")
             for record in records[1:]:
+                if record["selector"] == "model":
+                    continue
                 with self.subTest(selector=record["selector"]):
                     self.assertEqual(record["kill_after"], "5s")
                     self.assertEqual(record["duration"], "60s")

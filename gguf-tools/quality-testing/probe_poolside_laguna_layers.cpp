@@ -162,6 +162,11 @@ static Target classify_target(const char *name) {
     if (std::strcmp(name, "embd") == 0) {
         return {TargetKind::embedding, -1};
     }
+    // The final Laguna residual is the same tensor first named l_out-47 and
+    // then renamed h_nextn when the graph exposes it to speculative drafters.
+    if (std::strcmp(name, "h_nextn") == 0) {
+        return {TargetKind::layer, kLayers - 1};
+    }
     if (std::strcmp(name, "result_output") == 0) {
         return {TargetKind::logits, -1};
     }

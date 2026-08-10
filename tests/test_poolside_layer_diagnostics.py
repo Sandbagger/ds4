@@ -35,6 +35,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             "GGML_TYPE_F32",
             '"embd"',
             '"l_out-"',
+            '"h_nextn"',
             '"result_output"',
             "layer-%02d.f32",
             "embd.f32",

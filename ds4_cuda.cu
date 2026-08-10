@@ -5555,12 +5555,16 @@ __global__ static void quantize_q8_0_f32_kernel(
         if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
         __syncthreads();
     }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    /* Match llama.cpp's MMQ Q8_1 D4 activation contract exactly: form the
+     * reciprocal first, quantize with roundf, then recover the stored scale.
+     * Reversing those divisions and using lrintf changes boundary values and
+     * compounds across Laguna's resident graph. */
+    const float id = vals[0] != 0.0f ? 127.0f / vals[0] : 0.0f;
+    const float d = id != 0.0f ? 1.0f / id : 0.0f;
     if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
     int8_t *dst = xq + (tok * blocks + b) * 32;
     if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
+        int v = (int)roundf(xr[threadIdx.x] * id);
         v = v > 127 ? 127 : (v < -128 ? -128 : v);
         dst[threadIdx.x] = (int8_t)v;
     } else {
@@ -6539,7 +6543,9 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
  * tree levels), plus per-(j&3) sequential accumulators and a fixed tail for
  * the remaining levels. Fuzz-verified bitwise against both reference
  * kernels across shapes, including blocks < T and ragged out_dim/n_tok.
- * Rollback: DS4_CUDA_NO_Q8_MMA=1. */
+ * Rollback: DS4_CUDA_NO_Q8_MMA=1. The sm_121 path is bypassed automatically:
+ * a pinned 22-token Poolside projection exposed silent zero/corrupt outputs
+ * on GB10, while the exact native kernel remained numerically stable. */
 __device__ __forceinline__ static uint32_t ldu32_unaligned(const uint8_t *p) {
     const uintptr_t addr = (uintptr_t)p;
     const uint32_t *base = (const uint32_t *)(addr & ~(uintptr_t)3);
@@ -6736,7 +6742,23 @@ static int cuda_q8_mma_try_launch(
         uint64_t out_stride,
         uint32_t T) {
     static int disabled = -1;
-    if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
+    if (disabled < 0) {
+        disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
+        if (!disabled) {
+            int dev = 0, major = 0, minor = 0;
+            if (cudaGetDevice(&dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(
+                    &major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(
+                    &minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                major == 12 && minor == 1) {
+                disabled = 1;
+                fprintf(stderr,
+                        "ds4: CUDA Q8 MMA disabled on sm_121 after parity failure; "
+                        "using exact kernels\n");
+            }
+        }
+    }
     if (disabled || !cuda_q4_mma_ok()) return 0;
     if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < 8u) return 0;
     if (((uintptr_t)w & 1u) || ((uintptr_t)xq & 3u) || ((uintptr_t)xscale & 3u)) return 0;

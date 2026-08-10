@@ -1023,13 +1023,25 @@ class CudaBuildContractTest(unittest.TestCase):
             r"return ds4_gpu_add3_tensor\(out, moe, shared, residual, n\);",
         )
         self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", GPU_HEADER)
-        for function_name in (
-            "static bool laguna_graph_forward_token(",
-            "static bool laguna_graph_forward_batch(",
-        ):
+        graph_calls = {
+            "static bool laguna_graph_forward_token(": (
+                r"ds4_gpu_laguna_moe_residual_tensor\(\s*"
+                r"g->next,\s*g->after_attn,\s*g->ffn_out,\s*g->shared_out,\s*"
+                r"DS4_N_EMBD\s*\)"
+            ),
+            "static bool laguna_graph_forward_batch(": (
+                r"ds4_gpu_laguna_moe_residual_tensor\(\s*"
+                r"g->next,\s*g->after_attn,\s*g->ffn_out,\s*g->shared_out,\s*"
+                r"\(uint64_t\)n_tokens\s*\*\s*DS4_N_EMBD\s*\)"
+            ),
+        }
+        for function_name, expected_call in graph_calls.items():
             graph_body = source_function_body(DS4_SOURCE, function_name, "ds4.c")
-            self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", graph_body)
-            self.assertNotIn("ds4_gpu_add3_tensor(\n                        g->next", graph_body)
+            self.assertEqual(
+                graph_body.count("ds4_gpu_laguna_moe_residual_tensor("), 1
+            )
+            self.assertRegex(graph_body, expected_call)
+            self.assertNotIn("ds4_gpu_add3_tensor(", graph_body)
         kernel_main = source_function_body(
             LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
         )

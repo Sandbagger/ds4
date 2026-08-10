@@ -1,0 +1,63 @@
+{
+  "schema": "laguna-attention-auto-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "ds4_diagnostic_commit": "6138c5d3dd436f5859dad9422ebbffe2c058a182",
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "flash_attention": "AUTO",
+  "shape": {
+    "tokens": 22,
+    "query_heads": 48,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "position_start": 0,
+    "kv_rows": 256
+  },
+  "oracle": {
+    "input_callbacks": {
+      "layer-00-q-rope.f32": "Qcur_rope-0",
+      "layer-00-k-rope.f32": "Kcur_rope-0",
+      "layer-00-v-proj.f32": "Vcur-0",
+      "layer-00-gate-proj.f32": "attn_gate_proj-0"
+    },
+    "output_callback": {
+      "layer-00-attn-gated.f32": "attn_gated-0"
+    },
+    "global_max_abs_limit": 1e-05,
+    "global_rms_limit": 5e-07,
+    "per_head_max_abs_limit": 1e-05,
+    "per_head_rms_limit": 5e-07,
+    "sentinel": {
+      "token": 20,
+      "head": 43
+    }
+  },
+  "determinism": {
+    "runs": 2,
+    "all_62_capture_files_bit_exact": true
+  },
+  "files": {
+    "layer-00-q-rope.f32": {
+      "bytes": 540672,
+      "sha256": "ede9c00e83a4ad953900743104178f75af9219c85f66bda8d92d12ef3753c4da"
+    },
+    "layer-00-k-rope.f32": {
+      "bytes": 90112,
+      "sha256": "f961fc2d42616fccfc07d8d42eb10ec953f213cda9ee0d9d00bab012559cef4f"
+    },
+    "layer-00-v-proj.f32": {
+      "bytes": 90112,
+      "sha256": "d3f83952d2bc88275ef1af691c73b4b1bcedff41c5c0c5823f287b15a9f78c41"
+    },
+    "layer-00-gate-proj.f32": {
+      "bytes": 4224,
+      "sha256": "07fe34fc9bbe9e178da601b579c23037b616e4b1278ee960466e6b308663d3f1"
+    },
+    "layer-00-attn-gated.f32": {
+      "bytes": 540672,
+      "sha256": "f44669c93d81bbd22edb7dab4311af71b5880556a5646d3138aae1d5c0e4e3bd"
+    }
+  }
+}

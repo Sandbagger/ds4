@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 import unittest
@@ -21,6 +23,34 @@ LAGUNA_MODEL_TEST = (ROOT / "tests/test_cuda_laguna_model.c").read_text(
 LAGUNA_STREAM_TEST = (ROOT / "tests/test_cuda_laguna_stream.c").read_text(
     encoding="utf-8"
 )
+LAGUNA_KERNEL_TEST = (ROOT / "tests/test_cuda_laguna_kernels.c").read_text(
+    encoding="utf-8"
+)
+LAGUNA_ATTENTION_AUTO_FIXTURE = (
+    ROOT / "tests/test-vectors/laguna-attention-auto"
+)
+LAGUNA_ATTENTION_AUTO_FILES = {
+    "layer-00-q-rope.f32": (
+        540672,
+        "ede9c00e83a4ad953900743104178f75af9219c85f66bda8d92d12ef3753c4da",
+    ),
+    "layer-00-k-rope.f32": (
+        90112,
+        "f961fc2d42616fccfc07d8d42eb10ec953f213cda9ee0d9d00bab012559cef4f",
+    ),
+    "layer-00-v-proj.f32": (
+        90112,
+        "d3f83952d2bc88275ef1af691c73b4b1bcedff41c5c0c5823f287b15a9f78c41",
+    ),
+    "layer-00-gate-proj.f32": (
+        4224,
+        "07fe34fc9bbe9e178da601b579c23037b616e4b1278ee960466e6b308663d3f1",
+    ),
+    "layer-00-attn-gated.f32": (
+        540672,
+        "f44669c93d81bbd22edb7dab4311af71b5880556a5646d3138aae1d5c0e4e3bd",
+    ),
+}
 
 STANDALONE_CUDA_TARGETS = (
     "tests/cuda_long_context_smoke",
@@ -71,6 +101,51 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_laguna_attention_auto_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["schema"], "laguna-attention-auto-fixture/v1")
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(manifest["flash_attention"], "AUTO")
+        self.assertEqual(
+            manifest["shape"],
+            {
+                "tokens": 22,
+                "query_heads": 48,
+                "kv_heads": 8,
+                "head_dim": 128,
+                "position_start": 0,
+                "kv_rows": 256,
+            },
+        )
+        self.assertEqual(set(manifest["files"]), set(LAGUNA_ATTENTION_AUTO_FILES))
+        for name, (expected_size, expected_sha256) in (
+            LAGUNA_ATTENTION_AUTO_FILES.items()
+        ):
+            with self.subTest(name=name):
+                payload = (LAGUNA_ATTENTION_AUTO_FIXTURE / name).read_bytes()
+                self.assertEqual(len(payload), expected_size)
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+                self.assertEqual(
+                    manifest["files"][name],
+                    {"bytes": expected_size, "sha256": expected_sha256},
+                )
+
+        for required in (
+            '"prefill-attention-frozen"',
+            "run_prefill_attention_frozen_case",
+            "LAGUNA_ATTENTION_AUTO_FIXTURE_DIR",
+            "22u, 256u, 48u, 8u",
+            "5.0e-7f",
+            "1.0e-5f",
+            '"token20-head43"',
+        ):
+            self.assertIn(required, LAGUNA_KERNEL_TEST)
+
     def test_laguna_stream_links_cuda_lifecycle_test_hooks(self) -> None:
         hook_object = "tests/ds4_cuda_laguna_stream_test_hooks.o"
         hook_prerequisites = rule_prerequisites(hook_object)

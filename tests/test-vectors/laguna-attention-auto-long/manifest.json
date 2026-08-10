@@ -20,6 +20,20 @@
       "bytes": 21085,
       "sha256": "28825c8f2273ff5fef28d1250d2ec8bb82addbf5b736ec56a2bc99e1e07c9df6"
     },
+    "producer": {
+      "script": {
+        "path": "tests/oracle-producers/laguna-attention-auto-long/derive_capture_inputs.py",
+        "bytes": 7897,
+        "sha256": "6615389271c0adc9d99a2ef1610ef5d1ece6eea44bdbc6cdf92d8c039c1cd44d"
+      },
+      "token_prefix": {
+        "path": "tests/oracle-producers/laguna-attention-auto-long/swa-prefix-512.tokens.json",
+        "bytes": 277,
+        "sha256": "564c74a60015d8afd82c17ef89da3ceabb39259f49ba3d210901815a068de1dc",
+        "schema": "laguna-token-prefix/v1",
+        "tokens": 512
+      }
+    },
     "compiler": {
       "command": "g++",
       "flags": ["-std=c++17", "-O2"],
@@ -33,11 +47,13 @@
       "token_file": {
         "bytes": 2048,
         "sha256": "569aa6394783e0f17558db421ba26480d7a530d44dd2219bcc9aac2c09a3b559",
-        "derivation": "first 512 little-endian int32 IDs from pinned swa-513"
+        "derivation": "first 512 little-endian int32 IDs from pinned swa-513",
+        "prefix_tokens": 512
       },
       "capture_source": {
         "bytes": 18662,
-        "sha256": "dc53f359313c2cad649d5ae6c4419d1f8b582dfd5ce731dd3bf0ad86cc13f9ba"
+        "sha256": "dc53f359313c2cad649d5ae6c4419d1f8b582dfd5ce731dd3bf0ad86cc13f9ba",
+        "producer_case": "layer0_gqa6_512"
       },
       "probe_binary": {
         "bytes": 80032,
@@ -80,11 +96,13 @@
       "token_file": {
         "bytes": 256,
         "sha256": "cf4df9a692df0362683993b79a894a0b1763924a773e5b98f27f5c6ff5345557",
-        "derivation": "first 64 little-endian int32 IDs from pinned swa-513"
+        "derivation": "first 64 little-endian int32 IDs from pinned swa-513",
+        "prefix_tokens": 64
       },
       "capture_source": {
         "bytes": 18660,
-        "sha256": "99571ba16b0f0aafe24c1e03da249d6956e20c903f79786d87380b682a7846a6"
+        "sha256": "99571ba16b0f0aafe24c1e03da249d6956e20c903f79786d87380b682a7846a6",
+        "producer_case": "layer1_gqa9_64"
       },
       "probe_binary": {
         "bytes": 80032,

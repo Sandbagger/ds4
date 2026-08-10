@@ -22,7 +22,28 @@ the authority for that boundary.
 
 `manifest.json` pins the exact Poolside/model/device identities, raw captures,
 capture-source and binary hashes, byte-level extraction recipes, and compact
-files.  The source used for each capture was a narrowed derivative of
-`gguf-tools/quality-testing/probe_poolside_laguna_layers.cpp`: it requested only
-`Vcur`, `attn_gate_proj`, `Qcur_rope`, `Kcur_rope`, and `attn_gated`, accepted
-the pinned token prefix, and used the fixed token count recorded per case.
+files.  The tracked host-only producer
+`tests/oracle-producers/laguna-attention-auto-long/derive_capture_inputs.py`
+strictly narrows the pinned
+`gguf-tools/quality-testing/probe_poolside_laguna_layers.cpp` to the five
+required callbacks (`Vcur`, `attn_gate_proj`, `Qcur_rope`, `Kcur_rope`, and
+`attn_gated`) and emits the exact source used for either capture.  It also
+expands the tracked `swa-prefix-512.tokens.json` token specification into the
+exact little-endian int32 input: all 512 IDs for layer 0 or its first 64 IDs for
+layer 1.
+
+For example, regenerate the layer-0 inputs without a model, compiler, or GPU:
+
+```sh
+python3 tests/oracle-producers/laguna-attention-auto-long/derive_capture_inputs.py \
+  --case layer0_gqa6_512 \
+  --base-probe gguf-tools/quality-testing/probe_poolside_laguna_layers.cpp \
+  --token-prefix tests/oracle-producers/laguna-attention-auto-long/swa-prefix-512.tokens.json \
+  --probe-out /tmp/probe_poolside_laguna_512.cpp \
+  --tokens-out /tmp/swa-prefix-512.tokens.i32
+```
+
+Use `--case layer1_gqa9_64` for the 64-token layer-1 inputs.  The host fixture
+test runs both derivations and verifies their byte counts and SHA-256 identities
+against the manifest; compiling and running the probe remain explicit capture
+steps on the pinned Poolside checkout.

@@ -6,6 +6,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 
@@ -52,6 +55,80 @@ class LagunaAttentionLongFixtureTest(unittest.TestCase):
                 path = FIXTURE / name
                 self.assertEqual(path.stat().st_size, contract["bytes"])
                 self.assertEqual(sha256(path), contract["sha256"])
+
+    def test_tracked_producer_recreates_the_exact_capture_inputs(self) -> None:
+        producer = self.manifest["capture"]["producer"]
+        for asset_name in ("script", "token_prefix"):
+            with self.subTest(asset=asset_name):
+                contract = producer[asset_name]
+                path = ROOT / contract["path"]
+                self.assertEqual(path.stat().st_size, contract["bytes"])
+                self.assertEqual(sha256(path), contract["sha256"])
+
+        script = ROOT / producer["script"]["path"]
+        base_probe = ROOT / self.manifest["capture"]["base_probe"]["path"]
+        token_prefix = ROOT / producer["token_prefix"]["path"]
+        token_specification = json.loads(token_prefix.read_text(encoding="utf-8"))
+        self.assertEqual(
+            token_specification["schema"], producer["token_prefix"]["schema"]
+        )
+        self.assertEqual(
+            token_specification["tokens"], producer["token_prefix"]["tokens"]
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            derived_tokens = {}
+            for label, case in self.manifest["cases"].items():
+                with self.subTest(case=label):
+                    producer_case = case["capture_source"]["producer_case"]
+                    self.assertEqual(producer_case, label)
+                    self.assertEqual(
+                        case["token_file"]["prefix_tokens"],
+                        case["tokens"],
+                    )
+                    probe = temporary / f"{label}.cpp"
+                    tokens = temporary / f"{label}.tokens.i32"
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(script),
+                            "--case",
+                            producer_case,
+                            "--base-probe",
+                            str(base_probe),
+                            "--token-prefix",
+                            str(token_prefix),
+                            "--probe-out",
+                            str(probe),
+                            "--tokens-out",
+                            str(tokens),
+                        ],
+                        cwd=ROOT,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        probe.stat().st_size,
+                        case["capture_source"]["bytes"],
+                    )
+                    self.assertEqual(
+                        sha256(probe),
+                        case["capture_source"]["sha256"],
+                    )
+                    self.assertEqual(
+                        tokens.stat().st_size,
+                        case["token_file"]["bytes"],
+                    )
+                    self.assertEqual(
+                        sha256(tokens),
+                        case["token_file"]["sha256"],
+                    )
+                    derived_tokens[label] = tokens.read_bytes()
+            self.assertEqual(
+                derived_tokens["layer1_gqa9_64"],
+                derived_tokens["layer0_gqa6_512"][: 64 * 4],
+            )
 
     def test_extractions_are_bounded_and_preserve_gqa_mapping(self) -> None:
         for label, case in self.manifest["cases"].items():

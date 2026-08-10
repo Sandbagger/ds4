@@ -121,6 +121,21 @@ LAGUNA_Q4_MMQ_AUTO_FILES = {
         "f6ea0e74779aa61d39171891d49c64a373b41aa5f67facf23d7577be79cb5eb6",
     ),
 }
+LAGUNA_Q4_L2_AUTO_FIXTURE = ROOT / "tests/test-vectors/laguna-q4-l2-auto"
+LAGUNA_Q4_L2_AUTO_FILES = {
+    "mid-pair0.f32": (
+        4096,
+        "803af6831f6c89df4bac4d788821aded26edd61e4742f1929d3e5feaf30fdece",
+    ),
+    "expected-col-l2-pair0.f32": (
+        4,
+        "7288027f7f191e69e6832ec1bc80ff2da99012560990cfc888032496fdd35778",
+    ),
+    "expected-down-input-pair0.f32": (
+        4096,
+        "c058fcac9dc6a95dbf0b3aa59bbcc84f28ae1f8233ed273d59eecda23a30d0a1",
+    ),
+}
 
 STANDALONE_CUDA_TARGETS = (
     "tests/cuda_long_context_smoke",
@@ -731,6 +746,131 @@ class CudaBuildContractTest(unittest.TestCase):
             LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
         )
         self.assertIn("run_q4_mmq_frozen_case()", kernel_main)
+
+    def test_laguna_q4_l2_auto_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_Q4_L2_AUTO_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["schema"], "laguna-q4-l2-auto-fixture/v1")
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["model"],
+            {
+                "bytes": 68248759648,
+                "sha256": (
+                    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+                ),
+            },
+        )
+        capture = manifest["capture"]
+        self.assertEqual(
+            {key: capture[key] for key in (
+                "flash_attention", "layer", "tokens", "token_index", "slot",
+                "expert_mid_dim", "pair_count", "production_l2_threads",
+                "probe_sha256", "poolside_callback_patch_sha256",
+            )},
+            {
+                "flash_attention": "AUTO",
+                "layer": 1,
+                "tokens": 22,
+                "token_index": 0,
+                "slot": 0,
+                "expert_mid_dim": 1024,
+                "pair_count": 220,
+                "production_l2_threads": 128,
+                "probe_sha256": (
+                    "3443de0df29bc90fc9c37183e6c0e20d1de0625f562f29bbd9b63ef441389f4e"
+                ),
+                "poolside_callback_patch_sha256": (
+                    "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6"
+                ),
+            },
+        )
+        self.assertEqual(
+            capture["callbacks"],
+            {
+                "mid-pair0.f32": "ffn_moe_swiglu-1",
+                "expected-col-l2-pair0.f32": "ffn_moe_col_l2-1",
+                "expected-down-input-pair0.f32": "ffn_moe_down_input-1",
+            },
+        )
+        self.assertEqual(
+            capture["non_perturbation"],
+            {
+                "selected_sha256": (
+                    "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183"
+                ),
+                "weights_sha256": (
+                    "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c"
+                ),
+                "routed_output_sha256": (
+                    "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083"
+                ),
+                "layer_output_sha256": (
+                    "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
+                ),
+                "detail_capture_matches_prior_deep_capture": True,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"],
+            {
+                "column_l2_exact": True,
+                "down_input_exact": True,
+                "reduction_topology": "128-thread production SUM_ROWS tree",
+            },
+        )
+        self.assertEqual(set(manifest["files"]), set(LAGUNA_Q4_L2_AUTO_FILES))
+        self.assertEqual(
+            {path.name for path in LAGUNA_Q4_L2_AUTO_FIXTURE.iterdir()},
+            set(LAGUNA_Q4_L2_AUTO_FILES) | {"manifest.json"},
+        )
+        for name, (expected_size, expected_sha256) in (
+            LAGUNA_Q4_L2_AUTO_FILES.items()
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    manifest["files"][name],
+                    {"bytes": expected_size, "sha256": expected_sha256},
+                )
+                payload = (LAGUNA_Q4_L2_AUTO_FIXTURE / name).read_bytes()
+                self.assertEqual(len(payload), expected_size)
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+
+        for required in (
+            '"q4-l2-frozen"',
+            "run_q4_l2_frozen_case",
+            "LAGUNA_Q4_L2_AUTO_FIXTURE_DIR",
+            '"mid-pair0.f32"',
+            '"expected-col-l2-pair0.f32"',
+            '"expected-down-input-pair0.f32"',
+        ):
+            self.assertIn(required, LAGUNA_KERNEL_TEST)
+        case_body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_q4_l2_frozen_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn("ds4_gpu_test_glm_poolside_q4_l2_tensor(", case_body)
+        self.assertIn("cudaDeviceSynchronize()", case_body)
+        self.assertGreaterEqual(case_body.count("ds4_gpu_tensor_read("), 2)
+        self.assertIn("actual_bits != expected_bits", case_body)
+        self.assertRegex(case_body, r"expert_mid_dim\s*=\s*1024")
+
+        hook_body = function_body(
+            'extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor('
+        )
+        self.assertRegex(
+            hook_body,
+            r"glm_poolside_q4_l2_rescale_kernel<<<\s*\(uint32_t\)pair_count,\s*128u\s*>>>",
+        )
+        kernel_main = source_function_body(
+            LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
+        )
+        self.assertIn("run_q4_l2_frozen_case()", kernel_main)
 
     def test_laguna_attention_auto_is_qualified_only_for_gb10(self) -> None:
         body = function_body(

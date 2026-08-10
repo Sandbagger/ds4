@@ -27363,6 +27363,49 @@ __global__ static void glm_poolside_q4_l2_rescale_kernel(
     }
 }
 
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor(
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *column_l2,
+        uint32_t expert_mid_dim,
+        uint64_t pair_count) {
+    if (!mid || !column_l2 || !mid->ptr || !column_l2->ptr ||
+        expert_mid_dim != 1024u || pair_count == 0u ||
+        pair_count > (uint64_t)INT_MAX ||
+        (((uintptr_t)mid->ptr) & (sizeof(float) - 1u)) != 0u ||
+        (((uintptr_t)column_l2->ptr) & (sizeof(float) - 1u)) != 0u ||
+        pair_count > UINT64_MAX / expert_mid_dim) {
+        return 0;
+    }
+    const uint64_t mid_values = pair_count * expert_mid_dim;
+    if (mid_values > UINT64_MAX / sizeof(float) ||
+        pair_count > UINT64_MAX / sizeof(float) ||
+        mid->bytes < mid_values * sizeof(float) ||
+        column_l2->bytes < pair_count * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(mid);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(column_l2) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "test Poolside Q4 L2 get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    /* The real 22-token layer has 220 pairs on GB10 and therefore uses
+     * Poolside's 128-thread SUM_ROWS topology.  Keep that topology when the
+     * frozen test isolates pair zero instead of reselecting from pair_count. */
+    glm_poolside_q4_l2_rescale_kernel<<<
+        (uint32_t)pair_count, 128u>>>(
+            (float *)mid->ptr, (float *)column_l2->ptr,
+            expert_mid_dim, pair_count);
+    return cuda_ok(cudaGetLastError(), "test Poolside Q4 L2 rescale");
+}
+#endif
+
 __global__ static void glm_poolside_q4_down_kernel(
         float *out,
         const char *down_base,

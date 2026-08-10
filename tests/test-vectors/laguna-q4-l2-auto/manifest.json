@@ -1,0 +1,63 @@
+{
+  "schema": "laguna-q4-l2-auto-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "capture": {
+    "flash_attention": "AUTO",
+    "layer": 1,
+    "tokens": 22,
+    "token_index": 0,
+    "slot": 0,
+    "expert_mid_dim": 1024,
+    "pair_count": 220,
+    "production_l2_threads": 128,
+    "probe_sha256": "3443de0df29bc90fc9c37183e6c0e20d1de0625f562f29bbd9b63ef441389f4e",
+    "poolside_callback_patch_sha256": "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6",
+    "callbacks": {
+      "mid-pair0.f32": "ffn_moe_swiglu-1",
+      "expected-col-l2-pair0.f32": "ffn_moe_col_l2-1",
+      "expected-down-input-pair0.f32": "ffn_moe_down_input-1"
+    },
+    "non_perturbation": {
+      "selected_sha256": "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183",
+      "weights_sha256": "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c",
+      "routed_output_sha256": "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083",
+      "layer_output_sha256": "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
+      "detail_capture_matches_prior_deep_capture": true
+    }
+  },
+  "cuda": {
+    "device": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "flags": [
+      "-std=c++17",
+      "-O3",
+      "-use_fast_math",
+      "--generate-code=arch=compute_121a,code=[sm_121a]",
+      "-extended-lambda",
+      "-compress-mode=size"
+    ]
+  },
+  "oracle": {
+    "column_l2_exact": true,
+    "down_input_exact": true,
+    "reduction_topology": "128-thread production SUM_ROWS tree"
+  },
+  "files": {
+    "mid-pair0.f32": {
+      "bytes": 4096,
+      "sha256": "803af6831f6c89df4bac4d788821aded26edd61e4742f1929d3e5feaf30fdece"
+    },
+    "expected-col-l2-pair0.f32": {
+      "bytes": 4,
+      "sha256": "7288027f7f191e69e6832ec1bc80ff2da99012560990cfc888032496fdd35778"
+    },
+    "expected-down-input-pair0.f32": {
+      "bytes": 4096,
+      "sha256": "c058fcac9dc6a95dbf0b3aa59bbcc84f28ae1f8233ed273d59eecda23a30d0a1"
+    }
+  }
+}

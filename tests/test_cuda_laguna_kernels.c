@@ -2548,6 +2548,122 @@ cleanup:
     return rc;
 }
 
+#define LAGUNA_Q4_L2_AUTO_FIXTURE_DIR \
+    "tests/test-vectors/laguna-q4-l2-auto"
+
+static void *laguna_read_q4_l2_frozen(
+        const char *name, size_t expected_bytes) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s", LAGUNA_Q4_L2_AUTO_FIXTURE_DIR, name);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path) ||
+        expected_bytes == 0u) {
+        fprintf(stderr, "q4-l2-frozen: invalid fixture path or size\n");
+        return NULL;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u || sizeof(float) != 4u) {
+        fprintf(stderr,
+                "q4-l2-frozen: little-endian float32 host is required\n");
+        return NULL;
+    }
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        fprintf(stderr, "q4-l2-frozen: cannot open %s\n", path);
+        return NULL;
+    }
+    if (fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr, "q4-l2-frozen: cannot seek %s\n", path);
+        fclose(stream);
+        return NULL;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (size_t)file_bytes != expected_bytes) {
+        fprintf(stderr,
+                "q4-l2-frozen: %s bytes=%ld expected=%zu\n",
+                path, file_bytes, expected_bytes);
+        fclose(stream);
+        return NULL;
+    }
+    rewind(stream);
+    void *data = malloc(expected_bytes);
+    if (!data || fread(data, 1u, expected_bytes, stream) != expected_bytes ||
+        ferror(stream)) {
+        fprintf(stderr, "q4-l2-frozen: cannot read %s\n", path);
+        free(data);
+        fclose(stream);
+        return NULL;
+    }
+    fclose(stream);
+    return data;
+}
+
+static int run_q4_l2_frozen_case(void) {
+    enum { expert_mid_dim = 1024 };
+    const size_t mid_bytes = expert_mid_dim * sizeof(float);
+    float *mid_input = (float *)laguna_read_q4_l2_frozen(
+        "mid-pair0.f32", mid_bytes);
+    float *column_l2_expected = (float *)laguna_read_q4_l2_frozen(
+        "expected-col-l2-pair0.f32", sizeof(float));
+    float *down_input_expected = (float *)laguna_read_q4_l2_frozen(
+        "expected-down-input-pair0.f32", mid_bytes);
+    float *down_input_actual = (float *)malloc(mid_bytes);
+    ds4_gpu_tensor *mid = NULL;
+    ds4_gpu_tensor *column_l2 = NULL;
+    float column_l2_actual = 0.0f;
+    int rc = 1;
+    if (!mid_input || !column_l2_expected || !down_input_expected ||
+        !down_input_actual) {
+        goto cleanup;
+    }
+    mid = ds4_gpu_tensor_alloc(mid_bytes);
+    column_l2 = ds4_gpu_tensor_alloc(sizeof(float));
+    if (!mid || !column_l2 ||
+        !ds4_gpu_tensor_write(mid, 0, mid_input, mid_bytes) ||
+        !ds4_gpu_test_glm_poolside_q4_l2_tensor(
+            mid, column_l2, expert_mid_dim, 1u) ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        !ds4_gpu_tensor_read(
+            column_l2, 0, &column_l2_actual, sizeof(column_l2_actual)) ||
+        !ds4_gpu_tensor_read(mid, 0, down_input_actual, mid_bytes)) {
+        fprintf(stderr, "q4-l2-frozen: CUDA execution failed\n");
+        goto cleanup;
+    }
+    uint32_t actual_bits = 0u;
+    uint32_t expected_bits = 0u;
+    memcpy(&actual_bits, &column_l2_actual, sizeof(actual_bits));
+    memcpy(&expected_bits, column_l2_expected, sizeof(expected_bits));
+    if (actual_bits != expected_bits) {
+        fprintf(stderr,
+                "q4-l2-frozen: column-l2 got=%a (0x%08x) "
+                "expected=%a (0x%08x)\n",
+                column_l2_actual, actual_bits,
+                column_l2_expected[0], expected_bits);
+        goto cleanup;
+    }
+    for (size_t i = 0; i < expert_mid_dim; i++) {
+        memcpy(&actual_bits, &down_input_actual[i], sizeof(actual_bits));
+        memcpy(&expected_bits, &down_input_expected[i], sizeof(expected_bits));
+        if (actual_bits != expected_bits) {
+            fprintf(stderr,
+                    "q4-l2-frozen: down-input[%zu] got=%a (0x%08x) "
+                    "expected=%a (0x%08x)\n",
+                    i, down_input_actual[i], actual_bits,
+                    down_input_expected[i], expected_bits);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+cleanup:
+    ds4_gpu_tensor_free(column_l2);
+    ds4_gpu_tensor_free(mid);
+    free(down_input_actual);
+    free(down_input_expected);
+    free(column_l2_expected);
+    free(mid_input);
+    return rc;
+}
+
 /* Independent Poolside Q4_K/Q8_1 routed-MoE semantic oracle.  Both
  * quantization boundaries belong here: a float-only reference would test a
  * different kernel.  Small batches use Poolside MMVQ quantization/minimum
@@ -3228,7 +3344,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|q4-mmq-frozen|routed-moe|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|routed-moe|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3239,6 +3355,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "prefill-attention-frozen") != 0 &&
          strcmp(argv[2], "router-frozen") != 0 &&
          strcmp(argv[2], "q4-mmq-frozen") != 0 &&
+         strcmp(argv[2], "q4-l2-frozen") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
          strcmp(argv[2], "poolside-q8") != 0 &&
          strcmp(argv[2], "all") != 0)) {
@@ -3258,6 +3375,9 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_q4_mmq_frozen =
         strcmp(argv[2], "q4-mmq-frozen") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_q4_l2_frozen =
+        strcmp(argv[2], "q4-l2-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
@@ -3354,6 +3474,9 @@ int main(int argc, char **argv) {
         rc = 1;
     }
     if (run_q4_mmq_frozen && run_q4_mmq_frozen_case() != 0) {
+        rc = 1;
+    }
+    if (run_q4_l2_frozen && run_q4_l2_frozen_case() != 0) {
         rc = 1;
     }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */

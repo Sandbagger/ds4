@@ -191,6 +191,12 @@ const void *ds4_gpu_test_laguna_compact_resolve_weight_ptr(
         uint64_t bytes,
         int logical_tier,
         const char *label);
+int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate_row,
+        const ds4_gpu_tensor *up_row,
+        const ds4_gpu_tensor *input,
+        uint32_t input_elements);
 #endif
 
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);

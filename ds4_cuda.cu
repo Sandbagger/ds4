@@ -27125,6 +27125,90 @@ static __global__ void glm_poolside_q8_1_mmq_quantize_kernel(
     }
 }
 
+#ifdef DS4_TEST_HOOKS
+__global__ static void glm_poolside_q4_mmq_gate_up_test_kernel(
+        float *out,
+        const cuda_block_q4_K *gate_row,
+        const cuda_block_q4_K *up_row,
+        const poolside_q8_1_block *input_q8,
+        uint32_t q4_blocks) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t block = 0; block < q4_blocks; block++) {
+        gate = __fadd_rn(gate, dev_dot_q4_K_q8_1_block(
+            gate_row + block, input_q8 + (uint64_t)block * 8u, true));
+        up = __fadd_rn(up, dev_dot_q4_K_q8_1_block(
+            up_row + block, input_q8 + (uint64_t)block * 8u, true));
+    }
+    out[0] = gate;
+    out[1] = up;
+    out[2] = __fmul_rn(gate / (1.0f + expf(-gate)), up);
+}
+
+extern "C" int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate_row,
+        const ds4_gpu_tensor *up_row,
+        const ds4_gpu_tensor *input,
+        uint32_t input_elements) {
+    if (!out || !gate_row || !up_row || !input ||
+        !out->ptr || !gate_row->ptr || !up_row->ptr || !input->ptr ||
+        input_elements == 0u || (input_elements & 255u) != 0u ||
+        (((uintptr_t)gate_row->ptr) & 15u) != 0u ||
+        (((uintptr_t)up_row->ptr) & 15u) != 0u ||
+        (((uintptr_t)input->ptr) & 15u) != 0u) {
+        return 0;
+    }
+    const uint32_t q4_blocks = input_elements / 256u;
+    const uint32_t q8_groups = input_elements / 32u;
+    const uint64_t row_bytes =
+        (uint64_t)q4_blocks * sizeof(cuda_block_q4_K);
+    const uint64_t q8_bytes =
+        (uint64_t)q8_groups * sizeof(poolside_q8_1_block);
+    if (out->bytes < 3u * sizeof(float) ||
+        gate_row->bytes < row_bytes || up_row->bytes < row_bytes ||
+        input->bytes < (uint64_t)input_elements * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(gate_row) != tier ||
+        ds4_tensor_device_idx(up_row) != tier ||
+        ds4_tensor_device_idx(input) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "test Poolside Q4 MMQ get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    static ds4_gpu_tensor *q8_scratch[DS4_MAX_GPUS] = {0};
+    if (!q8_scratch[tier] || q8_scratch[tier]->bytes < q8_bytes) {
+        ds4_gpu_tensor_free(q8_scratch[tier]);
+        q8_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, q8_bytes);
+    }
+    if (!q8_scratch[tier]) return 0;
+    glm_poolside_q8_1_mmq_quantize_kernel<<<
+        (q8_groups + 31u) / 32u, 256>>>(
+            (poolside_q8_1_block *)q8_scratch[tier]->ptr,
+            (const float *)input->ptr, q8_groups);
+    if (!cuda_ok(cudaGetLastError(),
+                 "test Poolside Q4 MMQ input quantize")) {
+        return 0;
+    }
+    glm_poolside_q4_mmq_gate_up_test_kernel<<<1, 1>>>(
+        (float *)out->ptr,
+        (const cuda_block_q4_K *)gate_row->ptr,
+        (const cuda_block_q4_K *)up_row->ptr,
+        (const poolside_q8_1_block *)q8_scratch[tier]->ptr,
+        q4_blocks);
+    return cuda_ok(cudaGetLastError(),
+                   "test Poolside Q4 MMQ gate up");
+}
+#endif
+
 __global__ static void glm_poolside_q4_gate_up_kernel(
         float *mid,
         const char *gate_base,

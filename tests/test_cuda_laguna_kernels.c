@@ -2419,6 +2419,135 @@ cleanup:
     return rc;
 }
 
+#define LAGUNA_Q4_MMQ_AUTO_FIXTURE_DIR \
+    "tests/test-vectors/laguna-q4-mmq-auto"
+
+static void *laguna_read_q4_mmq_frozen(
+        const char *name, size_t expected_bytes) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s", LAGUNA_Q4_MMQ_AUTO_FIXTURE_DIR, name);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path) ||
+        expected_bytes == 0u) {
+        fprintf(stderr, "q4-mmq-frozen: invalid fixture path or size\n");
+        return NULL;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u || sizeof(float) != 4u) {
+        fprintf(stderr,
+                "q4-mmq-frozen: little-endian float32 host is required\n");
+        return NULL;
+    }
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        fprintf(stderr, "q4-mmq-frozen: cannot open %s\n", path);
+        return NULL;
+    }
+    if (fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr, "q4-mmq-frozen: cannot seek %s\n", path);
+        fclose(stream);
+        return NULL;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (size_t)file_bytes != expected_bytes) {
+        fprintf(stderr,
+                "q4-mmq-frozen: %s bytes=%ld expected=%zu\n",
+                path, file_bytes, expected_bytes);
+        fclose(stream);
+        return NULL;
+    }
+    rewind(stream);
+    void *data = malloc(expected_bytes);
+    if (!data || fread(data, 1u, expected_bytes, stream) != expected_bytes ||
+        ferror(stream)) {
+        fprintf(stderr, "q4-mmq-frozen: cannot read %s\n", path);
+        free(data);
+        fclose(stream);
+        return NULL;
+    }
+    fclose(stream);
+    return data;
+}
+
+static int run_q4_mmq_frozen_case(void) {
+    enum {
+        input_elements = 3072,
+        q4_row_bytes = 12 * 144,
+        result_count = 3,
+    };
+    float *input = (float *)laguna_read_q4_mmq_frozen(
+        "input-token-00.f32", input_elements * sizeof(float));
+    void *gate_row = laguna_read_q4_mmq_frozen(
+        "expert-246-row-000-gate.q4k", q4_row_bytes);
+    void *up_row = laguna_read_q4_mmq_frozen(
+        "expert-246-row-000-up.q4k", q4_row_bytes);
+    float *gate_expected = (float *)laguna_read_q4_mmq_frozen(
+        "gate.f32", sizeof(float));
+    float *up_expected = (float *)laguna_read_q4_mmq_frozen(
+        "up.f32", sizeof(float));
+    float *swiglu_expected = (float *)laguna_read_q4_mmq_frozen(
+        "swiglu.f32", sizeof(float));
+    ds4_gpu_tensor *input_t = NULL;
+    ds4_gpu_tensor *gate_t = NULL;
+    ds4_gpu_tensor *up_t = NULL;
+    ds4_gpu_tensor *out_t = NULL;
+    float actual[result_count] = {0.0f, 0.0f, 0.0f};
+    int rc = 1;
+    if (!input || !gate_row || !up_row || !gate_expected || !up_expected ||
+        !swiglu_expected) {
+        goto cleanup;
+    }
+    const float expected[result_count] = {
+        gate_expected[0], up_expected[0], swiglu_expected[0]
+    };
+    input_t = ds4_gpu_tensor_alloc(input_elements * sizeof(float));
+    gate_t = ds4_gpu_tensor_alloc(q4_row_bytes);
+    up_t = ds4_gpu_tensor_alloc(q4_row_bytes);
+    out_t = ds4_gpu_tensor_alloc(result_count * sizeof(float));
+    if (!input_t || !gate_t || !up_t || !out_t ||
+        !ds4_gpu_tensor_write(
+            input_t, 0, input, input_elements * sizeof(float)) ||
+        !ds4_gpu_tensor_write(gate_t, 0, gate_row, q4_row_bytes) ||
+        !ds4_gpu_tensor_write(up_t, 0, up_row, q4_row_bytes) ||
+        !ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
+            out_t, gate_t, up_t, input_t, input_elements) ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        !ds4_gpu_tensor_read(
+            out_t, 0, actual, result_count * sizeof(float))) {
+        fprintf(stderr, "q4-mmq-frozen: CUDA execution failed\n");
+        goto cleanup;
+    }
+    static const char *const names[result_count] = {
+        "gate", "up", "swiglu"
+    };
+    for (size_t i = 0; i < result_count; i++) {
+        uint32_t actual_bits = 0u;
+        uint32_t expected_bits = 0u;
+        memcpy(&actual_bits, &actual[i], sizeof(actual_bits));
+        memcpy(&expected_bits, &expected[i], sizeof(expected_bits));
+        if (actual_bits != expected_bits) {
+            fprintf(stderr,
+                    "q4-mmq-frozen: %s got=%a (0x%08x) expected=%a (0x%08x)\n",
+                    names[i], actual[i], actual_bits,
+                    expected[i], expected_bits);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+cleanup:
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(up_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(input_t);
+    free(swiglu_expected);
+    free(up_expected);
+    free(gate_expected);
+    free(up_row);
+    free(gate_row);
+    free(input);
+    return rc;
+}
+
 /* Independent Poolside Q4_K/Q8_1 routed-MoE semantic oracle.  Both
  * quantization boundaries belong here: a float-only reference would test a
  * different kernel.  Small batches use Poolside MMVQ quantization/minimum
@@ -3079,7 +3208,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|routed-moe|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|q4-mmq-frozen|routed-moe|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3089,6 +3218,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "prefill-attention-frozen") != 0 &&
          strcmp(argv[2], "router-frozen") != 0 &&
+         strcmp(argv[2], "q4-mmq-frozen") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
          strcmp(argv[2], "poolside-q8") != 0 &&
          strcmp(argv[2], "all") != 0)) {
@@ -3105,6 +3235,9 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "prefill-attention-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_router_frozen = strcmp(argv[2], "router-frozen") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_q4_mmq_frozen =
+        strcmp(argv[2], "q4-mmq-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
@@ -3198,6 +3331,9 @@ int main(int argc, char **argv) {
         rc = 1;
     }
     if (run_router_frozen && run_router_frozen_case() != 0) {
+        rc = 1;
+    }
+    if (run_q4_mmq_frozen && run_q4_mmq_frozen_case() != 0) {
         rc = 1;
     }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */

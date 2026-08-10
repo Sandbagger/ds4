@@ -94,10 +94,36 @@ LAGUNA_ROUTER_AUTO_FILE_SIZES = {
     "layer-01-router-selected.i32": 22 * 10 * 4,
     "layer-01-router-weights.f32": 22 * 10 * 4,
 }
+LAGUNA_Q4_MMQ_AUTO_FIXTURE = ROOT / "tests/test-vectors/laguna-q4-mmq-auto"
+LAGUNA_Q4_MMQ_AUTO_FILES = {
+    "input-token-00.f32": (
+        12288,
+        "fdf4b1ac532fc5775d1af92bcfeb37d942b64fef1a76d31ec8c0813795834605",
+    ),
+    "expert-246-row-000-gate.q4k": (
+        1728,
+        "9e20e5fe216f7738b2169a3f00eade92660274db11ab2ccb2fab6358d39a1e3a",
+    ),
+    "expert-246-row-000-up.q4k": (
+        1728,
+        "63c63676594b44ff20a5b6e78289202bbe16c0aff97594b391ca2b930b2f2a8f",
+    ),
+    "gate.f32": (
+        4,
+        "eb0bbc325acdcc0cd9ed7f16b6738a199f30b4f4267de9d6cf1edd983a533f3c",
+    ),
+    "up.f32": (
+        4,
+        "5d1643e77e5b23d36619b309cccfa933b7e84483ce75e742fbb86919b2c96bca",
+    ),
+    "swiglu.f32": (
+        4,
+        "f6ea0e74779aa61d39171891d49c64a373b41aa5f67facf23d7577be79cb5eb6",
+    ),
+}
 
 STANDALONE_CUDA_TARGETS = (
     "tests/cuda_long_context_smoke",
-    "tests/test_cuda_laguna_kernels",
     "tests/test_gpu_xdev",
     "tests/test_gpu_model_cache",
     "tests/test_gpu_lookup_cache_strict",
@@ -525,6 +551,168 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn("run_router_frozen_case()", kernel_main)
 
+    def test_laguna_q4_mmq_auto_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_Q4_MMQ_AUTO_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["schema"], "laguna-q4-mmq-auto-fixture/v1")
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["model"],
+            {
+                "bytes": 68248759648,
+                "sha256": (
+                    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+                ),
+            },
+        )
+        capture = manifest["capture"]
+        self.assertEqual(
+            {key: capture[key] for key in (
+                "flash_attention", "layer", "tokens", "token_index",
+                "slot", "expert", "row", "probe_sha256",
+            )},
+            {
+                "flash_attention": "AUTO",
+                "layer": 1,
+                "tokens": 22,
+                "token_index": 0,
+                "slot": 0,
+                "expert": 246,
+                "row": 0,
+                "probe_sha256": (
+                    "43cfc41d0d5930e060ae7cb3536b13caca11ce505718913834970aee8533a67b"
+                ),
+            },
+        )
+        self.assertEqual(
+            capture["callbacks"],
+            {
+                "gate.f32": "ffn_moe_gate-1",
+                "up.f32": "ffn_moe_up-1",
+                "swiglu.f32": "ffn_moe_swiglu-1",
+            },
+        )
+        self.assertEqual(
+            capture["non_perturbation"],
+            {
+                "selected_sha256": (
+                    "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183"
+                ),
+                "weights_sha256": (
+                    "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c"
+                ),
+                "routed_output_sha256": (
+                    "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083"
+                ),
+                "layer_output_sha256": (
+                    "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e"
+                ),
+                "detail_capture_matches_endpoint_only": True,
+            },
+        )
+        self.assertEqual(
+            manifest["cuda"],
+            {
+                "device": "NVIDIA GB10",
+                "compute_capability": "12.1",
+                "batch_mode": "MMQ",
+                "data_layout": "MMA",
+                "flags": [
+                    "-std=c++17",
+                    "-O3",
+                    "-use_fast_math",
+                    "--generate-code=arch=compute_121a,code=[sm_121a]",
+                    "-extended-lambda",
+                    "-compress-mode=size",
+                ],
+            },
+        )
+        self.assertEqual(
+            manifest["weights"],
+            {
+                "type": "Q4_K",
+                "input_elements": 3072,
+                "blocks_per_row": 12,
+                "block_bytes": 144,
+                "row_bytes": 1728,
+                "expert_bytes": 1769472,
+                "gate": {
+                    "tensor": "blk.1.ffn_gate_exps.weight",
+                    "tensor_absolute_model_offset": 1349566304,
+                    "row_absolute_model_offset": 1784856416,
+                },
+                "up": {
+                    "tensor": "blk.1.ffn_up_exps.weight",
+                    "tensor_absolute_model_offset": 1809051488,
+                    "row_absolute_model_offset": 2244341600,
+                },
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"],
+            {"gate_exact": True, "up_exact": True, "swiglu_exact": True},
+        )
+        self.assertEqual(set(manifest["files"]), set(LAGUNA_Q4_MMQ_AUTO_FILES))
+        self.assertEqual(
+            {path.name for path in LAGUNA_Q4_MMQ_AUTO_FIXTURE.iterdir()},
+            set(LAGUNA_Q4_MMQ_AUTO_FILES) | {"manifest.json"},
+        )
+        for name, (expected_size, expected_sha256) in (
+            LAGUNA_Q4_MMQ_AUTO_FILES.items()
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    manifest["files"][name],
+                    {"bytes": expected_size, "sha256": expected_sha256},
+                )
+                payload = (LAGUNA_Q4_MMQ_AUTO_FIXTURE / name).read_bytes()
+                self.assertEqual(len(payload), expected_size)
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+
+        for required in (
+            '"q4-mmq-frozen"',
+            "run_q4_mmq_frozen_case",
+            "LAGUNA_Q4_MMQ_AUTO_FIXTURE_DIR",
+            '"input-token-00.f32"',
+            '"expert-246-row-000-gate.q4k"',
+            '"expert-246-row-000-up.q4k"',
+            '"gate.f32"',
+            '"up.f32"',
+            '"swiglu.f32"',
+        ):
+            self.assertIn(required, LAGUNA_KERNEL_TEST)
+        case_body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_q4_mmq_frozen_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn(
+            "ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(", case_body
+        )
+        self.assertIn("cudaDeviceSynchronize()", case_body)
+        self.assertIn("ds4_gpu_tensor_read(", case_body)
+        self.assertIn("actual_bits != expected_bits", case_body)
+        self.assertRegex(case_body, r"input_elements\s*=\s*3072")
+
+        hook_body = function_body(
+            'extern "C" int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor('
+        )
+        self.assertIn("glm_poolside_q8_1_mmq_quantize_kernel<<<", hook_body)
+        self.assertIn("glm_poolside_q4_mmq_gate_up_test_kernel<<<", hook_body)
+        hook_kernel = function_body(
+            "__global__ static void glm_poolside_q4_mmq_gate_up_test_kernel("
+        )
+        self.assertIn("dev_dot_q4_K_q8_1_block(", hook_kernel)
+
+        kernel_main = source_function_body(
+            LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
+        )
+        self.assertIn("run_q4_mmq_frozen_case()", kernel_main)
+
     def test_laguna_attention_auto_is_qualified_only_for_gb10(self) -> None:
         body = function_body(
             'extern "C" int ds4_gpu_laguna_attention_prefill_tensor('
@@ -551,6 +739,24 @@ class CudaBuildContractTest(unittest.TestCase):
         ).split()
         self.assertIn(hook_object, stream_objects)
         self.assertNotIn("ds4_cuda.o", stream_objects)
+
+    def test_laguna_kernel_links_q4_mmq_test_hooks(self) -> None:
+        hook_object = "tests/ds4_cuda_laguna_kernels_test_hooks.o"
+        self.assertIn("ds4_cuda.cu", rule_prerequisites(hook_object))
+        self.assertIn(
+            "-DDS4_TEST_HOOKS",
+            "\n".join(rule_recipe_lines(hook_object)),
+        )
+        self.assertIn(
+            "-DDS4_TEST_HOOKS",
+            "\n".join(rule_recipe_lines("tests/test_cuda_laguna_kernels.o")),
+        )
+        kernel_objects = rule_prerequisites(
+            "tests/test_cuda_laguna_kernels"
+        ).split()
+        self.assertIn(hook_object, kernel_objects)
+        self.assertIn("ds4_runtime.o", kernel_objects)
+        self.assertNotIn("ds4_cuda.o", kernel_objects)
 
     def test_compact_lifecycle_compile_units_track_identity_headers(self) -> None:
         cuda_prerequisites = rule_prerequisites("ds4_cuda.o")

@@ -266,9 +266,12 @@ tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_ru
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_cuda_laguna_kernels.o: tests/test_cuda_laguna_kernels.c ds4_gpu.h ds4_laguna_plan.h
-	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o ds4_cuda.o ds4_runtime.o
+tests/ds4_cuda_laguna_kernels_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
+	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_cuda.cu
+
+tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-kernels: tests/test_cuda_laguna_kernels

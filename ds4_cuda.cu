@@ -5572,6 +5572,52 @@ __global__ static void quantize_q8_0_f32_kernel(
     }
 }
 
+typedef struct {
+    __half d;
+    __half s;
+    int8_t qs[32];
+} poolside_q8_1_block;
+
+static_assert(sizeof(poolside_q8_1_block) == 36u,
+              "unexpected Poolside Q8_1 block size");
+
+/* Match Poolside llama.cpp's MMVQ activation quantizer.  A 256-thread CUDA
+ * block contains eight independent quantization warps; Q8_1 retains its
+ * FP16 scale even though Q8_0 dot products do not consume the sum field. */
+__launch_bounds__(256, 1)
+static __global__ void
+quantize_poolside_q8_1_f32_kernel(
+        poolside_q8_1_block *y,
+        const float *x,
+        uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const float xi = x[i];
+    float amax = fabsf(xi);
+    float sum = xi;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        amax = fmaxf(amax,
+                     __shfl_xor_sync(0xffffffffu, amax, offset, 32));
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(0xffffffffu, sum, offset, 32));
+    }
+
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : (int8_t)roundf(xi / d);
+    poolside_q8_1_block *block = y + i / 32u;
+    block->qs[lane] = q;
+    if (lane == 0u) {
+        block->d = __float2half_rn(d);
+        block->s = __float2half_rn(sum);
+    }
+}
+
 __global__ static void quantize_q8_0_group_slice_rows_kernel(
         int8_t *xq,
         float *xscale,
@@ -6548,6 +6594,60 @@ __device__ __forceinline__ static float poolside_q8_streamk_segment(
         acc = __fmaf_rn(weighted, xsr[b], acc);
     }
     return acc;
+}
+
+/* Poolside llama.cpp 04b2b72's one-token Q8_0 MMVQ topology for K >= 1024.
+ * Four warps split each Q8 block into eight-value quarters.  Warp zero then
+ * combines the other warp partials in source order before the XOR reduction. */
+__launch_bounds__(128, 1)
+static __global__ void
+matmul_q8_0_preq_poolside_mmvq1_kernel(
+        float *out,
+        const unsigned char *w,
+        const poolside_q8_1_block *xq,
+        uint32_t blocks) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = 32u * warp + lane;
+    const uint32_t quarter = tid & 3u;
+    const unsigned char *wr =
+        w + (uint64_t)row * blocks * 34u;
+    float partial = 0.0f;
+
+    for (uint32_t b = tid / 4u; b < blocks; b += 32u) {
+        const unsigned char *wb = wr + (uint64_t)b * 34u;
+        const uint32_t q = quarter * 8u;
+        int32_t dot = 0;
+        dot = __dp4a(load_i8x4_i32_unaligned(
+                         (const int8_t *)(wb + 2u) + q),
+                     load_i8x4_i32_aligned(xq[b].qs + q), dot);
+        dot = __dp4a(load_i8x4_i32_unaligned(
+                         (const int8_t *)(wb + 2u) + q + 4u),
+                     load_i8x4_i32_aligned(xq[b].qs + q + 4u), dot);
+        const float scale = __fmul_rn(
+            __half2float(*(const __half *)wb), __half2float(xq[b].d));
+        partial = __fmaf_rn(scale, __int2float_rn(dot), partial);
+    }
+
+    __shared__ float warp_partials[3][32];
+    if (warp > 0u) {
+        warp_partials[warp - 1u][lane] = partial;
+    }
+    __syncthreads();
+    if (warp > 0u) return;
+
+#pragma unroll
+    for (uint32_t other = 0u; other < 3u; other++) {
+        partial = __fadd_rn(partial, warp_partials[other][lane]);
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        partial = __fadd_rn(
+            partial,
+            __shfl_xor_sync(0xffffffffu, partial, offset, 32));
+    }
+    if (lane == 0u) out[row] = partial;
 }
 
 /* Exact numeric emulation of Poolside llama.cpp 04b2b72's Q8_0 Stream-K
@@ -13827,6 +13927,64 @@ extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint64_t              n_tok) {
+    if (out && x && model_map && in_dim >= 1024u && out_dim != 0u &&
+        (in_dim & 31u) == 0u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok == 1u) {
+        const uint64_t blocks = in_dim / 32u;
+        if (out_dim <= UINT64_MAX / (blocks * 34u)) {
+            const uint64_t weight_bytes = out_dim * blocks * 34u;
+            if (weight_offset <= model_size &&
+                weight_bytes <= model_size - weight_offset &&
+                x->bytes >= in_dim * sizeof(float) &&
+                out->bytes >= out_dim * sizeof(float)) {
+                const int logical_tier = ds4_tensor_device_idx(out);
+                const int physical_device =
+                    (g_n_gpus > 1 && logical_tier >= 0 &&
+                     logical_tier < g_n_gpus)
+                        ? g_gpu[logical_tier].device_id : 0;
+                int major = 0;
+                int minor = 0;
+                int nsm = 0;
+                if (cudaDeviceGetAttribute(
+                        &major, cudaDevAttrComputeCapabilityMajor,
+                        physical_device) == cudaSuccess &&
+                    cudaDeviceGetAttribute(
+                        &minor, cudaDevAttrComputeCapabilityMinor,
+                        physical_device) == cudaSuccess &&
+                    cudaDeviceGetAttribute(
+                        &nsm, cudaDevAttrMultiProcessorCount,
+                        physical_device) == cudaSuccess &&
+                    major == 12 && minor == 1 && nsm == 48) {
+                    const char *wptr = cuda_resolve_weight_ptr(
+                        model_map, weight_offset, weight_bytes, logical_tier,
+                        "laguna_poolside_q8_0");
+                    poolside_q8_1_block *xq =
+                        (poolside_q8_1_block *)cuda_tmp_alloc_on(
+                            logical_tier,
+                            blocks * sizeof(poolside_q8_1_block),
+                            "laguna poolside q8_1 MMVQ prequant");
+                    if (!wptr || !xq) return 0;
+                    quantize_poolside_q8_1_f32_kernel
+                        <<<(unsigned)((in_dim + 255u) / 256u), 256>>>(
+                            xq, (const float *)x->ptr, (uint32_t)in_dim);
+                    if (!cuda_ok(cudaGetLastError(),
+                                 "laguna poolside q8_1 MMVQ quantize launch")) {
+                        return 0;
+                    }
+                    const dim3 block(32u, 4u, 1u);
+                    matmul_q8_0_preq_poolside_mmvq1_kernel
+                        <<<(unsigned)out_dim, block>>>(
+                            (float *)out->ptr,
+                            (const unsigned char *)wptr,
+                            xq,
+                            (uint32_t)blocks);
+                    return cuda_ok(cudaGetLastError(),
+                                   "laguna poolside q8_0 MMVQ launch");
+                }
+                (void)cudaGetLastError();
+            }
+        }
+    }
     if (out && x && model_map && in_dim != 0u && out_dim != 0u &&
         (in_dim & 31u) == 0u && in_dim <= UINT32_MAX &&
         out_dim <= UINT32_MAX && n_tok == 22u) {

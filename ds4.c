@@ -48801,6 +48801,11 @@ static bool laguna_graph_forward_batch(
                 DS4_N_EMBD,
                 n_tokens,
                 DS4_RMS_EPS) != 0;
+        if (ok && il == 0) {
+            failed_stage = "attn-norm diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->attn_norm, n_tokens, DS4_N_EMBD, 0, "attn-norm");
+        }
         if (ok) {
             failed_stage = "Q projection";
             ok = laguna_graph_matmul(g->q,
@@ -48830,6 +48835,28 @@ static bool laguna_graph_forward_batch(
                                      g->attn_norm,
                                      n_tokens);
         }
+        if (ok && il == 0) {
+            failed_stage = "q-proj diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->q, n_tokens, n_head * DS4_N_HEAD_DIM, 0, "q-proj");
+        }
+        if (ok && il == 0) {
+            failed_stage = "k-proj diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->k, n_tokens,
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0, "k-proj");
+        }
+        if (ok && il == 0) {
+            failed_stage = "v-proj diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->v, n_tokens,
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0, "v-proj");
+        }
+        if (ok && il == 0) {
+            failed_stage = "gate-proj diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->gate, n_tokens, n_head, 0, "gate-proj");
+        }
         if (ok) {
             failed_stage = "Q norm/RoPE";
             ok = ds4_gpu_laguna_head_rms_norm_rope_tensor(
@@ -48850,6 +48877,11 @@ static bool laguna_graph_forward_batch(
                     beta_fast,
                     beta_slow,
                     DS4_RMS_EPS) != 0;
+        }
+        if (ok && il == 0) {
+            failed_stage = "q-rope diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->q, n_tokens, n_head * DS4_N_HEAD_DIM, 0, "q-rope");
         }
         if (ok) {
             failed_stage = "K norm/RoPE";
@@ -48872,6 +48904,12 @@ static bool laguna_graph_forward_batch(
                     beta_slow,
                     DS4_RMS_EPS) != 0;
         }
+        if (ok && il == 0) {
+            failed_stage = "k-rope diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->k, n_tokens,
+                    DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0, "k-rope");
+        }
         if (ok) {
             failed_stage = "causal attention";
             ok = ds4_gpu_laguna_attention_prefill_tensor(
@@ -48891,6 +48929,12 @@ static bool laguna_graph_forward_batch(
                     DS4_N_HEAD_KV,
                     DS4_N_HEAD_DIM,
                     1.0f / sqrtf((float)DS4_N_HEAD_DIM)) != 0;
+        }
+        if (ok && il == 0) {
+            failed_stage = "attn-gated diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->heads, n_tokens,
+                    n_head * DS4_N_HEAD_DIM, 0, "attn-gated");
         }
         if (ok) {
             failed_stage = "attention output projection";

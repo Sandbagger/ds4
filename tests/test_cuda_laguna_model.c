@@ -385,7 +385,7 @@ static bool run_short(ds4_engine *engine, const oracle_case *fixture) {
         }
         if (ok) {
             fprintf(stderr,
-                    "short-layer-diag PASS files=54 nonperturbing=bit-exact\n");
+                    "short-layer-diag PASS files=62 nonperturbing=bit-exact\n");
         }
         ds4_session_free(probed);
         ds4_session_free(baseline);

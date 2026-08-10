@@ -103,7 +103,9 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     const uint32_t n_tokens = 22u;
     const uint32_t q8_block = 32u;
     const uint32_t blocks = in_dim / q8_block;
-    const uint64_t model_bytes = (uint64_t)out_dim * blocks * 34u;
+    const uint64_t q8_bytes = (uint64_t)out_dim * blocks * 34u;
+    const uint64_t rms_weight_offset = q8_bytes;
+    const uint64_t model_bytes = q8_bytes + (uint64_t)in_dim * sizeof(float);
     const uint64_t input_count = (uint64_t)n_tokens * in_dim;
     const uint64_t output_count = (uint64_t)n_tokens * out_dim;
     const float amax = 0x1.36573ap-8f;
@@ -115,8 +117,12 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     unsigned char *model = NULL;
     float *input = NULL;
     float *actual = NULL;
+    float *rms_input = NULL;
+    float *rms_actual = NULL;
     ds4_gpu_tensor *x = NULL;
     ds4_gpu_tensor *out = NULL;
+    ds4_gpu_tensor *rms_x = NULL;
+    ds4_gpu_tensor *rms_out = NULL;
     int registered = 0;
     int rc = 1;
 
@@ -127,7 +133,9 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     model = (unsigned char *)calloc(1, (size_t)model_bytes);
     input = (float *)calloc((size_t)input_count, sizeof(*input));
     actual = (float *)malloc((size_t)output_count * sizeof(*actual));
-    if (!model || !input || !actual) {
+    rms_input = (float *)malloc((size_t)in_dim * sizeof(*rms_input));
+    rms_actual = (float *)malloc((size_t)in_dim * sizeof(*rms_actual));
+    if (!model || !input || !actual || !rms_input || !rms_actual) {
         fprintf(stderr, "poolside-q8: synthetic allocation failed\n");
         goto cleanup;
     }
@@ -143,6 +151,18 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
             }
         }
     }
+    for (uint32_t i = 0; i < in_dim; i++) {
+        const uint32_t sign = ((i * 13u) & 1u) << 31;
+        const uint32_t exponent = 120u + ((i * 7u + 3u) % 15u);
+        const uint32_t mantissa = (i * 2654435761u) & 0x007fffffu;
+        const uint32_t input_bits = sign | (exponent << 23) | mantissa;
+        const uint32_t weight_mantissa =
+            (i * 2246822519u) & 0x003fffffu;
+        const uint32_t weight_bits = (127u << 23) | weight_mantissa;
+        memcpy(&rms_input[i], &input_bits, sizeof(input_bits));
+        memcpy(model + rms_weight_offset + (uint64_t)i * sizeof(weight_bits),
+               &weight_bits, sizeof(weight_bits));
+    }
     for (uint32_t token = 0; token < n_tokens; token++) {
         for (uint32_t block = 0; block < blocks; block++) {
             float *values = input + (uint64_t)token * in_dim + block * q8_block;
@@ -157,6 +177,47 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     }
     registered = 1;
     *retained_model = model;
+    rms_x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(*rms_input));
+    rms_out = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(*rms_actual));
+    if (!rms_x || !rms_out ||
+        !ds4_gpu_tensor_write(rms_x, 0, rms_input,
+                              (uint64_t)in_dim * sizeof(*rms_input)) ||
+        !ds4_gpu_rms_norm_weight_rows_tensor(
+            rms_out, rms_x, model, model_bytes, rms_weight_offset,
+            in_dim, 1u, 1.0e-6f) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(rms_out, 0, rms_actual,
+                             (uint64_t)in_dim * sizeof(*rms_actual))) {
+        fprintf(stderr, "poolside-q8: CUDA RMSNorm setup failed\n");
+        goto cleanup;
+    }
+    /* Pinned from Poolside llama.cpp 04b2b72 on GB10: its n=3072 fused
+     * RMSNorm+weight kernel uses 1024 threads and a two-stage warp tree.
+     * Exact bits matter because one ULP here can flip the following Q8_1
+     * activation quantization at a rounding boundary. */
+    static const struct {
+        uint32_t index;
+        uint32_t expected_bits;
+    } rms_oracle[] = {
+        { 0u,    0x3a919cd6u }, { 1u,    0xbe8c106cu },
+        { 31u,   0xbe671747u }, { 32u,   0x3ac4fb45u },
+        { 255u,  0xbb08f16bu }, { 256u,  0x3e99a2c0u },
+        { 1023u, 0xbe140d8fu }, { 1024u, 0x3a2e2f42u },
+        { 2047u, 0xbcdff3b8u }, { 2048u, 0x4086ea6eu },
+        { 3071u, 0xbc23c9cau },
+    };
+    for (size_t i = 0; i < sizeof(rms_oracle) / sizeof(rms_oracle[0]); i++) {
+        uint32_t actual_bits = 0;
+        memcpy(&actual_bits, &rms_actual[rms_oracle[i].index],
+               sizeof(actual_bits));
+        if (actual_bits != rms_oracle[i].expected_bits) {
+            fprintf(stderr,
+                    "poolside-q8: RMSNorm[%u]=0x%08x expected=0x%08x\n",
+                    rms_oracle[i].index, actual_bits,
+                    rms_oracle[i].expected_bits);
+            goto cleanup;
+        }
+    }
     x = ds4_gpu_tensor_alloc(input_count * sizeof(*input));
     out = ds4_gpu_tensor_alloc(output_count * sizeof(*actual));
     if (!x || !out ||
@@ -183,8 +244,12 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     rc = 0;
 
 cleanup:
+    ds4_gpu_tensor_free(rms_out);
+    ds4_gpu_tensor_free(rms_x);
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
+    free(rms_actual);
+    free(rms_input);
     free(actual);
     free(input);
     if (!registered) free(model);

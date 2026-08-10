@@ -48270,9 +48270,15 @@ static bool laguna_graph_diag_dump_tensor(
     }
 
     char path[PATH_MAX];
-    const int path_len = layer < 0 ?
-        snprintf(path, sizeof(path), "%s/%s.f32", dir, stage) :
-        snprintf(path, sizeof(path), "%s/layer-%02d.f32", dir, layer);
+    int path_len = 0;
+    if (layer < 0) {
+        path_len = snprintf(path, sizeof(path), "%s/%s.f32", dir, stage);
+    } else if (strcmp(stage, "l_out") == 0) {
+        path_len = snprintf(path, sizeof(path), "%s/layer-%02d.f32", dir, layer);
+    } else {
+        path_len = snprintf(
+                path, sizeof(path), "%s/layer-%02d-%s.f32", dir, layer, stage);
+    }
     if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
         fprintf(stderr, "ds4: Laguna diagnostic path is too long\n");
         return false;
@@ -48894,12 +48900,22 @@ static bool laguna_graph_forward_batch(
                                      g->heads,
                                      n_tokens);
         }
+        if (ok && il == 0) {
+            failed_stage = "attn-o-proj diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->attn_out, n_tokens, DS4_N_EMBD, 0, "attn-o-proj");
+        }
         if (ok) {
             failed_stage = "attention residual";
             ok = ds4_gpu_add_tensor(g->after_attn,
                                     g->cur,
                                     g->attn_out,
                                     (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+        }
+        if (ok && il == 0) {
+            failed_stage = "ffn-inp diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->after_attn, n_tokens, DS4_N_EMBD, 0, "ffn-inp");
         }
         if (ok) {
             failed_stage = "FFN norm";
@@ -48912,6 +48928,11 @@ static bool laguna_graph_forward_batch(
                     DS4_N_EMBD,
                     n_tokens,
                     DS4_RMS_EPS) != 0;
+        }
+        if (ok && il == 0) {
+            failed_stage = "ffn-norm diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->ffn_norm, n_tokens, DS4_N_EMBD, 0, "ffn-norm");
         }
 
         if (ok && il < DS4_N_LEADING_DENSE) {
@@ -48943,6 +48964,11 @@ static bool laguna_graph_forward_batch(
                                          l->ffn_down,
                                          g->ffn_mid,
                                          n_tokens);
+            }
+            if (ok && il == 0) {
+                failed_stage = "ffn-out diagnostic";
+                ok = laguna_graph_diag_checkpoint(
+                        g->ffn_out, n_tokens, DS4_N_EMBD, 0, "ffn-out");
             }
             if (ok) {
                 failed_stage = "dense FFN residual";

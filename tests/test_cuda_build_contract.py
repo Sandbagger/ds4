@@ -262,10 +262,36 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         for required in (
             "cudaDevAttrComputeCapabilityMajor",
-            "compute_major >= 8",
             "cache_cap >= n_tokens",
         ):
             self.assertIn(required, CUDA_SOURCE)
+
+    def test_laguna_attention_auto_requires_compiled_wmma_body(self) -> None:
+        body = function_body(
+            'extern "C" int ds4_gpu_laguna_attention_prefill_tensor('
+        )
+        attribute_query = re.search(
+            r"cudaFuncGetAttributes\s*\(\s*&(?P<attributes>[A-Za-z_]\w*)\s*,"
+            r"\s*laguna_attention_prefill_auto_mma32_kernel\s*\)"
+            r"\s*==\s*cudaSuccess",
+            body,
+        )
+        self.assertIsNotNone(attribute_query)
+        attributes = re.escape(attribute_query.group("attributes"))
+        self.assertRegex(
+            body,
+            rf"\(\s*{attributes}\.binaryVersion\s*>=\s*70\s*\|\|\s*"
+            rf"{attributes}\.ptxVersion\s*>=\s*70\s*\)",
+        )
+
+    def test_laguna_attention_auto_is_qualified_only_for_gb10(self) -> None:
+        body = function_body(
+            'extern "C" int ds4_gpu_laguna_attention_prefill_tensor('
+        )
+        self.assertIn("cudaDevAttrComputeCapabilityMinor", body)
+        self.assertRegex(body, r"\bcompute_major\s*==\s*12\b")
+        self.assertRegex(body, r"\bcompute_minor\s*==\s*1\b")
+        self.assertNotRegex(body, r"\bcompute_major\s*>=\s*8\b")
 
     def test_laguna_stream_links_cuda_lifecycle_test_hooks(self) -> None:
         hook_object = "tests/ds4_cuda_laguna_stream_test_hooks.o"

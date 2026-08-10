@@ -201,17 +201,25 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn('"%s/layer-%02d.f32"', DS4_SOURCE)
         self.assertIn('"%s/layer-%02d-%s.f32"', DS4_SOURCE)
-        for tensor, stage in (
-            ("attn_out", "attn-o-proj"),
-            ("after_attn", "ffn-inp"),
-            ("ffn_norm", "ffn-norm"),
-            ("ffn_out", "ffn-out"),
+        for tensor, stage, width in (
+            ("attn_norm", "attn-norm", r"DS4_N_EMBD"),
+            ("q", "q-proj", r"n_head\s*\*\s*DS4_N_HEAD_DIM"),
+            ("k", "k-proj", r"DS4_N_HEAD_KV\s*\*\s*DS4_N_HEAD_DIM"),
+            ("v", "v-proj", r"DS4_N_HEAD_KV\s*\*\s*DS4_N_HEAD_DIM"),
+            ("gate", "gate-proj", r"n_head"),
+            ("q", "q-rope", r"n_head\s*\*\s*DS4_N_HEAD_DIM"),
+            ("k", "k-rope", r"DS4_N_HEAD_KV\s*\*\s*DS4_N_HEAD_DIM"),
+            ("heads", "attn-gated", r"n_head\s*\*\s*DS4_N_HEAD_DIM"),
+            ("attn_out", "attn-o-proj", r"DS4_N_EMBD"),
+            ("after_attn", "ffn-inp", r"DS4_N_EMBD"),
+            ("ffn_norm", "ffn-norm", r"DS4_N_EMBD"),
+            ("ffn_out", "ffn-out", r"DS4_N_EMBD"),
         ):
             self.assertRegex(
                 body,
                 rf"if \(ok && il == 0\) \{{\s*failed_stage = \"{stage} diagnostic\";"
                 rf"\s*ok = laguna_graph_diag_checkpoint\(\s*g->{tensor},"
-                rf"\s*n_tokens,\s*DS4_N_EMBD,\s*0,\s*\"{stage}\"\s*\);",
+                rf"\s*n_tokens,\s*{width},\s*0,\s*\"{stage}\"\s*\);",
             )
         self.assertRegex(
             body,
@@ -230,7 +238,7 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("DS4_LAGUNA_DIAG_DIR", LAGUNA_MODEL_TEST)
         self.assertIn("memcmp(baseline_logits, probed_logits, VECTOR_BYTES)",
                       LAGUNA_MODEL_TEST)
-        self.assertIn("short-layer-diag PASS files=54", LAGUNA_MODEL_TEST)
+        self.assertIn("short-layer-diag PASS files=62", LAGUNA_MODEL_TEST)
         run_short = source_function_body(
             LAGUNA_MODEL_TEST, "static bool run_short(",
             "tests/test_cuda_laguna_model.c"

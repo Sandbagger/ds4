@@ -338,7 +338,7 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     }
     if (!ds4_gpu_tensor_write(x, 0, input,
                               input_count * sizeof(*input)) ||
-        !ds4_gpu_matmul_q8_0_tensor(
+        !ds4_gpu_matmul_q8_0_poolside_tensor(
             out, model, model_bytes, mmq_weight_offset,
             in_dim, mmq_out_dim, x, n_tokens) ||
         !ds4_gpu_synchronize() ||

@@ -48229,6 +48229,16 @@ static bool laguna_graph_matmul(
                                           x,
                                           n_tokens) != 0;
     }
+    if (weight->type == DS4_TENSOR_Q8_0) {
+        return ds4_gpu_matmul_q8_0_poolside_tensor(out,
+                                                    model->map,
+                                                    model->size,
+                                                    weight->abs_offset,
+                                                    weight->dim[0],
+                                                    weight->dim[1],
+                                                    x,
+                                                    n_tokens) != 0;
+    }
     return ds4_gpu_matmul_quant_tensor(out,
                                        model->map,
                                        model->size,

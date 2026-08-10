@@ -133,6 +133,8 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             self.assertEqual(
                 set(report["layer0_checkpoints"]), set(LAYER0_STAGES)
             )
+            for stage, _, width in LAYER0_TARGETS:
+                self.assertEqual(report["layer0_checkpoints"][stage]["width"], width)
             for stage in LAYER0_STAGES[:-1]:
                 self.assertTrue(report["layer0_checkpoints"][stage]["exact_hash"])
             self.assertFalse(

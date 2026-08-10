@@ -19,20 +19,21 @@ LAYER_COUNT = 48
 FLOAT_SIZE = 4
 LAYER_VALUES = WIDTH * TOKENS
 LAYER_BYTES = LAYER_VALUES * FLOAT_SIZE
-LAYER0_STAGES = (
-    "attn-norm",
-    "q-proj",
-    "k-proj",
-    "v-proj",
-    "gate-proj",
-    "q-rope",
-    "k-rope",
-    "attn-gated",
-    "attn-o-proj",
-    "ffn-inp",
-    "ffn-norm",
-    "ffn-out",
-)
+LAYER0_WIDTHS = {
+    "attn-norm": 3072,
+    "q-proj": 6144,
+    "k-proj": 1024,
+    "v-proj": 1024,
+    "gate-proj": 48,
+    "q-rope": 6144,
+    "k-rope": 1024,
+    "attn-gated": 6144,
+    "attn-o-proj": 3072,
+    "ffn-inp": 3072,
+    "ffn-norm": 3072,
+    "ffn-out": 3072,
+}
+LAYER0_STAGES = tuple(LAYER0_WIDTHS)
 
 
 class DiagnosticError(RuntimeError):
@@ -185,13 +186,16 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
     for stage, pair in layer0_pairs.items():
         if pair is None:
             continue
-        result = metrics(*pair, LAYER_BYTES)
+        width = LAYER0_WIDTHS[stage]
+        expected_bytes = width * TOKENS * FLOAT_SIZE
+        result = metrics(*pair, expected_bytes)
         result["last_token"] = metrics(
             *pair,
-            LAYER_BYTES,
-            value_start=(TOKENS - 1) * WIDTH,
-            value_count=WIDTH,
+            expected_bytes,
+            value_start=(TOKENS - 1) * width,
+            value_count=width,
         )
+        result["width"] = width
         layer0_checkpoints[stage] = result
 
     layers: list[dict[str, Any]] = []

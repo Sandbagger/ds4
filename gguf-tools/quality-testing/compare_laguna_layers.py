@@ -19,6 +19,7 @@ LAYER_COUNT = 48
 FLOAT_SIZE = 4
 LAYER_VALUES = WIDTH * TOKENS
 LAYER_BYTES = LAYER_VALUES * FLOAT_SIZE
+LAYER0_STAGES = ("attn-o-proj", "ffn-inp", "ffn-norm", "ffn-out")
 
 
 class DiagnosticError(RuntimeError):
@@ -154,6 +155,32 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
             value_count=WIDTH,
         )
 
+    layer0_pairs = {
+        stage: optional_pair(
+            reference, candidate, f"layer-00-{stage}.f32"
+        )
+        for stage in LAYER0_STAGES
+    }
+    if any(pair is not None for pair in layer0_pairs.values()) and not all(
+        pair is not None for pair in layer0_pairs.values()
+    ):
+        missing = next(stage for stage, pair in layer0_pairs.items() if pair is None)
+        raise DiagnosticError(
+            f"incomplete layer-0 diagnostics: missing layer-00-{missing}.f32"
+        )
+    layer0_checkpoints: dict[str, dict[str, Any]] = {}
+    for stage, pair in layer0_pairs.items():
+        if pair is None:
+            continue
+        result = metrics(*pair, LAYER_BYTES)
+        result["last_token"] = metrics(
+            *pair,
+            LAYER_BYTES,
+            value_start=(TOKENS - 1) * WIDTH,
+            value_count=WIDTH,
+        )
+        layer0_checkpoints[stage] = result
+
     layers: list[dict[str, Any]] = []
     for layer in range(LAYER_COUNT):
         name = f"layer-{layer:02d}.f32"
@@ -195,10 +222,15 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
     if embedding is not None and not embedding["exact_hash"]:
         first_divergence = {"stage": "embd", "layer": None}
     else:
-        for result in layers:
+        for stage, result in layer0_checkpoints.items():
             if not result["exact_hash"]:
-                first_divergence = {"stage": "l_out", "layer": result["layer"]}
+                first_divergence = {"stage": stage, "layer": 0}
                 break
+        if first_divergence is None:
+            for result in layers:
+                if not result["exact_hash"]:
+                    first_divergence = {"stage": "l_out", "layer": result["layer"]}
+                    break
         if first_divergence is None and logits is not None and not logits["exact_hash"]:
             first_divergence = {"stage": "logits", "layer": None}
 
@@ -206,6 +238,7 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
         "schema": "laguna-layer-comparison/v1",
         "shape": {"width": WIDTH, "tokens": TOKENS},
         "embedding": embedding,
+        "layer0_checkpoints": layer0_checkpoints,
         "layers": layers,
         "logits": logits,
         "first_divergence": first_divergence,
@@ -216,6 +249,8 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
 def metric_rows(report: dict[str, Any]):
     if report["embedding"] is not None:
         yield "embd", report["embedding"]
+    for stage, result in report["layer0_checkpoints"].items():
+        yield f"l0-{stage}", result
     for result in report["layers"]:
         yield f"l_out-{result['layer']}", result
     if report["logits"] is not None:

@@ -166,11 +166,24 @@ static void write_f32_little_endian(const fs::path &path, const std::vector<floa
     }
 }
 
-enum class TargetKind { none, embedding, layer, logits };
+struct Layer0Target {
+    const char *callback;
+    const char *filename;
+};
+
+static constexpr std::array<Layer0Target, 4> kLayer0Targets = {{
+    {"attn_o_proj-0", "layer-00-attn-o-proj.f32"},
+    {"ffn_inp-0", "layer-00-ffn-inp.f32"},
+    {"ffn_norm-0", "layer-00-ffn-norm.f32"},
+    {"ffn_out-0", "layer-00-ffn-out.f32"},
+}};
+
+enum class TargetKind { none, embedding, layer, layer0, logits };
 
 struct Target {
     TargetKind kind = TargetKind::none;
     int layer = -1;
+    int layer0_target = -1;
 };
 
 static Target classify_target(const char *name) {
@@ -184,6 +197,11 @@ static Target classify_target(const char *name) {
     }
     if (std::strcmp(name, "result_output") == 0) {
         return {TargetKind::logits, -1};
+    }
+    for (size_t index = 0; index < kLayer0Targets.size(); index++) {
+        if (std::strcmp(name, kLayer0Targets[index].callback) == 0) {
+            return {TargetKind::layer0, 0, static_cast<int>(index)};
+        }
     }
 
     static constexpr const char *prefix = "l_out-";
@@ -213,6 +231,7 @@ struct ProbeState {
     int n_vocab = 0;
     bool embedding_seen = false;
     std::array<bool, kLayers> layer_seen{};
+    std::array<bool, kLayer0Targets.size()> layer0_seen{};
     bool logits_seen = false;
     std::string error;
 };
@@ -273,6 +292,21 @@ static void capture_target(ProbeState &state, ggml_tensor *tensor, Target target
             write_f32_little_endian(state.out / filename, values);
             break;
         }
+        case TargetKind::layer0: {
+            const size_t index = static_cast<size_t>(target.layer0_target);
+            if (index >= kLayer0Targets.size()) {
+                fail("invalid layer-0 diagnostic target");
+            }
+            const Layer0Target &checkpoint = kLayer0Targets[index];
+            if (state.layer0_seen[index]) {
+                fail("duplicate " + std::string(checkpoint.callback) + " callback");
+            }
+            state.layer0_seen[index] = true;
+            const std::vector<float> values =
+                copy_exact_tensor(tensor, checkpoint.callback, kWidth, kTokens);
+            write_f32_little_endian(state.out / checkpoint.filename, values);
+            break;
+        }
         case TargetKind::logits: {
             if (state.logits_seen) {
                 fail("duplicate result_output callback");
@@ -317,6 +351,12 @@ static void require_complete_capture(const ProbeState &state) {
     for (int layer = 0; layer < kLayers; layer++) {
         if (!state.layer_seen[layer]) {
             fail("l_out callback was not observed for layer " + std::to_string(layer));
+        }
+    }
+    for (size_t index = 0; index < kLayer0Targets.size(); index++) {
+        if (!state.layer0_seen[index]) {
+            fail(std::string(kLayer0Targets[index].callback) +
+                 " callback was not observed");
         }
     }
     if (!state.logits_seen) {
@@ -441,7 +481,8 @@ int main(int argc, char **argv) {
 
         llama_backend_free();
         backend_initialized = false;
-        std::printf("embedding=embd.f32\nlayers=48\nlogits=logits.f32\nout=%s\n",
+        std::printf("embedding=embd.f32\nlayer0_checkpoints=4\nlayers=48\n"
+                    "logits=logits.f32\nout=%s\n",
                     options.out.c_str());
         return 0;
     } catch (const std::exception &error) {

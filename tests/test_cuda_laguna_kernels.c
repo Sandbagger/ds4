@@ -2606,6 +2606,32 @@ static float laguna_q4k_q8_1_dot(
         const laguna_q4k_block *weights,
         const laguna_q8_1_block *input,
         int mmq) {
+    const float d = reference_f16_to_f32(weights->d);
+    const float dmin = reference_f16_to_f32(weights->dmin);
+    if (mmq) {
+        float sum = 0.0f;
+        for (uint32_t group = 0; group < LAGUNA_QK_K / 32u; group++) {
+            uint8_t scale, minimum;
+            laguna_q4k_scale_min(
+                group, weights->scales, &scale, &minimum);
+            int integer_sum = 0;
+            const uint32_t byte_offset = (group >> 1u) * 32u;
+            const uint32_t shift = (group & 1u) * 4u;
+            for (uint32_t i = 0; i < 32u; i++) {
+                integer_sum +=
+                    (int)((weights->qs[byte_offset + i] >> shift) & 0x0fu) *
+                    (int)input[group].qs[i];
+            }
+            const float scaled_d = reference_f16_to_f32(
+                reference_f32_to_f16(d * (float)scale));
+            const float scaled_min = reference_f16_to_f32(
+                reference_f32_to_f16(-dmin * (float)minimum));
+            sum += scaled_d * reference_f16_to_f32(input[group].d) *
+                (float)integer_sum;
+            sum += scaled_min * reference_f16_to_f32(input[group].s);
+        }
+        return sum;
+    }
     float scaled_sum = 0.0f;
     float minimum_sum = 0.0f;
     for (uint32_t group = 0; group < LAGUNA_QK_K / 32u; group++) {
@@ -2618,20 +2644,14 @@ static float laguna_q4k_q8_1_dot(
                 (int)input[group].qs[i];
         scaled_sum += reference_f16_to_f32(input[group].d) *
             (float)((int)scale * integer_sum);
-        if (mmq) {
-            minimum_sum += reference_f16_to_f32(input[group].s) *
-                (float)minimum;
-        } else {
-            int quantized_sum = 0;
-            for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
-                quantized_sum += input[group].qs[i];
-            }
-            minimum_sum += reference_f16_to_f32(input[group].d) *
-                (float)(quantized_sum * (int)minimum);
+        int quantized_sum = 0;
+        for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
+            quantized_sum += input[group].qs[i];
         }
+        minimum_sum += reference_f16_to_f32(input[group].d) *
+            (float)(quantized_sum * (int)minimum);
     }
-    return reference_f16_to_f32(weights->d) * scaled_sum -
-        reference_f16_to_f32(weights->dmin) * minimum_sum;
+    return d * scaled_sum - dmin * minimum_sum;
 }
 
 static void laguna_encode_q4k(laguna_q4k_block *out, uint32_t seed, float scale) {

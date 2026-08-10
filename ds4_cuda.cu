@@ -18112,15 +18112,12 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
-/* Algebraic Q4_K x Q8_1 block dot used by Poolside's two CUDA batch modes.
- * MMVQ reconstructs each minimum term from d*sum(q); MMQ consumes the
- * independently rounded half-precision sum stored beside each 32-value
- * group.  Keeping the distinction here prevents the resident decode path
- * from silently inheriting prompt-only MMQ arithmetic. */
-__device__ static float dev_dot_q4_K_q8_1_block(
+/* Poolside MMVQ reconstructs each minimum term from d*sum(q).  Prompt MMQ
+ * uses the separate MMA row accumulator below; keeping these helpers split
+ * prevents decode from silently inheriting prompt-only scale rounding. */
+__device__ static float dev_dot_q4_K_q8_1_mmvq_block(
         const cuda_block_q4_K *x,
-        const poolside_q8_1_block *y,
-        bool mmq) {
+        const poolside_q8_1_block *y) {
     const float xd = dev_f16_to_f32(x->d);
     const float xmin = dev_f16_to_f32(x->dmin);
     float scaled_sum = 0.0f;
@@ -18138,27 +18135,58 @@ __device__ static float dev_dot_q4_K_q8_1_block(
         scaled_sum = __fadd_rn(
             scaled_sum,
             __fmul_rn(d8, __int2float_rn((int32_t)scale * integer_dot)));
-        float minimum_term = 0.0f;
-        if (mmq) {
-            minimum_term = __fmul_rn(
-                __half2float(y[group].s), (float)minimum);
-        } else {
-            int32_t quantized_sum = 0;
+        int32_t quantized_sum = 0;
 #pragma unroll
-            for (uint32_t i = 0; i < 32u; i += 4u) {
-                quantized_sum = __dp4a(
-                    0x01010101,
-                    *(const int32_t *)(y[group].qs + i),
-                    quantized_sum);
-            }
-            minimum_term = __fmul_rn(
-                d8,
-                __int2float_rn(quantized_sum * (int32_t)minimum));
+        for (uint32_t i = 0; i < 32u; i += 4u) {
+            quantized_sum = __dp4a(
+                0x01010101,
+                *(const int32_t *)(y[group].qs + i),
+                quantized_sum);
         }
+        const float minimum_term = __fmul_rn(
+            d8,
+            __int2float_rn(quantized_sum * (int32_t)minimum));
         minimum_sum = __fadd_rn(minimum_sum, minimum_term);
     }
     return __fsub_rn(__fmul_rn(xd, scaled_sum),
                      __fmul_rn(xmin, minimum_sum));
+}
+
+/* Poolside's GB10 Q4_K MMQ loader folds each six-bit group scale into the
+ * block d/dmin pair in FP16 before MMA.  Its dot kernel then carries one
+ * float accumulator across the whole row, adding the scaled integer dot and
+ * minimum term separately for every 32-value group. */
+__device__ static float dev_dot_q4_K_q8_1_mma_row(
+        const cuda_block_q4_K *x,
+        const poolside_q8_1_block *y,
+        uint32_t q4_blocks) {
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < q4_blocks; block++) {
+        const cuda_block_q4_K *weight = x + block;
+        const float d = dev_f16_to_f32(weight->d);
+        const float dmin = dev_f16_to_f32(weight->dmin);
+#pragma unroll
+        for (uint32_t group = 0; group < 8u; group++) {
+            uint8_t scale = 0;
+            uint8_t minimum = 0;
+            dev_q4_K_get_scale_min(
+                group, weight->scales, &scale, &minimum);
+            const uint32_t byte_offset = (group >> 1u) * 32u;
+            const int shift = (group & 1u) ? 4 : 0;
+            const poolside_q8_1_block *activation =
+                y + (uint64_t)block * 8u + group;
+            const int32_t integer_dot = dev_dot_q4_32(
+                weight->qs + byte_offset, activation->qs, shift);
+            const float scaled_d = __half2float(__float2half_rn(
+                d * (float)scale));
+            const float scaled_min = __half2float(__float2half_rn(
+                -dmin * (float)minimum));
+            sum += scaled_d * __half2float(activation->d) *
+                (float)integer_dot;
+            sum += scaled_min * __half2float(activation->s);
+        }
+    }
+    return sum;
 }
 
 /* Vector-load variant of dev_dot_q4_K_q8_K_block: loads the whole 144-byte
@@ -27133,14 +27161,10 @@ __global__ static void glm_poolside_q4_mmq_gate_up_test_kernel(
         const poolside_q8_1_block *input_q8,
         uint32_t q4_blocks) {
     if (blockIdx.x != 0u || threadIdx.x != 0u) return;
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint32_t block = 0; block < q4_blocks; block++) {
-        gate = __fadd_rn(gate, dev_dot_q4_K_q8_1_block(
-            gate_row + block, input_q8 + (uint64_t)block * 8u, true));
-        up = __fadd_rn(up, dev_dot_q4_K_q8_1_block(
-            up_row + block, input_q8 + (uint64_t)block * 8u, true));
-    }
+    const float gate = dev_dot_q4_K_q8_1_mma_row(
+        gate_row, input_q8, q4_blocks);
+    const float up = dev_dot_q4_K_q8_1_mma_row(
+        up_row, input_q8, q4_blocks);
     out[0] = gate;
     out[1] = up;
     out[2] = __fmul_rn(gate / (1.0f + expf(-gate)), up);
@@ -27249,11 +27273,18 @@ __global__ static void glm_poolside_q4_gate_up_kernel(
         input_q8 + (uint64_t)token * input_q8_groups;
     float gate = 0.0f;
     float up = 0.0f;
-    for (uint32_t block = 0; block < input_q4_blocks; block++) {
-        gate = __fadd_rn(gate, dev_dot_q4_K_q8_1_block(
-            gate_row + block, input_row + (uint64_t)block * 8u, mmq));
-        up = __fadd_rn(up, dev_dot_q4_K_q8_1_block(
-            up_row + block, input_row + (uint64_t)block * 8u, mmq));
+    if (mmq) {
+        gate = dev_dot_q4_K_q8_1_mma_row(
+            gate_row, input_row, input_q4_blocks);
+        up = dev_dot_q4_K_q8_1_mma_row(
+            up_row, input_row, input_q4_blocks);
+    } else {
+        for (uint32_t block = 0; block < input_q4_blocks; block++) {
+            gate = __fadd_rn(gate, dev_dot_q4_K_q8_1_mmvq_block(
+                gate_row + block, input_row + (uint64_t)block * 8u));
+            up = __fadd_rn(up, dev_dot_q4_K_q8_1_mmvq_block(
+                up_row + block, input_row + (uint64_t)block * 8u));
+        }
     }
     const float activated = gate / (1.0f + expf(-gate));
     mid[(uint64_t)token * mid_token_stride +
@@ -27363,13 +27394,17 @@ __global__ static void glm_poolside_q4_down_kernel(
         const poolside_q8_1_block *mid_row =
             mid_q8 + pair * mid_q8_groups;
         float expert_value = 0.0f;
-        for (uint32_t block = 0; block < mid_q4_blocks; block++) {
-            expert_value = __fadd_rn(
-                expert_value,
-                dev_dot_q4_K_q8_1_block(
-                    down_row + block,
-                    mid_row + (uint64_t)block * 8u,
-                    mmq));
+        if (mmq) {
+            expert_value = dev_dot_q4_K_q8_1_mma_row(
+                down_row, mid_row, mid_q4_blocks);
+        } else {
+            for (uint32_t block = 0; block < mid_q4_blocks; block++) {
+                expert_value = __fadd_rn(
+                    expert_value,
+                    dev_dot_q4_K_q8_1_mmvq_block(
+                        down_row + block,
+                        mid_row + (uint64_t)block * 8u));
+            }
         }
         expert_value = __fmul_rn(expert_value, column_l2[pair]);
         expert_value = __fmul_rn(expert_value, 1.0f / 32768.0f);

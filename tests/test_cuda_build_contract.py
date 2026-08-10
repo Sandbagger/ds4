@@ -706,7 +706,26 @@ class CudaBuildContractTest(unittest.TestCase):
         hook_kernel = function_body(
             "__global__ static void glm_poolside_q4_mmq_gate_up_test_kernel("
         )
-        self.assertIn("dev_dot_q4_K_q8_1_block(", hook_kernel)
+        self.assertIn("dev_dot_q4_K_q8_1_mma_row(", hook_kernel)
+        mma_body = function_body(
+            "__device__ static float dev_dot_q4_K_q8_1_mma_row("
+        )
+        self.assertGreaterEqual(mma_body.count("__float2half_rn("), 2)
+        self.assertIn("-dmin * (float)minimum", mma_body)
+        self.assertRegex(mma_body, r"sum\s*\+=\s*scaled_d")
+        self.assertRegex(mma_body, r"sum\s*\+=\s*scaled_min")
+        gate_up_body = function_body(
+            "__global__ static void glm_poolside_q4_gate_up_kernel("
+        )
+        self.assertIn("if (mmq)", gate_up_body)
+        self.assertGreaterEqual(
+            gate_up_body.count("dev_dot_q4_K_q8_1_mma_row("), 2
+        )
+        down_body = function_body(
+            "__global__ static void glm_poolside_q4_down_kernel("
+        )
+        self.assertIn("if (mmq)", down_body)
+        self.assertIn("dev_dot_q4_K_q8_1_mma_row(", down_body)
 
         kernel_main = source_function_body(
             LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"

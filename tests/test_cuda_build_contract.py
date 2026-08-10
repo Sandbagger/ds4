@@ -867,6 +867,12 @@ class CudaBuildContractTest(unittest.TestCase):
             hook_body,
             r"glm_poolside_q4_l2_rescale_kernel<<<\s*\(uint32_t\)pair_count,\s*128u\s*>>>",
         )
+        l2_body = function_body(
+            "__global__ static void glm_poolside_q4_l2_rescale_kernel("
+        )
+        self.assertIn("const float scaled = __fmul_rn(", l2_body)
+        self.assertRegex(l2_body, r"mid\[offset\]\s*=\s*scaled\s*/\s*l2;")
+        self.assertNotIn("__fdiv_rn(", l2_body)
         kernel_main = source_function_body(
             LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
         )

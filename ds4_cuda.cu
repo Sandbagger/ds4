@@ -27358,8 +27358,8 @@ __global__ static void glm_poolside_q4_l2_rescale_kernel(
     const float l2 = warp_values[0];
     for (uint32_t i = column; i < expert_mid_dim; i += blockDim.x) {
         const uint64_t offset = pair * expert_mid_dim + i;
-        mid[offset] = __fdiv_rn(
-            __fmul_rn(mid[offset], 32768.0f), l2);
+        const float scaled = __fmul_rn(mid[offset], 32768.0f);
+        mid[offset] = scaled / l2;
     }
 }
 

@@ -13938,50 +13938,55 @@ extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
                 x->bytes >= in_dim * sizeof(float) &&
                 out->bytes >= out_dim * sizeof(float)) {
                 const int logical_tier = ds4_tensor_device_idx(out);
-                const int physical_device =
-                    (g_n_gpus > 1 && logical_tier >= 0 &&
-                     logical_tier < g_n_gpus)
-                        ? g_gpu[logical_tier].device_id : 0;
-                int major = 0;
-                int minor = 0;
-                int nsm = 0;
-                if (cudaDeviceGetAttribute(
-                        &major, cudaDevAttrComputeCapabilityMajor,
-                        physical_device) == cudaSuccess &&
-                    cudaDeviceGetAttribute(
-                        &minor, cudaDevAttrComputeCapabilityMinor,
-                        physical_device) == cudaSuccess &&
-                    cudaDeviceGetAttribute(
-                        &nsm, cudaDevAttrMultiProcessorCount,
-                        physical_device) == cudaSuccess &&
-                    major == 12 && minor == 1 && nsm == 48) {
-                    const char *wptr = cuda_resolve_weight_ptr(
-                        model_map, weight_offset, weight_bytes, logical_tier,
-                        "laguna_poolside_q8_0");
-                    poolside_q8_1_block *xq =
-                        (poolside_q8_1_block *)cuda_tmp_alloc_on(
-                            logical_tier,
-                            blocks * sizeof(poolside_q8_1_block),
-                            "laguna poolside q8_1 MMVQ prequant");
-                    if (!wptr || !xq) return 0;
-                    quantize_poolside_q8_1_f32_kernel
-                        <<<(unsigned)((in_dim + 255u) / 256u), 256>>>(
-                            xq, (const float *)x->ptr, (uint32_t)in_dim);
-                    if (!cuda_ok(cudaGetLastError(),
-                                 "laguna poolside q8_1 MMVQ quantize launch")) {
-                        return 0;
+                if (logical_tier >= 0 && logical_tier < g_n_gpus) {
+                    const int physical_device =
+                        g_gpu[logical_tier].device_id;
+                    int current_device = -1;
+                    int major = 0;
+                    int minor = 0;
+                    int nsm = 0;
+                    if (cudaGetDevice(&current_device) == cudaSuccess &&
+                        current_device == physical_device &&
+                        cudaDeviceGetAttribute(
+                            &major, cudaDevAttrComputeCapabilityMajor,
+                            physical_device) == cudaSuccess &&
+                        cudaDeviceGetAttribute(
+                            &minor, cudaDevAttrComputeCapabilityMinor,
+                            physical_device) == cudaSuccess &&
+                        cudaDeviceGetAttribute(
+                            &nsm, cudaDevAttrMultiProcessorCount,
+                            physical_device) == cudaSuccess &&
+                        major == 12 && minor == 1 && nsm == 48) {
+                        const char *wptr = cuda_resolve_weight_ptr(
+                            model_map, weight_offset, weight_bytes,
+                            logical_tier, "laguna_poolside_q8_0");
+                        poolside_q8_1_block *xq =
+                            (poolside_q8_1_block *)cuda_tmp_alloc_on(
+                                logical_tier,
+                                blocks * sizeof(poolside_q8_1_block),
+                                "laguna poolside q8_1 MMVQ prequant");
+                        if (!wptr || !xq) return 0;
+                        quantize_poolside_q8_1_f32_kernel
+                            <<<(unsigned)((in_dim + 255u) / 256u), 256>>>(
+                                xq, (const float *)x->ptr,
+                                (uint32_t)in_dim);
+                        if (!cuda_ok(
+                                cudaGetLastError(),
+                                "laguna poolside q8_1 MMVQ quantize launch")) {
+                            return 0;
+                        }
+                        const dim3 block(32u, 4u, 1u);
+                        matmul_q8_0_preq_poolside_mmvq1_kernel
+                            <<<(unsigned)out_dim, block>>>(
+                                (float *)out->ptr,
+                                (const unsigned char *)wptr,
+                                xq,
+                                (uint32_t)blocks);
+                        return cuda_ok(cudaGetLastError(),
+                                       "laguna poolside q8_0 MMVQ launch");
                     }
-                    const dim3 block(32u, 4u, 1u);
-                    matmul_q8_0_preq_poolside_mmvq1_kernel
-                        <<<(unsigned)out_dim, block>>>(
-                            (float *)out->ptr,
-                            (const unsigned char *)wptr,
-                            xq,
-                            (uint32_t)blocks);
-                    return cuda_ok(cudaGetLastError(),
-                                   "laguna poolside q8_0 MMVQ launch");
+                    (void)cudaGetLastError();
                 }
-                (void)cudaGetLastError();
             }
         }
     }

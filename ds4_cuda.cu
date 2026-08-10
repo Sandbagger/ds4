@@ -6531,39 +6531,6 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
     }
 }
 
-/* Poolside's CUDA MMQ path keeps one accumulator per output and visits Q8
- * blocks in ascending order. Laguna's 3072-wide projections have 96 blocks;
- * the generic DS4 fallback instead reduced 128 independently rounded terms
- * through shared memory, which differs by a few ULPs at every layer. */
-__global__ static void matmul_q8_0_preq_poolside3072_batch_kernel(
-        float *out,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t out_dim,
-        uint64_t n_tok,
-        int use_dp4a) {
-    const uint64_t row =
-        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t tok = blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-    const uint64_t blocks = 96u;
-    const unsigned char *wr = w + row * blocks * 34u;
-    const int8_t *xqr = xq + tok * blocks * 32u;
-    const float *xsr = xscale + tok * blocks;
-    float acc = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        const unsigned char *wb = wr + b * 34u;
-        const __half *scale_h = (const __half *)wb;
-        const int8_t *qs = (const int8_t *)(wb + 2u);
-        const int8_t *xqb = xqr + b * 32u;
-        const int dot = dot_i8_block(qs, xqb, 32u, use_dp4a);
-        const float scaled = __fmul_rn(__half2float(*scale_h), (float)dot);
-        acc = __fmaf_rn(scaled, xsr[b], acc);
-    }
-    out[tok * out_dim + row] = acc;
-}
-
 
 /* ---- INT8 tensor-core exact Q8_0 batch matmul --------------------------
  * Bit-identical replacement for the exact tok2/warp8-family batched Q8_0
@@ -13667,21 +13634,6 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks,
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
-    }
-    if (in_dim == 3072u && blocks == 96u &&
-        !(n_tok == 2u && g_glm_mtp_verify_mode)) {
-        dim3 poolside_grid(((unsigned)out_dim + 255u) / 256u,
-                           (unsigned)n_tok, 1u);
-        matmul_q8_0_preq_poolside3072_batch_kernel<<<poolside_grid, 256>>>(
-                (float *)out->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq,
-                xscale,
-                out_dim,
-                n_tok,
-                use_dp4a);
-        return cuda_ok(cudaGetLastError(),
-                       "matmul_q8_0 Poolside 3072 batch launch");
     }
     const bool force_decode_warp =
         n_tok == 2u && g_glm_mtp_verify_mode;

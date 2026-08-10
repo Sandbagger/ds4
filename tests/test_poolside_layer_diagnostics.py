@@ -18,7 +18,21 @@ TOKENS = 22
 LAYERS = 48
 VALUES_PER_LAYER = WIDTH * TOKENS
 BYTES_PER_LAYER = VALUES_PER_LAYER * 4
-LAYER0_STAGES = ("attn-o-proj", "ffn-inp", "ffn-norm", "ffn-out")
+LAYER0_TARGETS = (
+    ("attn-norm", "attn_norm-0"),
+    ("q-proj", "Qcur-0"),
+    ("k-proj", "Kcur-0"),
+    ("v-proj", "Vcur-0"),
+    ("gate-proj", "attn_gate_proj-0"),
+    ("q-rope", "Qcur_rope-0"),
+    ("k-rope", "Kcur_rope-0"),
+    ("attn-gated", "attn_gated-0"),
+    ("attn-o-proj", "attn_o_proj-0"),
+    ("ffn-inp", "ffn_inp-0"),
+    ("ffn-norm", "ffn_norm-0"),
+    ("ffn-out", "ffn_out-0"),
+)
+LAYER0_STAGES = tuple(stage for stage, _ in LAYER0_TARGETS)
 
 
 class PoolsideLayerDiagnosticsTest(unittest.TestCase):
@@ -52,8 +66,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         self.assertRegex(source, r"kWidth\s*=\s*3072")
         self.assertRegex(source, r"kTokens\s*=\s*22")
         self.assertRegex(source, r"kLayers\s*=\s*48")
-        for stage in LAYER0_STAGES:
-            callback = stage.replace("-", "_") + "-0"
+        for stage, callback in LAYER0_TARGETS:
             self.assertIn(f'"{callback}"', source)
             self.assertIn(f'"layer-00-{stage}.f32"', source)
 

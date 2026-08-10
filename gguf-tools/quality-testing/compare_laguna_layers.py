@@ -19,7 +19,20 @@ LAYER_COUNT = 48
 FLOAT_SIZE = 4
 LAYER_VALUES = WIDTH * TOKENS
 LAYER_BYTES = LAYER_VALUES * FLOAT_SIZE
-LAYER0_STAGES = ("attn-o-proj", "ffn-inp", "ffn-norm", "ffn-out")
+LAYER0_STAGES = (
+    "attn-norm",
+    "q-proj",
+    "k-proj",
+    "v-proj",
+    "gate-proj",
+    "q-rope",
+    "k-rope",
+    "attn-gated",
+    "attn-o-proj",
+    "ffn-inp",
+    "ffn-norm",
+    "ffn-out",
+)
 
 
 class DiagnosticError(RuntimeError):

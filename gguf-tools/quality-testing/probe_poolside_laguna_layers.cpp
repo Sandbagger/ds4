@@ -169,13 +169,24 @@ static void write_f32_little_endian(const fs::path &path, const std::vector<floa
 struct Layer0Target {
     const char *callback;
     const char *filename;
+    int64_t ne0;
+    int64_t ne1;
+    int64_t ne2;
 };
 
-static constexpr std::array<Layer0Target, 4> kLayer0Targets = {{
-    {"attn_o_proj-0", "layer-00-attn-o-proj.f32"},
-    {"ffn_inp-0", "layer-00-ffn-inp.f32"},
-    {"ffn_norm-0", "layer-00-ffn-norm.f32"},
-    {"ffn_out-0", "layer-00-ffn-out.f32"},
+static constexpr std::array<Layer0Target, 12> kLayer0Targets = {{
+    {"attn_norm-0", "layer-00-attn-norm.f32", 3072, 22, 1},
+    {"Qcur-0", "layer-00-q-proj.f32", 6144, 22, 1},
+    {"Kcur-0", "layer-00-k-proj.f32", 1024, 22, 1},
+    {"Vcur-0", "layer-00-v-proj.f32", 1024, 22, 1},
+    {"attn_gate_proj-0", "layer-00-gate-proj.f32", 48, 22, 1},
+    {"Qcur_rope-0", "layer-00-q-rope.f32", 128, 48, 22},
+    {"Kcur_rope-0", "layer-00-k-rope.f32", 128, 8, 22},
+    {"attn_gated-0", "layer-00-attn-gated.f32", 6144, 22, 1},
+    {"attn_o_proj-0", "layer-00-attn-o-proj.f32", 3072, 22, 1},
+    {"ffn_inp-0", "layer-00-ffn-inp.f32", 3072, 22, 1},
+    {"ffn_norm-0", "layer-00-ffn-norm.f32", 3072, 22, 1},
+    {"ffn_out-0", "layer-00-ffn-out.f32", 3072, 22, 1},
 }};
 
 enum class TargetKind { none, embedding, layer, layer0, logits };
@@ -186,7 +197,8 @@ struct Target {
     int layer0_target = -1;
 };
 
-static Target classify_target(const char *name) {
+static Target classify_target(const ggml_tensor *tensor) {
+    const char *name = tensor->name;
     if (std::strcmp(name, "embd") == 0) {
         return {TargetKind::embedding, -1};
     }
@@ -199,7 +211,10 @@ static Target classify_target(const char *name) {
         return {TargetKind::logits, -1};
     }
     for (size_t index = 0; index < kLayer0Targets.size(); index++) {
-        if (std::strcmp(name, kLayer0Targets[index].callback) == 0) {
+        const Layer0Target &checkpoint = kLayer0Targets[index];
+        if (std::strcmp(name, checkpoint.callback) == 0 &&
+            tensor->ne[0] == checkpoint.ne0 && tensor->ne[1] == checkpoint.ne1 &&
+            tensor->ne[2] == checkpoint.ne2 && tensor->ne[3] == 1) {
             return {TargetKind::layer0, 0, static_cast<int>(index)};
         }
     }
@@ -266,6 +281,25 @@ static std::vector<float> copy_exact_tensor(
     return values;
 }
 
+static std::vector<float> copy_layer0_tensor(
+        const ggml_tensor *tensor,
+        const Layer0Target &checkpoint) {
+    validate_f32_contiguous(tensor, checkpoint.callback);
+    if (tensor->ne[0] != checkpoint.ne0 || tensor->ne[1] != checkpoint.ne1 ||
+        tensor->ne[2] != checkpoint.ne2 || tensor->ne[3] != 1) {
+        fail(std::string(checkpoint.callback) + " has a noncanonical shape");
+    }
+    const size_t count = static_cast<size_t>(checkpoint.ne0) *
+                         static_cast<size_t>(checkpoint.ne1) *
+                         static_cast<size_t>(checkpoint.ne2);
+    if (ggml_nbytes(tensor) != count * sizeof(float)) {
+        fail(std::string(checkpoint.callback) + " has a noncanonical byte count");
+    }
+    std::vector<float> values(count);
+    ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+    return values;
+}
+
 static void capture_target(ProbeState &state, ggml_tensor *tensor, Target target) {
     switch (target.kind) {
         case TargetKind::embedding: {
@@ -303,7 +337,7 @@ static void capture_target(ProbeState &state, ggml_tensor *tensor, Target target
             }
             state.layer0_seen[index] = true;
             const std::vector<float> values =
-                copy_exact_tensor(tensor, checkpoint.callback, kWidth, kTokens);
+                copy_layer0_tensor(tensor, checkpoint);
             write_f32_little_endian(state.out / checkpoint.filename, values);
             break;
         }
@@ -324,7 +358,7 @@ static void capture_target(ProbeState &state, ggml_tensor *tensor, Target target
 
 static bool probe_callback(ggml_tensor *tensor, bool ask, void *user_data) {
     auto &state = *static_cast<ProbeState *>(user_data);
-    const Target target = classify_target(tensor->name);
+    const Target target = classify_target(tensor);
     if (ask) {
         return target.kind != TargetKind::none && state.error.empty();
     }
@@ -481,7 +515,7 @@ int main(int argc, char **argv) {
 
         llama_backend_free();
         backend_initialized = false;
-        std::printf("embedding=embd.f32\nlayer0_checkpoints=4\nlayers=48\n"
+        std::printf("embedding=embd.f32\nlayer0_checkpoints=12\nlayers=48\n"
                     "logits=logits.f32\nout=%s\n",
                     options.out.c_str());
         return 0;

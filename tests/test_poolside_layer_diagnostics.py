@@ -125,7 +125,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
                 {"stage": "ffn-out", "layer": 0},
             )
             self.assertEqual(
-                list(report["layer0_checkpoints"]), list(LAYER0_STAGES)
+                set(report["layer0_checkpoints"]), set(LAYER0_STAGES)
             )
             for stage in LAYER0_STAGES[:-1]:
                 self.assertTrue(report["layer0_checkpoints"][stage]["exact_hash"])

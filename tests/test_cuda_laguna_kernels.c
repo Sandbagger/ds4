@@ -153,8 +153,10 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     const uint64_t mmq_weight_offset = rounding_q8_bytes;
     const uint64_t mmq_q8_bytes = (uint64_t)mmq_out_dim * blocks * 34u;
     const uint64_t rms_weight_offset = mmq_weight_offset + mmq_q8_bytes;
-    const uint64_t model_bytes =
+    const uint64_t n1_weight_offset =
         rms_weight_offset + (uint64_t)in_dim * sizeof(float);
+    const uint64_t n1_q8_bytes = (uint64_t)mmq_out_dim * blocks * 34u;
+    const uint64_t model_bytes = n1_weight_offset + n1_q8_bytes;
     const uint64_t input_count = (uint64_t)n_tokens * in_dim;
     const uint64_t rounding_output_count =
         (uint64_t)n_tokens * rounding_out_dim;
@@ -244,6 +246,22 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
         memcpy(&rms_input[i], &input_bits, sizeof(input_bits));
         memcpy(model + rms_weight_offset + (uint64_t)i * sizeof(weight_bits),
                &weight_bits, sizeof(weight_bits));
+    }
+    for (uint32_t row = 0; row < mmq_out_dim; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            unsigned char *weight = model + n1_weight_offset +
+                ((uint64_t)row * blocks + block) * 34u;
+            const uint16_t scale =
+                poolside_mmq_weight_scale_bits(row, block);
+            memcpy(weight, &scale, sizeof(scale));
+            int8_t *values = (int8_t *)(weight + sizeof(scale));
+            for (uint32_t i = 0; i < q8_block; i++) {
+                values[i] = poolside_mmq_weight_q(row, block, i);
+            }
+            if (poolside_mmq_dot(values, 0u, block) == 0) {
+                values[0] += values[0] < 127 ? 1 : -1;
+            }
+        }
     }
     for (uint32_t token = 0; token < n_tokens; token++) {
         for (uint32_t block = 0; block < blocks; block++) {
@@ -389,6 +407,59 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
         fprintf(stderr,
                 "poolside-q8: MMQ hash=0x%016llx expected=0xc7f239af7daa6dc7\n",
                 (unsigned long long)mmq_hash);
+        goto cleanup;
+    }
+
+    if (!ds4_gpu_matmul_q8_0_poolside_tensor(
+            out, model, model_bytes, n1_weight_offset,
+            in_dim, mmq_out_dim, x, 1u) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, actual,
+                             mmq_out_dim * sizeof(*actual))) {
+        fprintf(stderr, "poolside-q8: CUDA MMVQ oracle projection failed\n");
+        goto cleanup;
+    }
+    /* Actual Poolside llama.cpp 04b2b72 MMVQ output on GB10.  Nsight shows
+     * that M=128 and Laguna's M=100352 output head use the same quantize_q8_1
+     * and four-warp mul_mat_vec_q topology; only grid.x changes. */
+    static const struct {
+        uint32_t row;
+        uint32_t expected_bits;
+    } mmvq_oracle[] = {
+        { 0u,   0xc5b97414u }, { 1u,   0xc9efea4cu },
+        { 7u,   0xc93e1019u }, { 8u,   0x4684d66bu },
+        { 15u,  0xc97f6f81u }, { 16u,  0xc6a0e206u },
+        { 31u,  0xc9f6e8d4u }, { 32u,  0xc87f397fu },
+        { 63u,  0x465786abu }, { 64u,  0x494a7e55u },
+        { 95u,  0x48534e3au }, { 96u,  0xc7008d0eu },
+        { 127u, 0x4b16b145u },
+    };
+    for (size_t i = 0; i < sizeof(mmvq_oracle) / sizeof(mmvq_oracle[0]); i++) {
+        uint32_t actual_bits = 0;
+        memcpy(&actual_bits, &actual[mmvq_oracle[i].row],
+               sizeof(actual_bits));
+        if (actual_bits != mmvq_oracle[i].expected_bits) {
+            fprintf(stderr,
+                    "poolside-q8: MMVQ row=%u got=0x%08x expected=0x%08x\n",
+                    mmvq_oracle[i].row, actual_bits,
+                    mmvq_oracle[i].expected_bits);
+            goto cleanup;
+        }
+    }
+    uint64_t mmvq_hash = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < mmq_out_dim; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, &actual[i], sizeof(bits));
+        for (uint32_t byte = 0; byte < 4u; byte++) {
+            mmvq_hash ^= (bits >> (byte * 8u)) & 0xffu;
+            mmvq_hash *= UINT64_C(1099511628211);
+        }
+    }
+    if (mmvq_hash != UINT64_C(0xa4a437a74a744282)) {
+        fprintf(stderr,
+                "poolside-q8: MMVQ hash=0x%016llx "
+                "expected=0xa4a437a74a744282\n",
+                (unsigned long long)mmvq_hash);
         goto cleanup;
     }
     rc = 0;

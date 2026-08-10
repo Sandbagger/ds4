@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = ROOT / "gguf-tools/quality-testing/probe_poolside_laguna_layers.cpp"
 COMPARATOR = ROOT / "gguf-tools/quality-testing/compare_laguna_layers.py"
+DS4_SOURCE = ROOT / "ds4.c"
 WIDTH = 3072
 TOKENS = 22
 LAYERS = 48
@@ -45,6 +46,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             "--tokens",
             "--out",
             "--flash-attn",
+            "--detail-layer",
             "cb_eval",
             "ggml_backend_tensor_get",
             "ggml_is_contiguous",
@@ -67,8 +69,26 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         self.assertRegex(source, r"kTokens\s*=\s*22")
         self.assertRegex(source, r"kLayers\s*=\s*48")
         for stage, callback, _ in LAYER0_TARGETS:
-            self.assertIn(f'"{callback}"', source)
-            self.assertIn(f'"layer-00-{stage}.f32"', source)
+            callback_base = callback.removesuffix("-0")
+            self.assertIn(f'"{callback_base}"', source)
+            self.assertIn(f'"{stage}"', source)
+
+    def test_detail_layer_selector_defaults_to_zero_in_both_generators(self):
+        probe_source = PROBE.read_text(encoding="utf-8")
+        ds4_source = DS4_SOURCE.read_text(encoding="utf-8")
+
+        self.assertRegex(probe_source, r"detail_layer\s*=\s*0")
+        self.assertIn("--detail-layer must be an integer from 0 through 47", probe_source)
+        self.assertIn('"layer-%02d-%s.f32"', probe_source)
+        self.assertIn("state.detail_layer", probe_source)
+
+        self.assertIn('getenv("DS4_LAGUNA_DIAG_LAYER")', ds4_source)
+        self.assertIn(
+            "DS4_LAGUNA_DIAG_LAYER must be an integer from 0 through 47",
+            ds4_source,
+        )
+        self.assertIn("laguna_graph_diag_detail_layer", ds4_source)
+        self.assertIn("il == (uint32_t)detail_layer", ds4_source)
 
     def test_comparator_reports_every_layer_and_the_first_exact_divergence(self):
         self.assertTrue(COMPARATOR.is_file(), f"missing comparator: {COMPARATOR}")

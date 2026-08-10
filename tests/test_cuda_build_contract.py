@@ -177,6 +177,33 @@ class CudaBuildContractTest(unittest.TestCase):
             r"\s*g->ffn_up,\s*DS4_N_FF_SHARED,\s*0\.0f,\s*1\.0f\s*\)",
         )
 
+    def test_laguna_batch_layer_probe_is_test_only_and_nonperturbing(self) -> None:
+        self.assertIn("#ifdef DS4_TEST_HOOKS", DS4_SOURCE)
+        self.assertIn("DS4_LAGUNA_DIAG_DIR", DS4_SOURCE)
+        self.assertIn("laguna_graph_diag_dump_tensor", DS4_SOURCE)
+
+        body = source_function_body(
+            DS4_SOURCE, "static bool laguna_graph_forward_batch(", "ds4.c"
+        )
+        self.assertRegex(
+            body,
+            r"laguna_graph_diag_checkpoint\(\s*g->cur,\s*n_tokens,"
+            r"\s*DS4_N_EMBD,\s*-1,\s*\"embd\"\s*\)",
+        )
+        layer_dump = body.find(
+            'laguna_graph_diag_checkpoint(\n                    g->next,\n'
+        )
+        layer_swap = body.find("ds4_gpu_tensor *tmp = g->cur;")
+        self.assertGreaterEqual(layer_dump, 0, "missing full layer-output probe")
+        self.assertGreater(layer_swap, layer_dump, "probe must precede cur/next swap")
+        self.assertIn(
+            "(uint64_t)n_tokens * width * sizeof(float)", DS4_SOURCE
+        )
+
+        self.assertIn("DS4_LAGUNA_DIAG_DIR", LAGUNA_MODEL_TEST)
+        self.assertIn("memcmp(baseline_logits, probed_logits, VECTOR_BYTES)",
+                      LAGUNA_MODEL_TEST)
+
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')
         preamble, separator, _ = body.partition("g_current_logical_tier = -1;")

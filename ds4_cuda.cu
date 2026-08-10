@@ -30551,10 +30551,36 @@ __global__ static void laguna_attention_prefill_auto_mma32_kernel(
                 float weight = 0.0f;
                 if (key <= row) {
                     weight = expf(score_sh[tid * max_keys + key] - max_score);
-                    sum += weight;
                 }
+                score_sh[tid * max_keys + key] = weight;
                 p_sh[tid * max_keys + key] = __float2half_rn(weight);
             }
+            /* Poolside's 16x16 MMA accumulator distributes each KQ row over
+             * four lanes.  Each lane owns two-key chunks eight keys apart;
+             * the final XOR reduction combines lanes 0+2, 1+3, then both.
+             * Preserve that association because its divisor feeds a Q8
+             * quantization boundary in the following O projection. */
+            float lane_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint32_t key0 = 0; key0 < max_keys; key0 += 16u) {
+                for (uint32_t lane_id = 0; lane_id < 4u; lane_id++) {
+                    const uint32_t key = key0 + 2u * lane_id;
+                    lane_sum[lane_id] = __fadd_rn(
+                        lane_sum[lane_id],
+                        score_sh[tid * max_keys + key]);
+                    lane_sum[lane_id] = __fadd_rn(
+                        lane_sum[lane_id],
+                        score_sh[tid * max_keys + key + 1u]);
+                    lane_sum[lane_id] = __fadd_rn(
+                        lane_sum[lane_id],
+                        score_sh[tid * max_keys + key + 8u]);
+                    lane_sum[lane_id] = __fadd_rn(
+                        lane_sum[lane_id],
+                        score_sh[tid * max_keys + key + 9u]);
+                }
+            }
+            const float sum02 = __fadd_rn(lane_sum[0], lane_sum[2]);
+            const float sum13 = __fadd_rn(lane_sum[1], lane_sum[3]);
+            sum = __fadd_rn(sum02, sum13);
         } else {
             for (uint32_t key = 0; key < max_keys; key++) {
                 p_sh[tid * max_keys + key] = __float2half_rn(0.0f);

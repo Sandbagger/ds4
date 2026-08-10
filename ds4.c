@@ -48319,7 +48319,7 @@ static bool laguna_graph_diag_checkpoint(
         const char           *stage) {
     const char *dir = getenv("DS4_LAGUNA_DIAG_DIR");
     if (!dir || !dir[0]) return true;
-    if (!ds4_gpu_commands_active() || ds4_gpu_end_commands() == 0) {
+    if (ds4_gpu_end_commands() == 0) {
         return false;
     }
     const bool dumped = laguna_graph_diag_dump_tensor(

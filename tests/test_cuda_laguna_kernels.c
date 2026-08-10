@@ -1918,16 +1918,17 @@ static float laguna_q4k_q8_1_dot(
                 (int)input[group].qs[i];
         scaled_sum += reference_f16_to_f32(input[group].d) *
             (float)((int)scale * integer_sum);
-        float minimum_input = reference_f16_to_f32(input[group].s);
-        if (!mmq) {
+        if (mmq) {
+            minimum_sum += reference_f16_to_f32(input[group].s) *
+                (float)minimum;
+        } else {
             int quantized_sum = 0;
             for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
                 quantized_sum += input[group].qs[i];
             }
-            minimum_input = reference_f16_to_f32(input[group].d) *
-                (float)quantized_sum;
+            minimum_sum += reference_f16_to_f32(input[group].d) *
+                (float)(quantized_sum * (int)minimum);
         }
-        minimum_sum += minimum_input * (float)minimum;
     }
     return reference_f16_to_f32(weights->d) * scaled_sum -
         reference_f16_to_f32(weights->dmin) * minimum_sum;

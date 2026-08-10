@@ -138,6 +138,8 @@ class CudaBuildContractTest(unittest.TestCase):
         for required in (
             '"prefill-attention-frozen"',
             "run_prefill_attention_frozen_case",
+            "run_prefill_attention_frozen_gqa9_case",
+            '"poolside-auto-t22-gqa9-derived"',
             "LAGUNA_ATTENTION_AUTO_FIXTURE_DIR",
             "22u, 256u, 48u, 8u",
             "5.0e-7f",

@@ -29,6 +29,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             "--model",
             "--tokens",
             "--out",
+            "--flash-attn",
             "cb_eval",
             "ggml_backend_tensor_get",
             "ggml_is_contiguous",
@@ -41,6 +42,9 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
             "embd.f32",
             "logits.f32",
             "duplicate",
+            "LLAMA_FLASH_ATTN_TYPE_AUTO",
+            "LLAMA_FLASH_ATTN_TYPE_DISABLED",
+            "context_params.flash_attn_type = options.flash_attn_type",
         ):
             self.assertIn(required, source)
 

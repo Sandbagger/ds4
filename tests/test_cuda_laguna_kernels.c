@@ -97,17 +97,68 @@ static float reference_f16_to_f32(uint16_t value) {
     return result;
 }
 
+static int8_t poolside_mmq_activation_q(uint32_t token, uint32_t block,
+                                        uint32_t i) {
+    if (i == 0u) return 127;
+    if (i == 1u) return -127;
+    uint32_t x = token * 0x9e3779b9u;
+    x ^= block * 0x85ebca6bu;
+    x ^= i * 0xc2b2ae35u;
+    x ^= x >> 16u;
+    return (int8_t)((int)(x % 255u) - 127);
+}
+
+static int8_t poolside_mmq_weight_q(uint32_t row, uint32_t block,
+                                    uint32_t i) {
+    uint32_t x = row * 0x27d4eb2du;
+    x ^= block * 0x165667b1u;
+    x ^= i * 0x9e3779b9u;
+    x ^= x >> 15u;
+    return (int8_t)((int)(x % 255u) - 127);
+}
+
+static uint16_t poolside_mmq_weight_scale_bits(uint32_t row,
+                                                uint32_t block) {
+    const int exponent = (int)((row * 7u + block * 11u) % 11u) - 7;
+    const uint16_t mantissa = (uint16_t)(1u +
+        ((row * 73u + block * 151u + 19u) % 1023u));
+    return (uint16_t)(((uint16_t)(exponent + 15) << 10u) | mantissa);
+}
+
+static float poolside_mmq_activation_scale(uint32_t token,
+                                            uint32_t block) {
+    const int exponent = (int)((token * 5u + block * 7u) % 13u) - 9;
+    return ldexpf(1.0f, exponent);
+}
+
+static int32_t poolside_mmq_dot(const int8_t *weight, uint32_t token,
+                                uint32_t block) {
+    int32_t dot = 0;
+    for (uint32_t i = 0; i < 32u; i++) {
+        dot += (int32_t)weight[i] *
+               (int32_t)poolside_mmq_activation_q(token, block, i);
+    }
+    return dot;
+}
+
 static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     const uint32_t in_dim = 3072u;
-    const uint32_t out_dim = 64u;
+    const uint32_t rounding_out_dim = 64u;
+    const uint32_t mmq_out_dim = 128u;
     const uint32_t n_tokens = 22u;
     const uint32_t q8_block = 32u;
     const uint32_t blocks = in_dim / q8_block;
-    const uint64_t q8_bytes = (uint64_t)out_dim * blocks * 34u;
-    const uint64_t rms_weight_offset = q8_bytes;
-    const uint64_t model_bytes = q8_bytes + (uint64_t)in_dim * sizeof(float);
+    const uint64_t rounding_q8_bytes =
+        (uint64_t)rounding_out_dim * blocks * 34u;
+    const uint64_t mmq_weight_offset = rounding_q8_bytes;
+    const uint64_t mmq_q8_bytes = (uint64_t)mmq_out_dim * blocks * 34u;
+    const uint64_t rms_weight_offset = mmq_weight_offset + mmq_q8_bytes;
+    const uint64_t model_bytes =
+        rms_weight_offset + (uint64_t)in_dim * sizeof(float);
     const uint64_t input_count = (uint64_t)n_tokens * in_dim;
-    const uint64_t output_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t rounding_output_count =
+        (uint64_t)n_tokens * rounding_out_dim;
+    const uint64_t output_count = (uint64_t)n_tokens * mmq_out_dim;
     const float amax = 0x1.36573ap-8f;
     const float selected = 0x1.0a5afep-9f;
     /* Poolside D4: d_inv=127/amax, q=round(x*d_inv), d=1/d_inv.
@@ -141,13 +192,44 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     }
 
     const uint16_t unit_scale = reference_f32_to_f16(1.0f);
-    for (uint32_t row = 0; row < out_dim; row++) {
+    for (uint32_t row = 0; row < rounding_out_dim; row++) {
         for (uint32_t block = 0; block < blocks; block++) {
             unsigned char *weight = model +
                 ((uint64_t)row * blocks + block) * 34u;
             memcpy(weight, &unit_scale, sizeof(unit_scale));
             if (block == 0u) {
                 ((int8_t *)(weight + sizeof(unit_scale)))[1] = 1;
+            }
+        }
+    }
+    for (uint32_t row = 0; row < mmq_out_dim; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            unsigned char *weight = model + mmq_weight_offset +
+                ((uint64_t)row * blocks + block) * 34u;
+            const uint16_t scale =
+                poolside_mmq_weight_scale_bits(row, block);
+            memcpy(weight, &scale, sizeof(scale));
+            int8_t *values = (int8_t *)(weight + sizeof(scale));
+            for (uint32_t i = 0; i < q8_block - 1u; i++) {
+                values[i] = poolside_mmq_weight_q(row, block, i);
+            }
+            int found = 0;
+            for (int candidate = -127; candidate <= 127 && !found;
+                 candidate++) {
+                values[q8_block - 1u] = (int8_t)candidate;
+                found = 1;
+                for (uint32_t token = 0; token < n_tokens; token++) {
+                    if (poolside_mmq_dot(values, token, block) == 0) {
+                        found = 0;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                fprintf(stderr,
+                        "poolside-q8: cannot make nonzero dot row=%u block=%u\n",
+                        row, block);
+                goto cleanup;
             }
         }
     }
@@ -223,14 +305,14 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
     if (!x || !out ||
         !ds4_gpu_tensor_write(x, 0, input, input_count * sizeof(*input)) ||
         !ds4_gpu_matmul_q8_0_tensor(out, model, model_bytes, 0u,
-                                    in_dim, out_dim, x, n_tokens) ||
+                                    in_dim, rounding_out_dim, x, n_tokens) ||
         !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(out, 0, actual,
-                             output_count * sizeof(*actual))) {
+                             rounding_output_count * sizeof(*actual))) {
         fprintf(stderr, "poolside-q8: CUDA projection failed\n");
         goto cleanup;
     }
-    for (uint64_t i = 0; i < output_count; i++) {
+    for (uint64_t i = 0; i < rounding_output_count; i++) {
         const float error = fabsf(actual[i] - expected);
         if (!isfinite(actual[i]) || error > tolerance) {
             fprintf(stderr,
@@ -240,6 +322,74 @@ static int run_poolside_q8_projection_case(unsigned char **retained_model) {
                     tolerance);
             goto cleanup;
         }
+    }
+
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            const float scale =
+                poolside_mmq_activation_scale(token, block);
+            float *values = input +
+                (uint64_t)token * in_dim + (uint64_t)block * q8_block;
+            for (uint32_t i = 0; i < q8_block; i++) {
+                values[i] = scale *
+                    (float)poolside_mmq_activation_q(token, block, i);
+            }
+        }
+    }
+    if (!ds4_gpu_tensor_write(x, 0, input,
+                              input_count * sizeof(*input)) ||
+        !ds4_gpu_matmul_q8_0_tensor(
+            out, model, model_bytes, mmq_weight_offset,
+            in_dim, mmq_out_dim, x, n_tokens) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, actual,
+                             output_count * sizeof(*actual))) {
+        fprintf(stderr, "poolside-q8: CUDA MMQ oracle projection failed\n");
+        goto cleanup;
+    }
+    /* Actual Poolside llama.cpp 04b2b72 backend output on GB10 for this
+     * K=3072, M=128, N=22 all-block-nonzero fixture. The result includes
+     * MMQ tile/register order and stream-K fixup association; a natural
+     * block-order or shared-tree reconstruction is not equivalent. */
+    static const struct {
+        uint32_t token;
+        uint32_t row;
+        uint32_t expected_bits;
+    } mmq_oracle[] = {
+        { 0u,  0u,   0xc5fed1aeu }, { 1u,  1u,   0xc908d915u },
+        { 7u,  7u,   0xc82216b0u }, { 8u,  8u,   0xc5c2eb89u },
+        { 15u, 63u,  0x467ca1d8u }, { 16u, 64u,  0xca0b5968u },
+        { 21u, 127u, 0xcad7f502u },
+    };
+    for (size_t i = 0; i < sizeof(mmq_oracle) / sizeof(mmq_oracle[0]); i++) {
+        const uint64_t index =
+            (uint64_t)mmq_oracle[i].token * mmq_out_dim +
+            mmq_oracle[i].row;
+        uint32_t actual_bits = 0;
+        memcpy(&actual_bits, &actual[index], sizeof(actual_bits));
+        if (actual_bits != mmq_oracle[i].expected_bits) {
+            fprintf(stderr,
+                    "poolside-q8: MMQ token=%u row=%u got=0x%08x "
+                    "expected=0x%08x\n",
+                    mmq_oracle[i].token, mmq_oracle[i].row,
+                    actual_bits, mmq_oracle[i].expected_bits);
+            goto cleanup;
+        }
+    }
+    uint64_t mmq_hash = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < output_count; i++) {
+        uint32_t bits = 0;
+        memcpy(&bits, &actual[i], sizeof(bits));
+        for (uint32_t byte = 0; byte < 4u; byte++) {
+            mmq_hash ^= (bits >> (byte * 8u)) & 0xffu;
+            mmq_hash *= UINT64_C(1099511628211);
+        }
+    }
+    if (mmq_hash != UINT64_C(0xc7f239af7daa6dc7)) {
+        fprintf(stderr,
+                "poolside-q8: MMQ hash=0x%016llx expected=0xc7f239af7daa6dc7\n",
+                (unsigned long long)mmq_hash);
+        goto cleanup;
     }
     rc = 0;
 

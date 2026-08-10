@@ -1802,6 +1802,58 @@ static float *laguna_read_frozen_f32(const char *name, uint64_t count) {
     return values;
 }
 
+#define LAGUNA_ATTENTION_AUTO_LONG_FIXTURE_DIR \
+    "tests/test-vectors/laguna-attention-auto-long"
+
+static float *laguna_read_long_frozen_f32(
+        const char *name, uint64_t count) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s",
+        LAGUNA_ATTENTION_AUTO_LONG_FIXTURE_DIR, name);
+    const uint64_t expected_bytes = count * sizeof(float);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path) ||
+        sizeof(float) != 4u) {
+        fprintf(stderr,
+                "prefill-attention-long-frozen: invalid fixture contract\n");
+        return NULL;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u) {
+        fprintf(stderr,
+                "prefill-attention-long-frozen: little-endian host is required\n");
+        return NULL;
+    }
+    FILE *stream = fopen(path, "rb");
+    if (!stream || fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr,
+                "prefill-attention-long-frozen: cannot open %s\n", path);
+        if (stream) fclose(stream);
+        return NULL;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (uint64_t)file_bytes != expected_bytes) {
+        fprintf(stderr,
+                "prefill-attention-long-frozen: %s bytes=%ld expected=%llu\n",
+                path, file_bytes, (unsigned long long)expected_bytes);
+        fclose(stream);
+        return NULL;
+    }
+    rewind(stream);
+    float *values = (float *)malloc((size_t)expected_bytes);
+    if (!values ||
+        fread(values, sizeof(*values), (size_t)count, stream) != count ||
+        ferror(stream)) {
+        fprintf(stderr,
+                "prefill-attention-long-frozen: cannot read %s\n", path);
+        free(values);
+        fclose(stream);
+        return NULL;
+    }
+    fclose(stream);
+    return values;
+}
+
 static float *laguna_frozen_qk_model_map;
 
 static int laguna_frozen_qk_exact(
@@ -2129,6 +2181,146 @@ cleanup:
     free(q_host);
     free(v_host);
     free(k_host);
+    return rc;
+}
+
+typedef struct {
+    const char *name;
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t first_q_head;
+    uint32_t first_kv_head;
+    const char *q_file;
+    const char *k_file;
+    const char *v_file;
+    const char *gate_file;
+    const char *expected_file;
+} laguna_long_attention_frozen_case;
+
+static int run_prefill_attention_long_frozen_case(
+        const laguna_long_attention_frozen_case *fixture) {
+    static const uint32_t n_head_kv = 8u;
+    static const uint32_t selected_heads = 2u;
+    static const uint32_t head_dim = 128u;
+    const uint32_t n_tokens = fixture->n_tokens;
+    const laguna_prefill_case c = {
+        fixture->name, 0u, n_tokens, 512u, fixture->n_head, n_head_kv,
+    };
+    const uint64_t q_count =
+        (uint64_t)n_tokens * fixture->n_head * head_dim;
+    const uint64_t kv_count =
+        (uint64_t)n_tokens * n_head_kv * head_dim;
+    const uint64_t gate_count = (uint64_t)n_tokens * fixture->n_head;
+    const uint64_t cache_count =
+        (uint64_t)c.cache_cap * n_head_kv * head_dim;
+    const uint64_t selected_q_count = selected_heads * head_dim;
+    const uint64_t selected_kv_count =
+        (uint64_t)n_tokens * selected_heads * head_dim;
+    float *selected_q = laguna_read_long_frozen_f32(
+        fixture->q_file, selected_q_count);
+    float *selected_k = laguna_read_long_frozen_f32(
+        fixture->k_file, selected_kv_count);
+    float *selected_v = laguna_read_long_frozen_f32(
+        fixture->v_file, selected_kv_count);
+    float *selected_gate = laguna_read_long_frozen_f32(
+        fixture->gate_file, selected_heads);
+    float *reference = laguna_read_long_frozen_f32(
+        fixture->expected_file, selected_q_count);
+    float *q_host = (float *)calloc((size_t)q_count, sizeof(*q_host));
+    float *k_host = (float *)calloc((size_t)kv_count, sizeof(*k_host));
+    float *v_host = (float *)calloc((size_t)kv_count, sizeof(*v_host));
+    float *gate_host =
+        (float *)calloc((size_t)gate_count, sizeof(*gate_host));
+    uint16_t *key_initial =
+        (uint16_t *)calloc((size_t)cache_count, sizeof(*key_initial));
+    uint16_t *value_initial =
+        (uint16_t *)calloc((size_t)cache_count, sizeof(*value_initial));
+    laguna_prefill_result actual = {0};
+    int rc = 1;
+
+    if (!selected_q || !selected_k || !selected_v || !selected_gate ||
+        !reference || !q_host || !k_host || !v_host || !gate_host ||
+        !key_initial || !value_initial ||
+        !laguna_prefill_result_init(&actual, q_count, cache_count)) {
+        fprintf(stderr,
+                "prefill-attention-long-frozen/%s: fixture setup failed\n",
+                fixture->name);
+        goto cleanup;
+    }
+    const uint64_t final_q_offset =
+        ((uint64_t)(n_tokens - 1u) * fixture->n_head +
+         fixture->first_q_head) * head_dim;
+    memcpy(q_host + final_q_offset, selected_q,
+           (size_t)selected_q_count * sizeof(*selected_q));
+    memcpy(gate_host +
+               (uint64_t)(n_tokens - 1u) * fixture->n_head +
+               fixture->first_q_head,
+           selected_gate, selected_heads * sizeof(*selected_gate));
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t source =
+            (uint64_t)token * selected_heads * head_dim;
+        const uint64_t destination =
+            ((uint64_t)token * n_head_kv + fixture->first_kv_head) * head_dim;
+        memcpy(k_host + destination, selected_k + source,
+               selected_heads * head_dim * sizeof(*selected_k));
+        memcpy(v_host + destination, selected_v + source,
+               selected_heads * head_dim * sizeof(*selected_v));
+    }
+    if (laguna_run_prefill_once(
+            &c, "poolside-auto-long", q_host, k_host, v_host, gate_host,
+            key_initial, value_initial, &actual) != 0 ||
+        !laguna_frozen_cache_matches(&c, &actual, k_host, v_host)) {
+        goto cleanup;
+    }
+    const laguna_parity_span span = {
+        "final-token-gqa-boundary", actual.heads + final_q_offset, reference,
+        selected_q_count, selected_heads, head_dim, 0.0f, 0.0f,
+    };
+    if (!laguna_parity_spans_within_limits(
+            fixture->name, &span, 1u, 1)) {
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    laguna_prefill_result_free(&actual);
+    free(value_initial);
+    free(key_initial);
+    free(gate_host);
+    free(v_host);
+    free(k_host);
+    free(q_host);
+    free(reference);
+    free(selected_gate);
+    free(selected_v);
+    free(selected_k);
+    free(selected_q);
+    return rc;
+}
+
+static int run_prefill_attention_long_frozen_cases(void) {
+    static const laguna_long_attention_frozen_case cases[] = {
+        {
+            "poolside-auto-layer0-t512-gqa6", 512u, 48u, 41u, 6u,
+            "layer-00-q-t511-h41-h42.f32",
+            "layer-00-k-t0-t511-kv6-kv7.f32",
+            "layer-00-v-t0-t511-kv6-kv7.f32",
+            "layer-00-gate-t511-h41-h42.f32",
+            "layer-00-attn-gated-t511-h41-h42.f32",
+        },
+        {
+            "poolside-auto-layer1-t64-gqa9", 64u, 72u, 62u, 6u,
+            "layer-01-q-t63-h62-h63.f32",
+            "layer-01-k-t0-t63-kv6-kv7.f32",
+            "layer-01-v-t0-t63-kv6-kv7.f32",
+            "layer-01-gate-t63-h62-h63.f32",
+            "layer-01-attn-gated-t63-h62-h63.f32",
+        },
+    };
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (run_prefill_attention_long_frozen_case(&cases[i]) != 0) rc = 1;
+    }
     return rc;
 }
 
@@ -3492,7 +3684,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3501,6 +3693,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "decode-attention") != 0 &&
          strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "prefill-attention-frozen") != 0 &&
+         strcmp(argv[2], "prefill-attention-long-frozen") != 0 &&
          strcmp(argv[2], "router-frozen") != 0 &&
          strcmp(argv[2], "q4-mmq-frozen") != 0 &&
          strcmp(argv[2], "q4-l2-frozen") != 0 &&
@@ -3520,6 +3713,9 @@ int main(int argc, char **argv) {
     const bool run_prefill_frozen =
         strcmp(argv[2], "prefill-attention-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
+    const bool run_prefill_long_frozen =
+        strcmp(argv[2], "prefill-attention-long-frozen") == 0 ||
+        strcmp(argv[2], "all") == 0;
     const bool run_router_frozen = strcmp(argv[2], "router-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_q4_mmq_frozen =
@@ -3535,8 +3731,8 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_poolside_q8 = strcmp(argv[2], "poolside-q8") == 0 ||
         strcmp(argv[2], "all") == 0;
-    if ((run_decode || run_prefill || run_prefill_frozen || run_routed_moe ||
-         run_poolside_q8) &&
+    if ((run_decode || run_prefill || run_prefill_frozen ||
+         run_prefill_long_frozen || run_routed_moe || run_poolside_q8) &&
         run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
         fprintf(stderr, "norm-rope: ds4_gpu_init failed\n");
@@ -3614,6 +3810,10 @@ int main(int argc, char **argv) {
     if (run_prefill_frozen) {
         if (run_prefill_attention_frozen_case() != 0) rc = 1;
         if (run_prefill_attention_frozen_gqa9_case() != 0) rc = 1;
+    }
+    if (run_prefill_long_frozen &&
+        run_prefill_attention_long_frozen_cases() != 0) {
+        rc = 1;
     }
     if (run_routed_moe && run_routed_moe_cases() != 0) {
         rc = 1;

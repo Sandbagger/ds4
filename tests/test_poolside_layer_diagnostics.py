@@ -78,13 +78,15 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         ds4_source = DS4_SOURCE.read_text(encoding="utf-8")
 
         self.assertRegex(probe_source, r"detail_layer\s*=\s*0")
-        self.assertIn("--detail-layer must be an integer from 0 through 47", probe_source)
+        self.assertIn("--detail-layer must be 0 or 1", probe_source)
+        self.assertIn("detail_head_count", probe_source)
+        self.assertRegex(probe_source, r"detail_layer\s*==\s*0\s*\?\s*48\s*:\s*72")
         self.assertIn('"layer-%02d-%s.f32"', probe_source)
         self.assertIn("state.detail_layer", probe_source)
 
         self.assertIn('getenv("DS4_LAGUNA_DIAG_LAYER")', ds4_source)
         self.assertIn(
-            "DS4_LAGUNA_DIAG_LAYER must be an integer from 0 through 47",
+            "DS4_LAGUNA_DIAG_LAYER must be 0 or 1",
             ds4_source,
         )
         self.assertIn("laguna_graph_diag_detail_layer", ds4_source)

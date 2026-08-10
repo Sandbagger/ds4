@@ -48272,8 +48272,7 @@ static bool laguna_graph_diag_dump_tensor(
     char path[PATH_MAX];
     const int path_len = layer < 0 ?
         snprintf(path, sizeof(path), "%s/%s.f32", dir, stage) :
-        snprintf(path, sizeof(path), "%s/layer-%02d-%s.f32",
-                 dir, layer, stage);
+        snprintf(path, sizeof(path), "%s/layer-%02d.f32", dir, layer);
     if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
         fprintf(stderr, "ds4: Laguna diagnostic path is too long\n");
         return false;
@@ -49132,6 +49131,11 @@ static bool laguna_graph_forward_batch(
                                      weights->output,
                                      g->output_norm,
                                      1);
+        }
+        if (ok) {
+            failed_stage = "logits diagnostic";
+            ok = laguna_graph_diag_checkpoint(
+                    g->logits, 1, DS4_N_VOCAB, -1, "logits");
         }
     }
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;

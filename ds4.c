@@ -48320,30 +48320,26 @@ static bool laguna_graph_forward_token(
                         n_head,
                         g->attn_norm) != 0;
             } else {
-                ok = ds4_gpu_matmul_q8_0_pair_tensor(
-                        g->q,
-                        g->k,
-                        model->map,
-                        model->size,
-                        l->attn_q->abs_offset,
-                        l->attn_k->abs_offset,
-                        DS4_N_EMBD,
-                        q_dim,
-                        DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
-                        g->attn_norm,
-                        1) != 0 &&
-                     ds4_gpu_matmul_q8_0_pair_tensor(
-                        g->v,
-                        g->gate,
-                        model->map,
-                        model->size,
-                        l->attn_v->abs_offset,
-                        l->attn_gate->abs_offset,
-                        DS4_N_EMBD,
-                        DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
-                        n_head,
-                        g->attn_norm,
-                        1) != 0;
+                ok = laguna_graph_matmul(g->q,
+                                         model,
+                                         l->attn_q,
+                                         g->attn_norm,
+                                         1) &&
+                     laguna_graph_matmul(g->k,
+                                         model,
+                                         l->attn_k,
+                                         g->attn_norm,
+                                         1) &&
+                     laguna_graph_matmul(g->v,
+                                         model,
+                                         l->attn_v,
+                                         g->attn_norm,
+                                         1) &&
+                     laguna_graph_matmul(g->gate,
+                                         model,
+                                         l->attn_gate,
+                                         g->attn_norm,
+                                         1);
             }
         }
         if (ok) {
@@ -48518,25 +48514,33 @@ static bool laguna_graph_forward_token(
                         il,
                         g->ffn_norm,
                         true) != 0;
-                if (ok) {
-                    ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
-                            g->ffn_mid,
-                            model->map,
-                            model->size,
-                            l->ffn_gate_shexp->abs_offset,
-                            l->ffn_up_shexp->abs_offset,
-                            DS4_N_EMBD,
-                            DS4_N_FF_SHARED,
-                            g->ffn_norm,
-                            0.0f) != 0;
-                }
-                if (ok) {
-                    ok = laguna_graph_matmul(g->shared_out,
-                                             model,
-                                             l->ffn_down_shexp,
-                                             g->ffn_mid,
-                                             1);
-                }
+            }
+            if (ok) {
+                ok = laguna_graph_matmul(g->ffn_gate,
+                                         model,
+                                         l->ffn_gate_shexp,
+                                         g->ffn_norm,
+                                         1) &&
+                     laguna_graph_matmul(g->ffn_up,
+                                         model,
+                                         l->ffn_up_shexp,
+                                         g->ffn_norm,
+                                         1);
+            }
+            if (ok) {
+                ok = ds4_gpu_swiglu_tensor(g->ffn_mid,
+                                            g->ffn_gate,
+                                            g->ffn_up,
+                                            DS4_N_FF_SHARED,
+                                            0.0f,
+                                            1.0f) != 0;
+            }
+            if (ok) {
+                ok = laguna_graph_matmul(g->shared_out,
+                                         model,
+                                         l->ffn_down_shexp,
+                                         g->ffn_mid,
+                                         1);
             }
             if (ok) {
                 ok = ds4_gpu_add3_tensor(g->next,

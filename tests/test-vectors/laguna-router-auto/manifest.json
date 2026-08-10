@@ -1,0 +1,92 @@
+{
+  "schema": "laguna-router-auto-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "capture": {
+    "flash_attention": "AUTO",
+    "layer": 1,
+    "tokens": 22,
+    "probe_sha256": "25d32aab221b08db63ceb5e03923e5ea9552e8d0419c05b3d13f66d15e22d7d5",
+    "callbacks": {
+      "layer-01-router-logits.f32": "ffn_moe_logits-1",
+      "layer-01-router-selected.i32": "ffn_moe_topk-1",
+      "layer-01-router-weights.f32": "ffn_moe_weights_scaled-1"
+    },
+    "fusion_preservation": {
+      "router_boundary": "ffn_moe_weights_scaled-1",
+      "deferred_tensor": "ffn_moe_topk-1",
+      "reason": "requesting top-k as its own evaluation boundary splits the CUDA fusion; the probe saves its tensor pointer and copies it only at the final scaled-weight boundary"
+    },
+    "determinism": {
+      "successful_runs": 1
+    }
+  },
+  "fused_oracle": {
+    "source": {
+      "router_kernel": "ggml/src/ggml-cuda/topk-moe.cu:80-254",
+      "warp_reduction": "ggml/src/ggml-cuda/common.cuh:447-452",
+      "producer_sha256": "f815b8ce87c62e1551535d3096aa65d858f06ae4eb9e94fd1ed9b5b3235c8689"
+    },
+    "cuda_flags": [
+      "-std=c++17",
+      "-O3",
+      "-use_fast_math",
+      "--generate-code=arch=compute_121a,code=[sm_121a]",
+      "-extended-lambda",
+      "-compress-mode=size"
+    ],
+    "inputs": [
+      "layer-01-router-logits.f32",
+      "layer-01-router-bias.f32"
+    ],
+    "outputs": [
+      "layer-01-router-selected.i32",
+      "layer-01-router-weights.f32"
+    ],
+    "determinism": {
+      "runs": 2,
+      "outputs_bit_exact": true,
+      "actual_poolside_capture_matches": true
+    }
+  },
+  "router": {
+    "experts": 256,
+    "experts_used": 10,
+    "weight_scale": 2.5,
+    "gating": "sigmoid",
+    "selection": "biased top-k",
+    "normalization": "Poolside CUDA tree reduction, reciprocal multiply, then scale multiply"
+  },
+  "bias": {
+    "tensor": "blk.1.exp_probs_b.bias",
+    "type": "F32",
+    "elements": 256,
+    "absolute_model_offset": 893238112
+  },
+  "oracle": {
+    "selected_ids_exact": true,
+    "weights_max_abs_limit": 0.0,
+    "weights_rms_limit": 0.0
+  },
+  "files": {
+    "layer-01-router-logits.f32": {
+      "bytes": 22528,
+      "sha256": "d49b4fb40d390ae8444e325fe588141bd34440efd5f8a9dc99fdf4125af9f60f"
+    },
+    "layer-01-router-bias.f32": {
+      "bytes": 1024,
+      "sha256": "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+    },
+    "layer-01-router-selected.i32": {
+      "bytes": 880,
+      "sha256": "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183"
+    },
+    "layer-01-router-weights.f32": {
+      "bytes": 880,
+      "sha256": "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c"
+    }
+  }
+}

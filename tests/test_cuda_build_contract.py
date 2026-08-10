@@ -87,6 +87,13 @@ LAGUNA_ATTENTION_AUTO_FILES = {
         "43db94735d75e338303e6632bf5c063070e6f5ab01fa797dd606906e23e7d20c",
     ),
 }
+LAGUNA_ROUTER_AUTO_FIXTURE = ROOT / "tests/test-vectors/laguna-router-auto"
+LAGUNA_ROUTER_AUTO_FILE_SIZES = {
+    "layer-01-router-logits.f32": 22 * 256 * 4,
+    "layer-01-router-bias.f32": 256 * 4,
+    "layer-01-router-selected.i32": 22 * 10 * 4,
+    "layer-01-router-weights.f32": 22 * 10 * 4,
+}
 
 STANDALONE_CUDA_TARGETS = (
     "tests/cuda_long_context_smoke",
@@ -357,6 +364,166 @@ class CudaBuildContractTest(unittest.TestCase):
             rf"\(\s*{attributes}\.binaryVersion\s*>=\s*70\s*\|\|\s*"
             rf"{attributes}\.ptxVersion\s*>=\s*70\s*\)",
         )
+
+    def test_laguna_router_auto_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_ROUTER_AUTO_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["schema"], "laguna-router-auto-fixture/v1")
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["model"],
+            {
+                "bytes": 68248759648,
+                "sha256": (
+                    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+                ),
+            },
+        )
+        self.assertEqual(manifest["capture"]["flash_attention"], "AUTO")
+        self.assertEqual(manifest["capture"]["layer"], 1)
+        self.assertEqual(manifest["capture"]["tokens"], 22)
+        self.assertRegex(manifest["capture"]["probe_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            manifest["capture"]["callbacks"],
+            {
+                "layer-01-router-logits.f32": "ffn_moe_logits-1",
+                "layer-01-router-selected.i32": "ffn_moe_topk-1",
+                "layer-01-router-weights.f32": "ffn_moe_weights_scaled-1",
+            },
+        )
+        self.assertEqual(
+            manifest["capture"]["fusion_preservation"],
+            {
+                "router_boundary": "ffn_moe_weights_scaled-1",
+                "deferred_tensor": "ffn_moe_topk-1",
+                "reason": (
+                    "requesting top-k as its own evaluation boundary splits the CUDA "
+                    "fusion; the probe saves its tensor pointer and copies it only at "
+                    "the final scaled-weight boundary"
+                ),
+            },
+        )
+        self.assertEqual(
+            manifest["capture"]["determinism"], {"successful_runs": 1}
+        )
+        self.assertEqual(
+            manifest["fused_oracle"],
+            {
+                "source": {
+                    "router_kernel": "ggml/src/ggml-cuda/topk-moe.cu:80-254",
+                    "warp_reduction": "ggml/src/ggml-cuda/common.cuh:447-452",
+                    "producer_sha256": (
+                        "f815b8ce87c62e1551535d3096aa65d858f06ae4eb9e94fd1ed9b5b3235c8689"
+                    ),
+                },
+                "cuda_flags": [
+                    "-std=c++17",
+                    "-O3",
+                    "-use_fast_math",
+                    "--generate-code=arch=compute_121a,code=[sm_121a]",
+                    "-extended-lambda",
+                    "-compress-mode=size",
+                ],
+                "inputs": [
+                    "layer-01-router-logits.f32",
+                    "layer-01-router-bias.f32",
+                ],
+                "outputs": [
+                    "layer-01-router-selected.i32",
+                    "layer-01-router-weights.f32",
+                ],
+                "determinism": {
+                    "runs": 2,
+                    "outputs_bit_exact": True,
+                    "actual_poolside_capture_matches": True,
+                },
+            },
+        )
+        self.assertEqual(
+            manifest["router"],
+            {
+                "experts": 256,
+                "experts_used": 10,
+                "weight_scale": 2.5,
+                "gating": "sigmoid",
+                "selection": "biased top-k",
+                "normalization": (
+                    "Poolside CUDA tree reduction, reciprocal multiply, then scale multiply"
+                ),
+            },
+        )
+        self.assertEqual(
+            manifest["bias"],
+            {
+                "tensor": "blk.1.exp_probs_b.bias",
+                "type": "F32",
+                "elements": 256,
+                "absolute_model_offset": 893238112,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"],
+            {
+                "selected_ids_exact": True,
+                "weights_max_abs_limit": 0.0,
+                "weights_rms_limit": 0.0,
+            },
+        )
+
+        self.assertEqual(
+            set(manifest["files"]), set(LAGUNA_ROUTER_AUTO_FILE_SIZES)
+        )
+        for name, expected_size in LAGUNA_ROUTER_AUTO_FILE_SIZES.items():
+            with self.subTest(name=name):
+                file_contract = manifest["files"][name]
+                self.assertEqual(file_contract["bytes"], expected_size)
+                self.assertRegex(file_contract["sha256"], r"^[0-9a-f]{64}$")
+                payload = (LAGUNA_ROUTER_AUTO_FIXTURE / name).read_bytes()
+                self.assertEqual(len(payload), expected_size)
+                self.assertEqual(
+                    hashlib.sha256(payload).hexdigest(),
+                    file_contract["sha256"],
+                )
+
+        for required in (
+            '"router-frozen"',
+            "run_router_frozen_case",
+            "LAGUNA_ROUTER_AUTO_FIXTURE_DIR",
+            '"layer-01-router-logits.f32"',
+            '"layer-01-router-bias.f32"',
+            '"layer-01-router-selected.i32"',
+            '"layer-01-router-weights.f32"',
+        ):
+            self.assertIn(required, LAGUNA_KERNEL_TEST)
+
+        router_body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_router_frozen_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn("ds4_gpu_glm_router_select_batch_tensor(", router_body)
+        self.assertIn("cudaDeviceSynchronize()", router_body)
+        self.assertIn("ds4_gpu_tensor_read(selected", router_body)
+        self.assertIn("ds4_gpu_tensor_read(weights", router_body)
+        self.assertRegex(
+            router_body,
+            r"memcmp\(\s*selected_actual,\s*selected_reference,",
+        )
+        self.assertRegex(
+            router_body,
+            r"memcmp\(\s*weights_actual,\s*weights_reference,",
+        )
+        self.assertRegex(router_body, r"\b0u,\s*logits,")
+        self.assertRegex(router_body, r"\b256u,\s*10u,\s*2\.5f,\s*22u")
+
+        kernel_main = source_function_body(
+            LAGUNA_KERNEL_TEST, "int main(", "tests/test_cuda_laguna_kernels.c"
+        )
+        self.assertIn("run_router_frozen_case()", kernel_main)
 
     def test_laguna_attention_auto_is_qualified_only_for_gb10(self) -> None:
         body = function_body(

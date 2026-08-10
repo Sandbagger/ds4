@@ -2244,6 +2244,181 @@ static int run_prefill_attention_cases(void) {
     return rc;
 }
 
+#define LAGUNA_ROUTER_AUTO_FIXTURE_DIR \
+    "tests/test-vectors/laguna-router-auto"
+
+static void *laguna_read_router_frozen(
+        const char *name, uint64_t count, size_t element_bytes) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s", LAGUNA_ROUTER_AUTO_FIXTURE_DIR, name);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+        fprintf(stderr, "router-frozen: fixture path is too long\n");
+        return NULL;
+    }
+    if (element_bytes != 4u || count > SIZE_MAX / element_bytes) {
+        fprintf(stderr, "router-frozen: invalid fixture element contract\n");
+        return NULL;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u) {
+        fprintf(stderr, "router-frozen: little-endian host is required\n");
+        return NULL;
+    }
+    const size_t expected_bytes = (size_t)count * element_bytes;
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        fprintf(stderr, "router-frozen: cannot open %s\n", path);
+        return NULL;
+    }
+    if (fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr, "router-frozen: cannot seek %s\n", path);
+        fclose(stream);
+        return NULL;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (uint64_t)file_bytes != expected_bytes) {
+        fprintf(stderr,
+                "router-frozen: %s bytes=%ld expected=%llu\n",
+                path, file_bytes, (unsigned long long)expected_bytes);
+        fclose(stream);
+        return NULL;
+    }
+    rewind(stream);
+
+    void *values = malloc(expected_bytes);
+    if (!values || fread(values, element_bytes, (size_t)count, stream) != count ||
+        ferror(stream)) {
+        fprintf(stderr, "router-frozen: cannot read %s\n", path);
+        free(values);
+        fclose(stream);
+        return NULL;
+    }
+    fclose(stream);
+    return values;
+}
+
+static float *laguna_frozen_router_model_map;
+
+static int run_router_frozen_case(void) {
+    const uint32_t n_tokens = 22u;
+    const uint32_t n_expert = 256u;
+    const uint32_t n_expert_used = 10u;
+    const uint64_t logits_count = (uint64_t)n_tokens * n_expert;
+    const uint64_t selected_count = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+    float *logits_reference = (float *)laguna_read_router_frozen(
+        "layer-01-router-logits.f32", logits_count, sizeof(float));
+    float *bias = (float *)laguna_read_router_frozen(
+        "layer-01-router-bias.f32", n_expert, sizeof(float));
+    int32_t *selected_reference = (int32_t *)laguna_read_router_frozen(
+        "layer-01-router-selected.i32", selected_count, sizeof(int32_t));
+    float *weights_reference = (float *)laguna_read_router_frozen(
+        "layer-01-router-weights.f32", selected_count, sizeof(float));
+    int32_t *selected_actual = (int32_t *)malloc(
+        (size_t)selected_count * sizeof(*selected_actual));
+    float *weights_actual = (float *)malloc(
+        (size_t)selected_count * sizeof(*weights_actual));
+    ds4_gpu_tensor *logits = NULL;
+    ds4_gpu_tensor *probs = NULL;
+    ds4_gpu_tensor *selected = NULL;
+    ds4_gpu_tensor *weights = NULL;
+    int rc = 1;
+
+    if (!logits_reference || !bias || !selected_reference ||
+        !weights_reference || !selected_actual || !weights_actual ||
+        laguna_frozen_router_model_map) {
+        fprintf(stderr, "router-frozen: fixture setup failed\n");
+        goto cleanup;
+    }
+    if (!ds4_gpu_set_model_map(bias, bias_bytes)) {
+        fprintf(stderr, "router-frozen: bias model-map setup failed\n");
+        goto cleanup;
+    }
+    laguna_frozen_router_model_map = bias;
+    bias = NULL;
+
+    logits = ds4_gpu_tensor_alloc(logits_count * sizeof(float));
+    probs = ds4_gpu_tensor_alloc(logits_count * sizeof(float));
+    selected = ds4_gpu_tensor_alloc(selected_count * sizeof(int32_t));
+    weights = ds4_gpu_tensor_alloc(selected_count * sizeof(float));
+    if (!logits || !probs || !selected || !weights ||
+        !ds4_gpu_tensor_write(logits, 0, logits_reference,
+                              logits_count * sizeof(float))) {
+        fprintf(stderr, "router-frozen: tensor setup failed\n");
+        goto cleanup;
+    }
+
+    const int wrapper_ok = ds4_gpu_glm_router_select_batch_tensor(
+        selected, weights, probs,
+        laguna_frozen_router_model_map, bias_bytes,
+        0u, logits, 256u, 10u, 2.5f, 22u);
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (!wrapper_ok || sync != cudaSuccess) {
+        fprintf(stderr, "router-frozen: wrapper=%d sync=%s\n",
+                wrapper_ok, cudaGetErrorString(sync));
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(selected, 0, selected_actual,
+                             selected_count * sizeof(*selected_actual)) ||
+        !ds4_gpu_tensor_read(weights, 0, weights_actual,
+                             selected_count * sizeof(*weights_actual))) {
+        fprintf(stderr, "router-frozen: output read failed\n");
+        goto cleanup;
+    }
+
+    const int selected_exact = memcmp(
+        selected_actual, selected_reference,
+        (size_t)selected_count * sizeof(*selected_actual)) == 0;
+    const int weights_exact = memcmp(
+        weights_actual, weights_reference,
+        (size_t)selected_count * sizeof(*weights_actual)) == 0;
+    if (!selected_exact) {
+        for (uint64_t i = 0; i < selected_count; i++) {
+            if (selected_actual[i] != selected_reference[i]) {
+                fprintf(stderr,
+                        "router-frozen: selected mismatch token=%llu slot=%llu got=%d expected=%d\n",
+                        (unsigned long long)(i / n_expert_used),
+                        (unsigned long long)(i % n_expert_used),
+                        selected_actual[i], selected_reference[i]);
+                break;
+            }
+        }
+    }
+    if (!weights_exact) {
+        for (uint64_t i = 0; i < selected_count; i++) {
+            uint32_t actual_bits = 0u;
+            uint32_t reference_bits = 0u;
+            memcpy(&actual_bits, &weights_actual[i], sizeof(actual_bits));
+            memcpy(&reference_bits, &weights_reference[i],
+                   sizeof(reference_bits));
+            if (actual_bits != reference_bits) {
+                fprintf(stderr,
+                        "router-frozen: weight mismatch token=%llu slot=%llu got=%a (0x%08x) expected=%a (0x%08x)\n",
+                        (unsigned long long)(i / n_expert_used),
+                        (unsigned long long)(i % n_expert_used),
+                        weights_actual[i], actual_bits,
+                        weights_reference[i], reference_bits);
+                break;
+            }
+        }
+    }
+    if (selected_exact && weights_exact) rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(probs);
+    ds4_gpu_tensor_free(logits);
+    free(weights_actual);
+    free(selected_actual);
+    free(weights_reference);
+    free(selected_reference);
+    free(bias);
+    free(logits_reference);
+    return rc;
+}
+
 /* Independent Poolside Q4_K/Q8_1 routed-MoE semantic oracle.  Both
  * quantization boundaries belong here: a float-only reference would test a
  * different kernel.  Small batches use Poolside MMVQ quantization/minimum
@@ -2904,7 +3079,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|routed-moe|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|router-frozen|routed-moe|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2913,6 +3088,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "decode-attention") != 0 &&
          strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "prefill-attention-frozen") != 0 &&
+         strcmp(argv[2], "router-frozen") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
          strcmp(argv[2], "poolside-q8") != 0 &&
          strcmp(argv[2], "all") != 0)) {
@@ -2927,6 +3103,8 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_prefill_frozen =
         strcmp(argv[2], "prefill-attention-frozen") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_router_frozen = strcmp(argv[2], "router-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
@@ -3019,9 +3197,13 @@ int main(int argc, char **argv) {
         run_poolside_q8_projection_case(&poolside_q8_model) != 0) {
         rc = 1;
     }
+    if (run_router_frozen && run_router_frozen_case() != 0) {
+        rc = 1;
+    }
     /* The model-map registration pins weights until GPU cleanup unregisters it. */
     ds4_gpu_cleanup();
     free(laguna_frozen_qk_model_map);
+    free(laguna_frozen_router_model_map);
     free(poolside_q8_model);
     free(weights);
     return rc;

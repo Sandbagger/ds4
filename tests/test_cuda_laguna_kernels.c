@@ -1848,9 +1848,12 @@ static int run_prefill_attention_cases(void) {
     return rc;
 }
 
-/* Independent Poolside Q4_K/Q8_1 routed-MoE oracle.  Both quantization
- * boundaries belong here: a float-only reference would test a different
- * kernel.  Poolside applies router weights after the down projection. */
+/* Independent Poolside Q4_K/Q8_1 routed-MoE semantic oracle.  Both
+ * quantization boundaries belong here: a float-only reference would test a
+ * different kernel.  Small batches use Poolside MMVQ quantization/minimum
+ * semantics; the 22-token prompt uses MMQ.  Kernel tile association remains
+ * covered by the pinned full-model oracle.  Poolside applies router weights
+ * after the down projection. */
 #define LAGUNA_QK_K 256u
 #define LAGUNA_QK8_1 32u
 #define LAGUNA_MOE_DIM 256u
@@ -1875,7 +1878,10 @@ static void laguna_q4k_scale_min(uint32_t group, const uint8_t *scales, uint8_t 
            *minimum = (scales[group + 4u] >> 4u) | ((scales[group] >> 6u) << 4u); }
 }
 
-static void laguna_quantize_q8_1(laguna_q8_1_block *out, const float *in) {
+static void laguna_quantize_q8_1(
+        laguna_q8_1_block *out,
+        const float *in,
+        int mmq) {
     for (uint32_t block = 0; block < LAGUNA_QK_K / LAGUNA_QK8_1; block++) {
         const float *row = in + block * LAGUNA_QK8_1;
         float amax = 0.0f;
@@ -1884,8 +1890,10 @@ static void laguna_quantize_q8_1(laguna_q8_1_block *out, const float *in) {
             amax = fmaxf(amax, fabsf(row[i]));
             sum += row[i];
         }
-        const float scale = amax / 127.0f;
-        const float inverse_scale = scale == 0.0f ? 0.0f : 1.0f / scale;
+        const float inverse_scale = amax == 0.0f ? 0.0f :
+            (mmq ? 127.0f / amax : 1.0f / (amax / 127.0f));
+        const float scale = inverse_scale == 0.0f ? 0.0f :
+            (mmq ? 1.0f / inverse_scale : amax / 127.0f);
         for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
             out[block].qs[i] = (int8_t)roundf(row[i] * inverse_scale);
         }
@@ -1896,7 +1904,8 @@ static void laguna_quantize_q8_1(laguna_q8_1_block *out, const float *in) {
 
 static float laguna_q4k_q8_1_dot(
         const laguna_q4k_block *weights,
-        const laguna_q8_1_block *input) {
+        const laguna_q8_1_block *input,
+        int mmq) {
     float scaled_sum = 0.0f;
     float minimum_sum = 0.0f;
     for (uint32_t group = 0; group < LAGUNA_QK_K / 32u; group++) {
@@ -1909,7 +1918,16 @@ static float laguna_q4k_q8_1_dot(
                 (int)input[group].qs[i];
         scaled_sum += reference_f16_to_f32(input[group].d) *
             (float)((int)scale * integer_sum);
-        minimum_sum += reference_f16_to_f32(input[group].s) * (float)minimum;
+        float minimum_input = reference_f16_to_f32(input[group].s);
+        if (!mmq) {
+            int quantized_sum = 0;
+            for (uint32_t i = 0; i < LAGUNA_QK8_1; i++) {
+                quantized_sum += input[group].qs[i];
+            }
+            minimum_input = reference_f16_to_f32(input[group].d) *
+                (float)quantized_sum;
+        }
+        minimum_sum += minimum_input * (float)minimum;
     }
     return reference_f16_to_f32(weights->d) * scaled_sum -
         reference_f16_to_f32(weights->dmin) * minimum_sum;
@@ -1935,7 +1953,10 @@ static void laguna_fill_q4k_matrix(laguna_q4k_block *matrix, uint32_t expert, ui
                            0.000005f * (float)((row + projection) % 11u));
 }
 
-static float laguna_silu(float value) { return value >= 0.0f ? value / (1.0f + expf(-value)) : expf(value) / (1.0f + expf(value)); }
+static float laguna_silu(float value) {
+    return value >= 0.0f ? value / (1.0f + expf(-value)) :
+        value * expf(value) / (1.0f + expf(value));
+}
 
 static void laguna_reference_routed_moe(
         float *out,
@@ -1948,11 +1969,14 @@ static void laguna_reference_routed_moe(
     const laguna_q4k_block *routed_gate = (const laguna_q4k_block *)(model + routed->gate_offset);
     const laguna_q4k_block *routed_up = (const laguna_q4k_block *)(model + routed->up_offset);
     const laguna_q4k_block *routed_down = (const laguna_q4k_block *)(model + routed->down_offset);
+    const int mmq = n_tokens > 8u;
     for (uint32_t token = 0; token < n_tokens; token++) {
         laguna_q8_1_block xq[LAGUNA_QK_K / LAGUNA_QK8_1];
         laguna_q8_1_block midq[LAGUNA_QK_K / LAGUNA_QK8_1];
         float mid[LAGUNA_MOE_DIM];
-        laguna_quantize_q8_1(xq, x + (uint64_t)token * LAGUNA_MOE_DIM);
+        laguna_quantize_q8_1(xq,
+                             x + (uint64_t)token * LAGUNA_MOE_DIM,
+                             mmq);
         memset(out + (uint64_t)token * LAGUNA_MOE_DIM, 0, LAGUNA_MOE_DIM * sizeof(*out));
         for (uint32_t slot = 0; slot < LAGUNA_MOE_USED; slot++) {
             const uint32_t expert = (uint32_t)selected[(uint64_t)token * LAGUNA_MOE_USED + slot];
@@ -1961,8 +1985,9 @@ static void laguna_reference_routed_moe(
             const laguna_q4k_block *up = routed_up + (uint64_t)expert * LAGUNA_MOE_DIM;
             const laguna_q4k_block *down = routed_down + (uint64_t)expert * LAGUNA_MOE_DIM;
             for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
-                mid[row] = laguna_silu(laguna_q4k_q8_1_dot(gate + row, xq)) *
-                    laguna_q4k_q8_1_dot(up + row, xq);
+                mid[row] = laguna_silu(
+                    laguna_q4k_q8_1_dot(gate + row, xq, mmq)) *
+                    laguna_q4k_q8_1_dot(up + row, xq, mmq);
             }
             float square_sum = 0.0f;
             for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
@@ -1971,15 +1996,17 @@ static void laguna_reference_routed_moe(
             float column_l2 = sqrtf(square_sum);
             if (column_l2 < 1.0e-8f) column_l2 = 1.0e-8f;
             if (column_l2 > 1.0e30f) column_l2 = 1.0e30f;
-            const float safe_scale = 32768.0f / column_l2;
             for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
-                mid[row] *= safe_scale;
+                mid[row] = (mid[row] * 32768.0f) / column_l2;
             }
-            laguna_quantize_q8_1(midq, mid);
+            laguna_quantize_q8_1(midq, mid, mmq);
             for (uint32_t row = 0; row < LAGUNA_MOE_DIM; row++) {
-                out[(uint64_t)token * LAGUNA_MOE_DIM + row] +=
-                    weight * (column_l2 / 32768.0f) *
-                    laguna_q4k_q8_1_dot(down + row, midq);
+                float expert_value =
+                    laguna_q4k_q8_1_dot(down + row, midq, mmq);
+                expert_value *= column_l2;
+                expert_value *= 1.0f / 32768.0f;
+                expert_value *= weight;
+                out[(uint64_t)token * LAGUNA_MOE_DIM + row] += expert_value;
             }
         }
     }
@@ -2224,15 +2251,20 @@ static int run_routed_moe_cases(void) {
     const uint64_t model_size = 3u * projection_bytes;
     unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
     float one_input[LAGUNA_MOE_DIM], growth_input[3u * LAGUNA_MOE_DIM];
+    float prompt_input[22u * LAGUNA_MOE_DIM];
     float reuse_input[LAGUNA_MOE_DIM];
     float one_reference[LAGUNA_MOE_DIM], growth_reference[3u * LAGUNA_MOE_DIM];
+    float prompt_reference[22u * LAGUNA_MOE_DIM];
     float reuse_reference[LAGUNA_MOE_DIM];
     int32_t one_selected[LAGUNA_MOE_USED], growth_selected[3u * LAGUNA_MOE_USED];
+    int32_t prompt_selected[22u * LAGUNA_MOE_USED];
     int32_t reuse_selected[LAGUNA_MOE_USED];
     float one_router[LAGUNA_MOE_USED], growth_router[3u * LAGUNA_MOE_USED];
+    float prompt_router[22u * LAGUNA_MOE_USED];
     float reuse_router[LAGUNA_MOE_USED];
     ds4_gpu_tensor *mid = NULL, *selected_t = NULL, *router_t = NULL, *x = NULL;
     laguna_guarded_output one_output = {0}, growth_output = {0};
+    laguna_guarded_output prompt_output = {0};
     laguna_tensor_snapshot snapshots[2] = {0};
     int rc = 1;
     if (run_routed_moe_selected_validation_case() != 0) return 1;
@@ -2254,27 +2286,33 @@ static int run_routed_moe_cases(void) {
     }
     laguna_fill_routed_case(one_input, one_selected, one_router, 1u, 1u);
     laguna_fill_routed_case(growth_input, growth_selected, growth_router, 3u, 7u);
+    laguna_fill_routed_case(prompt_input, prompt_selected, prompt_router, 22u, 13u);
     laguna_fill_routed_case(reuse_input, reuse_selected, reuse_router, 1u, 19u);
     laguna_reference_routed_moe(one_reference, model, &routed,
                                 one_selected, one_router, one_input, 1u);
     laguna_reference_routed_moe(growth_reference, model, &routed,
                                 growth_selected, growth_router, growth_input, 3u);
+    laguna_reference_routed_moe(prompt_reference, model, &routed,
+                                prompt_selected, prompt_router, prompt_input, 22u);
     laguna_reference_routed_moe(reuse_reference, model, &routed,
                                 reuse_selected, reuse_router, reuse_input, 1u);
     if (!laguna_reference_signal("one", one_reference, LAGUNA_MOE_DIM) ||
         !laguna_reference_signal("growth", growth_reference,
                                  3u * LAGUNA_MOE_DIM) ||
+        !laguna_reference_signal("prompt", prompt_reference,
+                                 22u * LAGUNA_MOE_DIM) ||
         !laguna_reference_signal("reuse", reuse_reference, LAGUNA_MOE_DIM)) {
         goto cleanup;
     }
     if (!ds4_gpu_set_model_map(model, model_size)) goto cleanup;
-    mid = ds4_gpu_tensor_alloc(3u * LAGUNA_MOE_USED * LAGUNA_MOE_DIM * sizeof(float));
-    selected_t = ds4_gpu_tensor_alloc(3u * LAGUNA_MOE_USED * sizeof(int32_t));
-    router_t = ds4_gpu_tensor_alloc(3u * LAGUNA_MOE_USED * sizeof(float));
-    x = ds4_gpu_tensor_alloc(3u * LAGUNA_MOE_DIM * sizeof(float));
+    mid = ds4_gpu_tensor_alloc(22u * LAGUNA_MOE_USED * LAGUNA_MOE_DIM * sizeof(float));
+    selected_t = ds4_gpu_tensor_alloc(22u * LAGUNA_MOE_USED * sizeof(int32_t));
+    router_t = ds4_gpu_tensor_alloc(22u * LAGUNA_MOE_USED * sizeof(float));
+    x = ds4_gpu_tensor_alloc(22u * LAGUNA_MOE_DIM * sizeof(float));
     if (!mid || !selected_t || !router_t || !x ||
         !laguna_guarded_output_init(&one_output, LAGUNA_MOE_DIM) ||
-        !laguna_guarded_output_init(&growth_output, 3u * LAGUNA_MOE_DIM)) {
+        !laguna_guarded_output_init(&growth_output, 3u * LAGUNA_MOE_DIM) ||
+        !laguna_guarded_output_init(&prompt_output, 22u * LAGUNA_MOE_DIM)) {
         goto cleanup;
     }
     if (!ds4_gpu_tensor_write(selected_t, 0, one_selected, sizeof(one_selected)) ||
@@ -2302,6 +2340,19 @@ static int run_routed_moe_cases(void) {
     }
     if (cudaDeviceSynchronize() != cudaSuccess ||
         !laguna_guarded_output_check("growth", &growth_output, growth_reference, 3u)) goto cleanup;
+
+    if (!ds4_gpu_tensor_write(selected_t, 0, prompt_selected, sizeof(prompt_selected)) ||
+        !ds4_gpu_tensor_write(router_t, 0, prompt_router, sizeof(prompt_router)) ||
+        !ds4_gpu_tensor_write(x, 0, prompt_input, sizeof(prompt_input)) ||
+        !laguna_guarded_output_prepare(&prompt_output) ||
+        !laguna_glm_routed_moe_q4_call(prompt_output.view, mid, model, model_size,
+                                       projection_bytes, expert_bytes, row_bytes,
+                                       selected_t, router_t, x, 22u, true)) {
+        fprintf(stderr, "routed-moe/prompt: public GLM bridge returned failure\n");
+        goto cleanup;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess ||
+        !laguna_guarded_output_check("prompt", &prompt_output, prompt_reference, 22u)) goto cleanup;
 
     if (!ds4_gpu_tensor_write(selected_t, 0, reuse_selected, sizeof(reuse_selected)) ||
         !ds4_gpu_tensor_write(router_t, 0, reuse_router, sizeof(reuse_router)) ||
@@ -2436,6 +2487,7 @@ cleanup:
     for (size_t i = 0; i < sizeof(snapshots) / sizeof(snapshots[0]); i++) {
         free(snapshots[i].snapshot);
     }
+    laguna_guarded_output_free(&prompt_output);
     laguna_guarded_output_free(&growth_output);
     laguna_guarded_output_free(&one_output);
     ds4_gpu_tensor_free(x);

@@ -199,6 +199,14 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn(
             "(uint64_t)n_tokens * width * sizeof(float)", DS4_SOURCE
         )
+        checkpoint = source_function_body(
+            DS4_SOURCE, "static bool laguna_graph_diag_checkpoint(", "ds4.c"
+        )
+        self.assertNotIn(
+            "ds4_gpu_commands_active", checkpoint,
+            "CUDA intentionally reports no active command buffer",
+        )
+        self.assertIn("ds4_gpu_end_commands()", checkpoint)
 
         self.assertIn("DS4_LAGUNA_DIAG_DIR", LAGUNA_MODEL_TEST)
         self.assertIn("memcmp(baseline_logits, probed_logits, VECTOR_BYTES)",

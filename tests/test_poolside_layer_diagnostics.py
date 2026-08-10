@@ -19,20 +19,20 @@ LAYERS = 48
 VALUES_PER_LAYER = WIDTH * TOKENS
 BYTES_PER_LAYER = VALUES_PER_LAYER * 4
 LAYER0_TARGETS = (
-    ("attn-norm", "attn_norm-0"),
-    ("q-proj", "Qcur-0"),
-    ("k-proj", "Kcur-0"),
-    ("v-proj", "Vcur-0"),
-    ("gate-proj", "attn_gate_proj-0"),
-    ("q-rope", "Qcur_rope-0"),
-    ("k-rope", "Kcur_rope-0"),
-    ("attn-gated", "attn_gated-0"),
-    ("attn-o-proj", "attn_o_proj-0"),
-    ("ffn-inp", "ffn_inp-0"),
-    ("ffn-norm", "ffn_norm-0"),
-    ("ffn-out", "ffn_out-0"),
+    ("attn-norm", "attn_norm-0", 3072),
+    ("q-proj", "Qcur-0", 6144),
+    ("k-proj", "Kcur-0", 1024),
+    ("v-proj", "Vcur-0", 1024),
+    ("gate-proj", "attn_gate_proj-0", 48),
+    ("q-rope", "Qcur_rope-0", 6144),
+    ("k-rope", "Kcur_rope-0", 1024),
+    ("attn-gated", "attn_gated-0", 6144),
+    ("attn-o-proj", "attn_o_proj-0", 3072),
+    ("ffn-inp", "ffn_inp-0", 3072),
+    ("ffn-norm", "ffn_norm-0", 3072),
+    ("ffn-out", "ffn_out-0", 3072),
 )
-LAYER0_STAGES = tuple(stage for stage, _ in LAYER0_TARGETS)
+LAYER0_STAGES = tuple(stage for stage, _, _ in LAYER0_TARGETS)
 
 
 class PoolsideLayerDiagnosticsTest(unittest.TestCase):
@@ -66,7 +66,7 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         self.assertRegex(source, r"kWidth\s*=\s*3072")
         self.assertRegex(source, r"kTokens\s*=\s*22")
         self.assertRegex(source, r"kLayers\s*=\s*48")
-        for stage, callback in LAYER0_TARGETS:
+        for stage, callback, _ in LAYER0_TARGETS:
             self.assertIn(f'"{callback}"', source)
             self.assertIn(f'"layer-00-{stage}.f32"', source)
 
@@ -93,11 +93,17 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
 
             (reference / "embd.f32").write_bytes(one_layer)
             (candidate / "embd.f32").write_bytes(one_layer)
-            for stage in LAYER0_STAGES:
+            for stage, _, width in LAYER0_TARGETS:
                 name = f"layer-00-{stage}.f32"
-                (reference / name).write_bytes(one_layer)
-                candidate_bytes = changed_layer if stage == "ffn-out" else one_layer
+                checkpoint = struct.pack("<f", 1.0) * (width * TOKENS)
+                candidate_bytes = checkpoint
+                if stage == "ffn-out":
+                    candidate_bytes = bytearray(checkpoint)
+                    struct.pack_into(
+                        "<f", candidate_bytes, (TOKENS - 1) * width * 4, 2.0
+                    )
                 (candidate / name).write_bytes(candidate_bytes)
+                (reference / name).write_bytes(checkpoint)
 
             result = subprocess.run(
                 [

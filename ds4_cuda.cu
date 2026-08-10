@@ -6531,49 +6531,80 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
     }
 }
 
-/* Exact numeric emulation of Poolside llama.cpp 04b2b72's Q8_0 J=24
- * Stream-K association for K=3072, M=128, N=22 on a 48-SM GB10.  Alignment
- * leaves twelve non-empty eight-block segments.  The final segment writes
- * directly; the fixup walks the preceding segments in reverse CUDA-block
- * order before adding that aggregate to the direct result. */
-__global__ static void matmul_q8_0_preq_poolside_3072x128x22_kernel(
+__device__ __forceinline__ static float poolside_q8_streamk_segment(
+        const unsigned char *wr,
+        const int8_t *xqr,
+        const float *xsr,
+        uint32_t begin,
+        uint32_t end) {
+    float acc = 0.0f;
+    for (uint32_t b = begin; b < end; b++) {
+        const unsigned char *wb = wr + (uint64_t)b * 34u;
+        const int8_t *wq = (const int8_t *)(wb + 2u);
+        const int8_t *aq = xqr + (uint64_t)b * 32u;
+        const int32_t dot = dot_i8x32_dp4a(wq, aq);
+        const float weighted = __fmul_rn(
+            __half2float(*(const __half *)wb), __int2float_rn(dot));
+        acc = __fmaf_rn(weighted, xsr[b], acc);
+    }
+    return acc;
+}
+
+/* Exact numeric emulation of Poolside llama.cpp 04b2b72's Q8_0 Stream-K
+ * association for 22-token Laguna projections on a 48-SM GB10.  Each CUDA
+ * worker receives a proportional interval in continuous tile/K space, then
+ * rounds its bounds down within the tile to an eight-Q8-block iteration.
+ * The highest-index nonempty interval writes directly; the fixup walks all
+ * earlier intervals in reverse worker order before adding that aggregate. */
+__global__ static void matmul_q8_0_preq_poolside_streamk22_kernel(
         float *out,
         const unsigned char *w,
         const int8_t *xq,
-        const float *xscale) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+        const float *xscale,
+        uint32_t out_dim,
+        uint32_t blocks,
+        uint32_t tiles,
+        uint32_t launch_blocks) {
+    const uint32_t row = blockIdx.x * 128u + threadIdx.x;
     const uint32_t tok = blockIdx.y;
-    if (row >= 128u || tok >= 22u) return;
+    if (row >= out_dim || tok >= 22u) return;
 
-    const uint64_t blocks = 96u;
     const unsigned char *wr = w + (uint64_t)row * blocks * 34u;
     const int8_t *xqr = xq + (uint64_t)tok * blocks * 32u;
     const float *xsr = xscale + (uint64_t)tok * blocks;
-    float segment[12];
-
-#pragma unroll
-    for (uint32_t s = 0; s < 12u; s++) {
-        float acc = 0.0f;
-#pragma unroll
-        for (uint32_t i = 0; i < 8u; i++) {
-            const uint32_t b = s * 8u + i;
-            const unsigned char *wb = wr + (uint64_t)b * 34u;
-            const int8_t *wq = (const int8_t *)(wb + 2u);
-            const int8_t *aq = xqr + (uint64_t)b * 32u;
-            const int32_t dot = dot_i8x32_dp4a(wq, aq);
-            const float weighted = __fmul_rn(
-                __half2float(*(const __half *)wb), __int2float_rn(dot));
-            acc = __fmaf_rn(weighted, xsr[b], acc);
-        }
-        segment[s] = acc;
-    }
-
+    const uint32_t tile = row / 128u;
+    const uint64_t tile_begin = (uint64_t)tile * blocks;
+    const uint64_t tile_end = tile_begin + blocks;
+    const uint64_t total_work = (uint64_t)tiles * blocks;
+    bool have_direct = false;
+    float direct = 0.0f;
     float fixup = 0.0f;
-#pragma unroll
-    for (int32_t s = 10; s >= 0; s--) {
-        fixup = __fadd_rn(fixup, segment[s]);
+    for (int32_t worker = (int32_t)launch_blocks - 1;
+         worker >= 0; worker--) {
+        uint64_t begin =
+            (uint64_t)worker * total_work / launch_blocks;
+        uint64_t end =
+            (uint64_t)(worker + 1) * total_work / launch_blocks;
+        begin -= (begin % blocks) % 8u;
+        end -= (end % blocks) % 8u;
+        const uint64_t intersection_begin =
+            begin > tile_begin ? begin : tile_begin;
+        const uint64_t intersection_end =
+            end < tile_end ? end : tile_end;
+        if (intersection_begin >= intersection_end) continue;
+        const float partial = poolside_q8_streamk_segment(
+            wr, xqr, xsr,
+            (uint32_t)(intersection_begin - tile_begin),
+            (uint32_t)(intersection_end - tile_begin));
+        if (!have_direct) {
+            direct = partial;
+            have_direct = true;
+        } else {
+            fixup = __fadd_rn(fixup, partial);
+        }
     }
-    out[(uint64_t)tok * 128u + row] = __fadd_rn(segment[11], fixup);
+    out[(uint64_t)tok * out_dim + row] =
+        have_direct ? __fadd_rn(direct, fixup) : __int_as_float(0x7fffffff);
 }
 
 
@@ -13796,9 +13827,15 @@ extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint64_t              n_tok) {
-    if (out && x && model_map && in_dim == 3072u && out_dim == 128u &&
-        n_tok == 22u) {
-        const uint64_t blocks = 96u;
+    if (out && x && model_map && in_dim != 0u && out_dim != 0u &&
+        (in_dim & 31u) == 0u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok == 22u) {
+        const uint64_t blocks = in_dim / 32u;
+        if (out_dim > UINT64_MAX / (blocks * 34u)) {
+            return cuda_matmul_q8_0_tensor_labeled(
+                out, model_map, model_size, weight_offset,
+                in_dim, out_dim, x, n_tok, "laguna_poolside_q8_0");
+        }
         const uint64_t weight_bytes = out_dim * blocks * 34u;
         if (weight_offset <= model_size &&
             weight_bytes <= model_size - weight_offset &&
@@ -13832,13 +13869,23 @@ extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
                              "laguna poolside q8_0 quantize launch")) {
                     return 0;
                 }
-                dim3 grid(((unsigned)out_dim + 255u) / 256u,
-                          (unsigned)n_tok, 1);
-                matmul_q8_0_preq_poolside_3072x128x22_kernel
-                    <<<grid, 256>>>((float *)out->ptr,
+                const uint32_t tiles =
+                    (uint32_t)((out_dim + 127u) / 128u);
+                const uint32_t waves = (tiles + 47u) / 48u;
+                const uint32_t efficiency =
+                    100u * tiles / (48u * waves);
+                const uint32_t launch_blocks =
+                    efficiency >= 90u ? tiles : 48u;
+                dim3 grid(tiles, (unsigned)n_tok, 1);
+                matmul_q8_0_preq_poolside_streamk22_kernel
+                    <<<grid, 128>>>((float *)out->ptr,
                                     (const unsigned char *)wptr,
                                     xq,
-                                    xscale);
+                                    xscale,
+                                    (uint32_t)out_dim,
+                                    (uint32_t)blocks,
+                                    tiles,
+                                    launch_blocks);
                 return cuda_ok(cudaGetLastError(),
                                "laguna poolside q8_0 Stream-K launch");
             }

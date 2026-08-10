@@ -30742,14 +30742,24 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         ds4_tensor_device_idx(staged_key) != logical_tier || ds4_tensor_device_idx(staged_value) != logical_tier ||
         ds4_tensor_device_idx(q) != logical_tier || ds4_tensor_device_idx(k) != logical_tier ||
         ds4_tensor_device_idx(v) != logical_tier || ds4_tensor_device_idx(gate) != logical_tier) return 0;
-    int compute_major = 0;
-    const bool auto_mma_eligible =
-        cudaDeviceGetAttribute(
-            &compute_major, cudaDevAttrComputeCapabilityMajor,
-            g_gpu[logical_tier].device_id) == cudaSuccess &&
-        compute_major >= 8;
     int ok = 0;
     WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        int compute_major = 0;
+        int compute_minor = 0;
+        cudaFuncAttributes auto_mma_attributes = {};
+        const bool auto_mma_eligible =
+            cudaDeviceGetAttribute(
+                &compute_major, cudaDevAttrComputeCapabilityMajor,
+                g_gpu[logical_tier].device_id) == cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &compute_minor, cudaDevAttrComputeCapabilityMinor,
+                g_gpu[logical_tier].device_id) == cudaSuccess &&
+            compute_major == 12 && compute_minor == 1 &&
+            cudaFuncGetAttributes(
+                &auto_mma_attributes,
+                laguna_attention_prefill_auto_mma32_kernel) == cudaSuccess &&
+            (auto_mma_attributes.binaryVersion >= 70 ||
+             auto_mma_attributes.ptxVersion >= 70);
         laguna_stage_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
                 (const float *)k->ptr, (const float *)v->ptr,
                 (__half *)staged_key->ptr, (__half *)staged_value->ptr, kv_values);

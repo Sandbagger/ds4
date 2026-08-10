@@ -37,10 +37,15 @@ struct Options {
     fs::path model;
     fs::path tokens;
     fs::path out;
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 };
 
 static void usage(FILE *stream, const char *program) {
-    std::fprintf(stream, "Usage: %s --model MODEL --tokens TOKENS.i32 --out DIR\n", program);
+    std::fprintf(
+        stream,
+        "Usage: %s --model MODEL --tokens TOKENS.i32 --out DIR "
+        "[--flash-attn auto|disabled]\n",
+        program);
 }
 
 static Options parse_options(int argc, char **argv) {
@@ -53,12 +58,13 @@ static Options parse_options(int argc, char **argv) {
     bool have_model = false;
     bool have_tokens = false;
     bool have_out = false;
+    bool have_flash_attn = false;
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc) {
             fail(std::string("missing value for ") + argv[i]);
         }
         const std::string flag = argv[i++];
-        const fs::path value = argv[i];
+        const std::string value = argv[i];
         if (flag == "--model" && !have_model) {
             options.model = value;
             have_model = true;
@@ -68,6 +74,15 @@ static Options parse_options(int argc, char **argv) {
         } else if (flag == "--out" && !have_out) {
             options.out = value;
             have_out = true;
+        } else if (flag == "--flash-attn" && !have_flash_attn) {
+            if (value == "auto") {
+                options.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            } else if (value == "disabled") {
+                options.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            } else {
+                fail("--flash-attn must be auto or disabled");
+            }
+            have_flash_attn = true;
         } else {
             fail("unknown or duplicate argument: " + flag);
         }
@@ -409,6 +424,7 @@ int main(int argc, char **argv) {
             context_params.n_ubatch = 512;
             context_params.n_seq_max = 1;
             context_params.no_perf = true;
+            context_params.flash_attn_type = options.flash_attn_type;
             context_params.cb_eval = probe_callback;
             context_params.cb_eval_user_data = &state;
 

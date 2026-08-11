@@ -23,6 +23,22 @@ EMBEDDING = 3072
 EXPERT_MID = 1024
 Q8_1_BYTES = EMBEDDING // 32 * 36
 DOWN_Q8_1_BYTES = EXPERTS_USED * EXPERT_MID // 32 * 36
+PINNED_MODEL = {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+}
+PINNED_PREFIX = {
+    "count": 512,
+    "bytes": 2048,
+    "sha256": "569aa6394783e0f17558db421ba26480d7a530d44dd2219bcc9aac2c09a3b559",
+}
+PINNED_DEVICE = {
+    "name": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "driver": "580.126.09",
+}
+PINNED_POOLSIDE_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
+PINNED_DS4_CAPTURE_COMMIT = "1d009d4f134af0f069730702a6247c077e18fdbd"
 
 
 class ComparisonError(RuntimeError):
@@ -508,16 +524,73 @@ def load_run_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
             or len(digest) != 64
         ):
             raise ComparisonError(f"run manifest {label} identity is invalid")
-    if prefix.get("count") != 512:
-        raise ComparisonError("run manifest prefix count must be 512")
-    if not isinstance(manifest.get("device"), dict):
-        raise ComparisonError("run manifest device must be an object")
+    if model != PINNED_MODEL:
+        raise ComparisonError("run manifest model is not the pinned model")
+    if prefix != PINNED_PREFIX:
+        raise ComparisonError("run manifest prefix is not the pinned prefix")
+    if manifest.get("device") != PINNED_DEVICE:
+        raise ComparisonError("run manifest device is not the pinned device")
     runtimes = manifest.get("runtimes")
     if not isinstance(runtimes, dict) or not all(
         isinstance(runtimes.get(runtime), dict)
         for runtime in ("poolside", "ds4")
     ):
         raise ComparisonError("run manifest must identify both runtimes")
+    poolside = runtimes["poolside"]
+    ds4 = runtimes["ds4"]
+    if poolside.get("commit") != PINNED_POOLSIDE_COMMIT:
+        raise ComparisonError("run manifest Poolside commit is not pinned")
+    if ds4.get("capture_code_commit") != PINNED_DS4_CAPTURE_COMMIT:
+        raise ComparisonError("run manifest DS4 capture commit is not pinned")
+    for runtime, entry, fields in (
+        (
+            "Poolside",
+            poolside,
+            ("producer_source_sha256", "producer_binary_sha256"),
+        ),
+        (
+            "DS4",
+            ds4,
+            ("capture_probe_binary_sha256",),
+        ),
+    ):
+        for field in fields:
+            value = entry.get(field)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ComparisonError(
+                    f"run manifest {runtime} {field} is not a SHA-256"
+                )
+    controls = manifest.get("controls")
+    if not isinstance(controls, dict):
+        raise ComparisonError("run manifest controls must be an object")
+    if controls.get("release_vs_hook_null") != "bit-exact":
+        raise ComparisonError(
+            "run manifest release versus hook-null control is not bit-exact"
+        )
+    if controls.get("hook_null_vs_hook_active") != "bit-exact":
+        raise ComparisonError(
+            "run manifest hook-null versus active control is not bit-exact"
+        )
+    if controls.get("logits_bytes") != 401408:
+        raise ComparisonError("run manifest control logits byte count is invalid")
+    for field in (
+        "release_probe_binary_sha256",
+        "hook_probe_binary_sha256",
+        "logits_sha256",
+    ):
+        value = controls.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ComparisonError(
+                f"run manifest control {field} is not a SHA-256"
+            )
     return manifest, payload
 
 
@@ -582,6 +655,10 @@ def build_report(
         microscope_fixture
     )
     run_manifest, run_manifest_bytes = load_run_manifest(run_manifest_path)
+    if manifest.get("model") != run_manifest["model"]:
+        raise ComparisonError(
+            "run manifest model does not match microscope model identity"
+        )
 
     poolside_payloads: dict[str, bytes] = {}
     ds4_payloads: dict[str, bytes] = {}

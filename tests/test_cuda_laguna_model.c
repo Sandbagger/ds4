@@ -11,6 +11,7 @@
  */
 
 #include "ds4.h"
+#include "ds4_gpu.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -30,6 +31,18 @@
 #define CUDA_CENTERED_RMS_MAX 0.04
 #define CUDA_CENTERED_ABS_MAX 0.20
 #define CUDA_TOP20_MIN 18
+#define STREAMED_CACHE_BYTES (UINT64_C(8) * 1024u * 1024u * 1024u)
+
+typedef enum {
+    MODEL_MODE_RESIDENT,
+    MODEL_MODE_STREAMED,
+} model_mode;
+
+typedef enum {
+    MODEL_CASE_ALL,
+    MODEL_CASE_SHORT,
+    MODEL_CASE_CONTINUATION,
+} model_case_selection;
 
 typedef struct {
     const char *id;
@@ -52,6 +65,69 @@ static const char *case_ids[] = {
     "yarn-8193",
     "deep-32768",
 };
+
+static const char *model_mode_name(model_mode mode) {
+    return mode == MODEL_MODE_STREAMED ? "streamed" : "resident";
+}
+
+static const char *model_case_name(model_case_selection selected) {
+    switch (selected) {
+        case MODEL_CASE_SHORT: return "short";
+        case MODEL_CASE_CONTINUATION: return "continuation";
+        case MODEL_CASE_ALL: return "all";
+    }
+    return "unknown";
+}
+
+static void usage(const char *program) {
+    fprintf(stderr,
+            "Usage: %s [--mode resident|streamed "
+            "--case short|continuation|all]\n"
+            "       --case all is currently resident-only\n",
+            program);
+}
+
+static bool parse_selection(
+        int argc,
+        char **argv,
+        model_mode *mode,
+        model_case_selection *selected) {
+    if (!mode || !selected) return false;
+    *mode = MODEL_MODE_RESIDENT;
+    *selected = MODEL_CASE_ALL;
+    if (argc == 1) return true;
+    if (argc != 5) return false;
+
+    bool mode_seen = false;
+    bool case_seen = false;
+    for (int i = 1; i < argc; i += 2) {
+        if (strcmp(argv[i], "--mode") == 0 && !mode_seen) {
+            mode_seen = true;
+            if (strcmp(argv[i + 1], "resident") == 0) {
+                *mode = MODEL_MODE_RESIDENT;
+            } else if (strcmp(argv[i + 1], "streamed") == 0) {
+                *mode = MODEL_MODE_STREAMED;
+            } else {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--case") == 0 && !case_seen) {
+            case_seen = true;
+            if (strcmp(argv[i + 1], "short") == 0) {
+                *selected = MODEL_CASE_SHORT;
+            } else if (strcmp(argv[i + 1], "continuation") == 0) {
+                *selected = MODEL_CASE_CONTINUATION;
+            } else if (strcmp(argv[i + 1], "all") == 0) {
+                *selected = MODEL_CASE_ALL;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return mode_seen && case_seen &&
+        !(*mode == MODEL_MODE_STREAMED && *selected == MODEL_CASE_ALL);
+}
 
 static bool fail_message(const char *what, const char *detail) {
     fprintf(stderr, "FAIL: %s%s%s\n", what,
@@ -315,6 +391,61 @@ static bool compare_session_oracle(
     return ok;
 }
 
+static bool verify_streamed_cache_contract(const char *scenario) {
+    ds4_gpu_laguna_compact_test_snapshot compact;
+    ds4_gpu_laguna_routed_origin_test_snapshot origins;
+    memset(&compact, 0, sizeof(compact));
+    memset(&origins, 0, sizeof(origins));
+    if (!ds4_gpu_test_laguna_compact_active_snapshot(&compact)) {
+        return fail_message("streamed compact snapshot is unavailable", scenario);
+    }
+    if (!ds4_gpu_test_laguna_compact_routed_origin_snapshot(&origins)) {
+        return fail_message("streamed routed-origin audit is unavailable", scenario);
+    }
+
+    const bool no_fallback =
+        compact.model_mapping_registered_bytes == 0 &&
+        compact.whole_model_copied_bytes == 0 &&
+        compact.opportunistic_range_allocated_bytes == 0 &&
+        compact.legacy_model_range_count == 0 &&
+        compact.legacy_model_arena_count == 0;
+    const bool origin_exact =
+        origins.routed_projection_requests != 0 &&
+        origins.engine_slot_resolutions ==
+            origins.routed_projection_requests &&
+        origins.static_slab_resolutions == 0 &&
+        origins.model_mapping_resolutions == 0 &&
+        origins.managed_resolutions == 0 &&
+        origins.per_request_resolutions == 0 &&
+        origins.unknown_resolutions == 0;
+    const bool cache_healthy =
+        compact.cache_acquire_misses != 0 &&
+        compact.cache_load_successes == compact.cache_acquire_misses &&
+        compact.cache_load_failures == 0 &&
+        !compact.cache_unsafe &&
+        compact.routed_payload_bytes != 0 &&
+        compact.routed_payload_bytes <= compact.cache_payload_bytes;
+    const bool ok = no_fallback && origin_exact && cache_healthy;
+    fprintf(stderr,
+            "%s cache-origin requests=%llu engine_slots=%llu "
+            "static=%llu model_map=%llu managed=%llu request=%llu "
+            "unknown=%llu hits=%llu misses=%llu loads=%llu/%llu %s\n",
+            scenario,
+            (unsigned long long)origins.routed_projection_requests,
+            (unsigned long long)origins.engine_slot_resolutions,
+            (unsigned long long)origins.static_slab_resolutions,
+            (unsigned long long)origins.model_mapping_resolutions,
+            (unsigned long long)origins.managed_resolutions,
+            (unsigned long long)origins.per_request_resolutions,
+            (unsigned long long)origins.unknown_resolutions,
+            (unsigned long long)compact.cache_acquire_hits,
+            (unsigned long long)compact.cache_acquire_misses,
+            (unsigned long long)compact.cache_load_successes,
+            (unsigned long long)compact.cache_load_failures,
+            ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool create_and_sync(
         ds4_engine *engine,
         const ds4_tokens *tokens,
@@ -430,7 +561,8 @@ static bool run_raw_frontier(
         int frontier,
         int context,
         const oracle_case *fixture,
-        const int *continuation) {
+        const int *continuation,
+        bool require_continuation_cache_hits) {
     ds4_tokens tokens = {0};
     if (!tokenize_raw_fixture(engine, prompt_file, frontier, &tokens)) return false;
     ds4_session *session = NULL;
@@ -439,6 +571,17 @@ static bool run_raw_frontier(
         return false;
     }
     bool ok = compare_session_oracle(session, fixture, case_id);
+    uint64_t hits_before_continuation = 0;
+    if (ok && continuation && require_continuation_cache_hits) {
+        ds4_gpu_laguna_compact_test_snapshot before;
+        memset(&before, 0, sizeof(before));
+        if (!ds4_gpu_test_laguna_compact_active_snapshot(&before)) {
+            ok = fail_message(
+                    "continuation compact snapshot is unavailable", case_id);
+        } else {
+            hits_before_continuation = before.cache_acquire_hits;
+        }
+    }
     if (ok && continuation) {
         char err[256] = {0};
         for (int step = 0; step < CONTINUATION_COUNT; step++) {
@@ -457,6 +600,15 @@ static bool run_raw_frontier(
                 ok = false;
                 break;
             }
+        }
+    }
+    if (ok && continuation && require_continuation_cache_hits) {
+        ds4_gpu_laguna_compact_test_snapshot after;
+        memset(&after, 0, sizeof(after));
+        if (!ds4_gpu_test_laguna_compact_active_snapshot(&after) ||
+            after.cache_acquire_hits <= hits_before_continuation) {
+            ok = fail_message(
+                    "teacher-forced continuation produced no cache hit", case_id);
         }
     }
     ds4_session_free(session);
@@ -880,7 +1032,13 @@ static bool run_mixed_batch(ds4_engine *engine) {
     return ok;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    model_mode mode;
+    model_case_selection selected;
+    if (!parse_selection(argc, argv, &mode, &selected)) {
+        usage(argv[0]);
+        return 2;
+    }
     const char *model = getenv("DS4_TEST_MODEL");
     if (!model || !model[0]) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
@@ -888,6 +1046,13 @@ int main(void) {
     }
     const char *diag_dir = getenv("DS4_LAGUNA_DIAG_DIR");
     const bool diagnostic_mode = diag_dir && diag_dir[0];
+    if (diagnostic_mode &&
+        (mode != MODEL_MODE_RESIDENT ||
+         selected == MODEL_CASE_CONTINUATION)) {
+        fprintf(stderr,
+                "FAIL: DS4_LAGUNA_DIAG_DIR supports resident short only\n");
+        return 2;
+    }
     int model_fd = -1;
     bool model_fd_set = false;
     if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
@@ -899,6 +1064,14 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
         .n_threads = 1,
+        .context_size = mode == MODEL_MODE_STREAMED ? 32768 : 0,
+        .prefill_chunk = mode == MODEL_MODE_STREAMED ? 4096u : 0,
+        .ssd_streaming_cache_bytes =
+            mode == MODEL_MODE_STREAMED ? STREAMED_CACHE_BYTES : 0,
+        .ssd_streaming = mode == MODEL_MODE_STREAMED,
+        .ssd_streaming_cache_bytes_set =
+            mode == MODEL_MODE_STREAMED,
+        .session_slots = mode == MODEL_MODE_STREAMED ? 1u : 0,
         .qualification_model_fd = model_fd,
         .qualification_model_fd_set = model_fd_set,
     };
@@ -916,17 +1089,26 @@ int main(void) {
         return 1;
     }
 
-    bool ok = run_short(engine, &fixtures.cases[0]);
-    if (!diagnostic_mode) {
+    bool ok = true;
+    if (selected == MODEL_CASE_SHORT || selected == MODEL_CASE_ALL) {
+        ok = run_short(engine, &fixtures.cases[0]);
+    }
+    if (ok && selected == MODEL_CASE_CONTINUATION) {
+        ok = run_raw_frontier(
+                engine, "yarn-8193", "yarn-8193.prompt", 8193, 8202,
+                &fixtures.cases[2], fixtures.continuation,
+                mode == MODEL_MODE_STREAMED);
+    }
+    if (ok && selected == MODEL_CASE_ALL && !diagnostic_mode) {
         if (ok) {
             ok = run_raw_frontier(
                     engine, "swa-513", "swa-513.prompt", 513, 1024,
-                    &fixtures.cases[1], NULL);
+                    &fixtures.cases[1], NULL, false);
         }
         if (ok) {
             ok = run_raw_frontier(
                     engine, "yarn-8193", "yarn-8193.prompt", 8193, 8202,
-                    &fixtures.cases[2], fixtures.continuation);
+                    &fixtures.cases[2], fixtures.continuation, false);
         }
         /* run_raw_frontier frees the 8202-token session before deep allocation. */
         if (ok) ok = run_deep_exact_context(engine, &fixtures.cases[3]);
@@ -934,11 +1116,20 @@ int main(void) {
         if (ok) ok = run_decode_batch(engine);
         if (ok) ok = run_mixed_batch(engine);
     }
+    if (ok && mode == MODEL_MODE_STREAMED) {
+        ok = verify_streamed_cache_contract(model_case_name(selected));
+    }
 
     ds4_engine_close(engine);
     free_fixtures(&fixtures);
     if (!ok) return 1;
     if (diagnostic_mode) return 0;
+    if (selected != MODEL_CASE_ALL) {
+        fprintf(stderr,
+                "test_cuda_laguna_model PASS oracle=poolside mode=%s case=%s\n",
+                model_mode_name(mode), model_case_name(selected));
+        return 0;
+    }
     fprintf(stderr,
             "test_cuda_laguna_model PASS oracle=poolside cases=4 vectors=4 continuation=8 "
             "decode_batch=2 mixed=1+2\n");

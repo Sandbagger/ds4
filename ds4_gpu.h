@@ -242,11 +242,27 @@ typedef struct {
     uint64_t legacy_model_arena_count;
 } ds4_gpu_laguna_compact_test_snapshot;
 
+/* Test-only proof that every routed projection consumed by compact Laguna
+ * execution came from the fixed engine-lifetime cache payload.  Requests and
+ * classifications are both monotonic; a healthy run classifies every request
+ * as exactly one engine-slot resolution and never observes a fallback. */
+typedef struct {
+    uint64_t routed_projection_requests;
+    uint64_t engine_slot_resolutions;
+    uint64_t static_slab_resolutions;
+    uint64_t model_mapping_resolutions;
+    uint64_t managed_resolutions;
+    uint64_t per_request_resolutions;
+    uint64_t unknown_resolutions;
+} ds4_gpu_laguna_routed_origin_test_snapshot;
+
 int ds4_gpu_test_laguna_compact_snapshot(
         const ds4_gpu_laguna_compact *ctx,
         ds4_gpu_laguna_compact_test_snapshot *out);
 int ds4_gpu_test_laguna_compact_active_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out);
+int ds4_gpu_test_laguna_compact_routed_origin_snapshot(
+        ds4_gpu_laguna_routed_origin_test_snapshot *out);
 uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);
 uint64_t ds4_gpu_test_generic_cleanup_attempts(void);
 void ds4_gpu_test_laguna_compact_fail_sync_once(void);

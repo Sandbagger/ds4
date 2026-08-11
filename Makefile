@@ -448,7 +448,7 @@ tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o
 test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 
-tests/test_cuda_laguna_model.o: tests/test_cuda_laguna_model.c ds4.h ds4_gpu_args.h
+tests/test_cuda_laguna_model.o: tests/test_cuda_laguna_model.c ds4.h ds4_gpu.h ds4_gpu_args.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_cuda_laguna_model: tests/test_cuda_laguna_model.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
@@ -473,7 +473,7 @@ tests/probe_ds4_laguna_behavior: tests/probe_ds4_laguna_behavior.o ds4.o ds4_gpu
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-model: tests/test_cuda_laguna_model
-	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode resident --case all
 
 tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<

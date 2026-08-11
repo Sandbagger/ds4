@@ -522,6 +522,18 @@ typedef struct {
     uint64_t legacy_model_arena_count;
 } ds4_gpu_laguna_compact_test_snapshot;
 
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    uint64_t routed_projection_requests;
+    uint64_t engine_slot_resolutions;
+    uint64_t static_slab_resolutions;
+    uint64_t model_mapping_resolutions;
+    uint64_t managed_resolutions;
+    uint64_t per_request_resolutions;
+    uint64_t unknown_resolutions;
+} ds4_gpu_laguna_routed_origin_test_snapshot;
+#endif
+
 struct ds4_gpu_laguna_compact {
     int model_fd;
     const void *model_map;
@@ -596,6 +608,9 @@ struct ds4_gpu_laguna_compact {
     int tracker_pinned_staging_live[4];
     int cache_policy_live;
     int cache_unsafe;
+#ifdef DS4_TEST_HOOKS
+    ds4_gpu_laguna_routed_origin_test_snapshot routed_origin;
+#endif
 };
 
 static ds4_gpu_laguna_compact g_laguna_compact_storage;
@@ -3328,6 +3343,20 @@ extern "C" int ds4_gpu_test_laguna_compact_active_snapshot(
     return cuda_laguna_compact_snapshot_locked(
         &g_laguna_compact_storage, out, state);
 }
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_laguna_compact_routed_origin_snapshot(
+        ds4_gpu_laguna_routed_origin_test_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state != DS4_LAGUNA_COMPACT_ACTIVE) return 0;
+    *out = g_laguna_compact_storage.routed_origin;
+    return 1;
+}
+#endif
 
 #ifdef DS4_TEST_HOOKS
 extern "C" int ds4_gpu_test_laguna_compact_nonidle_snapshot(

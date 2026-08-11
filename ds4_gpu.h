@@ -203,6 +203,52 @@ int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
         const ds4_gpu_tensor *weight_row,
         const ds4_gpu_tensor *activation,
         uint32_t input_elements);
+#ifndef DS4_GPU_GLM_MOE_CAPTURE_LAYOUT_DEFINED
+#define DS4_GPU_GLM_MOE_CAPTURE_LAYOUT_DEFINED
+enum {
+    DS4_GPU_GLM_MOE_CAPTURE_GATE_F32 = 0,
+    DS4_GPU_GLM_MOE_CAPTURE_UP_F32 = 10240,
+    DS4_GPU_GLM_MOE_CAPTURE_SWIGLU_F32 = 20480,
+    DS4_GPU_GLM_MOE_CAPTURE_COLUMN_L2_F32 = 30720,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_INPUT_F32 = 30730,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_F32 = 40970,
+    DS4_GPU_GLM_MOE_CAPTURE_WEIGHTED_F32 = 71690,
+    DS4_GPU_GLM_MOE_CAPTURE_F32_COUNT = 102410,
+    DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_OFFSET = 409640,
+    DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_BYTES = 3456,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_OFFSET = 413096,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_BYTES = 11520,
+    DS4_GPU_GLM_MOE_CAPTURE_BYTES = 424616,
+};
+#endif
+int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
+        ds4_gpu_tensor       *capture,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              up_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              layer_index,
+        const ds4_gpu_tensor *x,
+        bool                  force_resident);
 int ds4_gpu_test_glm_poolside_q4_l2_tensor(
         ds4_gpu_tensor *mid,
         ds4_gpu_tensor *column_l2,

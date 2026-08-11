@@ -27449,7 +27449,13 @@ __global__ static void glm_poolside_q4_gate_up_kernel(
         uint32_t n_total_expert,
         uint32_t n_expert,
         uint32_t n_tokens,
-        bool mmq) {
+        bool mmq
+#ifdef DS4_TEST_HOOKS
+        , float *capture_gate,
+        float *capture_up,
+        float *capture_swiglu
+#endif
+        ) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t slot = blockIdx.y;
     const uint32_t token = blockIdx.z;
@@ -27486,9 +27492,15 @@ __global__ static void glm_poolside_q4_gate_up_kernel(
         }
     }
     const float activated = gate / (1.0f + expf(-gate));
-    mid[(uint64_t)token * mid_token_stride +
-        (uint64_t)slot * expert_mid_dim + row] =
-        __fmul_rn(activated, up);
+    const uint64_t mid_index = (uint64_t)token * mid_token_stride +
+        (uint64_t)slot * expert_mid_dim + row;
+    const float swiglu = __fmul_rn(activated, up);
+#ifdef DS4_TEST_HOOKS
+    if (capture_gate) capture_gate[mid_index] = gate;
+    if (capture_up) capture_up[mid_index] = up;
+    if (capture_swiglu) capture_swiglu[mid_index] = swiglu;
+#endif
+    mid[mid_index] = swiglu;
 }
 
 static uint32_t glm_poolside_q4_l2_thread_count(
@@ -27640,7 +27652,12 @@ __global__ static void glm_poolside_q4_down_kernel(
         uint32_t n_total_expert,
         uint32_t n_expert,
         uint32_t n_tokens,
-        bool mmq) {
+        bool mmq
+#ifdef DS4_TEST_HOOKS
+        , float *capture_down,
+        float *capture_weighted
+#endif
+        ) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t token = blockIdx.y;
     if (row >= out_dim || token >= n_tokens) return;
@@ -27670,7 +27687,17 @@ __global__ static void glm_poolside_q4_down_kernel(
         }
         expert_value = __fmul_rn(expert_value, column_l2[pair]);
         expert_value = __fmul_rn(expert_value, 1.0f / 32768.0f);
+#ifdef DS4_TEST_HOOKS
+        if (capture_down) {
+            capture_down[pair * out_dim + row] = expert_value;
+        }
+#endif
         expert_value = __fmul_rn(expert_value, weights[pair]);
+#ifdef DS4_TEST_HOOKS
+        if (capture_weighted) {
+            capture_weighted[pair * out_dim + row] = expert_value;
+        }
+#endif
         output = __fadd_rn(output, expert_value);
     }
     out[(uint64_t)token * out_dim + row] = output;
@@ -27703,7 +27730,11 @@ static int glm_poolside_routed_moe_q4_launch(
         uint32_t              n_expert,
         const ds4_gpu_tensor *input,
         uint32_t              n_tokens,
-        uint32_t              mid_token_stride) {
+        uint32_t              mid_token_stride
+#ifdef DS4_TEST_HOOKS
+        , ds4_gpu_tensor     *capture
+#endif
+        ) {
     if (!out || !mid || !selected || !weights || !input || !model_map ||
         !out->ptr || !mid->ptr || !selected->ptr || !weights->ptr ||
         !input->ptr || n_tokens == 0u || n_expert == 0u ||
@@ -27834,6 +27865,44 @@ static int glm_poolside_routed_moe_q4_launch(
         return 0;
     }
 
+#ifdef DS4_TEST_HOOKS
+    float *capture_gate = NULL;
+    float *capture_up = NULL;
+    float *capture_swiglu = NULL;
+    float *capture_column_l2 = NULL;
+    float *capture_down_input = NULL;
+    float *capture_down = NULL;
+    float *capture_weighted = NULL;
+    void *capture_input_q8 = NULL;
+    void *capture_down_q8 = NULL;
+    if (capture) {
+        if (!capture->ptr || ds4_tensor_device_idx(capture) != tier ||
+            capture->bytes < DS4_GPU_GLM_MOE_CAPTURE_BYTES ||
+            n_tokens != 1u || n_expert != 10u ||
+            expert_in_dim != 3072u || expert_mid_dim != 1024u ||
+            out_dim != 3072u ||
+            input_q8_bytes != DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_BYTES ||
+            mid_q8_bytes != DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_BYTES) {
+            return 0;
+        }
+        float *capture_f32 = (float *)capture->ptr;
+        capture_gate = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_GATE_F32;
+        capture_up = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_UP_F32;
+        capture_swiglu = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_SWIGLU_F32;
+        capture_column_l2 =
+            capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_COLUMN_L2_F32;
+        capture_down_input =
+            capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_DOWN_INPUT_F32;
+        capture_down = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_DOWN_F32;
+        capture_weighted =
+            capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_WEIGHTED_F32;
+        capture_input_q8 = (char *)capture->ptr +
+            DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_OFFSET;
+        capture_down_q8 = (char *)capture->ptr +
+            DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_OFFSET;
+    }
+#endif
+
     const char *gate = cuda_resolve_weight_ptr(
         model_map, gate_offset, gate_bytes, tier,
         "laguna_poolside_gate_exps");
@@ -27864,6 +27933,16 @@ static int glm_poolside_routed_moe_q4_launch(
                  "glm Poolside routed moe input quantize")) {
         return 0;
     }
+#ifdef DS4_TEST_HOOKS
+    if (capture_input_q8 &&
+        !cuda_ok(cudaMemcpyAsync(capture_input_q8,
+                                 input_q8,
+                                 input_q8_bytes,
+                                 cudaMemcpyDeviceToDevice),
+                 "glm Poolside routed moe capture input q8")) {
+        return 0;
+    }
+#endif
 
     const dim3 gate_grid(
         (expert_mid_dim + 255u) / 256u, n_expert, n_tokens);
@@ -27874,7 +27953,11 @@ static int glm_poolside_routed_moe_q4_launch(
         up_expert_bytes, up_row_bytes,
         (uint32_t)input_q4_blocks, (uint32_t)input_q8_groups,
         expert_mid_dim, mid_token_stride, n_total_expert,
-        n_expert, n_tokens, mmq);
+        n_expert, n_tokens, mmq
+#ifdef DS4_TEST_HOOKS
+        , capture_gate, capture_up, capture_swiglu
+#endif
+        );
     if (!cuda_ok(cudaGetLastError(),
                  "glm Poolside routed moe gate up")) {
         return 0;
@@ -27898,6 +27981,21 @@ static int glm_poolside_routed_moe_q4_launch(
                  "glm Poolside routed moe L2 rescale")) {
         return 0;
     }
+#ifdef DS4_TEST_HOOKS
+    if (capture_column_l2 &&
+        (!cuda_ok(cudaMemcpyAsync(capture_column_l2,
+                                  l2_scratch[tier]->ptr,
+                                  l2_bytes,
+                                  cudaMemcpyDeviceToDevice),
+                  "glm Poolside routed moe capture column l2") ||
+         !cuda_ok(cudaMemcpyAsync(capture_down_input,
+                                  mid->ptr,
+                                  mid_values * sizeof(float),
+                                  cudaMemcpyDeviceToDevice),
+                  "glm Poolside routed moe capture down input"))) {
+        return 0;
+    }
+#endif
 
     if (mmq) {
         glm_poolside_q8_1_mmq_quantize_kernel<<<
@@ -27914,6 +28012,16 @@ static int glm_poolside_routed_moe_q4_launch(
                  "glm Poolside routed moe mid quantize")) {
         return 0;
     }
+#ifdef DS4_TEST_HOOKS
+    if (capture_down_q8 &&
+        !cuda_ok(cudaMemcpyAsync(capture_down_q8,
+                                 mid_q8,
+                                 mid_q8_bytes,
+                                 cudaMemcpyDeviceToDevice),
+                 "glm Poolside routed moe capture down q8")) {
+        return 0;
+    }
+#endif
 
     const dim3 down_grid((uint32_t)output_grid_x, n_tokens, 1u);
     glm_poolside_q4_down_kernel<<<down_grid, 256>>>(
@@ -27923,7 +28031,11 @@ static int glm_poolside_routed_moe_q4_launch(
         (const float *)weights->ptr,
         down_expert_bytes, down_row_bytes,
         (uint32_t)mid_q4_blocks, (uint32_t)mid_q8_groups,
-        out_dim, n_total_expert, n_expert, n_tokens, mmq);
+        out_dim, n_total_expert, n_expert, n_tokens, mmq
+#ifdef DS4_TEST_HOOKS
+        , capture_down, capture_weighted
+#endif
+        );
     return cuda_ok(cudaGetLastError(),
                    "glm Poolside routed moe down");
 }
@@ -28651,7 +28763,11 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim,
                 selected, weights, n_total_expert, n_expert,
-                x, n_tokens, mid_token_stride);
+                x, n_tokens, mid_token_stride
+#ifdef DS4_TEST_HOOKS
+                , NULL
+#endif
+                );
     }
     if (gate_type != 10u || up_type != 10u || down_type != 10u) {
         fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",
@@ -29010,6 +29126,69 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
             selected, weights, n_total_expert, n_expert, layer_index,
             x, 1, n_expert * expert_mid_dim, force_resident);
 }
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
+        ds4_gpu_tensor       *capture,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              up_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              layer_index,
+        const ds4_gpu_tensor *x,
+        bool                  force_resident) {
+    if (!capture) {
+        return ds4_gpu_glm_routed_moe_one_tensor(
+                out, mid, model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                gate_type, up_type, down_type,
+                gate_expert_bytes, gate_row_bytes,
+                up_expert_bytes, up_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert,
+                layer_index, x, force_resident);
+    }
+    (void)layer_index;
+    if (!force_resident || gate_type != 12u || up_type != 12u ||
+        down_type != 12u) {
+        return 0;
+    }
+    if (getenv("DS4_CUDA_VALIDATE_SELECTED") != NULL &&
+        !glm_routed_moe_selected_ids_valid(
+                selected, n_expert, n_total_expert)) {
+        return 0;
+    }
+    return glm_poolside_routed_moe_q4_launch(
+            out, mid, model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, gate_row_bytes,
+            up_expert_bytes, up_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert,
+            x, 1u, n_expert * expert_mid_dim, capture);
+}
+#endif
 
 /* Parallel router select: 256 threads compute sigmoid probs, then top-k
  * via k rounds of shared-memory argmax over probs+bias (value desc, index

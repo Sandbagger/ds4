@@ -18,6 +18,7 @@ MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 CUDA_SOURCE = (ROOT / "ds4_cuda.cu").read_text(encoding="utf-8")
 DS4_HEADER = (ROOT / "ds4.h").read_text(encoding="utf-8")
 GPU_HEADER = (ROOT / "ds4_gpu.h").read_text(encoding="utf-8")
+GPU_MGPU_HEADER = (ROOT / "ds4_gpu_mgpu.h").read_text(encoding="utf-8")
 DS4_SOURCE = (ROOT / "ds4.c").read_text(encoding="utf-8")
 LAGUNA_MODEL_TEST = (ROOT / "tests/test_cuda_laguna_model.c").read_text(
     encoding="utf-8"
@@ -199,6 +200,7 @@ LAGUNA_C7_ORACLE_PRODUCER = ROOT / "tests/oracle-producers/laguna-c7"
 LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "capture_poolside_laguna_moe.sh",
     "poolside-l2-callback.patch",
+    "probe_ds4_laguna_moe.c",
     "probe_poolside_laguna_moe.cpp",
     "short.tokens.i32",
     "verify_poolside_laguna_moe.py",
@@ -1965,7 +1967,6 @@ class CudaBuildContractTest(unittest.TestCase):
             ("after_attn", "ffn-inp", r"DS4_N_EMBD"),
             ("ffn_norm", "ffn-norm", r"DS4_N_EMBD"),
             ("router_logits", "router-logits", r"DS4_N_EXPERT"),
-            ("router_selected", "router-selected", r"DS4_N_EXPERT_USED"),
             ("router_weights", "router-weights", r"DS4_N_EXPERT_USED"),
             ("ffn_out", "ffn-moe-out", r"DS4_N_EMBD"),
             ("shared_out", "ffn-shared-out", r"DS4_N_EMBD"),
@@ -1977,6 +1978,12 @@ class CudaBuildContractTest(unittest.TestCase):
                     rf"laguna_graph_diag_checkpoint\(\s*g->{tensor},\s*1,"
                     rf"\s*{width},\s*\(int\)il,\s*\"{stage}\"\s*\)",
                 )
+        self.assertRegex(
+            body,
+            r"laguna_graph_diag_checkpoint_i32\(\s*g->router_selected,\s*1,"
+            r"\s*DS4_N_EXPERT_USED,\s*\(int\)il,"
+            r"\s*\"router-selected\"\s*\)",
+        )
         layer_dump_match = re.search(
             r"laguna_graph_diag_checkpoint\(\s*g->next,\s*1,"
             r"\s*DS4_N_EMBD,\s*\(int\)il,\s*\"l_out\"\s*\)",
@@ -2050,11 +2057,40 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("DS4_LAGUNA_DIAG_DIR", producer_source)
         self.assertIn("DS4_LAGUNA_DIAG_LAYER", producer_source)
         self.assertIn("tests/probe_ds4_laguna_moe:", MAKEFILE)
+        probe_link = re.search(
+            r"^tests/probe_ds4_laguna_moe:\s*(?P<objects>.*)$",
+            MAKEFILE,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(probe_link)
+        probe_objects = probe_link.group("objects")
+        self.assertIn("tests/ds4_cuda_laguna_kernels_test_hooks.o", probe_objects)
+        self.assertNotRegex(probe_objects, r"(?:^|\s)ds4_cuda\.o(?:\s|$)")
 
         capture_hook = "ds4_gpu_test_glm_routed_moe_one_capture_tensor("
         self.assertIn(capture_hook, GPU_HEADER)
         self.assertIn(capture_hook, CUDA_SOURCE)
         self.assertIn(capture_hook, DS4_SOURCE)
+        for layout_name in (
+            "DS4_GPU_GLM_MOE_CAPTURE_GATE_F32",
+            "DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_OFFSET",
+            "DS4_GPU_GLM_MOE_CAPTURE_BYTES",
+        ):
+            self.assertIn(layout_name, GPU_HEADER)
+            self.assertIn(layout_name, GPU_MGPU_HEADER)
+
+        cuda_hook_object = "tests/ds4_cuda_laguna_kernels_test_hooks.o"
+        for target in (
+            "tests/test_engine_mgpu_runtime",
+            "tests/test_sampling",
+            "tests/test_cuda_mixed_batch",
+            "tests/test_cuda_laguna_model",
+            "tests/probe_ds4_laguna_moe",
+        ):
+            with self.subTest(target=target):
+                objects = rule_prerequisites(target).split()
+                self.assertIn(cuda_hook_object, objects)
+                self.assertNotIn("ds4_cuda.o", objects)
 
         decode = source_function_body(
             DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
@@ -2074,8 +2110,9 @@ class CudaBuildContractTest(unittest.TestCase):
             r"laguna_graph_diag_checkpoint_i32\(\s*g->router_selected,\s*1,"
             r"\s*DS4_N_EXPERT_USED,\s*\(int\)il,\s*\"router-selected\"\s*\)",
         )
-        self.assertIn('"%s/layer-%02d-%s.i32"', DS4_SOURCE)
-        self.assertIn('"ffn-moe-input.q8_1"', decode)
+        self.assertIn('"%s/layer-%02d-%s.%s"', DS4_SOURCE)
+        self.assertIn('"ffn-moe-input"', decode)
+        self.assertIn('"q8_1"', decode)
 
         gate_up = function_body(
             "__global__ static void glm_poolside_q4_gate_up_kernel("
@@ -2084,7 +2121,7 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("capture_up", gate_up)
         self.assertIn("capture_swiglu", gate_up)
         self.assertGreater(
-            gate_up.find("capture_gate"), gate_up.find("float gate = 0.0f")
+            gate_up.rfind("capture_gate"), gate_up.find("float gate = 0.0f")
         )
 
         down = function_body(
@@ -2093,7 +2130,7 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("capture_down", down)
         self.assertIn("capture_weighted", down)
         self.assertLess(
-            down.find("capture_down"), down.find("output = __fadd_rn")
+            down.rfind("capture_down"), down.find("output = __fadd_rn")
         )
 
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:

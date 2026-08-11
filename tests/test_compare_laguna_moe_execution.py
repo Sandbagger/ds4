@@ -303,6 +303,9 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             )
             self.assertTrue(microscope["input_binding"]["ffn_norm_exact"])
             self.assertTrue(microscope["input_binding"]["q8_1_exact"])
+            self.assertFalse(
+                microscope["input_binding"]["poolside_q8_1_observed"]
+            )
             down_q8 = report["unpaired_boundaries"]["down_input_q8_1"]
             self.assertEqual(down_q8["status"], "unavailable_for_comparison")
             self.assertFalse(down_q8["poolside_observed"])
@@ -468,6 +471,41 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("F32 replay", result.stderr)
+            self.assertFalse(json_out.exists())
+
+    def test_scans_l2_boundary_before_a_later_microscope_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture = SyntheticCapture(root)
+            replace_f32(capture.ds4 / STAGES["up"][0], 2, F32_ONE)
+            replace_f32(capture.ds4 / STAGES["col_l2"][0], 0, F32_TWO)
+            manifest_path = capture.microscope / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["origin"].update(
+                {
+                    "projection": "gate",
+                    "selected_slot": 1,
+                    "expert": 145,
+                    "row": 0,
+                }
+            )
+            manifest["oracle"]["ds4_serial_float32_bits"] = "0x3f800001"
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            json_out = root / "report.json"
+            result = subprocess.run(
+                capture.command(json_out),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("first routed mismatch", result.stderr)
+            self.assertIn("'stage': 'col_l2'", result.stderr)
             self.assertFalse(json_out.exists())
 
 

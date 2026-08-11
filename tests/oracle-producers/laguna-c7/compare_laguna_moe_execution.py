@@ -21,6 +21,7 @@ EXPERTS_TOTAL = 256
 EMBEDDING = 3072
 EXPERT_MID = 1024
 Q8_1_BYTES = EMBEDDING // 32 * 36
+DOWN_Q8_1_BYTES = EXPERTS_USED * EXPERT_MID // 32 * 36
 
 
 class ComparisonError(RuntimeError):
@@ -98,6 +99,24 @@ ROUTED_STAGES = (
         EXPERT_MID,
     ),
     StageSpec(
+        "col_l2",
+        "layer-01-ffn-moe-col-l2.f32",
+        "f32-le",
+        EXPERTS_USED,
+        (1, EXPERTS_USED, 1),
+        "routed",
+        1,
+    ),
+    StageSpec(
+        "down_input",
+        "layer-01-ffn-moe-down-input.f32",
+        "f32-le",
+        EXPERTS_USED * EXPERT_MID,
+        (EXPERT_MID, EXPERTS_USED, 1),
+        "routed",
+        EXPERT_MID,
+    ),
+    StageSpec(
         "down",
         "layer-01-ffn-moe-down.f32",
         "f32-le",
@@ -154,7 +173,8 @@ SEMANTIC_ORDER = [
     "router_logits",
     "selected",
     "router_weights",
-    "for each slot: gate, up, swiglu, down, weighted",
+    "for each slot: gate, up, swiglu, col_l2, down_input, "
+    "down_input_q8_1, down, weighted",
     "routed_sum",
     "shared",
     "combined",
@@ -467,8 +487,10 @@ def validate_origin(manifest: dict[str, Any]) -> tuple[dict[str, Any], StageSpec
         raise ComparisonError("microscope origin must be token 513, layer 1")
     projection = origin.get("projection")
     stage = STAGE_BY_NAME.get(projection) if isinstance(projection, str) else None
-    if stage not in ROUTED_STAGES:
-        raise ComparisonError("microscope origin projection is not a routed stage")
+    if stage is None or stage.name not in ("gate", "up"):
+        raise ComparisonError(
+            "microscope origin projection must be a routed gate/up Q4_K stage"
+        )
     slot = origin.get("selected_slot")
     row = origin.get("row")
     expert = origin.get("expert")
@@ -519,6 +541,11 @@ def build_report(
         ds4_dir / "layer-01-ffn-moe-input.q8_1",
         Q8_1_BYTES,
         "DS4 routed input Q8_1",
+    )
+    ds4_down_q8 = read_exact(
+        ds4_dir / "layer-01-ffn-moe-down-input.q8_1",
+        DOWN_Q8_1_BYTES,
+        "DS4 down input Q8_1",
     )
     fixture_ffn_norm = fixture_payloads["input.f32"]
     fixture_q8 = fixture_payloads["input.q8_1"]
@@ -720,6 +747,22 @@ def build_report(
             "expert_mid": EXPERT_MID,
         },
         "stages": stages,
+        "unpaired_boundaries": {
+            "down_input_q8_1": {
+                "semantic_after": "down_input",
+                "semantic_before": "down",
+                "status": "unavailable_for_comparison",
+                "poolside_observed": False,
+                "poolside_reason": (
+                    "Poolside graph callbacks expose the F32 down input; "
+                    "Q8_1 quantization is internal to the CUDA Q4_K multiply"
+                ),
+                "ds4_observed": True,
+                "ds4_artifact": "layer-01-ffn-moe-down-input.q8_1",
+                "ds4_bytes": len(ds4_down_q8),
+                "ds4_sha256": sha256(ds4_down_q8),
+            }
+        },
         "counterfactual_decomposition": counterfactual_decomposition,
         "first_overall_mismatch": first_overall,
         "first_routed_expert_mismatch": first_routed,
@@ -732,6 +775,11 @@ def build_report(
             "input_binding": {
                 "ffn_norm_exact": True,
                 "q8_1_exact": True,
+                "poolside_q8_1_observed": False,
+                "poolside_q8_1_binding": (
+                    "inferred from byte-exact F32 input and the pinned "
+                    "microscope quantization; not a Poolside runtime capture"
+                ),
                 "microscope_ffn_norm_sha256": sha256(fixture_ffn_norm),
                 "poolside_ffn_norm_sha256": sha256(
                     poolside_payloads["ffn_norm"]

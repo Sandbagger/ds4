@@ -3842,11 +3842,37 @@ typedef enum {
     CACHE_LEDGER_WRONG_PARENT = 1,
     CACHE_LEDGER_WRONG_SUBRANGE = 2,
     CACHE_LEDGER_OVERLAPPING_DEVICE_VIEWS = 3,
-} cache_ledger_mutation;
+    CACHE_LEDGER_INCONSISTENT_LAYER_EXPERT_COUNT = 4,
+    CACHE_PLAN_UNDERSLOTTED = 5,
+} cache_boundary_mutation;
+
+static void cache_ledger_make_layer_expert_counts_inconsistent(
+        ds4_laguna_ledger *ledger) {
+    const uint64_t expert_bytes = ledger->routed_projection_expert_bytes;
+    const ds4_laguna_expert_entry layer_two_zero =
+        ledger->expert_entries[2];
+    const ds4_laguna_expert_entry layer_two_one =
+        ledger->expert_entries[3];
+    for (size_t i = 0; i < ledger->tensor_range_count; i++) {
+        ds4_laguna_tensor_range *range = &ledger->tensor_ranges[i];
+        if (range->tensor_class != DS4_LAGUNA_TENSOR_ROUTED_EXPERT) {
+            continue;
+        }
+        range->source_bytes = range->routed_layer == 1u ?
+            expert_bytes : 3u * expert_bytes;
+    }
+    ledger->expert_entries[1] = layer_two_zero;
+    ledger->expert_entries[2] = layer_two_one;
+    ledger->expert_entries[3] = layer_two_one;
+    ledger->expert_entries[3].expert = 2u;
+    ledger->expert_entries[3].gate.source_offset += expert_bytes;
+    ledger->expert_entries[3].up.source_offset += expert_bytes;
+    ledger->expert_entries[3].down.source_offset += expert_bytes;
+}
 
 static bool cache_cuda_fixture_open_mutated(
         cache_cuda_fixture *fixture,
-        cache_ledger_mutation mutation) {
+        cache_boundary_mutation mutation) {
     memset(fixture, 0, sizeof(*fixture));
     fixture->fd = -1;
     fixture->model_map = MAP_FAILED;
@@ -3882,6 +3908,17 @@ static bool cache_cuda_fixture_open_mutated(
     } else if (mutation == CACHE_LEDGER_OVERLAPPING_DEVICE_VIEWS) {
         fixture->ledger.expert_entries[0].up.device_offset =
             fixture->ledger.expert_entries[0].gate.device_offset;
+    } else if (mutation ==
+                   CACHE_LEDGER_INCONSISTENT_LAYER_EXPERT_COUNT) {
+        cache_ledger_make_layer_expert_counts_inconsistent(
+            &fixture->ledger);
+    } else if (mutation == CACHE_PLAN_UNDERSLOTTED) {
+        fixture->plan.configured_cache_bytes +=
+            fixture->ledger.slot_stride_bytes;
+        fixture->plan.effective_cache_limit_bytes =
+            fixture->plan.configured_cache_bytes;
+        fixture->plan.cache_tail_uncharged_bytes =
+            fixture->ledger.slot_stride_bytes;
     }
     if (!tracker_fixture_init(
             &fixture->runtime, &fixture->plan, &fixture->ledger)) {
@@ -3910,6 +3947,19 @@ static void cache_cuda_fixture_close(cache_cuda_fixture *fixture) {
             ds4_gpu_laguna_compact_destroy(fixture->context);
         if (destroyed == DS4_GPU_LAGUNA_DESTROY_OK) {
             fixture->context = NULL;
+        } else {
+            CHECK(false,
+                  "cache fixture cleanup retains a non-quiescent context");
+            /* The compact context still owns or references every object below.
+             * Leave the CUDA runtime, tracker, ledger, mapping, and descriptors
+             * intact for process exit rather than turning the original failure
+             * into cleanup-time use-after-free. */
+            if (fixture->path[0]) {
+                unlink(fixture->path);
+                fixture->path[0] = '\0';
+            }
+            restore_forbidden_environment(&fixture->saved);
+            return;
         }
     }
     if (fixture->gpu_initialized) ds4_gpu_cleanup();
@@ -3962,13 +4012,20 @@ static bool cache_device_map_matches_slots(
         cache_cuda_fixture *fixture,
         const ds4_gpu_laguna_compact_test_snapshot *snapshot,
         size_t expected_resident) {
+    if (!fixture || !snapshot || !snapshot->cache_slots ||
+        !snapshot->device_entry_to_slot || snapshot->cache_slot_count == 0) {
+        return false;
+    }
     const size_t count = (size_t)fixture->ledger.expert_entry_count;
     uint32_t *mapping = calloc(count, sizeof(*mapping));
-    if (!mapping || !snapshot->device_entry_to_slot ||
+    bool *slot_mapped = calloc(
+        (size_t)snapshot->cache_slot_count, sizeof(*slot_mapped));
+    if (!mapping || !slot_mapped ||
         cudaMemcpy(mapping, snapshot->device_entry_to_slot,
                    count * sizeof(*mapping),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         free(mapping);
+        free(slot_mapped);
         return false;
     }
     size_t resident = 0;
@@ -3976,7 +4033,8 @@ static bool cache_device_map_matches_slots(
     for (size_t entry_index = 0; entry_index < count; entry_index++) {
         const uint32_t slot_index = mapping[entry_index];
         if (slot_index == DS4_LAGUNA_CACHE_SLOT_NONE) continue;
-        if (slot_index >= snapshot->cache_slot_count) {
+        if (slot_index >= snapshot->cache_slot_count ||
+            slot_mapped[slot_index]) {
             matches = false;
             break;
         }
@@ -3990,10 +4048,180 @@ static bool cache_device_map_matches_slots(
             matches = false;
             break;
         }
+        slot_mapped[slot_index] = true;
         resident++;
     }
+    if (matches) {
+        for (size_t slot_index = 0;
+             slot_index < (size_t)snapshot->cache_slot_count; slot_index++) {
+            const ds4_laguna_cache_slot *slot =
+                &snapshot->cache_slots[slot_index];
+            const bool should_be_mapped =
+                slot->state == DS4_LAGUNA_CACHE_SLOT_READY ||
+                slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE;
+            if (slot_mapped[slot_index] != should_be_mapped) {
+                matches = false;
+                break;
+            }
+        }
+    }
     free(mapping);
+    free(slot_mapped);
     return matches && resident == expected_resident;
+}
+
+static bool cache_snapshot_has_no_fallback(
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot) {
+    return snapshot && snapshot->model_mapping_registered_bytes == 0 &&
+        snapshot->whole_model_copied_bytes == 0 &&
+        snapshot->opportunistic_range_allocated_bytes == 0 &&
+        snapshot->legacy_model_range_count == 0 &&
+        snapshot->legacy_model_arena_count == 0;
+}
+
+static bool cache_snapshot_keeps_fixed_allocations(
+        const ds4_gpu_laguna_compact_test_snapshot *baseline,
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot) {
+    return baseline && snapshot && snapshot->cache_payload_live &&
+        snapshot->cache_policy_live &&
+        snapshot->device_entry_to_slot_live &&
+        snapshot->cache_payload == baseline->cache_payload &&
+        snapshot->cache_slots == baseline->cache_slots &&
+        snapshot->device_entry_to_slot == baseline->device_entry_to_slot &&
+        snapshot->cache_payload_bytes == baseline->cache_payload_bytes &&
+        snapshot->cache_slot_count == baseline->cache_slot_count &&
+        snapshot->cache_slot_stride_bytes ==
+            baseline->cache_slot_stride_bytes &&
+        snapshot->pinned_staging_live_count ==
+            baseline->pinned_staging_live_count &&
+        snapshot->pinned_staging_bytes == baseline->pinned_staging_bytes &&
+        snapshot->cache_payload_allocation_attempts ==
+            baseline->cache_payload_allocation_attempts &&
+        snapshot->pinned_staging_allocation_attempts ==
+            baseline->pinned_staging_allocation_attempts;
+}
+
+static bool cache_slots_match_residents(
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot,
+        const ds4_laguna_expert_key *expected,
+        size_t expected_count) {
+    bool seen[16] = {false};
+    if (!snapshot || !snapshot->cache_slots ||
+        expected_count > ARRAY_LEN(seen) ||
+        (expected_count != 0 && !expected)) {
+        return false;
+    }
+    size_t resident_count = 0;
+    for (size_t slot_index = 0;
+         slot_index < (size_t)snapshot->cache_slot_count; slot_index++) {
+        const ds4_laguna_cache_slot *slot =
+            &snapshot->cache_slots[slot_index];
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+            if (slot->refs != 0 || slot->layer != UINT32_MAX ||
+                slot->expert != UINT32_MAX) {
+                return false;
+            }
+            continue;
+        }
+        if ((slot->state != DS4_LAGUNA_CACHE_SLOT_READY &&
+             slot->state != DS4_LAGUNA_CACHE_SLOT_IN_USE) ||
+            (slot->state == DS4_LAGUNA_CACHE_SLOT_READY && slot->refs != 0) ||
+            (slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE && slot->refs == 0)) {
+            return false;
+        }
+        size_t found = SIZE_MAX;
+        for (size_t i = 0; i < expected_count; i++) {
+            if (expected[i].layer_id == slot->layer &&
+                expected[i].expert_id == slot->expert) {
+                found = i;
+                break;
+            }
+        }
+        if (found == SIZE_MAX || seen[found]) return false;
+        seen[found] = true;
+        resident_count++;
+    }
+    if (resident_count != expected_count) return false;
+    for (size_t i = 0; i < expected_count; i++) {
+        if (!seen[i]) return false;
+    }
+    return true;
+}
+
+static bool cache_snapshot_matches_residents(
+        cache_cuda_fixture *fixture,
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot,
+        const ds4_laguna_expert_key *expected,
+        size_t expected_count,
+        uint64_t expected_source_bytes) {
+    return snapshot && snapshot->routed_payload_bytes == expected_source_bytes &&
+        cache_slots_match_residents(snapshot, expected, expected_count) &&
+        cache_device_map_matches_slots(fixture, snapshot, expected_count);
+}
+
+static bool cache_find_only_loading(
+        cache_cuda_fixture *fixture,
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot,
+        ds4_laguna_expert_key expected,
+        ds4_laguna_cache_handle *handle) {
+    if (handle) {
+        memset(handle, 0, sizeof(*handle));
+        handle->slot_index = DS4_LAGUNA_CACHE_SLOT_NONE;
+        handle->entry_index = SIZE_MAX;
+    }
+    if (!fixture || !snapshot || !snapshot->cache_slots || !handle) {
+        return false;
+    }
+    size_t entry_index = SIZE_MAX;
+    for (size_t i = 0;
+         i < (size_t)fixture->ledger.expert_entry_count; i++) {
+        const ds4_laguna_expert_entry *entry =
+            &fixture->ledger.expert_entries[i];
+        if (entry->layer == expected.layer_id &&
+            entry->expert == expected.expert_id) {
+            entry_index = i;
+            break;
+        }
+    }
+    if (entry_index == SIZE_MAX) return false;
+    size_t loading_count = 0;
+    for (size_t slot_index = 0;
+         slot_index < (size_t)snapshot->cache_slot_count; slot_index++) {
+        const ds4_laguna_cache_slot *slot =
+            &snapshot->cache_slots[slot_index];
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+            if (slot->refs != 0 || slot->layer != UINT32_MAX ||
+                slot->expert != UINT32_MAX) {
+                return false;
+            }
+            continue;
+        }
+        if (slot->state != DS4_LAGUNA_CACHE_SLOT_LOADING ||
+            slot->refs != 0 || slot->generation == 0 ||
+            slot->layer != expected.layer_id ||
+            slot->expert != expected.expert_id || loading_count != 0) {
+            return false;
+        }
+        loading_count++;
+        handle->slot_index = (uint32_t)slot_index;
+        handle->generation = slot->generation;
+        handle->entry_index = entry_index;
+        handle->key = expected;
+    }
+    return loading_count == 1u;
+}
+
+typedef struct {
+    ds4_gpu_laguna_compact *context;
+    ds4_laguna_cache_handle handle;
+    ds4_laguna_cache_status status;
+} cache_complete_probe;
+
+static void *cache_complete_probe_run(void *opaque) {
+    cache_complete_probe *load = opaque;
+    load->status = ds4_gpu_laguna_compact_cache_complete(
+        load->context, &load->handle);
+    return NULL;
 }
 
 typedef struct {
@@ -4002,25 +4230,29 @@ typedef struct {
     ds4_laguna_cache_handle handle;
     ds4_laguna_cache_acquire_outcome outcome;
     ds4_laguna_cache_status status;
-} cache_load_probe;
+} cache_begin_probe;
 
-static void *cache_load_probe_run(void *opaque) {
-    cache_load_probe *load = opaque;
-    load->status = ds4_gpu_laguna_compact_cache_acquire(
-        load->context, load->key, &load->handle, &load->outcome);
+static void *cache_begin_probe_run(void *opaque) {
+    cache_begin_probe *begin = opaque;
+    begin->status = ds4_gpu_laguna_compact_cache_begin(
+        begin->context, begin->key, &begin->handle, &begin->outcome);
     return NULL;
 }
 
 static int run_cache_validation(void) {
-    const cache_ledger_mutation mutations[] = {
+    const cache_boundary_mutation mutations[] = {
         CACHE_LEDGER_WRONG_PARENT,
         CACHE_LEDGER_WRONG_SUBRANGE,
         CACHE_LEDGER_OVERLAPPING_DEVICE_VIEWS,
+        CACHE_LEDGER_INCONSISTENT_LAYER_EXPERT_COUNT,
+        CACHE_PLAN_UNDERSLOTTED,
     };
     const char *const messages[] = {
         "cache boundary rejects a view with the wrong routed parent",
         "cache boundary rejects a view outside its exact expert subrange",
         "cache boundary rejects overlapping projection device views",
+        "cache boundary rejects inconsistent expert counts across layers",
+        "cache boundary rejects slot counts below configured capacity",
     };
     for (size_t i = 0; i < ARRAY_LEN(mutations); i++) {
         cache_cuda_fixture fixture;
@@ -4105,11 +4337,18 @@ static int run_cache_io(void) {
     ds4_laguna_cache_handle first = {0};
     ds4_laguna_cache_acquire_outcome outcome =
         DS4_LAGUNA_CACHE_ACQUIRE_NONE;
-    CHECK(ds4_gpu_laguna_compact_cache_acquire(
-              fixture.context, cache_fixture_key(1u, 0u),
-              &first, &outcome) == DS4_LAGUNA_CACHE_OK &&
-              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+    const bool first_loaded =
+        ds4_gpu_laguna_compact_cache_acquire(
+            fixture.context, cache_fixture_key(1u, 0u),
+            &first, &outcome) == DS4_LAGUNA_CACHE_OK &&
+        outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+        first.entry_index < fixture.ledger.expert_entry_count;
+    CHECK(first_loaded,
           "first expert acquire performs one bounded cache load");
+    if (!first_loaded) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
     const ds4_laguna_expert_entry *entry =
         &fixture.ledger.expert_entries[first.entry_index];
     CHECK(cache_projection_matches_source(
@@ -4215,12 +4454,141 @@ static int run_cache_io(void) {
                       DS4_RUNTIME_CATEGORY_PINNED_STAGING],
           "tracker remains fixed and below plan ceilings under pressure");
 
-    CHECK(ds4_gpu_laguna_compact_destroy(fixture.context) ==
-              DS4_GPU_LAGUNA_DESTROY_OK,
+    const ds4_gpu_laguna_destroy_status cache_io_destroyed =
+        ds4_gpu_laguna_compact_destroy(fixture.context);
+    CHECK(cache_io_destroyed == DS4_GPU_LAGUNA_DESTROY_OK,
           "quiescent fixed cache tears down safely");
-    fixture.context = NULL;
-    CHECK(tracker_has_only_ledger(&fixture.runtime.tracker),
+    if (cache_io_destroyed == DS4_GPU_LAGUNA_DESTROY_OK) {
+        fixture.context = NULL;
+    }
+    CHECK(cache_io_destroyed == DS4_GPU_LAGUNA_DESTROY_OK &&
+              tracker_has_only_ledger(&fixture.runtime.tracker),
           "cache teardown restores the ledger-only accounting baseline");
+
+    const bool recreated = cache_io_destroyed == DS4_GPU_LAGUNA_DESTROY_OK &&
+        ds4_gpu_laguna_compact_create(
+            &fixture.context, fixture.fd, fixture.model_map,
+            FIXTURE_MODEL_BYTES, &fixture.identity, &fixture.ledger,
+            &fixture.plan, &fixture.runtime.tracker) != 0 &&
+        fixture.context != NULL;
+    CHECK(recreated,
+          "cache context can recreate after a complete tracked teardown");
+    if (recreated) {
+        ds4_laguna_cache_handle recreated_owner = {0};
+        outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+        CHECK(ds4_gpu_laguna_compact_cache_begin(
+                  fixture.context, cache_fixture_key(1u, 0u),
+                  &recreated_owner, &outcome) == DS4_LAGUNA_CACHE_OK &&
+                  outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+                  recreated_owner.slot_index == first.slot_index &&
+                  recreated_owner.generation == first.generation &&
+                  recreated_owner.entry_index == first.entry_index &&
+                  recreated_owner.lifecycle_epoch != 0 &&
+                  recreated_owner.lifecycle_epoch != first.lifecycle_epoch,
+              "recreated lifecycle can reuse the exact slot generation without reusing its epoch");
+        const void *stale_view = (const void *)(uintptr_t)1u;
+        uint64_t stale_bytes = 1u;
+        CHECK(ds4_gpu_laguna_compact_cache_cancel(
+                  fixture.context, first) == DS4_LAGUNA_CACHE_RECOVERABLE &&
+                  !ds4_gpu_laguna_compact_cache_view(
+                      fixture.context, first,
+                      DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+                      &stale_view, &stale_bytes) &&
+                  stale_view == NULL && stale_bytes == 0 &&
+                  ds4_gpu_laguna_compact_cache_unpin(
+                      fixture.context, first) ==
+                      DS4_LAGUNA_CACHE_RECOVERABLE,
+              "stale lifecycle handles cannot cancel, view, or unpin a colliding owner");
+        CHECK(ds4_gpu_laguna_compact_cache_complete(
+                  fixture.context, &recreated_owner) ==
+                      DS4_LAGUNA_CACHE_OK,
+              "current lifecycle owner still publishes after stale-handle probes");
+        const ds4_laguna_expert_entry *recreated_entry =
+            &fixture.ledger.expert_entries[recreated_owner.entry_index];
+        CHECK(cache_projection_matches_source(
+                  &fixture, recreated_owner,
+                  DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+                  &recreated_entry->gate) &&
+                  ds4_gpu_laguna_compact_cache_unpin(
+                      fixture.context, recreated_owner) ==
+                      DS4_LAGUNA_CACHE_OK,
+              "recreated lifecycle retains the current owner's exact payload and pin");
+        cache_begin_probe queued_begin = {
+            .context = fixture.context,
+            .key = cache_fixture_key(2u, 0u),
+            .outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE,
+            .status = DS4_LAGUNA_CACHE_UNSAFE,
+        };
+        pthread_t begin_thread;
+        ds4_gpu_test_laguna_compact_pause_cache_begin_once();
+        const bool begin_started = pthread_create(
+            &begin_thread, NULL, cache_begin_probe_run,
+            &queued_begin) == 0;
+        const bool begin_paused = begin_started &&
+            ds4_gpu_test_laguna_compact_wait_cache_begin_paused();
+        CHECK(begin_paused,
+              "cache begin captures its lifecycle before waiting for the mutex");
+
+        const ds4_gpu_laguna_destroy_status recreated_destroyed =
+            ds4_gpu_laguna_compact_destroy(fixture.context);
+        CHECK(recreated_destroyed == DS4_GPU_LAGUNA_DESTROY_OK,
+              "queued begin does not prevent its original lifecycle teardown");
+        if (recreated_destroyed == DS4_GPU_LAGUNA_DESTROY_OK) {
+            fixture.context = NULL;
+        }
+        const bool third_created =
+            recreated_destroyed == DS4_GPU_LAGUNA_DESTROY_OK &&
+            ds4_gpu_laguna_compact_create(
+                &fixture.context, fixture.fd, fixture.model_map,
+                FIXTURE_MODEL_BYTES, &fixture.identity, &fixture.ledger,
+                &fixture.plan, &fixture.runtime.tracker) != 0 &&
+            fixture.context != NULL;
+        CHECK(third_created,
+              "a new compact lifecycle can win before queued begin resumes");
+        ds4_gpu_laguna_compact_test_snapshot before_queued_resume;
+        memset(&before_queued_resume, 0, sizeof(before_queued_resume));
+        CHECK(third_created &&
+                  ds4_gpu_test_laguna_compact_snapshot(
+                      fixture.context, &before_queued_resume) &&
+                  before_queued_resume.cache_acquire_misses == 0 &&
+                  before_queued_resume.routed_payload_bytes == 0 &&
+                  cache_device_map_matches_slots(
+                      &fixture, &before_queued_resume, 0u),
+              "replacement lifecycle starts with an untouched empty cache");
+
+        if (begin_started) {
+            ds4_gpu_test_laguna_compact_resume_cache_begin();
+        }
+        CHECK(begin_started && pthread_join(begin_thread, NULL) == 0 &&
+                  queued_begin.status == DS4_LAGUNA_CACHE_RECOVERABLE &&
+                  queued_begin.outcome == DS4_LAGUNA_CACHE_ACQUIRE_NONE &&
+                  queued_begin.handle.slot_index ==
+                      DS4_LAGUNA_CACHE_SLOT_NONE &&
+                  queued_begin.handle.lifecycle_epoch == 0,
+              "queued begin refuses to cross into a replacement lifecycle");
+        ds4_gpu_laguna_compact_test_snapshot after_queued_resume;
+        memset(&after_queued_resume, 0, sizeof(after_queued_resume));
+        CHECK(third_created &&
+                  ds4_gpu_test_laguna_compact_snapshot(
+                      fixture.context, &after_queued_resume) &&
+                  after_queued_resume.cache_acquire_misses == 0 &&
+                  after_queued_resume.routed_payload_bytes == 0 &&
+                  cache_device_map_matches_slots(
+                      &fixture, &after_queued_resume, 0u),
+              "stale queued begin cannot mutate replacement cache state");
+        if (third_created) {
+            const ds4_gpu_laguna_destroy_status third_destroyed =
+                ds4_gpu_laguna_compact_destroy(fixture.context);
+            CHECK(third_destroyed == DS4_GPU_LAGUNA_DESTROY_OK,
+                  "replacement lifecycle tears down after ABA refusal");
+            if (third_destroyed == DS4_GPU_LAGUNA_DESTROY_OK) {
+                fixture.context = NULL;
+            }
+        }
+    }
+    CHECK(fixture.context == NULL &&
+              tracker_has_only_ledger(&fixture.runtime.tracker),
+          "recreated lifecycle returns to the same ledger-only baseline");
     const int result = g_failures == 0 ? 0 : 1;
     cache_cuda_fixture_close(&fixture);
     return result;
@@ -4235,16 +4603,78 @@ static int run_cache_faults(void) {
         return 1;
     }
 
+    ds4_gpu_laguna_compact_test_snapshot fixed_baseline;
+    ds4_runtime_snapshot tracker_baseline;
+    ds4_runtime_allocation_record
+        tracker_records_baseline[TRACKER_RECORD_CAPACITY];
+    memset(&fixed_baseline, 0, sizeof(fixed_baseline));
+    const bool baseline_captured =
+        ds4_gpu_test_laguna_compact_snapshot(
+            fixture.context, &fixed_baseline) &&
+        capture_tracker_snapshot(
+            &fixture.runtime.tracker, &tracker_baseline,
+            tracker_records_baseline);
+    CHECK(baseline_captured &&
+              fixed_baseline.cache_payload_allocation_attempts == 1u &&
+              fixed_baseline.pinned_staging_allocation_attempts == 4u &&
+              cache_snapshot_has_no_fallback(&fixed_baseline),
+          "cache faults start from one fixed allocation set without fallback");
+    if (!baseline_captured) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+
     ds4_laguna_cache_handle handle = {0};
     ds4_laguna_cache_acquire_outcome outcome =
         DS4_LAGUNA_CACHE_ACQUIRE_NONE;
     ds4_gpu_test_laguna_compact_cache_fault_once(
         DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EINTR);
-    CHECK(ds4_gpu_laguna_compact_cache_acquire(
-              fixture.context, cache_fixture_key(1u, 0u),
-              &handle, &outcome) == DS4_LAGUNA_CACHE_OK &&
-              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+    const bool eintr_loaded =
+        ds4_gpu_laguna_compact_cache_acquire(
+            fixture.context, cache_fixture_key(1u, 0u),
+            &handle, &outcome) == DS4_LAGUNA_CACHE_OK &&
+        outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+        handle.entry_index < fixture.ledger.expert_entry_count;
+    CHECK(eintr_loaded,
           "EINTR retries the same exact read and still publishes");
+    if (!eintr_loaded) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+    const ds4_laguna_expert_entry *eintr_entry =
+        &fixture.ledger.expert_entries[handle.entry_index];
+    const uint64_t resident_source_bytes =
+        eintr_entry->gate.source_bytes + eintr_entry->up.source_bytes +
+        eintr_entry->down.source_bytes;
+    CHECK(cache_projection_matches_source(
+              &fixture, handle, DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+              &eintr_entry->gate) &&
+              cache_projection_matches_source(
+                  &fixture, handle, DS4_LAGUNA_ROUTED_PROJECTION_UP,
+                  &eintr_entry->up) &&
+              cache_projection_matches_source(
+                  &fixture, handle, DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
+                  &eintr_entry->down),
+          "EINTR retry preserves exact gate/up/down source offsets");
+    const ds4_laguna_expert_key resident_keys[] = {
+        cache_fixture_key(1u, 0u),
+    };
+    ds4_gpu_laguna_compact_test_snapshot after_eintr;
+    memset(&after_eintr, 0, sizeof(after_eintr));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &after_eintr) &&
+              after_eintr.pread_eintr_retries == 1u &&
+              after_eintr.model_file_read_calls == 4u &&
+              after_eintr.model_file_read_bytes == resident_source_bytes &&
+              after_eintr.cache_acquire_misses == 1u &&
+              after_eintr.cache_load_successes == 1u &&
+              cache_snapshot_keeps_fixed_allocations(
+                  &fixed_baseline, &after_eintr) &&
+              cache_snapshot_has_no_fallback(&after_eintr) &&
+              cache_snapshot_matches_residents(
+                  &fixture, &after_eintr, resident_keys,
+                  ARRAY_LEN(resident_keys), resident_source_bytes),
+          "EINTR adds one retry call, exact bytes, and one published resident");
     CHECK(ds4_gpu_laguna_compact_cache_unpin(
               fixture.context, handle) == DS4_LAGUNA_CACHE_OK,
           "EINTR-recovered load unpins cleanly");
@@ -4268,6 +4698,30 @@ static int run_cache_faults(void) {
                   outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
                   handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
               "injected cache load fault fails closed and releases capacity");
+        ds4_gpu_laguna_compact_test_snapshot after_fault;
+        ds4_runtime_snapshot tracker_after_fault;
+        ds4_runtime_allocation_record
+            tracker_records_after_fault[TRACKER_RECORD_CAPACITY];
+        memset(&after_fault, 0, sizeof(after_fault));
+        const bool after_fault_captured =
+            ds4_gpu_test_laguna_compact_snapshot(
+                fixture.context, &after_fault) &&
+            capture_tracker_snapshot(
+                &fixture.runtime.tracker, &tracker_after_fault,
+                tracker_records_after_fault);
+        CHECK(after_fault_captured &&
+                  after_fault.cache_load_failures == i + 1u &&
+                  !after_fault.cache_unsafe &&
+                  cache_snapshot_keeps_fixed_allocations(
+                      &fixed_baseline, &after_fault) &&
+                  cache_snapshot_has_no_fallback(&after_fault) &&
+                  cache_snapshot_matches_residents(
+                      &fixture, &after_fault, resident_keys,
+                      ARRAY_LEN(resident_keys), resident_source_bytes) &&
+                  tracker_snapshots_equal(
+                      &tracker_baseline, tracker_records_baseline,
+                      &tracker_after_fault, tracker_records_after_fault),
+              "each recoverable fault immediately restores the exact fixed cache");
     }
 
     ds4_gpu_laguna_compact_test_snapshot faults;
@@ -4311,22 +4765,27 @@ static int run_cache_faults(void) {
               fixture.context, handle) == DS4_LAGUNA_CACHE_OK,
           "IN_USE teardown probe can release its reservation");
 
-    cache_load_probe probe = {
+    ds4_laguna_cache_handle loading_handle = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(2u, 0u),
+              &loading_handle, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+              loading_handle.slot_index != DS4_LAGUNA_CACHE_SLOT_NONE &&
+              loading_handle.lifecycle_epoch != 0,
+          "split acquire exposes a lifecycle-bound LOADING owner before I/O");
+    cache_complete_probe probe = {
         .context = fixture.context,
-        .key = cache_fixture_key(2u, 0u),
-        .outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE,
+        .handle = loading_handle,
         .status = DS4_LAGUNA_CACHE_UNSAFE,
     };
     pthread_t load_thread;
-    ds4_laguna_cache_handle loading_handle = {0};
     ds4_gpu_test_laguna_compact_pause_cache_load_once();
     const bool load_started =
-        pthread_create(&load_thread, NULL, cache_load_probe_run, &probe) == 0;
-    CHECK(load_started, "real cache load starts on a worker thread");
-    if (load_started) {
-        ds4_gpu_test_laguna_compact_wait_cache_load_paused(
-            &loading_handle);
-    }
+        pthread_create(&load_thread, NULL, cache_complete_probe_run, &probe) == 0;
+    CHECK(load_started &&
+              ds4_gpu_test_laguna_compact_wait_cache_load_paused(NULL),
+          "real cache load pauses after submitting CUDA work");
     ds4_gpu_laguna_compact_test_snapshot while_loading;
     memset(&while_loading, 0, sizeof(while_loading));
     CHECK(load_started &&
@@ -4335,6 +4794,33 @@ static int run_cache_faults(void) {
               cache_device_map_matches_slots(
                   &fixture, &while_loading, 1u),
           "device reverse map advertises neither victim nor LOADING entry");
+    ds4_laguna_cache_handle concurrent_hit = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(1u, 0u),
+              &concurrent_hit, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED &&
+              ds4_gpu_laguna_compact_cache_unpin(
+                  fixture.context, concurrent_hit) == DS4_LAGUNA_CACHE_OK,
+          "a resident hit does not wait behind an unrelated cache load");
+    ds4_laguna_cache_handle duplicate = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(2u, 0u),
+              &duplicate, &outcome) == DS4_LAGUNA_CACHE_RECOVERABLE &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_BUSY_LOADING &&
+              duplicate.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "a duplicate acquire reports LOADING without waiting for I/O");
+    ds4_laguna_cache_handle concurrent_pressure = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(2u, 1u),
+              &concurrent_pressure, &outcome) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_PRESSURE &&
+              concurrent_pressure.slot_index ==
+                  DS4_LAGUNA_CACHE_SLOT_NONE,
+          "an unrelated miss cannot reserve a second loader or evict in flight");
     CHECK(ds4_gpu_laguna_compact_destroy(fixture.context) ==
               DS4_GPU_LAGUNA_DESTROY_RECOVERABLE,
           "teardown observes a real in-flight LOADING owner without blocking");
@@ -4346,9 +4832,8 @@ static int run_cache_faults(void) {
         ds4_gpu_test_laguna_compact_resume_cache_load();
         CHECK(pthread_join(load_thread, NULL) == 0 &&
                   probe.status == DS4_LAGUNA_CACHE_RECOVERABLE &&
-                  probe.outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
                   probe.handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
-              "cancelled loader drains and restores its slot before joining");
+              "cancelled loader drains submitted CUDA work and restores its slot");
     }
     ds4_gpu_laguna_compact_test_snapshot after_cancel;
     memset(&after_cancel, 0, sizeof(after_cancel));
@@ -4361,13 +4846,79 @@ static int run_cache_faults(void) {
                   after_cancel.cache_load_successes +
                   after_cancel.cache_load_failures &&
               cache_device_map_matches_slots(
-                  &fixture, &after_cancel, 2u),
+                  &fixture, &after_cancel, 1u),
           "real cancellation is one typed failed miss with a coherent map");
-    CHECK(ds4_gpu_laguna_compact_destroy(fixture.context) ==
-              DS4_GPU_LAGUNA_DESTROY_OK,
+
+    ds4_laguna_cache_handle after_drain = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    const bool after_drain_loaded =
+        ds4_gpu_laguna_compact_cache_acquire(
+            fixture.context, cache_fixture_key(2u, 1u),
+            &after_drain, &outcome) == DS4_LAGUNA_CACHE_OK &&
+        outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+        after_drain.entry_index < fixture.ledger.expert_entry_count;
+    CHECK(after_drain_loaded,
+          "a cancelled slot is immediately reusable after the upload drain");
+    if (after_drain_loaded) {
+        const ds4_laguna_expert_entry *after_drain_entry =
+            &fixture.ledger.expert_entries[after_drain.entry_index];
+        CHECK(cache_projection_matches_source(
+                  &fixture, after_drain,
+                  DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+                  &after_drain_entry->gate) &&
+                  cache_projection_matches_source(
+                      &fixture, after_drain,
+                      DS4_LAGUNA_ROUTED_PROJECTION_UP,
+                      &after_drain_entry->up) &&
+                  cache_projection_matches_source(
+                      &fixture, after_drain,
+                      DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
+                      &after_drain_entry->down),
+              "post-cancel reuse contains only the replacement expert bytes");
+        CHECK(ds4_gpu_laguna_compact_cache_unpin(
+                  fixture.context, after_drain) == DS4_LAGUNA_CACHE_OK,
+              "post-cancel replacement releases its reservation");
+    }
+
+    ds4_laguna_cache_handle reserved_cancel = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(1u, 1u),
+              &reserved_cancel, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "request cancellation can own a reservation before I/O starts");
+    const ds4_laguna_cache_handle cancelled_reservation = reserved_cancel;
+    CHECK(ds4_gpu_laguna_compact_cache_cancel(
+              fixture.context, reserved_cancel) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              ds4_gpu_laguna_compact_cache_complete(
+                  fixture.context, &reserved_cancel) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              memcmp(&reserved_cancel, &cancelled_reservation,
+                     sizeof(reserved_cancel)) == 0,
+          "RESERVED cancellation restores capacity and makes completion stale");
+    ds4_gpu_laguna_compact_test_snapshot after_reserved_cancel;
+    memset(&after_reserved_cancel, 0, sizeof(after_reserved_cancel));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &after_reserved_cancel) &&
+              after_reserved_cancel.cache_cancellations == 3u &&
+              after_reserved_cancel.cache_load_failures ==
+                  ARRAY_LEN(recoverable_faults) + 2u &&
+              after_reserved_cancel.cache_acquire_misses ==
+                  after_reserved_cancel.cache_load_successes +
+                  after_reserved_cancel.cache_load_failures &&
+              cache_device_map_matches_slots(
+                  &fixture, &after_reserved_cancel, 1u),
+          "RESERVED cancellation is one reconciled failed miss with no publication");
+    const ds4_gpu_laguna_destroy_status cache_faults_destroyed =
+        ds4_gpu_laguna_compact_destroy(fixture.context);
+    CHECK(cache_faults_destroyed == DS4_GPU_LAGUNA_DESTROY_OK,
           "teardown succeeds after every cache owner is released");
-    fixture.context = NULL;
-    CHECK(tracker_has_only_ledger(&fixture.runtime.tracker),
+    if (cache_faults_destroyed == DS4_GPU_LAGUNA_DESTROY_OK) {
+        fixture.context = NULL;
+    }
+    CHECK(cache_faults_destroyed == DS4_GPU_LAGUNA_DESTROY_OK &&
+              tracker_has_only_ledger(&fixture.runtime.tracker),
           "fault-case teardown restores ledger-only accounting");
 
     const int result = g_failures == 0 ? 0 : 1;
@@ -4384,18 +4935,260 @@ static int run_cache_unsafe(void) {
         return 1;
     }
 
+    ds4_gpu_laguna_compact_test_snapshot fixed_baseline;
+    ds4_runtime_snapshot tracker_baseline;
+    ds4_runtime_allocation_record
+        tracker_records_baseline[TRACKER_RECORD_CAPACITY];
+    memset(&fixed_baseline, 0, sizeof(fixed_baseline));
+    const bool baseline_captured =
+        ds4_gpu_test_laguna_compact_snapshot(
+            fixture.context, &fixed_baseline) &&
+        capture_tracker_snapshot(
+            &fixture.runtime.tracker, &tracker_baseline,
+            tracker_records_baseline);
+    CHECK(baseline_captured &&
+              tracker_baseline.violation == DS4_RUNTIME_VIOLATION_NONE &&
+              tracker_baseline.active_record_count == 15u &&
+              fixed_baseline.cache_payload_allocation_attempts == 1u &&
+              fixed_baseline.pinned_staging_allocation_attempts == 4u &&
+              fixed_baseline.pinned_staging_live_count == 4u &&
+              cache_snapshot_keeps_fixed_allocations(
+                  &fixed_baseline, &fixed_baseline) &&
+              cache_snapshot_has_no_fallback(&fixed_baseline),
+          "unsafe cache case captures every fixed owner before loading");
+    if (!baseline_captured) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+
+    const ds4_laguna_expert_key poisoned_key = cache_fixture_key(1u, 0u);
     ds4_laguna_cache_handle handle = {0};
     ds4_laguna_cache_acquire_outcome outcome =
         DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    const bool owner_reserved =
+        ds4_gpu_laguna_compact_cache_begin(
+            fixture.context, poisoned_key, &handle, &outcome) ==
+                DS4_LAGUNA_CACHE_OK &&
+        outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+        handle.slot_index != DS4_LAGUNA_CACHE_SLOT_NONE &&
+        handle.entry_index < fixture.ledger.expert_entry_count &&
+        handle.lifecycle_epoch != 0;
+    CHECK(owner_reserved,
+          "unsafe completion starts from a lifecycle-bound LOADING owner");
+    if (!owner_reserved) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+    const ds4_laguna_cache_handle poisoned_handle = handle;
     ds4_gpu_test_laguna_compact_cache_fault_once(
         DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION);
-    CHECK(ds4_gpu_laguna_compact_cache_acquire(
-              fixture.context, cache_fixture_key(1u, 0u),
-              &handle, &outcome) == DS4_LAGUNA_CACHE_UNSAFE &&
-              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
-              handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+    CHECK(ds4_gpu_laguna_compact_cache_complete(
+              fixture.context, &handle) == DS4_LAGUNA_CACHE_UNSAFE &&
+              handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE &&
+              handle.entry_index == SIZE_MAX && handle.lifecycle_epoch == 0,
           "event-completion uncertainty poisons the load permanently");
     ds4_gpu_laguna_compact_test_snapshot snapshot;
+    ds4_runtime_snapshot tracker_after_fault;
+    ds4_runtime_allocation_record
+        tracker_records_after_fault[TRACKER_RECORD_CAPACITY];
+    ds4_laguna_cache_handle observed_loading = {0};
+    memset(&snapshot, 0, sizeof(snapshot));
+    const bool fault_captured =
+        ds4_gpu_test_laguna_compact_snapshot(
+            fixture.context, &snapshot) &&
+        capture_tracker_snapshot(
+            &fixture.runtime.tracker, &tracker_after_fault,
+            tracker_records_after_fault);
+    CHECK(fault_captured &&
+              snapshot.cache_unsafe &&
+              snapshot.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE &&
+              snapshot.model_fd_live && snapshot.static_slab_live &&
+              snapshot.static_offsets_live && snapshot.cache_payload_live &&
+              snapshot.cache_policy_live &&
+              snapshot.device_entry_to_slot_live &&
+              snapshot.tracker_mapping_live && snapshot.tracker_static_live &&
+              snapshot.tracker_offsets_live &&
+              snapshot.cache_acquire_misses == 1u &&
+              snapshot.cache_load_failures == 1u &&
+              snapshot.cache_load_successes == 0u &&
+              snapshot.event_completion_failures == 1u &&
+              snapshot.routed_payload_bytes == 0 &&
+              cache_snapshot_keeps_fixed_allocations(
+                  &fixed_baseline, &snapshot) &&
+              cache_snapshot_has_no_fallback(&snapshot) &&
+              cache_find_only_loading(
+                  &fixture, &snapshot, poisoned_key, &observed_loading) &&
+              observed_loading.slot_index == poisoned_handle.slot_index &&
+              observed_loading.generation == poisoned_handle.generation &&
+              observed_loading.entry_index == poisoned_handle.entry_index &&
+              poisoned_handle.lifecycle_epoch != 0 &&
+              cache_device_map_matches_slots(&fixture, &snapshot, 0u) &&
+              tracker_snapshots_equal(
+                  &tracker_baseline, tracker_records_baseline,
+                  &tracker_after_fault, tracker_records_after_fault) &&
+              ds4_gpu_laguna_compact_ownership_pending(
+                  &fixture.runtime.tracker),
+          "unsafe completion retains one unpublished LOADING owner and all accounting");
+
+    ds4_laguna_cache_handle rejected = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    const void *rejected_view = (const void *)(uintptr_t)1u;
+    uint64_t rejected_bytes = 1u;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(1u, 1u),
+              &rejected, &outcome) == DS4_LAGUNA_CACHE_UNSAFE &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_NONE &&
+              rejected.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE &&
+              rejected.entry_index == SIZE_MAX && rejected.lifecycle_epoch == 0 &&
+              !ds4_gpu_laguna_compact_cache_view(
+                  fixture.context, poisoned_handle,
+                  DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+                  &rejected_view, &rejected_bytes) &&
+              rejected_view == NULL && rejected_bytes == 0 &&
+              ds4_gpu_laguna_compact_cache_unpin(
+                  fixture.context, poisoned_handle) ==
+                  DS4_LAGUNA_CACHE_UNSAFE &&
+              ds4_gpu_laguna_compact_cache_cancel(
+                  fixture.context, poisoned_handle) ==
+                  DS4_LAGUNA_CACHE_UNSAFE,
+          "poisoned cache rejects begin, view, unpin, and cancellation APIs");
+
+    ds4_gpu_laguna_compact_test_snapshot after_rejection;
+    ds4_runtime_snapshot tracker_after_rejection;
+    ds4_runtime_allocation_record
+        tracker_records_after_rejection[TRACKER_RECORD_CAPACITY];
+    ds4_laguna_cache_handle still_loading = {0};
+    memset(&after_rejection, 0, sizeof(after_rejection));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &after_rejection) &&
+              capture_tracker_snapshot(
+                  &fixture.runtime.tracker, &tracker_after_rejection,
+                  tracker_records_after_rejection) &&
+              after_rejection.cache_unsafe &&
+              after_rejection.cache_acquire_misses ==
+                  snapshot.cache_acquire_misses &&
+              after_rejection.cache_load_failures ==
+                  snapshot.cache_load_failures &&
+              after_rejection.event_completion_failures ==
+                  snapshot.event_completion_failures &&
+              after_rejection.routed_payload_bytes == 0 &&
+              cache_snapshot_keeps_fixed_allocations(
+                  &fixed_baseline, &after_rejection) &&
+              cache_snapshot_has_no_fallback(&after_rejection) &&
+              cache_find_only_loading(
+                  &fixture, &after_rejection, poisoned_key,
+                  &still_loading) &&
+              still_loading.slot_index == poisoned_handle.slot_index &&
+              still_loading.generation == poisoned_handle.generation &&
+              cache_device_map_matches_slots(
+                  &fixture, &after_rejection, 0u) &&
+              tracker_snapshots_equal(
+                  &tracker_baseline, tracker_records_baseline,
+                  &tracker_after_rejection,
+                  tracker_records_after_rejection),
+          "rejected cache APIs cannot mutate the retained unsafe owner");
+    CHECK(ds4_gpu_laguna_compact_destroy(fixture.context) ==
+              DS4_GPU_LAGUNA_DESTROY_UNSAFE,
+          "poisoned cache teardown is permanently UNSAFE");
+
+    ds4_gpu_laguna_compact_test_snapshot retained;
+    ds4_runtime_snapshot tracker_retained;
+    ds4_runtime_allocation_record
+        tracker_records_retained[TRACKER_RECORD_CAPACITY];
+    ds4_laguna_cache_handle retained_loading = {0};
+    memset(&retained, 0, sizeof(retained));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &retained) &&
+              capture_tracker_snapshot(
+                  &fixture.runtime.tracker, &tracker_retained,
+                  tracker_records_retained) &&
+              retained.lifecycle == DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE &&
+              retained.cache_unsafe && retained.model_fd_live &&
+              retained.static_slab_live && retained.static_offsets_live &&
+              retained.cache_payload_live && retained.cache_policy_live &&
+              retained.device_entry_to_slot_live &&
+              cache_snapshot_keeps_fixed_allocations(
+                  &fixed_baseline, &retained) &&
+              cache_snapshot_has_no_fallback(&retained) &&
+              cache_find_only_loading(
+                  &fixture, &retained, poisoned_key, &retained_loading) &&
+              retained_loading.slot_index == poisoned_handle.slot_index &&
+              retained_loading.generation == poisoned_handle.generation &&
+              cache_device_map_matches_slots(&fixture, &retained, 0u) &&
+              tracker_snapshots_equal(
+                  &tracker_baseline, tracker_records_baseline,
+                  &tracker_retained, tracker_records_retained) &&
+              ds4_gpu_laguna_compact_ownership_pending(
+                  &fixture.runtime.tracker),
+          "unsafe destroy retains every compact owner and unpublished slot");
+
+    /* This isolated process intentionally retains the poisoned CUDA context;
+     * physical cleanup belongs to process exit after an uncertain completion. */
+    if (fixture.path[0]) unlink(fixture.path);
+    restore_forbidden_environment(&fixture.saved);
+    return g_failures == 0 ? 0 : 1;
+}
+
+static int run_cache_unsafe_race(void) {
+    cache_cuda_fixture fixture;
+    CHECK(cache_cuda_fixture_open(&fixture),
+          "unsafe race fixture creates a compact CUDA context");
+    if (!fixture.context) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+
+    const ds4_laguna_expert_key key = cache_fixture_key(1u, 0u);
+    ds4_laguna_cache_handle owner = {0};
+    ds4_laguna_cache_acquire_outcome outcome =
+        DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    const bool reserved = ds4_gpu_laguna_compact_cache_begin(
+            fixture.context, key, &owner, &outcome) ==
+                DS4_LAGUNA_CACHE_OK &&
+        outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER;
+    CHECK(reserved,
+          "unsafe race owns one lifecycle-bound cache reservation");
+    if (!reserved) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+
+    cache_complete_probe probe = {
+        .context = fixture.context,
+        .handle = owner,
+        .status = DS4_LAGUNA_CACHE_RECOVERABLE,
+    };
+    pthread_t worker;
+    ds4_gpu_test_laguna_compact_pause_cache_load_once();
+    const bool worker_started =
+        pthread_create(&worker, NULL, cache_complete_probe_run, &probe) == 0;
+    const bool submitted = worker_started &&
+        ds4_gpu_test_laguna_compact_wait_cache_load_paused(NULL);
+    CHECK(submitted,
+          "unsafe race pauses after at least one H2D submission");
+    if (!submitted) {
+        if (worker_started) {
+            ds4_gpu_test_laguna_compact_resume_cache_load();
+            (void)pthread_join(worker, NULL);
+        } else {
+            (void)ds4_gpu_laguna_compact_cache_cancel(
+                fixture.context, owner);
+        }
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, owner) == DS4_LAGUNA_CACHE_UNSAFE,
+          "a concurrent invalid transition latches the cache unsafe");
+    ds4_gpu_test_laguna_compact_resume_cache_load();
+    CHECK(pthread_join(worker, NULL) == 0 &&
+              probe.status == DS4_LAGUNA_CACHE_UNSAFE &&
+              probe.handle.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "loader revalidates unsafe state and refuses publication");
+
+    ds4_gpu_laguna_compact_test_snapshot snapshot;
+    ds4_laguna_cache_handle observed = {0};
     memset(&snapshot, 0, sizeof(snapshot));
     CHECK(ds4_gpu_test_laguna_compact_snapshot(
               fixture.context, &snapshot) &&
@@ -4403,15 +5196,17 @@ static int run_cache_unsafe(void) {
               snapshot.cache_acquire_misses == 1u &&
               snapshot.cache_load_failures == 1u &&
               snapshot.cache_load_successes == 0u &&
-              snapshot.event_completion_failures == 1u &&
-              snapshot.routed_payload_bytes == 0,
-          "unsafe completion remains visible and reconciles its failed miss");
+              snapshot.routed_payload_bytes == 0 &&
+              cache_find_only_loading(
+                  &fixture, &snapshot, key, &observed) &&
+              cache_device_map_matches_slots(&fixture, &snapshot, 0u) &&
+              cache_snapshot_has_no_fallback(&snapshot),
+          "unsafe race retains one unpublished LOADING owner without fallback");
     CHECK(ds4_gpu_laguna_compact_destroy(fixture.context) ==
               DS4_GPU_LAGUNA_DESTROY_UNSAFE,
-          "poisoned cache teardown is permanently UNSAFE");
+          "unsafe race teardown cannot release uncertain ownership");
 
-    /* This isolated process intentionally retains the poisoned CUDA context;
-     * physical cleanup belongs to process exit after an uncertain completion. */
+    /* Isolated poison case: process exit owns physical CUDA cleanup. */
     if (fixture.path[0]) unlink(fixture.path);
     restore_forbidden_environment(&fixture.saved);
     return g_failures == 0 ? 0 : 1;
@@ -4426,7 +5221,7 @@ static void usage(const char *program) {
             "model-teardown-reconcile-unsafe|"
             "model-cleanup-release-unsafe|"
             "model-teardown-second-recoverable|cache-validation|cache-io|"
-            "cache-faults|cache-unsafe\n",
+            "cache-faults|cache-unsafe|cache-unsafe-race\n",
             program);
 }
 
@@ -4466,6 +5261,8 @@ int main(int argc, char **argv) {
         rc = run_cache_faults();
     } else if (strcmp(argv[2], "cache-unsafe") == 0) {
         rc = run_cache_unsafe();
+    } else if (strcmp(argv[2], "cache-unsafe-race") == 0) {
+        rc = run_cache_unsafe_race();
     } else {
         usage(argv[0]);
         return 2;

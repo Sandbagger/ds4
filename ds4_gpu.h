@@ -124,9 +124,23 @@ ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
 bool ds4_gpu_laguna_compact_ownership_pending(
         const ds4_runtime_tracker *tracker);
 
-/* Acquire one routed expert from the fixed compact cache.  A successful
- * LOAD_OWNER result includes the completed SSD read and CUDA publication;
- * the returned handle is already pinned exactly like HIT_RESERVED. */
+/* Reserve one routed expert without performing SSD or CUDA work.  A cache hit
+ * is returned already pinned.  LOAD_OWNER returns a lifecycle-bound LOADING
+ * handle which must be passed to cache_complete() or cache_cancel(); exposing
+ * that handle before blocking I/O makes cooperative request cancellation
+ * reachable without racing on an acquire out-parameter. */
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome);
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_complete(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle *handle);
+
+/* Synchronous convenience wrapper around begin/complete.  Callers requiring
+ * externally reachable cancellation use the split API above.  A successful
+ * result is pinned for both HIT_RESERVED and LOAD_OWNER. */
 ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_acquire(
         ds4_gpu_laguna_compact *ctx,
         ds4_laguna_expert_key key,
@@ -138,6 +152,9 @@ ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_unpin(
 ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_cancel(
         ds4_gpu_laguna_compact *ctx,
         ds4_laguna_cache_handle handle);
+/* The returned pointer remains valid only while `handle` is IN_USE.  A caller
+ * must synchronize the last CUDA consumer before cache_unpin() permits slot
+ * reuse. */
 int ds4_gpu_laguna_compact_cache_view(
         const ds4_gpu_laguna_compact *ctx,
         ds4_laguna_cache_handle handle,
@@ -242,9 +259,12 @@ void ds4_gpu_test_laguna_compact_fail_before_publish_once(void);
 void ds4_gpu_test_laguna_compact_cache_fault_once(
         ds4_gpu_laguna_cache_test_fault fault);
 void ds4_gpu_test_laguna_compact_pause_cache_load_once(void);
-void ds4_gpu_test_laguna_compact_wait_cache_load_paused(
+int ds4_gpu_test_laguna_compact_wait_cache_load_paused(
         ds4_laguna_cache_handle *handle);
 void ds4_gpu_test_laguna_compact_resume_cache_load(void);
+void ds4_gpu_test_laguna_compact_pause_cache_begin_once(void);
+int ds4_gpu_test_laguna_compact_wait_cache_begin_paused(void);
+void ds4_gpu_test_laguna_compact_resume_cache_begin(void);
 uint64_t ds4_gpu_test_laguna_compact_snapshot_size(void);
 ds4_laguna_cache_status ds4_gpu_test_laguna_compact_cache_reserve_loading(
         ds4_gpu_laguna_compact *ctx,

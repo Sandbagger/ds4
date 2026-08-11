@@ -230,6 +230,10 @@ typedef struct {
     uint64_t generation;
     size_t entry_index;
     ds4_laguna_expert_key key;
+    /* Set by the CUDA wrapper.  The allocation-free policy leaves this zero;
+     * engine-facing operations bind it to one compact-context lifecycle so a
+     * stale slot generation cannot become valid after destroy/recreate. */
+    uint64_t lifecycle_epoch;
 } ds4_laguna_cache_handle;
 
 typedef struct {

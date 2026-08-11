@@ -490,6 +490,7 @@ test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-io
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-faults
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-unsafe
+	timeout 60s ./tests/test_cuda_laguna_stream --case cache-unsafe-race
 	timeout 60s ./tests/test_cuda_laguna_stream --case create-unwind-unsafe
 	timeout 60s ./tests/test_cuda_laguna_stream --case teardown-unsafe
 

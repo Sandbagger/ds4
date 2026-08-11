@@ -298,6 +298,7 @@ static void cache_handle_clear(ds4_laguna_cache_handle *handle) {
     handle->entry_index = SIZE_MAX;
     handle->key.layer_id = UINT32_MAX;
     handle->key.expert_id = UINT32_MAX;
+    handle->lifecycle_epoch = 0;
 }
 
 static ds4_laguna_cache_status cache_handle_resolve(

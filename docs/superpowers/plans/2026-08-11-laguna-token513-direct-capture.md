@@ -216,6 +216,11 @@ is about 2.25 times the routing-only delta. Both contributions are measurable.
 - The generic microscope matches both pinned topology outputs.
 - The raw tensor bundles are scratch artifacts rather than Git blobs; their
   hashes and exact producers are durable.
+- The release/null/active verdicts are content-addressed in the run envelope,
+  but their raw console logs are not committed; the tracked probe reruns them.
+- The restored long-prefill production paths are exercised by the pinned
+  512-token case. A CUDA regression sweep over ragged token counts, nonzero
+  starting positions, and cache wrap remains separate hardening work.
 - Router arithmetic attribution remains a hypothesis pending a router-specific
   reduction microscope.
 

@@ -124,6 +124,27 @@ ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
 bool ds4_gpu_laguna_compact_ownership_pending(
         const ds4_runtime_tracker *tracker);
 
+/* Acquire one routed expert from the fixed compact cache.  A successful
+ * LOAD_OWNER result includes the completed SSD read and CUDA publication;
+ * the returned handle is already pinned exactly like HIT_RESERVED. */
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_acquire(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome);
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_unpin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle);
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_cancel(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle);
+int ds4_gpu_laguna_compact_cache_view(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle,
+        ds4_laguna_routed_projection projection,
+        const void **device_ptr,
+        uint64_t *bytes);
+
 #ifdef DS4_TEST_HOOKS
 typedef enum {
     DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
@@ -133,6 +154,18 @@ typedef enum {
     DS4_GPU_LAGUNA_LIFECYCLE_RELEASING = 4,
 } ds4_gpu_laguna_lifecycle;
 
+typedef enum {
+    DS4_GPU_LAGUNA_CACHE_FAULT_NONE = 0,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EINTR = 1,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EOF = 2,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_SHORT = 3,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_ERROR = 4,
+    DS4_GPU_LAGUNA_CACHE_FAULT_CUDA_COPY = 5,
+    DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_RECORD = 6,
+    DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION = 7,
+    DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION = 8,
+} ds4_gpu_laguna_cache_test_fault;
+
 typedef struct {
     ds4_gpu_laguna_lifecycle lifecycle;
     int model_fd;
@@ -141,9 +174,15 @@ typedef struct {
     ds4_laguna_file_identity model_identity;
     void *static_slab;
     uint64_t *static_offsets;
+    void *cache_payload;
+    ds4_laguna_cache_slot *cache_slots;
+    uint32_t *device_entry_to_slot;
     bool model_fd_live;
     bool static_slab_live;
     bool static_offsets_live;
+    bool cache_payload_live;
+    bool cache_policy_live;
+    bool device_entry_to_slot_live;
     bool tracker_mapping_live;
     bool tracker_static_live;
     bool tracker_offsets_live;
@@ -155,6 +194,28 @@ typedef struct {
     uint64_t static_range_count;
     uint64_t static_offset_count;
     uint64_t static_offset_bytes;
+    uint64_t cache_payload_bytes;
+    uint64_t cache_slot_count;
+    uint64_t cache_slot_stride_bytes;
+    uint64_t pinned_staging_live_count;
+    uint64_t pinned_staging_bytes;
+    uint64_t cache_payload_allocation_attempts;
+    uint64_t pinned_staging_allocation_attempts;
+    uint64_t cache_acquire_hits;
+    uint64_t cache_acquire_misses;
+    uint64_t cache_load_successes;
+    uint64_t cache_load_failures;
+    uint64_t model_file_read_calls;
+    uint64_t model_file_read_bytes;
+    uint64_t pread_eintr_retries;
+    uint64_t pread_eof_failures;
+    uint64_t pread_short_failures;
+    uint64_t pread_error_failures;
+    uint64_t cuda_copy_failures;
+    uint64_t event_record_failures;
+    uint64_t event_completion_failures;
+    uint64_t cache_cancellations;
+    bool cache_unsafe;
     uint64_t model_mapping_registered_bytes;
     uint64_t whole_model_copied_bytes;
     uint64_t routed_payload_bytes;
@@ -177,6 +238,13 @@ void ds4_gpu_test_laguna_compact_pause_creating_once(void);
 void ds4_gpu_test_laguna_compact_wait_creating_paused(void);
 void ds4_gpu_test_laguna_compact_resume_creating(void);
 void ds4_gpu_test_laguna_compact_fail_before_publish_once(void);
+void ds4_gpu_test_laguna_compact_cache_fault_once(
+        ds4_gpu_laguna_cache_test_fault fault);
+ds4_laguna_cache_status ds4_gpu_test_laguna_compact_cache_reserve_loading(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome);
 int ds4_gpu_test_laguna_compact_nonidle_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out);
 int ds4_gpu_test_laguna_compact_lookup(
@@ -196,6 +264,11 @@ int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
         const ds4_gpu_tensor *gate_row,
         const ds4_gpu_tensor *up_row,
         const ds4_gpu_tensor *input,
+        uint32_t input_elements);
+int ds4_gpu_test_f32_mmvf_microscope_tensor(
+        ds4_gpu_tensor *values,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
         uint32_t input_elements);
 int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
         ds4_gpu_tensor *values,

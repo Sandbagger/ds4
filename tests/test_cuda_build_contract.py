@@ -2135,6 +2135,53 @@ class CudaBuildContractTest(unittest.TestCase):
             down.rfind("capture_down"), down.find("output = __fadd_rn")
         )
 
+    def test_laguna_decode_capture_binds_release_and_hook_logits(self) -> None:
+        producer = (
+            ROOT
+            / "tests/oracle-producers/laguna-c7/probe_ds4_laguna_moe.c"
+        )
+        producer_source = producer.read_text(encoding="utf-8")
+
+        release_object = "tests/probe_ds4_laguna_moe_release.o"
+        release_binary = "tests/probe_ds4_laguna_moe_release"
+        release_compile = "\n".join(rule_recipe_lines(release_object))
+        self.assertIn("-DDS4_LAGUNA_RELEASE_CONTROL", release_compile)
+        self.assertNotIn("-DDS4_TEST_HOOKS", release_compile)
+
+        release_objects = rule_prerequisites(release_binary).split()
+        self.assertIn(release_object, release_objects)
+        self.assertIn("ds4.o", release_objects)
+        self.assertIn("ds4_cuda.o", release_objects)
+        self.assertNotIn("ds4_cuda_test_hooks.o", release_objects)
+        self.assertNotIn(
+            "tests/ds4_cuda_laguna_kernels_test_hooks.o", release_objects
+        )
+
+        hook_objects = rule_prerequisites("tests/probe_ds4_laguna_moe").split()
+        self.assertIn("ds4_cuda_test_hooks.o", hook_objects)
+        self.assertIn(
+            "tests/ds4_cuda_laguna_kernels_test_hooks.o", hook_objects
+        )
+        self.assertNotIn("ds4.o", hook_objects)
+        self.assertNotIn("ds4_cuda.o", hook_objects)
+
+        self.assertIn("DS4_LAGUNA_RELEASE_CONTROL", producer_source)
+        self.assertIn('"--release-logits"', producer_source)
+        self.assertIn("write_release_logits(", producer_source)
+        self.assertIn("read_release_logits(", producer_source)
+        self.assertIn(
+            "memcmp(release_logits, control_logits, LOGITS_BYTES)",
+            producer_source,
+        )
+        self.assertIn(
+            "memcmp(control_logits, captured_logits, LOGITS_BYTES)",
+            producer_source,
+        )
+
+        clean_recipe = "\n".join(rule_recipe_lines("clean"))
+        self.assertIn(release_binary, clean_recipe)
+        self.assertIn(release_object, clean_recipe)
+
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')
         preamble, separator, _ = body.partition("g_current_logical_tier = -1;")

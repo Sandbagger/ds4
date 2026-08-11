@@ -20,7 +20,10 @@ COMPARATOR = (
 
 F32_ONE = 0x3F800000
 F32_TWO = 0x40000000
+F32_THREE = 0x40400000
+F32_SIX = 0x40C00000
 F32_TEN = 0x41200000
+F32_FIFTEEN = 0x41700000
 
 STAGES = {
     "router_logits": ("layer-01-router-logits.f32", 256),
@@ -50,6 +53,12 @@ def replace_f32(path: Path, index: int, bits: int) -> None:
     path.write_bytes(payload)
 
 
+def replace_f32_range(path: Path, start: int, count: int, bits: int) -> None:
+    payload = bytearray(path.read_bytes())
+    payload[start * 4 : (start + count) * 4] = struct.pack("<I", bits) * count
+    path.write_bytes(payload)
+
+
 class SyntheticCapture:
     def __init__(self, root: Path) -> None:
         self.poolside = root / "poolside"
@@ -72,6 +81,9 @@ class SyntheticCapture:
             )
             for _, (filename, count) in STAGES.items():
                 (directory / filename).write_bytes(f32_payload(count))
+            (directory / STAGES["routed_sum"][0]).write_bytes(
+                f32_payload(3072, F32_TEN)
+            )
 
         # Semantic execution order is slot-major. Up in slot 0 must beat gate
         # in slot 1, even though gate precedes up in the per-stage list.
@@ -84,6 +96,16 @@ class SyntheticCapture:
             self.ds4 / STAGES["gate"][0],
             1024,
             F32_ONE + 1,
+        )
+        replace_f32(self.ds4 / STAGES["router_weights"][0], 0, F32_TWO)
+        replace_f32_range(
+            self.ds4 / STAGES["down"][0], 0, 3072, F32_THREE
+        )
+        replace_f32_range(
+            self.ds4 / STAGES["weighted"][0], 0, 3072, F32_SIX
+        )
+        (self.ds4 / STAGES["routed_sum"][0]).write_bytes(
+            f32_payload(3072, F32_FIFTEEN)
         )
 
         input_q8 = bytes((index * 29 + 7) & 0xFF for index in range(3456))
@@ -200,7 +222,16 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                     "combined",
                 ],
             )
-            expected_first = {
+            expected_first_overall = {
+                "stage": "router_weights",
+                "slot": 0,
+                "expert": 144,
+                "poolside_expert": 144,
+                "ds4_expert": 144,
+                "poolside_bits": "0x3f800000",
+                "ds4_bits": "0x40000000",
+            }
+            expected_first_routed = {
                 "stage": "up",
                 "slot": 0,
                 "expert": 144,
@@ -210,9 +241,11 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                 "poolside_bits": "0x3f800000",
                 "ds4_bits": "0x40000000",
             }
-            self.assertEqual(report["first_overall_mismatch"], expected_first)
             self.assertEqual(
-                report["first_routed_expert_mismatch"], expected_first
+                report["first_overall_mismatch"], expected_first_overall
+            )
+            self.assertEqual(
+                report["first_routed_expert_mismatch"], expected_first_routed
             )
 
             gate = report["stages"]["gate"]
@@ -226,15 +259,18 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             up = report["stages"]["up"]
             self.assertEqual(up["equal_count"], 10 * 1024 - 1)
             self.assertEqual(up["mismatch_count"], 1)
+            self.assertEqual(
+                report["stages"]["router_weights"]["mismatch_count"], 1
+            )
+            for stage in ("down", "weighted", "routed_sum"):
+                self.assertEqual(
+                    report["stages"][stage]["mismatch_count"], 3072
+                )
             for stage in (
                 "ffn_norm",
                 "router_logits",
                 "selected",
-                "router_weights",
                 "swiglu",
-                "down",
-                "weighted",
-                "routed_sum",
                 "shared",
                 "combined",
             ):
@@ -255,8 +291,43 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             )
             self.assertTrue(microscope["input_binding"]["ffn_norm_exact"])
             self.assertTrue(microscope["input_binding"]["q8_1_exact"])
+            decomposition = report["counterfactual_decomposition"]
+            self.assertTrue(decomposition["poolside_replay"]["weighted_exact"])
+            self.assertTrue(decomposition["poolside_replay"]["routed_sum_exact"])
+            self.assertTrue(decomposition["ds4_replay"]["weighted_exact"])
+            self.assertTrue(decomposition["ds4_replay"]["routed_sum_exact"])
+            self.assertEqual(
+                decomposition["routing_only"],
+                {
+                    "unequal_rows": 3072,
+                    "rows": 3072,
+                    "max_absolute_delta": 1.0,
+                    "rms_delta": 1.0,
+                    "l2_delta": 3072**0.5,
+                },
+            )
+            self.assertEqual(
+                decomposition["expert_only"],
+                {
+                    "unequal_rows": 3072,
+                    "rows": 3072,
+                    "max_absolute_delta": 2.0,
+                    "rms_delta": 2.0,
+                    "l2_delta": 2.0 * 3072**0.5,
+                },
+            )
+            self.assertEqual(
+                decomposition["combined"],
+                {
+                    "unequal_rows": 3072,
+                    "rows": 3072,
+                    "max_absolute_delta": 5.0,
+                    "rms_delta": 5.0,
+                    "l2_delta": 5.0 * 3072**0.5,
+                },
+            )
             self.assertIn(
-                "first_overall_mismatch stage=up slot=0 expert=144 row=2",
+                "first_routed_expert_mismatch stage=up slot=0 expert=144 row=2",
                 first.stdout,
             )
             self.assertNotIn("largest", first.stdout.lower())

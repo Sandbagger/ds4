@@ -41,8 +41,8 @@
   "producer": {
     "probe": {
       "path": "tests/oracle-producers/laguna-c7/probe_poolside_laguna_token513_moe.cpp",
-      "bytes": 26595,
-      "sha256": "d1fde16a289b3451afc2002345d67dd3c2ac000d40df0bcc1229402b91a2246e"
+      "bytes": 26659,
+      "sha256": "2bc85cef0d9440ffaf7e8bd65bb47f7f1ffd526839d9f1d9570e4f2527d54564"
     },
     "poolside_callback_patch": {
       "path": "tests/oracle-producers/laguna-c7/poolside-l2-callback.patch",
@@ -124,6 +124,13 @@
       {
         "callback": "ffn_inp-1",
         "file": "layer-01-ffn-inp.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 1, 1, 1],
+        "bytes": 12288
+      },
+      {
+        "callback": "ffn_norm-1",
+        "file": "layer-01-ffn-norm.f32",
         "dtype": "f32-le",
         "shape": [3072, 1, 1, 1],
         "bytes": 12288
@@ -244,9 +251,18 @@
   },
   "reference_capture": {
     "raw_bundle_committed": false,
+    "ffn_norm_confirmation": {
+      "callback": "ffn_norm-1",
+      "shape": [3072, 1, 1, 1],
+      "dtype": "f32-le",
+      "bytes": 12288,
+      "sha256": "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e",
+      "provenance": "separate accepted Poolside token-513 layer-1 capture"
+    },
     "known_output_sha256": {
       "embd.f32": "92e9ae0b77a2d8a63745457ec33a0776839388fcca9cd8512f4bac581ce04eff",
       "layer-01-ffn-inp.f32": "ce9535454570f8c60d79dcfd42497099c14a41abd7566554defff0f586fdb43d",
+      "layer-01-ffn-norm.f32": "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e",
       "layer-01-router-logits.f32": "d31b41ebc7b321b1cecf95ffb04ad659f76d492659dd1e03c69b04e8e623475e",
       "layer-01-router-selected.i32": "efee9b247512c96a5bb11a0d03e4bfa416d6cc4e31e8540f71ba2f5298264090",
       "layer-01-router-weights.f32": "101b0c3fd6bcfb247aa43db1bd5c3e65916eafe9dfc27a64936d673a6dcf9767",

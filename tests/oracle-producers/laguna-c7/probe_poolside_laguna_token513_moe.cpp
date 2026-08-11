@@ -227,8 +227,9 @@ struct DetailTarget {
     bool i32 = false;
 };
 
-static constexpr std::array<DetailTarget, 14> kDetailTargets = {{
+static constexpr std::array<DetailTarget, 15> kDetailTargets = {{
     {"ffn_inp", "ffn-inp", DetailLayout::fixed, 3072, -1, 1},
+    {"ffn_norm", "ffn-norm", DetailLayout::fixed, 3072, -1, 1},
     {"ffn_moe_logits", "router-logits", DetailLayout::fixed, 256, -1, 1},
     {"ffn_moe_topk", "router-selected", DetailLayout::fixed, 10, -1, 1, true},
     {"ffn_moe_weights_scaled", "router-weights", DetailLayout::fixed, 1, 10, -1},

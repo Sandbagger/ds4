@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 
 SCHEMA = "laguna-moe-execution-comparison/v1"
+RUN_SCHEMA = "laguna-token513-direct-capture-run/v1"
 LAYER = 1
 EXPERTS_USED = 10
 EXPERTS_TOTAL = 256
@@ -479,6 +480,71 @@ def load_microscope(
     return manifest, manifest_bytes, payloads, bindings
 
 
+def load_run_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
+    try:
+        payload = path.read_bytes()
+        manifest = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ComparisonError(f"cannot read run manifest {path}: {error}") from error
+    if not isinstance(manifest, dict):
+        raise ComparisonError("run manifest must be a JSON object")
+    if manifest.get("schema") != RUN_SCHEMA:
+        raise ComparisonError("unexpected run manifest schema")
+    if manifest.get("token") != 513 or manifest.get("layer") != LAYER:
+        raise ComparisonError("run manifest must identify token 513, layer 1")
+    if manifest.get("resume_token") != 3612:
+        raise ComparisonError("run manifest must identify resume token 3612")
+    model = manifest.get("model")
+    prefix = manifest.get("prefix")
+    if not isinstance(model, dict) or not isinstance(prefix, dict):
+        raise ComparisonError("run manifest model and prefix must be objects")
+    for label, identity in (("model", model), ("prefix", prefix)):
+        size = identity.get("bytes")
+        digest = identity.get("sha256")
+        if (
+            not isinstance(size, int)
+            or size <= 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            raise ComparisonError(f"run manifest {label} identity is invalid")
+    if prefix.get("count") != 512:
+        raise ComparisonError("run manifest prefix count must be 512")
+    if not isinstance(manifest.get("device"), dict):
+        raise ComparisonError("run manifest device must be an object")
+    runtimes = manifest.get("runtimes")
+    if not isinstance(runtimes, dict) or not all(
+        isinstance(runtimes.get(runtime), dict)
+        for runtime in ("poolside", "ds4")
+    ):
+        raise ComparisonError("run manifest must identify both runtimes")
+    return manifest, payload
+
+
+def require_manifest_artifact(
+    manifest: dict[str, Any],
+    runtime: str,
+    name: str,
+    payload: bytes,
+) -> None:
+    captures = manifest.get("captures")
+    capture = captures.get(runtime) if isinstance(captures, dict) else None
+    artifacts = capture.get("artifacts") if isinstance(capture, dict) else None
+    contract = artifacts.get(name) if isinstance(artifacts, dict) else None
+    if not isinstance(contract, dict):
+        raise ComparisonError(
+            f"run manifest is missing {runtime} artifact contract: {name}"
+        )
+    if contract.get("bytes") != len(payload):
+        raise ComparisonError(
+            f"run manifest artifact byte count does not match {runtime} {name}"
+        )
+    if contract.get("sha256") != sha256(payload):
+        raise ComparisonError(
+            f"run manifest artifact hash does not match {runtime} {name}"
+        )
+
+
 def validate_origin(manifest: dict[str, Any]) -> tuple[dict[str, Any], StageSpec]:
     origin = manifest.get("origin")
     if not isinstance(origin, dict):
@@ -508,12 +574,14 @@ def build_report(
     poolside_ffn_norm_path: Path,
     ds4_dir: Path,
     microscope_fixture: Path,
+    run_manifest_path: Path,
 ) -> dict[str, Any]:
     require_directory(poolside_moe, "Poolside MoE capture")
     require_directory(ds4_dir, "DS4 capture")
     manifest, manifest_bytes, fixture_payloads, fixture_files = load_microscope(
         microscope_fixture
     )
+    run_manifest, run_manifest_bytes = load_run_manifest(run_manifest_path)
 
     poolside_payloads: dict[str, bytes] = {}
     ds4_payloads: dict[str, bytes] = {}
@@ -736,6 +804,57 @@ def build_report(
             f"expected {expected_origin_coordinate}, got {actual_origin_coordinate}"
         )
 
+    for stage in ALL_STAGES:
+        require_manifest_artifact(
+            run_manifest,
+            "poolside",
+            stage.name,
+            poolside_payloads[stage.name],
+        )
+        require_manifest_artifact(
+            run_manifest,
+            "ds4",
+            stage.name,
+            ds4_payloads[stage.name],
+        )
+    require_manifest_artifact(
+        run_manifest, "ds4", "moe_input_q8_1", ds4_q8
+    )
+    require_manifest_artifact(
+        run_manifest, "ds4", "down_input_q8_1", ds4_down_q8
+    )
+    declared_microscope_sha256 = run_manifest.get(
+        "microscope_manifest_sha256"
+    )
+    if declared_microscope_sha256 != sha256(manifest_bytes):
+        raise ComparisonError(
+            "run manifest microscope hash does not match fixture manifest"
+        )
+
+    weight_mismatches = []
+    for slot in range(EXPERTS_USED):
+        if (
+            poolside_payloads["router_weights"][slot * 4 : slot * 4 + 4]
+            == ds4_payloads["router_weights"][slot * 4 : slot * 4 + 4]
+        ):
+            continue
+        weight_mismatches.append(
+            {
+                "slot": slot,
+                "expert": (
+                    poolside_selected[slot]
+                    if poolside_selected[slot] == ds4_selected[slot]
+                    else None
+                ),
+                "poolside_bits": bits_text(
+                    bits_at(poolside_payloads["router_weights"], slot)
+                ),
+                "ds4_bits": bits_text(
+                    bits_at(ds4_payloads["router_weights"], slot)
+                ),
+            }
+        )
+
     return {
         "schema": SCHEMA,
         "semantic_order": SEMANTIC_ORDER,
@@ -745,6 +864,31 @@ def build_report(
             "experts_used": EXPERTS_USED,
             "embedding": EMBEDDING,
             "expert_mid": EXPERT_MID,
+        },
+        "run_manifest": {
+            "schema": run_manifest["schema"],
+            "artifact": run_manifest_path.name,
+            "sha256": sha256(run_manifest_bytes),
+            "captures_bound": True,
+            "token": run_manifest["token"],
+            "layer": run_manifest["layer"],
+            "model": run_manifest["model"],
+            "prefix": run_manifest["prefix"],
+            "resume_token": run_manifest["resume_token"],
+            "device": run_manifest["device"],
+            "runtimes": run_manifest["runtimes"],
+            "controls": run_manifest.get("controls", {}),
+        },
+        "routing": {
+            "selected_ids": {
+                "poolside": list(poolside_selected),
+                "ds4": list(ds4_selected),
+                "exact": poolside_selected == ds4_selected,
+            },
+            "router_logits_mismatch_count": stages["router_logits"][
+                "mismatch_count"
+            ],
+            "weight_mismatches": weight_mismatches,
         },
         "stages": stages,
         "unpaired_boundaries": {
@@ -852,6 +996,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--poolside-ffn-norm", required=True, type=Path)
     parser.add_argument("--ds4", required=True, type=Path)
     parser.add_argument("--microscope-fixture", required=True, type=Path)
+    parser.add_argument("--run-manifest", required=True, type=Path)
     parser.add_argument("--json-out", required=True, type=Path)
     return parser.parse_args(argv)
 
@@ -864,6 +1009,7 @@ def main(argv: list[str]) -> int:
             options.poolside_ffn_norm,
             options.ds4,
             options.microscope_fixture,
+            options.run_manifest,
         )
         payload = json.dumps(
             report, indent=2, sort_keys=True, allow_nan=False

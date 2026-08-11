@@ -2036,6 +2036,60 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertGreater(diagnostic_done, failed)
         self.assertGreater(full_suite_pass, diagnostic_done)
 
+    def test_laguna_decode_direct_moe_capture_observes_production_stages(self) -> None:
+        producer = (
+            ROOT
+            / "tests/oracle-producers/laguna-c7/probe_ds4_laguna_moe.c"
+        )
+        self.assertTrue(producer.is_file(), "missing tracked DS4 512+1 producer")
+        producer_source = producer.read_text(encoding="utf-8")
+        self.assertIn("ds4_session_sync(", producer_source)
+        self.assertIn("ds4_session_eval(", producer_source)
+        self.assertIn("DS4_LAGUNA_DIAG_DIR", producer_source)
+        self.assertIn("DS4_LAGUNA_DIAG_LAYER", producer_source)
+        self.assertIn("tests/probe_ds4_laguna_moe:", MAKEFILE)
+
+        for hook in (
+            "ds4_gpu_test_glm_routed_moe_capture_begin(",
+            "ds4_gpu_test_glm_routed_moe_capture_end(",
+        ):
+            self.assertIn(hook, GPU_HEADER)
+            self.assertIn(hook, CUDA_SOURCE)
+            self.assertIn(hook, DS4_SOURCE)
+
+        decode = source_function_body(
+            DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
+        )
+        for stage in (
+            "ffn-moe-gate",
+            "ffn-moe-up",
+            "ffn-moe-swiglu",
+            "ffn-moe-col-l2",
+            "ffn-moe-down-input",
+            "ffn-moe-down",
+            "ffn-moe-weighted",
+        ):
+            self.assertIn(f'"{stage}"', decode)
+
+        gate_up = function_body(
+            "__global__ static void glm_poolside_q4_gate_up_kernel("
+        )
+        self.assertIn("capture_gate", gate_up)
+        self.assertIn("capture_up", gate_up)
+        self.assertIn("capture_swiglu", gate_up)
+        self.assertGreater(
+            gate_up.find("capture_gate"), gate_up.find("float gate = 0.0f")
+        )
+
+        down = function_body(
+            "__global__ static void glm_poolside_q4_down_kernel("
+        )
+        self.assertIn("capture_down", down)
+        self.assertIn("capture_weighted", down)
+        self.assertLess(
+            down.find("capture_down"), down.find("output = __fadd_rn")
+        )
+
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')
         preamble, separator, _ = body.partition("g_current_logical_tier = -1;")

@@ -1089,6 +1089,70 @@ class CudaBuildContractTest(unittest.TestCase):
             hook,
         )
 
+    def test_laguna_decode_poolside_mmvq_is_opt_in_and_narrow(self) -> None:
+        self.assertIn(
+            "static int g_cuda_mmvq_reduction_poolside;", CUDA_SOURCE
+        )
+        refresh = function_body("static void cuda_decode_dispatch_env_refresh(void)")
+        self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', refresh)
+        self.assertIn('strcmp(mmvq_reduction, "poolside") == 0', refresh)
+
+        fragment_signature = (
+            "dev_dot_q4_K_q8_1_poolside_mmvq_fragment("
+        )
+        fragment_offset = CUDA_SOURCE.index(fragment_signature)
+        preceding_guard = CUDA_SOURCE.rfind(
+            "#ifdef DS4_TEST_HOOKS", 0, fragment_offset
+        )
+        self.assertGreaterEqual(preceding_guard, 0)
+        self.assertLess(
+            CUDA_SOURCE.find("#endif", preceding_guard), fragment_offset,
+            "the production Poolside reduction fragment cannot be test-only",
+        )
+
+        gate_up = function_body(
+            "__global__ static void "
+            "glm_poolside_q4_gate_up_poolside_mmvq_kernel("
+        )
+        self.assertIn("const uint32_t tid = warp * 32u + lane;", gate_up)
+        self.assertGreaterEqual(gate_up.count(fragment_signature), 2)
+        self.assertIn("gate_other_warps[3][32]", gate_up)
+        self.assertIn("up_other_warps[3][32]", gate_up)
+        self.assertRegex(gate_up, r"block\s*\+=\s*8u")
+        self.assertRegex(
+            gate_up,
+            r"for \(uint32_t offset = 16u; offset > 0u; offset >>= 1u\)",
+        )
+
+        down = function_body(
+            "__global__ static void "
+            "glm_poolside_q4_down_poolside_mmvq_kernel("
+        )
+        self.assertIn("other_warps[3][4][32]", down)
+        self.assertIn("for (uint32_t slot = 0; slot < n_expert; slot++)", down)
+        self.assertIn(fragment_signature, down)
+        self.assertRegex(down, r"block\s*\+=\s*8u")
+        self.assertRegex(
+            down,
+            r"for \(uint32_t offset = 16u; offset > 0u; offset >>= 1u\)",
+        )
+
+        launch = function_body("static int glm_poolside_routed_moe_q4_launch(")
+        self.assertIn(
+            "const bool poolside_mmvq = !mmq && n_tokens == 1u &&\n"
+            "        g_cuda_mmvq_reduction_poolside;",
+            launch,
+        )
+        self.assertIn(
+            "glm_poolside_q4_gate_up_poolside_mmvq_kernel<<<", launch
+        )
+        self.assertIn(
+            "glm_poolside_q4_down_poolside_mmvq_kernel<<<", launch
+        )
+        self.assertIn("glm_poolside_q4_gate_up_kernel<<<", launch)
+        self.assertIn("glm_poolside_q4_down_kernel<<<", launch)
+        self.assertGreaterEqual(launch.count("dim3(32, 4, 1)"), 2)
+
     def test_laguna_c7_oracle_producer_is_self_contained(self) -> None:
         self.assertEqual(
             {path.name for path in LAGUNA_C7_ORACLE_PRODUCER.iterdir()},

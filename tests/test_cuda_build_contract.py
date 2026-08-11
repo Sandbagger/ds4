@@ -1090,12 +1090,11 @@ class CudaBuildContractTest(unittest.TestCase):
         )
 
     def test_laguna_decode_poolside_mmvq_is_opt_in_and_narrow(self) -> None:
-        self.assertIn(
-            "static int g_cuda_mmvq_reduction_poolside;", CUDA_SOURCE
+        selector = function_body(
+            "static bool cuda_poolside_mmvq_requested(void)"
         )
-        refresh = function_body("static void cuda_decode_dispatch_env_refresh(void)")
-        self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', refresh)
-        self.assertIn('strcmp(mmvq_reduction, "poolside") == 0', refresh)
+        self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', selector)
+        self.assertIn('strcmp(reduction, "poolside") == 0', selector)
 
         fragment_signature = (
             "dev_dot_q4_K_q8_1_poolside_mmvq_fragment("
@@ -1113,6 +1112,11 @@ class CudaBuildContractTest(unittest.TestCase):
         gate_up = function_body(
             "__global__ static void "
             "glm_poolside_q4_gate_up_poolside_mmvq_kernel("
+        )
+        self.assertRegex(
+            CUDA_SOURCE,
+            r"__launch_bounds__\(128, 1\)\s*__global__ static void\s+"
+            r"glm_poolside_q4_gate_up_poolside_mmvq_kernel\(",
         )
         self.assertIn("const uint32_t tid = warp * 32u + lane;", gate_up)
         self.assertGreaterEqual(gate_up.count(fragment_signature), 2)
@@ -1140,7 +1144,7 @@ class CudaBuildContractTest(unittest.TestCase):
         launch = function_body("static int glm_poolside_routed_moe_q4_launch(")
         self.assertIn(
             "const bool poolside_mmvq = !mmq && n_tokens == 1u &&\n"
-            "        g_cuda_mmvq_reduction_poolside;",
+            "        cuda_poolside_mmvq_requested();",
             launch,
         )
         self.assertIn(

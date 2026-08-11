@@ -307,6 +307,11 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_moe_decode_graph = getenv("DS4_CUDA_MOE_DECODE_GRAPH") != NULL;
 }
 
+static bool cuda_poolside_mmvq_requested(void) {
+    const char *reduction = getenv("DS4_MM_VQ_REDUCTION");
+    return reduction && strcmp(reduction, "poolside") == 0;
+}
+
 /* WITH_DEVICE(d) { ... } scope macro.
  *
  * Save the calling thread's current CUDA device, switch to device `d`,
@@ -27188,7 +27193,6 @@ static __global__ void glm_poolside_q8_1_mmq_quantize_kernel(
     }
 }
 
-#ifdef DS4_TEST_HOOKS
 __device__ __forceinline__ static float
 dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
         const cuda_block_q4_K *weight,
@@ -27240,6 +27244,7 @@ dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
            dev_f16_to_f32(weight->dmin) * minimum_sum;
 }
 
+#ifdef DS4_TEST_HOOKS
 __global__ static void q4_k_mmvq_serial_microscope_kernel(
         float *values,
         const cuda_block_q4_K *weight_row,
@@ -27431,6 +27436,106 @@ extern "C" int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
                    "test Poolside Q4 MMQ gate up");
 }
 #endif
+
+/* Opt-in decode microscope promoted to the routed expert path.  Poolside's
+ * generic CUDA MMVQ assigns four warps to one Q4_K row when there is one
+ * Q8_1 activation column.  Keep this separate from the existing serial
+ * kernel so the default path and the >8-token MMQ path remain unchanged. */
+__launch_bounds__(128, 1)
+__global__ static void glm_poolside_q4_gate_up_poolside_mmvq_kernel(
+        float *mid,
+        const char *gate_base,
+        const char *up_base,
+        const poolside_q8_1_block *input_q8,
+        const int32_t *selected,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t input_q4_blocks,
+        uint32_t input_q8_groups,
+        uint32_t expert_mid_dim,
+        uint32_t mid_token_stride,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens
+#ifdef DS4_TEST_HOOKS
+        , float *capture_gate,
+        float *capture_up,
+        float *capture_swiglu
+#endif
+        ) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    const uint32_t row = blockIdx.x;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (row >= expert_mid_dim || slot >= n_expert || token >= n_tokens) {
+        return;
+    }
+    const uint64_t pair = (uint64_t)token * n_expert + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) return;
+
+    const cuda_block_q4_K *gate_row =
+        (const cuda_block_q4_K *)(gate_base +
+            (uint64_t)(uint32_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *up_row =
+        (const cuda_block_q4_K *)(up_base +
+            (uint64_t)(uint32_t)expert * up_expert_bytes +
+            (uint64_t)row * up_row_bytes);
+    const poolside_q8_1_block *input_row =
+        input_q8 + (uint64_t)token * input_q8_groups;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t block = tid / 16u;
+         block < input_q4_blocks;
+         block += 8u) {
+        const uint32_t iqs = 2u * (tid % 16u);
+        gate += dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+            gate_row + block,
+            input_row + (uint64_t)block * 8u,
+            iqs);
+        up += dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+            up_row + block,
+            input_row + (uint64_t)block * 8u,
+            iqs);
+    }
+
+    __shared__ float gate_other_warps[3][32];
+    __shared__ float up_other_warps[3][32];
+    if (warp > 0u) {
+        gate_other_warps[warp - 1u][lane] = gate;
+        up_other_warps[warp - 1u][lane] = up;
+    }
+    __syncthreads();
+    if (warp > 0u) return;
+    gate += gate_other_warps[0][lane];
+    gate += gate_other_warps[1][lane];
+    gate += gate_other_warps[2][lane];
+    up += up_other_warps[0][lane];
+    up += up_other_warps[1][lane];
+    up += up_other_warps[2][lane];
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        gate += __shfl_xor_sync(0xffffffffu, gate, offset, 32);
+        up += __shfl_xor_sync(0xffffffffu, up, offset, 32);
+    }
+    if (lane != 0u) return;
+
+    const float activated = gate / (1.0f + expf(-gate));
+    const uint64_t mid_index = (uint64_t)token * mid_token_stride +
+        (uint64_t)slot * expert_mid_dim + row;
+    const float swiglu = __fmul_rn(activated, up);
+#ifdef DS4_TEST_HOOKS
+    if (capture_gate) capture_gate[mid_index] = gate;
+    if (capture_up) capture_up[mid_index] = up;
+    if (capture_swiglu) capture_swiglu[mid_index] = swiglu;
+#endif
+    mid[mid_index] = swiglu;
+}
 
 __global__ static void glm_poolside_q4_gate_up_kernel(
         float *mid,
@@ -27637,6 +27742,123 @@ extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor(
 }
 #endif
 
+/* Poolside's small-K specialization covers four adjacent down-projection
+ * rows per four-warp block for Laguna's K=1024.  Experts remain serial in
+ * slot order inside each block so this experiment changes only each expert
+ * dot-product reduction, not DS4's routing-weight accumulation order. */
+__launch_bounds__(128, 1)
+__global__ static void glm_poolside_q4_down_poolside_mmvq_kernel(
+        float *out,
+        const char *down_base,
+        const poolside_q8_1_block *mid_q8,
+        const float *column_l2,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t mid_q4_blocks,
+        uint32_t mid_q8_groups,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens
+#ifdef DS4_TEST_HOOKS
+        , float *capture_down,
+        float *capture_weighted
+#endif
+        ) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    const uint32_t row0 = blockIdx.x * 4u;
+    const uint32_t token = blockIdx.y;
+    if (token >= n_tokens) return;
+
+    float output = 0.0f;
+    __shared__ float other_warps[3][4][32];
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)token * n_expert + slot;
+        const int32_t expert = selected[pair];
+        const bool valid_expert =
+            expert >= 0 && (uint32_t)expert < n_total_expert;
+        const poolside_q8_1_block *mid_row =
+            mid_q8 + pair * mid_q8_groups;
+        float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+            const uint32_t row = row0 + local_row;
+            if (!valid_expert || row >= out_dim) continue;
+            const cuda_block_q4_K *down_row =
+                (const cuda_block_q4_K *)(down_base +
+                    (uint64_t)(uint32_t)expert * down_expert_bytes +
+                    (uint64_t)row * down_row_bytes);
+            for (uint32_t block = tid / 16u;
+                 block < mid_q4_blocks;
+                 block += 8u) {
+                partial[local_row] +=
+                    dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+                        down_row + block,
+                        mid_row + (uint64_t)block * 8u,
+                        2u * (tid % 16u));
+            }
+        }
+
+        if (warp > 0u) {
+#pragma unroll
+            for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+                other_warps[warp - 1u][local_row][lane] =
+                    partial[local_row];
+            }
+        }
+        __syncthreads();
+        if (warp == 0u) {
+#pragma unroll
+            for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+                partial[local_row] += other_warps[0][local_row][lane];
+                partial[local_row] += other_warps[1][local_row][lane];
+                partial[local_row] += other_warps[2][local_row][lane];
+            }
+#pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+#pragma unroll
+                for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+                    partial[local_row] += __shfl_xor_sync(
+                        0xffffffffu, partial[local_row], offset, 32);
+                }
+            }
+            if (lane < 4u) {
+                const uint32_t row = row0 + lane;
+                if (valid_expert && row < out_dim) {
+                    float expert_value = __fmul_rn(
+                        partial[lane], column_l2[pair]);
+                    expert_value = __fmul_rn(
+                        expert_value, 1.0f / 32768.0f);
+#ifdef DS4_TEST_HOOKS
+                    if (capture_down) {
+                        capture_down[pair * out_dim + row] = expert_value;
+                    }
+#endif
+                    expert_value = __fmul_rn(
+                        expert_value, weights[pair]);
+#ifdef DS4_TEST_HOOKS
+                    if (capture_weighted) {
+                        capture_weighted[pair * out_dim + row] =
+                            expert_value;
+                    }
+#endif
+                    output = __fadd_rn(output, expert_value);
+                }
+            }
+        }
+        /* Warps 1-3 must not race the next slot's shared-memory writes with
+         * warp 0's current-slot reads. */
+        __syncthreads();
+    }
+    if (warp == 0u && lane < 4u && row0 + lane < out_dim) {
+        out[(uint64_t)token * out_dim + row0 + lane] = output;
+    }
+}
+
 __global__ static void glm_poolside_q4_down_kernel(
         float *out,
         const char *down_base,
@@ -27809,6 +28031,8 @@ static int glm_poolside_routed_moe_q4_launch(
     const uint64_t output_values = (uint64_t)n_tokens * out_dim;
     const uint64_t output_grid_x = ((uint64_t)out_dim + 255u) / 256u;
     const bool mmq = n_tokens > 8u;
+    const bool poolside_mmvq = !mmq && n_tokens == 1u &&
+        cuda_poolside_mmvq_requested();
     if ((mmq && ((((uintptr_t)input->ptr) & 15u) != 0u ||
                  (((uintptr_t)mid->ptr) & 15u) != 0u)) ||
         input_values > UINT32_MAX ||
@@ -27944,20 +28168,38 @@ static int glm_poolside_routed_moe_q4_launch(
     }
 #endif
 
-    const dim3 gate_grid(
-        (expert_mid_dim + 255u) / 256u, n_expert, n_tokens);
-    glm_poolside_q4_gate_up_kernel<<<gate_grid, 256>>>(
-        (float *)mid->ptr, gate, up, input_q8,
-        (const int32_t *)selected->ptr,
-        gate_expert_bytes, gate_row_bytes,
-        up_expert_bytes, up_row_bytes,
-        (uint32_t)input_q4_blocks, (uint32_t)input_q8_groups,
-        expert_mid_dim, mid_token_stride, n_total_expert,
-        n_expert, n_tokens, mmq
+    if (poolside_mmvq) {
+        const dim3 gate_grid(expert_mid_dim, n_expert, n_tokens);
+        glm_poolside_q4_gate_up_poolside_mmvq_kernel<<<
+            gate_grid, dim3(32, 4, 1)>>>(
+                (float *)mid->ptr, gate, up, input_q8,
+                (const int32_t *)selected->ptr,
+                gate_expert_bytes, gate_row_bytes,
+                up_expert_bytes, up_row_bytes,
+                (uint32_t)input_q4_blocks,
+                (uint32_t)input_q8_groups,
+                expert_mid_dim, mid_token_stride, n_total_expert,
+                n_expert, n_tokens
 #ifdef DS4_TEST_HOOKS
-        , capture_gate, capture_up, capture_swiglu
+                , capture_gate, capture_up, capture_swiglu
 #endif
-        );
+                );
+    } else {
+        const dim3 gate_grid(
+            (expert_mid_dim + 255u) / 256u, n_expert, n_tokens);
+        glm_poolside_q4_gate_up_kernel<<<gate_grid, 256>>>(
+            (float *)mid->ptr, gate, up, input_q8,
+            (const int32_t *)selected->ptr,
+            gate_expert_bytes, gate_row_bytes,
+            up_expert_bytes, up_row_bytes,
+            (uint32_t)input_q4_blocks, (uint32_t)input_q8_groups,
+            expert_mid_dim, mid_token_stride, n_total_expert,
+            n_expert, n_tokens, mmq
+#ifdef DS4_TEST_HOOKS
+            , capture_gate, capture_up, capture_swiglu
+#endif
+            );
+    }
     if (!cuda_ok(cudaGetLastError(),
                  "glm Poolside routed moe gate up")) {
         return 0;
@@ -28023,19 +28265,37 @@ static int glm_poolside_routed_moe_q4_launch(
     }
 #endif
 
-    const dim3 down_grid((uint32_t)output_grid_x, n_tokens, 1u);
-    glm_poolside_q4_down_kernel<<<down_grid, 256>>>(
-        (float *)out->ptr, down, mid_q8,
-        (const float *)l2_scratch[tier]->ptr,
-        (const int32_t *)selected->ptr,
-        (const float *)weights->ptr,
-        down_expert_bytes, down_row_bytes,
-        (uint32_t)mid_q4_blocks, (uint32_t)mid_q8_groups,
-        out_dim, n_total_expert, n_expert, n_tokens, mmq
+    if (poolside_mmvq) {
+        const dim3 down_grid((out_dim + 3u) / 4u, n_tokens, 1u);
+        glm_poolside_q4_down_poolside_mmvq_kernel<<<
+            down_grid, dim3(32, 4, 1)>>>(
+                (float *)out->ptr, down, mid_q8,
+                (const float *)l2_scratch[tier]->ptr,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                down_expert_bytes, down_row_bytes,
+                (uint32_t)mid_q4_blocks,
+                (uint32_t)mid_q8_groups,
+                out_dim, n_total_expert, n_expert, n_tokens
 #ifdef DS4_TEST_HOOKS
-        , capture_down, capture_weighted
+                , capture_down, capture_weighted
 #endif
-        );
+                );
+    } else {
+        const dim3 down_grid((uint32_t)output_grid_x, n_tokens, 1u);
+        glm_poolside_q4_down_kernel<<<down_grid, 256>>>(
+            (float *)out->ptr, down, mid_q8,
+            (const float *)l2_scratch[tier]->ptr,
+            (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            down_expert_bytes, down_row_bytes,
+            (uint32_t)mid_q4_blocks, (uint32_t)mid_q8_groups,
+            out_dim, n_total_expert, n_expert, n_tokens, mmq
+#ifdef DS4_TEST_HOOKS
+            , capture_down, capture_weighted
+#endif
+            );
+    }
     return cuda_ok(cudaGetLastError(),
                    "glm Poolside routed moe down");
 }

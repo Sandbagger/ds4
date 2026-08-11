@@ -32,6 +32,8 @@
 #define CUDA_CENTERED_ABS_MAX 0.20
 #define CUDA_TOP20_MIN 18
 #define STREAMED_CACHE_BYTES (UINT64_C(8) * 1024u * 1024u * 1024u)
+#define LAGUNA_ROUTED_LAYERS 47u
+#define LAGUNA_ROUTED_EXPERTS 10u
 
 typedef enum {
     MODEL_MODE_RESIDENT,
@@ -391,7 +393,9 @@ static bool compare_session_oracle(
     return ok;
 }
 
-static bool verify_streamed_cache_contract(const char *scenario) {
+static bool verify_streamed_cache_contract(
+        const char *scenario,
+        uint64_t routed_tokens) {
     ds4_gpu_laguna_compact_test_snapshot compact;
     ds4_gpu_laguna_routed_origin_test_snapshot origins;
     memset(&compact, 0, sizeof(compact));
@@ -409,8 +413,12 @@ static bool verify_streamed_cache_contract(const char *scenario) {
         compact.opportunistic_range_allocated_bytes == 0 &&
         compact.legacy_model_range_count == 0 &&
         compact.legacy_model_arena_count == 0;
+    const uint64_t expected_projection_requests =
+        routed_tokens * LAGUNA_ROUTED_LAYERS *
+        LAGUNA_ROUTED_EXPERTS * 3u;
     const bool origin_exact =
-        origins.routed_projection_requests != 0 &&
+        expected_projection_requests != 0 &&
+        origins.routed_projection_requests == expected_projection_requests &&
         origins.engine_slot_resolutions ==
             origins.routed_projection_requests &&
         origins.static_slab_resolutions == 0 &&
@@ -465,7 +473,10 @@ static bool create_and_sync(
     return true;
 }
 
-static bool run_short(ds4_engine *engine, const oracle_case *fixture) {
+static bool run_short(
+        ds4_engine *engine,
+        const oracle_case *fixture,
+        uint64_t *routed_tokens) {
     static const char expected[] =
         "Explain why a ring buffer wraps, in two sentences.\n";
     char *text = read_text("short.txt");
@@ -477,6 +488,7 @@ static bool run_short(ds4_engine *engine, const oracle_case *fixture) {
     ds4_tokens tokens = {0};
     ds4_encode_chat_prompt(engine, "", text, DS4_THINK_NONE, &tokens);
     free(text);
+    if (routed_tokens) *routed_tokens = (uint64_t)tokens.len;
 
     const char *diag_dir_env = getenv("DS4_LAGUNA_DIAG_DIR");
     if (diag_dir_env && diag_dir_env[0]) {
@@ -1090,14 +1102,20 @@ int main(int argc, char **argv) {
     }
 
     bool ok = true;
+    uint64_t streamed_routed_tokens = 0u;
     if (selected == MODEL_CASE_SHORT || selected == MODEL_CASE_ALL) {
-        ok = run_short(engine, &fixtures.cases[0]);
+        ok = run_short(
+            engine, &fixtures.cases[0],
+            mode == MODEL_MODE_STREAMED ? &streamed_routed_tokens : NULL);
     }
     if (ok && selected == MODEL_CASE_CONTINUATION) {
         ok = run_raw_frontier(
                 engine, "yarn-8193", "yarn-8193.prompt", 8193, 8202,
                 &fixtures.cases[2], fixtures.continuation,
                 mode == MODEL_MODE_STREAMED);
+        if (mode == MODEL_MODE_STREAMED) {
+            streamed_routed_tokens = 8193u + CONTINUATION_COUNT;
+        }
     }
     if (ok && selected == MODEL_CASE_ALL && !diagnostic_mode) {
         if (ok) {
@@ -1116,8 +1134,11 @@ int main(int argc, char **argv) {
         if (ok) ok = run_decode_batch(engine);
         if (ok) ok = run_mixed_batch(engine);
     }
-    if (ok && mode == MODEL_MODE_STREAMED) {
-        ok = verify_streamed_cache_contract(model_case_name(selected));
+    if (mode == MODEL_MODE_STREAMED) {
+        const bool cache_contract =
+            verify_streamed_cache_contract(
+                model_case_name(selected), streamed_routed_tokens);
+        ok = cache_contract && ok;
     }
 
     ds4_engine_close(engine);

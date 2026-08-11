@@ -1935,7 +1935,7 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn("ds4_gpu_laguna_moe_residual_tensor(", GPU_HEADER)
         graph_calls = {
-            "static bool laguna_graph_forward_token(": (
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(": (
                 r"ds4_gpu_laguna_moe_residual_tensor\(\s*"
                 r"g->next,\s*g->after_attn,\s*g->ffn_out,\s*g->shared_out,\s*"
                 r"DS4_N_EMBD\s*\)"
@@ -2066,7 +2066,9 @@ class CudaBuildContractTest(unittest.TestCase):
         self,
     ) -> None:
         body = source_function_body(
-            DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "ds4.c",
         )
         self.assertNotIn("ds4_gpu_matmul_q8_0_pair_tensor", body)
         self.assertNotIn("ds4_gpu_shared_mid_swiglu_q8_0_tensor", body)
@@ -2158,7 +2160,9 @@ class CudaBuildContractTest(unittest.TestCase):
 
     def test_laguna_decode_layer_probe_covers_the_same_boundaries(self) -> None:
         body = source_function_body(
-            DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "ds4.c",
         )
         self.assertIn("laguna_graph_diag_detail_layer()", body)
         self.assertRegex(
@@ -2234,14 +2238,21 @@ class CudaBuildContractTest(unittest.TestCase):
             "diagnostic environment must be cleared after the probed session",
         )
         main = source_function_body(
-            LAGUNA_MODEL_TEST, "int main(void)", "tests/test_cuda_laguna_model.c"
+            LAGUNA_MODEL_TEST,
+            "int main(int argc, char **argv)",
+            "tests/test_cuda_laguna_model.c",
         )
         self.assertIn("const bool diagnostic_mode", main)
-        diagnostic_guard = main.find("if (!diagnostic_mode) {")
+        diagnostic_guard = main.find(
+            "if (ok && selected == MODEL_CASE_ALL && !diagnostic_mode) {"
+        )
         swa_case = main.find('engine, "swa-513"')
         self.assertGreaterEqual(diagnostic_guard, 0)
         self.assertGreater(swa_case, diagnostic_guard)
-        suite_end = main.find("\n    }\n\n    ds4_engine_close", diagnostic_guard)
+        suite_end = main.find(
+            "\n    }\n    if (mode == MODEL_MODE_STREAMED)",
+            diagnostic_guard,
+        )
         self.assertGreater(suite_end, swa_case)
         guarded_suite = main[diagnostic_guard:suite_end]
         for call in (
@@ -2305,7 +2316,9 @@ class CudaBuildContractTest(unittest.TestCase):
                 self.assertNotIn("ds4_cuda.o", objects)
 
         decode = source_function_body(
-            DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "ds4.c",
         )
         for stage in (
             "ffn-moe-gate",
@@ -2343,6 +2356,342 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("capture_weighted", down)
         self.assertLess(
             down.rfind("capture_down"), down.find("output = __fadd_rn")
+        )
+
+    def test_laguna_compact_sync_checkpoint_always_has_matching_logits(
+        self,
+    ) -> None:
+        body = source_function_body(
+            DS4_SOURCE,
+            "static int ds4_session_sync_internal(ds4_session *s,\n"
+            "                                     const ds4_tokens *prompt,\n"
+            "                                     bool allow_exact_context,\n"
+            "                                     char *err,\n"
+            "                                     size_t errlen) {",
+            "ds4.c",
+        )
+        laguna_start = body.find("if (ds4_session_is_laguna(s)) {")
+        glm_start = body.find("if (ds4_session_is_glm(s)) {", laguna_start)
+        self.assertGreaterEqual(laguna_start, 0)
+        self.assertGreater(glm_start, laguna_start)
+        laguna = body[laguna_start:glm_start]
+
+        # A compact one-token prefill may be interrupted after any successful
+        # token.  The retained checkpoint must therefore either receive fresh
+        # logits on every compact token, or roll back to the last checkpoint
+        # whose logits were actually written.
+        direct_per_token_logits = re.search(
+            r"(?:last\s*\|\|\s*e->laguna_compact|"
+            r"e->laguna_compact\s*\|\|\s*last)\s*"
+            r"\?\s*s->logits\s*:\s*NULL",
+            laguna,
+        )
+        logits_policy = re.search(
+            r"(?:const\s+)?bool\s+(?P<name>[A-Za-z_]\w*)\s*=\s*"
+            r"(?:last\s*\|\|\s*e->laguna_compact|"
+            r"e->laguna_compact\s*\|\|\s*last)\s*;",
+            laguna,
+        )
+        named_per_token_logits = bool(
+            logits_policy
+            and re.search(
+                rf"\b{re.escape(logits_policy.group('name'))}\s*"
+                r"\?\s*s->logits\s*:\s*NULL",
+                laguna,
+            )
+        )
+
+        rollback = re.search(
+            r"(?:const\s+)?int\s+"
+            r"(?P<name>[A-Za-z_]\w*checkpoint\w*logits\w*)\s*=\s*"
+            r"s->checkpoint_valid\s*\?\s*s->checkpoint\.len\s*:\s*0\s*;",
+            laguna,
+            re.IGNORECASE,
+        )
+        rollback_is_complete = False
+        if rollback:
+            marker = re.escape(rollback.group("name"))
+            rollback_is_complete = (
+                len(
+                    re.findall(
+                        rf"s->checkpoint\.len\s*=\s*{marker}\s*;", laguna
+                    )
+                )
+                >= 2
+                and len(
+                    re.findall(
+                        rf"s->checkpoint_valid\s*=\s*{marker}\s*>\s*0\s*;",
+                        laguna,
+                    )
+                )
+                >= 2
+            )
+
+        self.assertTrue(
+            direct_per_token_logits
+            or named_per_token_logits
+            or rollback_is_complete,
+            "compact cancellation can retain a checkpoint without matching logits",
+        )
+
+    def test_laguna_compact_engine_generation_uses_a_session_before_reserve(
+        self,
+    ) -> None:
+        body = source_function_body(
+            DS4_SOURCE, "int ds4_engine_generate_argmax(", "ds4.c"
+        )
+        manual_reserve = body.find("ds4_engine_reserve_exact_cache_session(")
+        self.assertGreaterEqual(manual_reserve, 0)
+        prefix = body[:manual_reserve]
+        compact_guard = re.search(
+            r"if\s*\([^{};]*\be->laguna_compact\b[^{};]*\)\s*\{",
+            prefix,
+        )
+        self.assertIsNotNone(
+            compact_guard,
+            "compact generation must select the session path before manual reserve",
+        )
+        session_create = prefix.find("ds4_session_create(", compact_guard.end())
+        self.assertGreater(
+            session_create,
+            compact_guard.end(),
+            "the compact guard must route through ds4_session_create",
+        )
+
+    def test_laguna_session_eval_argmax_uses_session_eval_path(self) -> None:
+        body = source_function_body(
+            DS4_SOURCE, "int ds4_session_eval_argmax(", "ds4.c"
+        )
+        fast_path, separator, _ = body.partition("#ifdef DS4_NO_GPU")
+        self.assertTrue(separator, "missing graph-backend compile guard")
+        dispatch = re.search(
+            r"if\s*\((?P<condition>[^{};]*)\)\s*\{\s*"
+            r"if\s*\(ds4_session_eval\(s,\s*token,\s*err,\s*errlen\)\s*"
+            r"!=\s*0\)\s*return\s+-1\s*;\s*"
+            r"return\s+ds4_session_argmax\(s\)\s*;",
+            fast_path,
+        )
+        self.assertIsNotNone(dispatch, "missing simple session eval/argmax path")
+        condition = dispatch.group("condition")
+        for predicate in (
+            "ds4_session_is_cpu(s)",
+            "ds4_session_is_glm(s)",
+            "ds4_session_is_laguna(s)",
+        ):
+            with self.subTest(predicate=predicate):
+                self.assertIn(predicate, condition)
+
+    def test_laguna_compact_routed_execution_holds_a_lifecycle_lease(
+        self,
+    ) -> None:
+        self.assertTrue(
+            "active_execution_count" in CUDA_SOURCE,
+            "compact context is missing its active execution reference count",
+        )
+        for helper in (
+            "cuda_laguna_compact_exec_enter(",
+            "cuda_laguna_compact_exec_leave(",
+        ):
+            with self.subTest(helper=helper):
+                self.assertTrue(
+                    helper in CUDA_SOURCE,
+                    f"compact lifecycle is missing {helper}",
+                )
+
+        enter_definition = re.search(
+            r"static\s+(?:int|bool)\s+cuda_laguna_compact_exec_enter\s*\(",
+            CUDA_SOURCE,
+        )
+        self.assertIsNotNone(enter_definition)
+        enter = source_function_body(
+            CUDA_SOURCE, enter_definition.group(0), "CUDA"
+        )
+        self.assertIn("g_laguna_compact_mutex", enter)
+        self.assertIn("ctx->active_execution_count", enter)
+        self.assertRegex(
+            enter,
+            r"(?:\+\+ctx->active_execution_count|"
+            r"ctx->active_execution_count\s*(?:\+\+|\+=\s*1u?))",
+        )
+        self.assertTrue(
+            "lifecycle_epoch" in enter
+            or "cuda_laguna_compact_exec_epoch_matches_locked(" in enter,
+            "enter must bind its reference to the published lifecycle identity",
+        )
+
+        leave_definition = re.search(
+            r"static\s+(?:int|bool)\s+cuda_laguna_compact_exec_leave\s*\(",
+            CUDA_SOURCE,
+        )
+        self.assertIsNotNone(
+            leave_definition,
+            "leave must report an epoch/reference mismatch to its caller",
+        )
+        leave = source_function_body(
+            CUDA_SOURCE, leave_definition.group(0), "CUDA"
+        )
+        self.assertIn("g_laguna_compact_mutex", leave)
+        self.assertIn("ctx->active_execution_count", leave)
+        self.assertRegex(
+            leave,
+            r"(?:--ctx->active_execution_count|"
+            r"ctx->active_execution_count\s*(?:--|-=\s*1u?))",
+        )
+        self.assertTrue(
+            "lifecycle_epoch" in leave
+            or "cuda_laguna_compact_exec_epoch_matches_locked(" in leave,
+            "leave must validate the lifecycle identity it entered",
+        )
+
+        routed = function_body(
+            'extern "C" ds4_gpu_laguna_exec_result\n'
+            "ds4_gpu_laguna_compact_routed_moe_one_tensor("
+        )
+        enter_at = routed.find("cuda_laguna_compact_exec_enter(")
+        leave_at = routed.find("cuda_laguna_compact_exec_leave(", enter_at)
+        core_call = re.search(
+            r"(?P<name>cuda_laguna_compact_[A-Za-z0-9_]*"
+            r"(?:core|entered|held|impl))\s*\(",
+            routed[enter_at:],
+        )
+        first_ctx_dereference = routed.find("ctx->")
+        self.assertGreaterEqual(enter_at, 0)
+        self.assertIsNotNone(
+            core_call,
+            "public wrapper must put the many-return implementation behind a lease",
+        )
+        core_at = enter_at + core_call.start()
+        self.assertGreater(core_at, enter_at)
+        self.assertGreater(leave_at, core_at)
+        self.assertTrue(
+            first_ctx_dereference < 0 or first_ctx_dereference > enter_at,
+            "public wrapper dereferences ctx before acquiring its lifecycle lease",
+        )
+        self.assertIn(
+            "DS4_GPU_LAGUNA_EXEC_UNSAFE",
+            routed[leave_at:],
+            "a failed leave must make the execution result unsafe",
+        )
+        core_definition = re.search(
+            r"static\s+ds4_gpu_laguna_exec_result\s+"
+            rf"{re.escape(core_call.group('name'))}\s*\(",
+            CUDA_SOURCE,
+        )
+        self.assertIsNotNone(core_definition)
+        core = source_function_body(
+            CUDA_SOURCE, core_definition.group(0), "CUDA"
+        )
+        self.assertIn("cuda_laguna_compact_exec_note_routes(", core)
+        self.assertIn("glm_poolside_routed_moe_q4_launch(", core)
+
+        destroy = function_body(
+            "static ds4_gpu_laguna_destroy_status "
+            "cuda_laguna_compact_destroy_checked("
+        )
+        self.assertRegex(
+            destroy,
+            r"if\s*\(\s*ctx->active_execution_count\s*"
+            r"(?:!=\s*0u?|>\s*0u?)\s*\)\s*\{?\s*"
+            r"return\s+DS4_GPU_LAGUNA_DESTROY_RECOVERABLE\s*;",
+        )
+
+    def test_laguna_compact_routed_live_ranges_are_isolated(self) -> None:
+        routed = function_body(
+            'extern "C" ds4_gpu_laguna_exec_result\n'
+            "ds4_gpu_laguna_compact_routed_moe_one_tensor("
+        )
+        core_call = re.search(
+            r"(?P<name>cuda_laguna_compact_[A-Za-z0-9_]*"
+            r"(?:core|entered|held|impl))\s*\(",
+            routed,
+        )
+        if core_call:
+            core_definition = re.search(
+                r"static\s+ds4_gpu_laguna_exec_result\s+"
+                rf"{re.escape(core_call.group('name'))}\s*\(",
+                CUDA_SOURCE,
+            )
+            self.assertIsNotNone(core_definition)
+            routed = source_function_body(
+                CUDA_SOURCE, core_definition.group(0), "CUDA"
+            )
+        writable = re.search(
+            r"(?:const\s+)?cuda_laguna_compact_exec_range\s+"
+            r"(?P<name>(?=[A-Za-z0-9_]*writable)"
+            r"[A-Za-z_][A-Za-z0-9_]*)\s*\[\]\s*=\s*\{"
+            r"(?P<entries>.*?)\n\s*\};",
+            routed,
+            re.DOTALL | re.IGNORECASE,
+        )
+        read_only = re.search(
+            r"(?:const\s+)?cuda_laguna_compact_exec_range\s+"
+            r"(?P<name>(?=[A-Za-z0-9_]*(?:read_only|readonly))"
+            r"[A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"\[\]\s*=\s*\{(?P<entries>.*?)\n\s*\};",
+            routed,
+            re.DOTALL | re.IGNORECASE,
+        )
+        self.assertIsNotNone(writable, "missing declarative writable range table")
+        self.assertIsNotNone(read_only, "missing declarative read-only range table")
+        for pointer in (
+            "out->ptr",
+            "mid->ptr",
+            "input_q8_scratch->ptr",
+            "mid_q8_scratch->ptr",
+            "aux_scratch->ptr",
+        ):
+            with self.subTest(writable=pointer):
+                self.assertIn(pointer, writable.group("entries"))
+        for pointer in ("selected->ptr", "weights->ptr", "x->ptr"):
+            with self.subTest(read_only=pointer):
+                self.assertIn(pointer, read_only.group("entries"))
+
+        validators = re.finditer(
+            r"static\s+(?:int|bool)\s+"
+            r"(?P<name>cuda_laguna_compact_exec_[A-Za-z0-9_]*range[A-Za-z0-9_]*)"
+            r"\s*\(",
+            CUDA_SOURCE,
+        )
+        validator_name = None
+        validator = None
+        for candidate in validators:
+            candidate_body = source_function_body(
+                CUDA_SOURCE, candidate.group(0), "CUDA"
+            )
+            if all(
+                needle in candidate_body
+                for needle in ("writable_count", "read_only_count")
+            ):
+                validator_name = candidate.group("name")
+                validator = candidate_body
+                break
+        self.assertIsNotNone(
+            validator, "missing generic writable/read-only range validator"
+        )
+        self.assertIn(f"{validator_name}(", routed)
+        for backing in (
+            "ctx->cache_payload",
+            "ctx->static_slab",
+            "ctx->device_entry_to_slot",
+        ):
+            with self.subTest(backing=backing):
+                self.assertIn(backing, validator)
+        self.assertGreaterEqual(
+            validator.count("cuda_laguna_compact_exec_ranges_overlap("),
+            3,
+        )
+        self.assertRegex(
+            validator,
+            r"for\s*\([^)]*\bi\b[^)]*writable_count[^)]*\)",
+        )
+        self.assertRegex(
+            validator,
+            r"for\s*\([^)]*\bj\b\s*=\s*i\s*\+\s*1u?"
+            r"[^)]*writable_count[^)]*\)",
+        )
+        self.assertRegex(
+            validator,
+            r"for\s*\([^)]*\bj\b[^)]*read_only_count[^)]*\)",
         )
 
     def test_laguna_decode_capture_binds_release_and_hook_logits(self) -> None:

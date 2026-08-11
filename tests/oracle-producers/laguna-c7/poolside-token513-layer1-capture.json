@@ -1,0 +1,270 @@
+{
+  "schema": "laguna-poolside-token513-layer1-capture/v1",
+  "poolside": {
+    "commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+    "source_state": "clean commit before applying the pinned callback patch",
+    "device": {
+      "name": "NVIDIA GB10",
+      "compute_capability": "12.1",
+      "driver": "580.126.09"
+    }
+  },
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "prefix": {
+    "format": "little-endian-int32",
+    "count": 512,
+    "bytes": 2048,
+    "sha256": "569aa6394783e0f17558db421ba26480d7a530d44dd2219bcc9aac2c09a3b559",
+    "pattern_ids": [
+      785,
+      10068,
+      3612,
+      8473,
+      1077,
+      1857,
+      606,
+      330,
+      2746,
+      22910,
+      1059,
+      4158,
+      7799,
+      83,
+      268
+    ],
+    "full_repetitions": 34,
+    "tail_ids": [785, 10068]
+  },
+  "producer": {
+    "probe": {
+      "path": "tests/oracle-producers/laguna-c7/probe_poolside_laguna_token513_moe.cpp",
+      "bytes": 26595,
+      "sha256": "d1fde16a289b3451afc2002345d67dd3c2ac000d40df0bcc1229402b91a2246e"
+    },
+    "poolside_callback_patch": {
+      "path": "tests/oracle-producers/laguna-c7/poolside-l2-callback.patch",
+      "bytes": 904,
+      "sha256": "36b84feca9f828f4bae0553291fa3a559bfb13ca4f8f1cfca3bd80266315f2c6"
+    }
+  },
+  "build": {
+    "poolside": [
+      "/usr/bin/cmake",
+      "--build",
+      "{poolside_build}",
+      "--target",
+      "llama",
+      "-j4"
+    ],
+    "probe": [
+      "/usr/bin/c++",
+      "-std=c++17",
+      "-O2",
+      "-I{poolside_src}/include",
+      "-I{poolside_src}/ggml/include",
+      "tests/oracle-producers/laguna-c7/probe_poolside_laguna_token513_moe.cpp",
+      "{poolside_build}/bin/libllama.so",
+      "{poolside_build}/bin/libggml.so",
+      "{poolside_build}/bin/libggml-base.so",
+      "-Wl,-rpath-link,{poolside_build}/bin",
+      "-o",
+      "{probe_binary}"
+    ]
+  },
+  "run": {
+    "preconditions": [
+      "the model byte count and SHA-256 match this manifest",
+      "the reconstructed prefix byte count and SHA-256 match this manifest",
+      "the Poolside checkout is the pinned commit with only the pinned callback patch applied",
+      "the output directory is empty",
+      "no other GPU compute process is running"
+    ],
+    "environment": {
+      "mode": "env-i",
+      "PATH": "/usr/bin:/bin:/usr/local/cuda/bin",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "LD_LIBRARY_PATH": "{poolside_build}/bin"
+    },
+    "argv": [
+      "{probe_binary}",
+      "--model",
+      "{model}",
+      "--tokens",
+      "{prefix_i32}",
+      "--out",
+      "{empty_output_dir}",
+      "--flash-attn",
+      "auto",
+      "--detail-layer",
+      "1",
+      "--token-count",
+      "1"
+    ]
+  },
+  "capture": {
+    "prefix_tokens": 512,
+    "resume_token": 3612,
+    "resume_position": 512,
+    "logical_token_number": 513,
+    "layer": 1,
+    "flash_attention": "AUTO",
+    "context_tokens": 1024,
+    "batch_tokens": 1024,
+    "microbatch_tokens": 512,
+    "gpu_layers": "all",
+    "q8_1_down_input_exposed": false,
+    "q8_1_down_input_note": "Poolside exposes ffn_moe_down_input as the contiguous F32 cur_s graph tensor. Q8_1 quantization is internal to the CUDA Q4_K multiply and is not a ggml graph callback tensor."
+  },
+  "outputs": {
+    "layer_1_execution_order": [
+      {
+        "callback": "ffn_inp-1",
+        "file": "layer-01-ffn-inp.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 1, 1, 1],
+        "bytes": 12288
+      },
+      {
+        "callback": "ffn_moe_logits-1",
+        "file": "layer-01-router-logits.f32",
+        "dtype": "f32-le",
+        "shape": [256, 1, 1, 1],
+        "bytes": 1024
+      },
+      {
+        "callback": "ffn_moe_topk-1",
+        "file": "layer-01-router-selected.i32",
+        "dtype": "i32-le",
+        "shape": [10, 1, 1, 1],
+        "bytes": 40
+      },
+      {
+        "callback": "ffn_moe_weights_scaled-1",
+        "file": "layer-01-router-weights.f32",
+        "dtype": "f32-le",
+        "shape": [1, 10, 1, 1],
+        "bytes": 40
+      },
+      {
+        "callback": "ffn_moe_gate-1",
+        "file": "layer-01-ffn-moe-gate.f32",
+        "dtype": "f32-le",
+        "shape": [1024, 10, 1, 1],
+        "bytes": 40960
+      },
+      {
+        "callback": "ffn_moe_up-1",
+        "file": "layer-01-ffn-moe-up.f32",
+        "dtype": "f32-le",
+        "shape": [1024, 10, 1, 1],
+        "bytes": 40960
+      },
+      {
+        "callback": "ffn_moe_swiglu-1",
+        "file": "layer-01-ffn-moe-swiglu.f32",
+        "dtype": "f32-le",
+        "shape": [1024, 10, 1, 1],
+        "bytes": 40960
+      },
+      {
+        "callback": "ffn_moe_col_l2-1",
+        "file": "layer-01-ffn-moe-col-l2.f32",
+        "dtype": "f32-le",
+        "shape": [1, 10, 1, 1],
+        "bytes": 40
+      },
+      {
+        "callback": "ffn_moe_down_input-1",
+        "file": "layer-01-ffn-moe-down-input.f32",
+        "dtype": "f32-le",
+        "shape": [1024, 10, 1, 1],
+        "bytes": 40960
+      },
+      {
+        "callback": "ffn_moe_down-1",
+        "file": "layer-01-ffn-moe-down.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 10, 1, 1],
+        "bytes": 122880
+      },
+      {
+        "callback": "ffn_moe_weighted-1",
+        "file": "layer-01-ffn-moe-weighted.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 10, 1, 1],
+        "bytes": 122880
+      },
+      {
+        "callback": "ffn_moe_out-1",
+        "file": "layer-01-ffn-moe-out.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 1, 1, 1],
+        "bytes": 12288
+      },
+      {
+        "callback": "ffn_shexp-1",
+        "file": "layer-01-ffn-shared-out.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 1, 1, 1],
+        "bytes": 12288
+      },
+      {
+        "callback": "ffn_out-1",
+        "file": "layer-01-ffn-out.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 1, 1, 1],
+        "bytes": 12288
+      }
+    ],
+    "whole_decode": {
+      "embedding": {
+        "file": "embd.f32",
+        "dtype": "f32-le",
+        "shape": [3072, 1],
+        "bytes": 12288
+      },
+      "layer_outputs": {
+        "file_pattern": "layer-%02d.f32",
+        "layers": 48,
+        "dtype": "f32-le",
+        "shape_each": [3072, 1],
+        "bytes_each": 12288
+      },
+      "logits": {
+        "file": "logits.f32",
+        "dtype": "f32-le",
+        "shape": [100352, 1],
+        "bytes": 401408
+      }
+    }
+  },
+  "reference_capture": {
+    "raw_bundle_committed": false,
+    "known_output_sha256": {
+      "embd.f32": "92e9ae0b77a2d8a63745457ec33a0776839388fcca9cd8512f4bac581ce04eff",
+      "layer-01-ffn-inp.f32": "ce9535454570f8c60d79dcfd42497099c14a41abd7566554defff0f586fdb43d",
+      "layer-01-router-logits.f32": "d31b41ebc7b321b1cecf95ffb04ad659f76d492659dd1e03c69b04e8e623475e",
+      "layer-01-router-selected.i32": "efee9b247512c96a5bb11a0d03e4bfa416d6cc4e31e8540f71ba2f5298264090",
+      "layer-01-router-weights.f32": "101b0c3fd6bcfb247aa43db1bd5c3e65916eafe9dfc27a64936d673a6dcf9767",
+      "layer-01-ffn-moe-gate.f32": "5563a95ae9d46efe1e451414ae0134535a8ac483f39f35a6b3e2592b8e621140",
+      "layer-01-ffn-moe-up.f32": "32863fcb4ca3b54833e8d740ebd67495a0bb22f008fdc42b9d07887dc49488ea",
+      "layer-01-ffn-moe-swiglu.f32": "8210b05b89bd1fc793e71ad58329ec3327c439f2a165d973a3e949ae3b3e6157",
+      "layer-01-ffn-moe-down.f32": "9d5578056e4d4a0a9daed53e841d5ee08e583fdd512cf71e4def65de447e2dc2",
+      "layer-01-ffn-moe-weighted.f32": "96b172afc454e98cae22ec320762c814fc40199c9ba3ff62b10db61c04f3392d",
+      "layer-01-ffn-moe-out.f32": "f16ca2c8ab6eeace6a0dcc867a7eb6b67f49cc1b76b939fb88aa6f47d2dc34e2",
+      "layer-01-ffn-shared-out.f32": "3327b2fd5b88324118ba07e26ff9429b8b52ad4fff8bfab8efcba0c32dd0d935",
+      "layer-01-ffn-out.f32": "19714f371f369f3ec85dffe502f8d53645e760b96eefab7cdabd5c1438d4251e",
+      "layer-01.f32": "e82201c0ba24411e248e64ce01beadef4d625ef082d4bd28ff6ff8c564d3a590",
+      "logits.f32": "d984734d99380848364f70fe0bb7fbb6c99d1bdf52cfc4116ecba84f6aa468d4"
+    },
+    "missing_from_local_analysis_copy": [
+      "layer-01-ffn-moe-col-l2.f32",
+      "layer-01-ffn-moe-down-input.f32"
+    ],
+    "limitation": "The source, inputs, recipe, output contract, and hashes used by the comparison are durable. The original raw tensor directory is not committed, and the local analysis copy omitted the col-L2 and F32 down-input files; rerun this producer to regenerate a complete raw bundle."
+  }
+}

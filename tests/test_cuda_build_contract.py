@@ -204,6 +204,7 @@ LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "probe_ds4_laguna_moe.c",
     "probe_poolside_laguna_moe.cpp",
     "short.tokens.i32",
+    "token513-layer1-comparison.json",
     "verify_poolside_laguna_moe.py",
 }
 LAGUNA_C7_TOOLCHAIN = {

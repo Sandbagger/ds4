@@ -257,7 +257,7 @@
       "dtype": "f32-le",
       "bytes": 12288,
       "sha256": "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e",
-      "provenance": "separate accepted Poolside token-513 layer-1 capture"
+      "provenance": "unified complete Poolside token-513 rerun; reproduced the separate accepted capture"
     },
     "known_output_sha256": {
       "embd.f32": "92e9ae0b77a2d8a63745457ec33a0776839388fcca9cd8512f4bac581ce04eff",
@@ -269,6 +269,8 @@
       "layer-01-ffn-moe-gate.f32": "5563a95ae9d46efe1e451414ae0134535a8ac483f39f35a6b3e2592b8e621140",
       "layer-01-ffn-moe-up.f32": "32863fcb4ca3b54833e8d740ebd67495a0bb22f008fdc42b9d07887dc49488ea",
       "layer-01-ffn-moe-swiglu.f32": "8210b05b89bd1fc793e71ad58329ec3327c439f2a165d973a3e949ae3b3e6157",
+      "layer-01-ffn-moe-col-l2.f32": "6e0259346ea225f9e1cfc3df924d91c59af97ef073ceb518c003ae43e1195542",
+      "layer-01-ffn-moe-down-input.f32": "134a4b9971b529e600b7919a240b4b8123ba4aa85a51e7fe0b6c80c7a681057a",
       "layer-01-ffn-moe-down.f32": "9d5578056e4d4a0a9daed53e841d5ee08e583fdd512cf71e4def65de447e2dc2",
       "layer-01-ffn-moe-weighted.f32": "96b172afc454e98cae22ec320762c814fc40199c9ba3ff62b10db61c04f3392d",
       "layer-01-ffn-moe-out.f32": "f16ca2c8ab6eeace6a0dcc867a7eb6b67f49cc1b76b939fb88aa6f47d2dc34e2",
@@ -277,10 +279,14 @@
       "layer-01.f32": "e82201c0ba24411e248e64ce01beadef4d625ef082d4bd28ff6ff8c564d3a590",
       "logits.f32": "d984734d99380848364f70fe0bb7fbb6c99d1bdf52cfc4116ecba84f6aa468d4"
     },
-    "missing_from_local_analysis_copy": [
-      "layer-01-ffn-moe-col-l2.f32",
-      "layer-01-ffn-moe-down-input.f32"
-    ],
-    "limitation": "The source, inputs, recipe, output contract, and hashes used by the comparison are durable. The original raw tensor directory is not committed, and the local analysis copy omitted the col-L2 and F32 down-input files; rerun this producer to regenerate a complete raw bundle."
+    "complete_rerun": {
+      "date": "2026-08-11",
+      "capture_host_path": "/tmp/poolside-laguna-token513-complete.CVy1F1",
+      "all_prior_hashes_exact": true,
+      "poolside_source_clean_after_capture": true,
+      "gpu_processes_after_capture": 0
+    },
+    "missing_from_local_analysis_copy": [],
+    "limitation": "The source, inputs, recipe, output contract, and hashes used by the comparison are durable. The complete raw tensor bundle exists on the capture host and in the local analysis scratch directory, but is not committed to Git."
   }
 }

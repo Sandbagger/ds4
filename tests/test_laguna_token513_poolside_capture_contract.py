@@ -104,6 +104,7 @@ class PoolsideToken513CaptureContractTests(unittest.TestCase):
             callbacks,
             [
                 "ffn_inp-1",
+                "ffn_norm-1",
                 "ffn_moe_logits-1",
                 "ffn_moe_topk-1",
                 "ffn_moe_weights_scaled-1",
@@ -120,6 +121,14 @@ class PoolsideToken513CaptureContractTests(unittest.TestCase):
             ],
         )
         by_callback = {entry["callback"]: entry for entry in outputs}
+        self.assertEqual(by_callback["ffn_norm-1"]["bytes"], 12288)
+        self.assertEqual(by_callback["ffn_norm-1"]["dtype"], "f32-le")
+        self.assertEqual(
+            self.manifest["reference_capture"]["known_output_sha256"][
+                "layer-01-ffn-norm.f32"
+            ],
+            "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e",
+        )
         self.assertEqual(by_callback["ffn_moe_col_l2-1"]["bytes"], 40)
         self.assertEqual(by_callback["ffn_moe_down_input-1"]["bytes"], 40960)
         self.assertEqual(by_callback["ffn_moe_down_input-1"]["dtype"], "f32-le")

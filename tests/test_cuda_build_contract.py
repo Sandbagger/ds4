@@ -1095,8 +1095,13 @@ class CudaBuildContractTest(unittest.TestCase):
         selector = function_body(
             "static bool cuda_poolside_mmvq_requested(void)"
         )
-        self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', selector)
-        self.assertIn('strcmp(reduction, "poolside") == 0', selector)
+        self.assertIn("return g_cuda_poolside_mmvq != 0;", selector)
+        self.assertNotIn("getenv", selector)
+        refresh = function_body(
+            "static void cuda_decode_dispatch_env_refresh(void)"
+        )
+        self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', refresh)
+        self.assertIn('strcmp(reduction, "poolside") == 0', refresh)
 
         fragment_signature = (
             "dev_dot_q4_K_q8_1_poolside_mmvq_fragment("

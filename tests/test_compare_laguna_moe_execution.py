@@ -32,6 +32,8 @@ STAGES = {
     "gate": ("layer-01-ffn-moe-gate.f32", 10 * 1024),
     "up": ("layer-01-ffn-moe-up.f32", 10 * 1024),
     "swiglu": ("layer-01-ffn-moe-swiglu.f32", 10 * 1024),
+    "col_l2": ("layer-01-ffn-moe-col-l2.f32", 10),
+    "down_input": ("layer-01-ffn-moe-down-input.f32", 10 * 1024),
     "down": ("layer-01-ffn-moe-down.f32", 10 * 3072),
     "weighted": ("layer-01-ffn-moe-weighted.f32", 10 * 3072),
     "routed_sum": ("layer-01-ffn-moe-out.f32", 3072),
@@ -111,6 +113,12 @@ class SyntheticCapture:
 
         input_q8 = bytes((index * 29 + 7) & 0xFF for index in range(3456))
         (self.ds4 / "layer-01-ffn-moe-input.q8_1").write_bytes(input_q8)
+        down_input_q8 = bytes(
+            (index * 11 + 5) & 0xFF for index in range(10 * 1024 // 32 * 36)
+        )
+        (self.ds4 / "layer-01-ffn-moe-down-input.q8_1").write_bytes(
+            down_input_q8
+        )
         weight_row = bytes((index * 17 + 3) & 0xFF for index in range(1728))
         poolside_output = struct.pack("<I", F32_ONE)
 
@@ -217,7 +225,8 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                     "router_logits",
                     "selected",
                     "router_weights",
-                    "for each slot: gate, up, swiglu, down, weighted",
+                    "for each slot: gate, up, swiglu, col_l2, "
+                    "down_input, down_input_q8_1, down, weighted",
                     "routed_sum",
                     "shared",
                     "combined",
@@ -272,6 +281,8 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                 "router_logits",
                 "selected",
                 "swiglu",
+                "col_l2",
+                "down_input",
                 "shared",
                 "combined",
             ):
@@ -292,6 +303,20 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             )
             self.assertTrue(microscope["input_binding"]["ffn_norm_exact"])
             self.assertTrue(microscope["input_binding"]["q8_1_exact"])
+            down_q8 = report["unpaired_boundaries"]["down_input_q8_1"]
+            self.assertEqual(down_q8["status"], "unavailable_for_comparison")
+            self.assertFalse(down_q8["poolside_observed"])
+            self.assertTrue(down_q8["ds4_observed"])
+            self.assertEqual(down_q8["ds4_bytes"], 10 * 1024 // 32 * 36)
+            self.assertEqual(
+                down_q8["ds4_sha256"],
+                sha256(
+                    (
+                        capture.ds4
+                        / "layer-01-ffn-moe-down-input.q8_1"
+                    ).read_bytes()
+                ),
+            )
             decomposition = report["counterfactual_decomposition"]
             self.assertTrue(decomposition["poolside_replay"]["weighted_exact"])
             self.assertTrue(decomposition["poolside_replay"]["routed_sum_exact"])

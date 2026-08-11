@@ -203,6 +203,7 @@ typedef struct {
     uint64_t pinned_staging_allocation_attempts;
     uint64_t cache_acquire_hits;
     uint64_t cache_acquire_misses;
+    uint64_t cache_evictions;
     uint64_t cache_load_successes;
     uint64_t cache_load_failures;
     uint64_t model_file_read_calls;
@@ -240,6 +241,11 @@ void ds4_gpu_test_laguna_compact_resume_creating(void);
 void ds4_gpu_test_laguna_compact_fail_before_publish_once(void);
 void ds4_gpu_test_laguna_compact_cache_fault_once(
         ds4_gpu_laguna_cache_test_fault fault);
+void ds4_gpu_test_laguna_compact_pause_cache_load_once(void);
+void ds4_gpu_test_laguna_compact_wait_cache_load_paused(
+        ds4_laguna_cache_handle *handle);
+void ds4_gpu_test_laguna_compact_resume_cache_load(void);
+uint64_t ds4_gpu_test_laguna_compact_snapshot_size(void);
 ds4_laguna_cache_status ds4_gpu_test_laguna_compact_cache_reserve_loading(
         ds4_gpu_laguna_compact *ctx,
         ds4_laguna_expert_key key,

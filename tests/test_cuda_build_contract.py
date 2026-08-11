@@ -1940,7 +1940,7 @@ class CudaBuildContractTest(unittest.TestCase):
                 r"g->next,\s*g->after_attn,\s*g->ffn_out,\s*g->shared_out,\s*"
                 r"DS4_N_EMBD\s*\)"
             ),
-            "static bool laguna_graph_forward_batch(": (
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(": (
                 r"ds4_gpu_laguna_moe_residual_tensor\(\s*"
                 r"g->next,\s*g->after_attn,\s*g->ffn_out,\s*g->shared_out,\s*"
                 r"\(uint64_t\)n_tokens\s*\*\s*DS4_N_EMBD\s*\)"
@@ -2103,7 +2103,9 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("laguna_graph_diag_dump_tensor", DS4_SOURCE)
 
         body = source_function_body(
-            DS4_SOURCE, "static bool laguna_graph_forward_batch(", "ds4.c"
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
+            "ds4.c",
         )
         self.assertRegex(
             body,
@@ -2704,7 +2706,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
             "ds4.c",
         )
-        self.assertIn("ds4_gpu_laguna_compact *compact", batch)
+        self.assertIn("if (compact)", batch)
         self.assertIn(
             "ds4_gpu_laguna_compact_routed_moe_batch_tensor(", batch
         )
@@ -2747,6 +2749,43 @@ class CudaBuildContractTest(unittest.TestCase):
             "CUDA",
         )
         self.assertNotIn("n_tokens != 1u", launch)
+
+    def test_laguna_graph_does_not_synthesize_unlatched_unsafe(self) -> None:
+        for signature in (
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
+        ):
+            with self.subTest(signature=signature):
+                body = source_function_body(DS4_SOURCE, signature, "ds4.c")
+                begin = body.find("ds4_gpu_begin_commands()")
+                self.assertGreater(begin, 0)
+                self.assertNotIn(
+                    "compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE",
+                    body[:begin],
+                    "pre-cache caller/graph failures are request-recoverable",
+                )
+                fallback = body.rfind(
+                    "if (!ok && execution_result == "
+                    "DS4_GPU_LAGUNA_EXEC_SUCCESS) {"
+                )
+                self.assertGreater(fallback, 0)
+                tail = body[fallback:]
+                self.assertIn(
+                    "execution_result = DS4_GPU_LAGUNA_EXEC_RECOVERABLE;",
+                    tail,
+                )
+                self.assertNotIn("DS4_GPU_LAGUNA_EXEC_UNSAFE", tail)
+                command_end = body.rfind(
+                    "if (ds4_gpu_commands_active() && "
+                    "ds4_gpu_end_commands() == 0)",
+                    0,
+                    fallback,
+                )
+                self.assertGreater(command_end, 0)
+                self.assertNotIn(
+                    "execution_result = DS4_GPU_LAGUNA_EXEC_UNSAFE",
+                    body[command_end:fallback],
+                )
 
     def test_laguna_decode_capture_binds_release_and_hook_logits(self) -> None:
         producer = (

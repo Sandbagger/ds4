@@ -162,6 +162,47 @@ int ds4_gpu_laguna_compact_cache_view(
         const void **device_ptr,
         uint64_t *bytes);
 
+/* Compact decode never falls back to resident model resolution.  A
+ * recoverable result is local to the request; UNSAFE means the compact
+ * runtime can no longer prove that cached bytes are safe to consume. */
+typedef enum {
+    DS4_GPU_LAGUNA_EXEC_SUCCESS = 0,
+    DS4_GPU_LAGUNA_EXEC_CANCELLED = 1,
+    DS4_GPU_LAGUNA_EXEC_RECOVERABLE = 2,
+    DS4_GPU_LAGUNA_EXEC_UNSAFE = 3,
+} ds4_gpu_laguna_exec_result;
+
+/* Internal adapter for ds4_session_cancel_fn; it inherits that callback's
+ * nonblocking, side-effect-free, no-CUDA/no-device-change contract. */
+typedef bool (*ds4_gpu_laguna_cancel_fn)(void *userdata);
+
+/* One-token Q4_K routed execution through ten pinned compact-cache slots.
+ * Scratch is caller-owned, preallocated, and live for the synchronous call:
+ * aux_scratch stores ten L2 floats at byte zero and the immutable ten-entry
+ * slot descriptor at byte offset 64. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_one_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata);
+
 #ifdef DS4_TEST_HOOKS
 typedef enum {
     DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,

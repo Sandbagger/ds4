@@ -48493,31 +48493,46 @@ static bool laguna_graph_diag_checkpoint_i32(
 }
 #endif
 
-static bool laguna_graph_forward_token(
+static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
         const ds4_weights    *weights,
         int                   token,
         uint32_t              pos,
-        float                *logits_out) {
+        float                *logits_out,
+        ds4_gpu_laguna_compact *compact,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void                 *cancel_ud) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)cancel;
+    (void)cancel_ud;
+#endif
     if (!g || !model || !weights || token < 0 ||
         token >= (int)DS4_N_VOCAB || pos >= g->ctx_size) {
-        return false;
+        return compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE :
+                         DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
     }
 
     const int detail_layer = laguna_graph_diag_detail_layer();
-    if (detail_layer < 0) return false;
+    if (detail_layer < 0) {
+        return compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE :
+                         DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
 
 #ifdef DS4_TEST_HOOKS
     const char *diag_dir = getenv("DS4_LAGUNA_DIAG_DIR");
     const bool direct_moe_capture =
-        diag_dir && diag_dir[0] &&
+        !compact && diag_dir && diag_dir[0] &&
         detail_layer >= (int)DS4_N_LEADING_DENSE;
     ds4_gpu_tensor *moe_capture = direct_moe_capture ?
         ds4_gpu_tensor_alloc(DS4_GPU_GLM_MOE_CAPTURE_BYTES) : NULL;
-    if (direct_moe_capture && !moe_capture) return false;
+    if (direct_moe_capture && !moe_capture) {
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
 #endif
 
+    ds4_gpu_laguna_exec_result execution_result =
+        DS4_GPU_LAGUNA_EXEC_SUCCESS;
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -48823,7 +48838,35 @@ static bool laguna_graph_forward_token(
                 l->ffn_up_exps->dim[1] * up_row_bytes;
             const uint64_t down_expert_bytes =
                 l->ffn_down_exps->dim[1] * down_row_bytes;
-            if (ok) {
+            if (ok && compact) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+                execution_result =
+                    ds4_gpu_laguna_compact_routed_moe_one_tensor(
+                        compact,
+                        g->ffn_out,
+                        g->routed_mid,
+                        g->ffn_gate,
+                        g->ffn_up,
+                        g->ffn_mid,
+                        il,
+                        l->ffn_gate_exps->type,
+                        l->ffn_up_exps->type,
+                        l->ffn_down_exps->type,
+                        DS4_N_EMBD,
+                        DS4_N_FF_EXP,
+                        DS4_N_EMBD,
+                        g->router_selected,
+                        g->router_weights,
+                        DS4_N_EXPERT,
+                        DS4_N_EXPERT_USED,
+                        g->ffn_norm,
+                        cancel,
+                        cancel_ud);
+#else
+                execution_result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+#endif
+                ok = execution_result == DS4_GPU_LAGUNA_EXEC_SUCCESS;
+            } else if (ok) {
 #ifdef DS4_TEST_HOOKS
                 ok = ds4_gpu_test_glm_routed_moe_one_capture_tensor(
                         il == (uint32_t)detail_layer ? moe_capture : NULL,
@@ -48858,7 +48901,8 @@ static bool laguna_graph_forward_token(
                         true) != 0;
             }
 #ifdef DS4_TEST_HOOKS
-            if (ok && moe_capture && il == (uint32_t)detail_layer) {
+            if (ok && !compact && moe_capture &&
+                il == (uint32_t)detail_layer) {
                 ok = laguna_graph_diag_checkpoint_bytes(
                         moe_capture,
                         DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_OFFSET,
@@ -49011,7 +49055,10 @@ static bool laguna_graph_forward_token(
                     g->logits, 1, DS4_N_VOCAB, -1, "logits");
         }
     }
-    if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
+    if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) {
+        ok = false;
+        if (compact) execution_result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits,
                                  0,
@@ -49021,7 +49068,11 @@ static bool laguna_graph_forward_token(
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(moe_capture);
 #endif
-    return ok;
+    if (!ok && execution_result == DS4_GPU_LAGUNA_EXEC_SUCCESS) {
+        execution_result = compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE :
+                                     DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
+    return ok ? DS4_GPU_LAGUNA_EXEC_SUCCESS : execution_result;
 }
 
 static void laguna_graph_report_prefill_display_progress(
@@ -49644,7 +49695,9 @@ static int generate_laguna_metal_argmax(
         if (emit) emit(emit_ud, token);
         generated++;
         if (i + 1 == n_predict || pos + 1u >= (uint32_t)ctx_size) break;
-        ok = laguna_graph_forward_token(&g, model, weights, token, pos, logits);
+        ok = laguna_graph_forward_token(
+                 &g, model, weights, token, pos, logits,
+                 NULL, NULL, NULL) == DS4_GPU_LAGUNA_EXEC_SUCCESS;
         pos++;
     }
     const double decode_t1 = now_sec();
@@ -54350,7 +54403,8 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
         return -1;
     }
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) ||
+        ds4_session_is_laguna(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -54829,21 +54883,28 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier) {
+        if (e->multi_tier || e->laguna_compact) {
+            const bool compact_session = e->laguna_compact != NULL;
+            const char *session_kind = compact_session ?
+                "compact Laguna" : "multi-tier";
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
             const int session_rc = ds4_session_create(&s, e, ctx_size);
             if (session_rc != 0) {
-                fprintf(stderr, "ds4: failed to create multi-tier graph session\n");
+                fprintf(stderr, "ds4: failed to create %s graph session\n",
+                        session_kind);
                 return session_rc;
             }
             ds4_session_set_progress(s, progress, progress_ud);
-            if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+            const int sync_rc =
+                ds4_session_sync(s, prompt, err, sizeof(err));
+            if (sync_rc != 0) {
                 ds4_session_set_progress(s, NULL, NULL);
-                fprintf(stderr, "ds4: multi-tier prefill failed: %s\n", err);
+                fprintf(stderr, "ds4: %s prefill failed: %s\n",
+                        session_kind, err);
                 ds4_session_free(s);
-                return 1;
+                return compact_session ? sync_rc : 1;
             }
             ds4_session_set_progress(s, NULL, NULL);
             const double t_prefill1 = now_sec();
@@ -54863,7 +54924,16 @@ int ds4_engine_generate_argmax(
                 if (emit) emit(emit_ud, token);
                 n_generated++;
                 if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
-                if (greedy_top1) {
+                if (compact_session) {
+                    const int eval_rc =
+                        ds4_session_eval(s, token, err, sizeof(err));
+                    if (eval_rc == 0) {
+                        token = ds4_session_argmax(s);
+                    } else {
+                        rc = eval_rc;
+                        token = -1;
+                    }
+                } else if (greedy_top1) {
                     token = ds4_session_eval_argmax(s, token, err, sizeof(err));
                 } else if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
                     token = ds4_session_argmax(s);
@@ -54871,8 +54941,9 @@ int ds4_engine_generate_argmax(
                     token = -1;
                 }
                 if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier decode failed: %s\n", err);
-                    rc = 1;
+                    fprintf(stderr, "ds4: %s decode failed: %s\n",
+                            session_kind, err);
+                    if (rc == 0) rc = 1;
                     break;
                 }
             }
@@ -64077,46 +64148,77 @@ static int ds4_session_sync_internal(ds4_session *s,
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
         }
+        int last_checkpoint_len_with_logits =
+            s->checkpoint_valid ? s->checkpoint.len : 0;
 
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
-                s->checkpoint_valid = s->checkpoint.len != 0;
+                s->checkpoint.len = last_checkpoint_len_with_logits;
+                s->checkpoint_valid = last_checkpoint_len_with_logits > 0;
+                s->mtp_draft_valid = false;
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             uint32_t n = (uint32_t)(prompt->len - i);
-            if (n > s->laguna_graph.prefill_cap) {
+            if (e->laguna_compact) {
+                /* Task 9 streams one routed decision at a time.  Stable
+                 * over-capacity grouping for batch prefill lands in Task 10. */
+                n = 1u;
+            } else if (n > s->laguna_graph.prefill_cap) {
                 n = s->laguna_graph.prefill_cap;
             }
             const bool last = i + (int)n == prompt->len;
-            const bool ok = n == 1u ?
+            const ds4_gpu_laguna_exec_result result = n == 1u ?
                 laguna_graph_forward_token(&s->laguna_graph,
                                            &e->model,
                                            &e->weights,
                                            prompt->v[i],
                                            (uint32_t)i,
-                                           last ? s->logits : NULL) :
-                laguna_graph_forward_batch(&s->laguna_graph,
-                                           &e->model,
-                                           &e->weights,
-                                           prompt->v + i,
-                                           n,
-                                           (uint32_t)i,
                                            last ? s->logits : NULL,
-                                           s->display_progress,
-                                           s->display_progress_ud,
-                                           prompt->len);
-            if (!ok) {
+                                           e->laguna_compact,
+                                           e->laguna_compact ?
+                                               ds4_session_cancelled_cb : NULL,
+                                           e->laguna_compact ? s : NULL) :
+                (laguna_graph_forward_batch(&s->laguna_graph,
+                                            &e->model,
+                                            &e->weights,
+                                            prompt->v + i,
+                                            n,
+                                            (uint32_t)i,
+                                            last ? s->logits : NULL,
+                                            s->display_progress,
+                                            s->display_progress_ud,
+                                            prompt->len) ?
+                     DS4_GPU_LAGUNA_EXEC_SUCCESS :
+                     DS4_GPU_LAGUNA_EXEC_RECOVERABLE);
+            if (result != DS4_GPU_LAGUNA_EXEC_SUCCESS) {
+                if (result == DS4_GPU_LAGUNA_EXEC_CANCELLED) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint.len = last_checkpoint_len_with_logits;
+                    s->checkpoint_valid = last_checkpoint_len_with_logits > 0;
+                    s->mtp_draft_valid = false;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                s->checkpoint_valid = false;
+                if (result == DS4_GPU_LAGUNA_EXEC_UNSAFE) {
+                    snprintf(err, errlen,
+                             "%s Laguna compact runtime unsafe at prefill token %d",
+                             backend_name,
+                             i);
+                    return 3;
+                }
                 snprintf(err, errlen,
-                         "%s Laguna prefill failed at token %d",
+                         e->laguna_compact ?
+                             "%s Laguna compact routed cache load failed at prefill token %d" :
+                             "%s Laguna prefill failed at token %d",
                          backend_name,
                          i);
-                s->checkpoint_valid = false;
                 return 1;
             }
             for (uint32_t j = 0; j < n; j++) {
                 token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
             }
+            if (last) last_checkpoint_len_with_logits = s->checkpoint.len;
             i += (int)n;
             if (s->progress) {
                 s->progress(s->progress_ud,
@@ -65739,15 +65841,38 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                  s->laguna_graph.ctx_size);
             return 1;
         }
-        if (!laguna_graph_forward_token(&s->laguna_graph,
-                                        &e->model,
-                                        &e->weights,
-                                        token,
-                                        (uint32_t)s->checkpoint.len,
-                                        s->logits)) {
-            if (errlen) snprintf(err, errlen, "%s Laguna decode failed",
-                                 ds4_backend_name(e->backend));
+        const ds4_gpu_laguna_exec_result result =
+            laguna_graph_forward_token(
+                &s->laguna_graph,
+                &e->model,
+                &e->weights,
+                token,
+                (uint32_t)s->checkpoint.len,
+                s->logits,
+                e->laguna_compact,
+                e->laguna_compact ? ds4_session_cancelled_cb : NULL,
+                e->laguna_compact ? s : NULL);
+        if (result != DS4_GPU_LAGUNA_EXEC_SUCCESS) {
+            if (result == DS4_GPU_LAGUNA_EXEC_CANCELLED) {
+                if (errlen) snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
             s->checkpoint_valid = false;
+            if (result == DS4_GPU_LAGUNA_EXEC_UNSAFE) {
+                if (errlen) {
+                    snprintf(err, errlen,
+                             "%s Laguna compact runtime unsafe",
+                             ds4_backend_name(e->backend));
+                }
+                return 3;
+            }
+            if (errlen) {
+                snprintf(err, errlen,
+                         e->laguna_compact ?
+                             "%s Laguna compact routed cache load failed" :
+                             "%s Laguna decode failed",
+                         ds4_backend_name(e->backend));
+            }
             return 1;
         }
         token_vec_push(&s->checkpoint, token);

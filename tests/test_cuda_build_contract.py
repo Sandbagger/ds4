@@ -1826,8 +1826,10 @@ class CudaBuildContractTest(unittest.TestCase):
         body = function_body(
             'extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor('
         )
-        n1_prefix, n22_marker, _ = body.partition("n_tok == 22u")
-        self.assertTrue(n22_marker, "missing Poolside n_tok=22 branch")
+        n1_prefix, multi_token_marker, _ = body.partition("n_tok > 1u")
+        self.assertTrue(
+            multi_token_marker, "missing Poolside multi-token Stream-K branch"
+        )
         self.assertNotIn("g_n_gpus > 1", n1_prefix)
         self.assertNotIn(": 0;", n1_prefix)
         device_guard = re.search(

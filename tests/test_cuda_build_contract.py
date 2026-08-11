@@ -2070,6 +2070,13 @@ class CudaBuildContractTest(unittest.TestCase):
             "ffn-moe-weighted",
         ):
             self.assertIn(f'"{stage}"', decode)
+        self.assertRegex(
+            decode,
+            r"laguna_graph_diag_checkpoint_i32\(\s*g->router_selected,\s*1,"
+            r"\s*DS4_N_EXPERT_USED,\s*\(int\)il,\s*\"router-selected\"\s*\)",
+        )
+        self.assertIn('"%s/layer-%02d-%s.i32"', DS4_SOURCE)
+        self.assertIn('"ffn-moe-input.q8_1"', decode)
 
         gate_up = function_body(
             "__global__ static void glm_poolside_q4_gate_up_kernel("

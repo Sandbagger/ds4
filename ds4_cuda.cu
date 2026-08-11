@@ -28032,7 +28032,9 @@ static int glm_poolside_routed_moe_q4_launch(
     const uint64_t output_grid_x = ((uint64_t)out_dim + 255u) / 256u;
     const bool mmq = n_tokens > 8u;
     const bool poolside_mmvq = !mmq && n_tokens == 1u &&
-        cuda_poolside_mmvq_requested();
+        n_total_expert == 256u && n_expert == 10u &&
+        expert_in_dim == 3072u && expert_mid_dim == 1024u &&
+        out_dim == 3072u && cuda_poolside_mmvq_requested();
     if ((mmq && ((((uintptr_t)input->ptr) & 15u) != 0u ||
                  (((uintptr_t)mid->ptr) & 15u) != 0u)) ||
         input_values > UINT32_MAX ||

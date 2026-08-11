@@ -134,6 +134,21 @@ class PoolsideToken513CaptureContractTests(unittest.TestCase):
         self.assertEqual(by_callback["ffn_moe_down_input-1"]["dtype"], "f32-le")
         self.assertFalse(self.manifest["capture"]["q8_1_down_input_exposed"])
 
+    def test_complete_rerun_pins_new_boundary_hashes(self) -> None:
+        reference = self.manifest["reference_capture"]
+        known = reference["known_output_sha256"]
+        self.assertEqual(
+            known["layer-01-ffn-moe-col-l2.f32"],
+            "6e0259346ea225f9e1cfc3df924d91c59af97ef073ceb518c003ae43e1195542",
+        )
+        self.assertEqual(
+            known["layer-01-ffn-moe-down-input.f32"],
+            "134a4b9971b529e600b7919a240b4b8123ba4aa85a51e7fe0b6c80c7a681057a",
+        )
+        self.assertEqual(reference["missing_from_local_analysis_copy"], [])
+        self.assertTrue(reference["complete_rerun"]["all_prior_hashes_exact"])
+        self.assertFalse(reference["raw_bundle_committed"])
+
 
 if __name__ == "__main__":
     unittest.main()

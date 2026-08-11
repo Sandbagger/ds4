@@ -548,6 +548,42 @@ def build_report(
         poolside_payloads[origin_stage.name], origin_index
     )
     direct_ds4_bits = bits_at(ds4_payloads[origin_stage.name], origin_index)
+    if poolside_selected[origin_slot] != origin["expert"]:
+        raise ComparisonError(
+            "Poolside selected expert at microscope origin does not match manifest"
+        )
+    if ds4_selected[origin_slot] != origin["expert"]:
+        raise ComparisonError(
+            "DS4 selected expert at microscope origin does not match manifest"
+        )
+    if direct_poolside_bits != poolside_oracle_bits:
+        raise ComparisonError(
+            "Poolside direct output does not match microscope oracle"
+        )
+    if direct_poolside_bits != fixture_output_bits:
+        raise ComparisonError(
+            "Poolside direct output does not match microscope fixture output"
+        )
+    if direct_ds4_bits != ds4_oracle_bits:
+        raise ComparisonError("DS4 direct output does not match microscope oracle")
+    if first_routed is None:
+        raise ComparisonError(
+            "microscope origin exists but captures have no first routed mismatch"
+        )
+    expected_origin_coordinate = {
+        "stage": origin_stage.name,
+        "slot": origin_slot,
+        "expert": origin["expert"],
+        "row": origin["row"],
+    }
+    actual_origin_coordinate = {
+        key: first_routed.get(key) for key in expected_origin_coordinate
+    }
+    if actual_origin_coordinate != expected_origin_coordinate:
+        raise ComparisonError(
+            "microscope origin does not match first routed mismatch: "
+            f"expected {expected_origin_coordinate}, got {actual_origin_coordinate}"
+        )
 
     return {
         "schema": SCHEMA,
@@ -582,19 +618,15 @@ def build_report(
             "origin_binding": {
                 "poolside_selected_expert": poolside_selected[origin_slot],
                 "ds4_selected_expert": ds4_selected[origin_slot],
-                "poolside_matches_manifest":
-                    poolside_selected[origin_slot] == origin["expert"],
-                "ds4_matches_manifest":
-                    ds4_selected[origin_slot] == origin["expert"],
+                "poolside_matches_manifest": True,
+                "ds4_matches_manifest": True,
             },
             "direct_output_binding": {
                 "poolside_bits": bits_text(direct_poolside_bits),
                 "ds4_bits": bits_text(direct_ds4_bits),
-                "poolside_matches_oracle":
-                    direct_poolside_bits == poolside_oracle_bits,
-                "ds4_matches_oracle": direct_ds4_bits == ds4_oracle_bits,
-                "poolside_matches_fixture_output":
-                    direct_poolside_bits == fixture_output_bits,
+                "poolside_matches_oracle": True,
+                "ds4_matches_oracle": True,
+                "poolside_matches_fixture_output": True,
             },
         },
     }

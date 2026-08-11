@@ -1,9 +1,9 @@
 /* Direct DS4 512+1 decode capture for the Laguna layer-1 routed MoE.
  *
- * This producer runs the exact resident CUDA path twice from the same
- * 512-token prefix.  The first decode is the control; the second enables the
- * test-only tensor observer for token 513.  Their logits must remain bitwise
- * identical, so capture stores cannot silently become part of inference.
+ * The release-control build emits token-513 logits using only release DS4 and
+ * CUDA objects.  The hook build runs the same decode twice from the same
+ * 512-token prefix, first with the observer disabled and then enabled, and
+ * requires all three logit vectors to be bitwise identical.
  */
 
 #include "ds4.h"
@@ -26,8 +26,12 @@ typedef struct {
     const char *model;
     const char *tokens;
     const char *out;
+    const char *release_logits;
 } options;
 
+#define LOGITS_BYTES ((size_t)VOCAB_SIZE * sizeof(float))
+
+#ifndef DS4_LAGUNA_RELEASE_CONTROL
 typedef struct {
     const char *name;
     uint64_t bytes;
@@ -52,11 +56,20 @@ static const expected_artifact EXPECTED_ARTIFACTS[] = {
     {"layer-01-ffn-out.f32", 3072u * 4u},
     {"layer-01.f32", 3072u * 4u},
 };
+#endif
 
 static void usage(FILE *stream, const char *program) {
+#ifdef DS4_LAGUNA_RELEASE_CONTROL
     fprintf(stream,
-            "usage: %s --model MODEL --tokens PREFIX-512.i32 --out DIR\n",
+            "usage: %s --model MODEL --tokens PREFIX-512.i32 "
+            "--release-logits FILE\n",
             program);
+#else
+    fprintf(stream,
+            "usage: %s --model MODEL --tokens PREFIX-512.i32 --out DIR "
+            "--release-logits FILE\n",
+            program);
+#endif
 }
 
 static int parse_options(int argc, char **argv, options *out) {
@@ -71,11 +84,18 @@ static int parse_options(int argc, char **argv, options *out) {
             out->tokens = value;
         } else if (strcmp(flag, "--out") == 0 && !out->out) {
             out->out = value;
+        } else if (strcmp(flag, "--release-logits") == 0 &&
+                   !out->release_logits) {
+            out->release_logits = value;
         } else {
             return 0;
         }
     }
-    return out->model && out->tokens && out->out;
+#ifdef DS4_LAGUNA_RELEASE_CONTROL
+    return out->model && out->tokens && out->release_logits && !out->out;
+#else
+    return out->model && out->tokens && out->out && out->release_logits;
+#endif
 }
 
 static int read_prefix(const char *path, ds4_tokens *tokens) {
@@ -152,6 +172,46 @@ static int copy_logits(ds4_session *session, float *logits, const char *name) {
     return 1;
 }
 
+#ifdef DS4_LAGUNA_RELEASE_CONTROL
+static int write_release_logits(const char *path, const float *logits) {
+    FILE *stream = fopen(path, "wbx");
+    if (!stream) {
+        fprintf(stderr, "capture: create release logits %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    const size_t written = fwrite(logits, 1, LOGITS_BYTES, stream);
+    const int close_rc = fclose(stream);
+    if (written != LOGITS_BYTES || close_rc != 0) {
+        fprintf(stderr, "capture: write release logits %s failed\n", path);
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+#ifndef DS4_LAGUNA_RELEASE_CONTROL
+static int read_release_logits(const char *path, float *logits) {
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        fprintf(stderr, "capture: open release logits %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    const size_t got = fread(logits, 1, LOGITS_BYTES, stream);
+    const int trailing = fgetc(stream);
+    const int close_rc = fclose(stream);
+    if (got != LOGITS_BYTES || trailing != EOF || close_rc != 0) {
+        fprintf(stderr,
+                "capture: %s is not exactly %zu bytes of release logits\n",
+                path, LOGITS_BYTES);
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+#ifndef DS4_LAGUNA_RELEASE_CONTROL
 static int verify_artifacts(const char *directory) {
     char path[4096];
     for (size_t i = 0;
@@ -172,6 +232,7 @@ static int verify_artifacts(const char *directory) {
     }
     return 1;
 }
+#endif
 
 int main(int argc, char **argv) {
     options opt;
@@ -184,17 +245,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "capture: diagnostic environment must start unset\n");
         return 2;
     }
+#ifndef DS4_LAGUNA_RELEASE_CONTROL
     if (mkdir(opt.out, 0700) != 0) {
         fprintf(stderr, "capture: create output %s: %s\n",
                 opt.out, strerror(errno));
         return 2;
     }
+#endif
 
     int rc = 1;
     ds4_tokens prefix = {0};
     ds4_engine *engine = NULL;
     ds4_session *control = NULL;
     ds4_session *captured = NULL;
+    float *release_logits = NULL;
     float *control_logits = NULL;
     float *captured_logits = NULL;
     if (!read_prefix(opt.tokens, &prefix)) goto cleanup;
@@ -212,19 +276,49 @@ int main(int argc, char **argv) {
         fprintf(stderr, "capture: vocabulary mismatch\n");
         goto cleanup;
     }
-    if (!create_synced_session(engine, &prefix, &control, "control") ||
-        !create_synced_session(engine, &prefix, &captured, "captured")) {
+    if (!create_synced_session(engine, &prefix, &control,
+#ifdef DS4_LAGUNA_RELEASE_CONTROL
+                               "release")) {
+#else
+                               "hook-null") ||
+        !create_synced_session(engine, &prefix, &captured, "hook-active")) {
+#endif
         goto cleanup;
     }
 
     control_logits = malloc((size_t)VOCAB_SIZE * sizeof(float));
+#ifndef DS4_LAGUNA_RELEASE_CONTROL
+    release_logits = malloc((size_t)VOCAB_SIZE * sizeof(float));
     captured_logits = malloc((size_t)VOCAB_SIZE * sizeof(float));
-    if (!control_logits || !captured_logits) goto cleanup;
-    if (!eval_resume(control, "control") ||
-        !copy_logits(control, control_logits, "control")) {
+    if (!release_logits || !control_logits || !captured_logits) goto cleanup;
+    if (!read_release_logits(opt.release_logits, release_logits)) goto cleanup;
+#else
+    if (!control_logits) goto cleanup;
+#endif
+    if (!eval_resume(control,
+#ifdef DS4_LAGUNA_RELEASE_CONTROL
+                     "release") ||
+        !copy_logits(control, control_logits, "release")) {
+#else
+                     "hook-null") ||
+        !copy_logits(control, control_logits, "hook-null")) {
+#endif
         goto cleanup;
     }
 
+#ifdef DS4_LAGUNA_RELEASE_CONTROL
+    if (!write_release_logits(opt.release_logits, control_logits)) goto cleanup;
+    fprintf(stderr,
+            "probe_ds4_laguna_moe PASS token=513 mode=release "
+            "resume_token=%d logits_bytes=%zu\n",
+            RESUME_TOKEN, LOGITS_BYTES);
+    rc = 0;
+#else
+    if (memcmp(release_logits, control_logits, LOGITS_BYTES) != 0) {
+        fprintf(stderr,
+                "capture: release and hook-null token-513 logits differ\n");
+        goto cleanup;
+    }
     if (setenv("DS4_LAGUNA_DIAG_DIR", opt.out, 1) != 0 ||
         setenv("DS4_LAGUNA_DIAG_LAYER", "1", 1) != 0) {
         fprintf(stderr, "capture: enable diagnostics failed\n");
@@ -237,9 +331,7 @@ int main(int argc, char **argv) {
         !copy_logits(captured, captured_logits, "captured")) {
         goto cleanup;
     }
-    if (memcmp(control_logits,
-               captured_logits,
-               (size_t)VOCAB_SIZE * sizeof(float)) != 0) {
+    if (memcmp(control_logits, captured_logits, LOGITS_BYTES) != 0) {
         fprintf(stderr, "capture: diagnostics perturbed token-513 logits\n");
         goto cleanup;
     }
@@ -247,15 +339,18 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "probe_ds4_laguna_moe PASS token=513 layer=1 "
-            "resume_token=%d nonperturbing=bit-exact\n",
+            "resume_token=%d release_vs_hook_null=bit-exact "
+            "hook_null_vs_hook_active=bit-exact\n",
             RESUME_TOKEN);
     rc = 0;
+#endif
 
 cleanup:
     unsetenv("DS4_LAGUNA_DIAG_DIR");
     unsetenv("DS4_LAGUNA_DIAG_LAYER");
     free(captured_logits);
     free(control_logits);
+    free(release_logits);
     ds4_session_free(captured);
     ds4_session_free(control);
     ds4_engine_close(engine);

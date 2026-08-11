@@ -2049,13 +2049,10 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("DS4_LAGUNA_DIAG_LAYER", producer_source)
         self.assertIn("tests/probe_ds4_laguna_moe:", MAKEFILE)
 
-        for hook in (
-            "ds4_gpu_test_glm_routed_moe_capture_begin(",
-            "ds4_gpu_test_glm_routed_moe_capture_end(",
-        ):
-            self.assertIn(hook, GPU_HEADER)
-            self.assertIn(hook, CUDA_SOURCE)
-            self.assertIn(hook, DS4_SOURCE)
+        capture_hook = "ds4_gpu_test_glm_routed_moe_one_capture_tensor("
+        self.assertIn(capture_hook, GPU_HEADER)
+        self.assertIn(capture_hook, CUDA_SOURCE)
+        self.assertIn(capture_hook, DS4_SOURCE)
 
         decode = source_function_body(
             DS4_SOURCE, "static bool laguna_graph_forward_token(", "ds4.c"

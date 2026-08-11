@@ -133,6 +133,7 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
+static int g_cuda_poolside_mmvq;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
@@ -305,11 +306,13 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_exact_score_split_fuse_inv_rope =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL;
     g_cuda_moe_decode_graph = getenv("DS4_CUDA_MOE_DECODE_GRAPH") != NULL;
+    const char *reduction = getenv("DS4_MM_VQ_REDUCTION");
+    g_cuda_poolside_mmvq =
+        reduction && strcmp(reduction, "poolside") == 0;
 }
 
 static bool cuda_poolside_mmvq_requested(void) {
-    const char *reduction = getenv("DS4_MM_VQ_REDUCTION");
-    return reduction && strcmp(reduction, "poolside") == 0;
+    return g_cuda_poolside_mmvq != 0;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.

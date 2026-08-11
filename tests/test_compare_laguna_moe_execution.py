@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import struct
 import subprocess
 import sys
@@ -303,7 +304,7 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                     "rows": 3072,
                     "max_absolute_delta": 1.0,
                     "rms_delta": 1.0,
-                    "l2_delta": 3072**0.5,
+                    "l2_delta": math.sqrt(3072),
                 },
             )
             self.assertEqual(
@@ -313,7 +314,7 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                     "rows": 3072,
                     "max_absolute_delta": 2.0,
                     "rms_delta": 2.0,
-                    "l2_delta": 2.0 * 3072**0.5,
+                    "l2_delta": math.sqrt(4.0 * 3072),
                 },
             )
             self.assertEqual(
@@ -323,7 +324,7 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                     "rows": 3072,
                     "max_absolute_delta": 5.0,
                     "rms_delta": 5.0,
-                    "l2_delta": 5.0 * 3072**0.5,
+                    "l2_delta": math.sqrt(25.0 * 3072),
                 },
             )
             self.assertIn(
@@ -424,6 +425,24 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("first routed mismatch", result.stderr)
+            self.assertFalse(json_out.exists())
+
+    def test_rejects_capture_not_reproduced_by_f32_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture = SyntheticCapture(root)
+            replace_f32(capture.ds4 / STAGES["weighted"][0], 7, F32_ONE)
+
+            json_out = root / "report.json"
+            result = subprocess.run(
+                capture.command(json_out),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("F32 replay", result.stderr)
             self.assertFalse(json_out.exists())
 
 

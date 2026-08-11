@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import struct
 import sys
 from dataclasses import dataclass
@@ -197,6 +198,87 @@ def bits_text(bits: int) -> str:
 
 def i32_values(payload: bytes) -> tuple[int, ...]:
     return struct.unpack(f"<{len(payload) // 4}i", payload)
+
+
+def f32_values(payload: bytes) -> tuple[float, ...]:
+    return struct.unpack(f"<{len(payload) // 4}f", payload)
+
+
+def f32_round(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def replay_routed_sum(
+    down_payload: bytes,
+    weights_payload: bytes,
+) -> tuple[bytes, bytes]:
+    down = f32_values(down_payload)
+    weights = f32_values(weights_payload)
+    weighted = [0.0] * (EXPERTS_USED * EMBEDDING)
+    routed_sum = [f32_round(0.0)] * EMBEDDING
+    for slot in range(EXPERTS_USED):
+        weight = weights[slot]
+        base = slot * EMBEDDING
+        for row in range(EMBEDDING):
+            product = f32_round(down[base + row] * weight)
+            weighted[base + row] = product
+            routed_sum[row] = f32_round(routed_sum[row] + product)
+    return (
+        struct.pack(f"<{len(weighted)}f", *weighted),
+        struct.pack(f"<{len(routed_sum)}f", *routed_sum),
+    )
+
+
+def replay_binding(
+    runtime: str,
+    replay_weighted: bytes,
+    replay_sum: bytes,
+    captured_weighted: bytes,
+    captured_sum: bytes,
+) -> dict[str, Any]:
+    weighted_exact = replay_weighted == captured_weighted
+    routed_sum_exact = replay_sum == captured_sum
+    if not weighted_exact or not routed_sum_exact:
+        failed = []
+        if not weighted_exact:
+            failed.append("weighted")
+        if not routed_sum_exact:
+            failed.append("routed_sum")
+        raise ComparisonError(
+            f"{runtime} F32 replay does not reproduce captured "
+            + " and ".join(failed)
+        )
+    return {
+        "weighted_exact": True,
+        "weighted_elements": EXPERTS_USED * EMBEDDING,
+        "weighted_sha256": sha256(replay_weighted),
+        "routed_sum_exact": True,
+        "routed_sum_elements": EMBEDDING,
+        "routed_sum_sha256": sha256(replay_sum),
+    }
+
+
+def delta_metrics(candidate: bytes, reference: bytes) -> dict[str, Any]:
+    candidate_values = f32_values(candidate)
+    reference_values = f32_values(reference)
+    deltas = [
+        candidate_value - reference_value
+        for candidate_value, reference_value in zip(
+            candidate_values, reference_values, strict=True
+        )
+    ]
+    unequal_rows = sum(
+        candidate[index : index + 4] != reference[index : index + 4]
+        for index in range(0, len(reference), 4)
+    )
+    squared_sum = sum(delta * delta for delta in deltas)
+    return {
+        "unequal_rows": unequal_rows,
+        "rows": len(reference_values),
+        "max_absolute_delta": max((abs(delta) for delta in deltas), default=0.0),
+        "rms_delta": math.sqrt(squared_sum / len(deltas)),
+        "l2_delta": math.sqrt(squared_sum),
+    }
 
 
 def parse_bits(value: Any, label: str) -> int:
@@ -471,6 +553,48 @@ def build_report(
         for stage in ALL_STAGES
     }
 
+    poolside_replay_weighted, poolside_replay_sum = replay_routed_sum(
+        poolside_payloads["down"], poolside_payloads["router_weights"]
+    )
+    ds4_replay_weighted, ds4_replay_sum = replay_routed_sum(
+        ds4_payloads["down"], ds4_payloads["router_weights"]
+    )
+    poolside_replay = replay_binding(
+        "Poolside",
+        poolside_replay_weighted,
+        poolside_replay_sum,
+        poolside_payloads["weighted"],
+        poolside_payloads["routed_sum"],
+    )
+    ds4_replay = replay_binding(
+        "DS4",
+        ds4_replay_weighted,
+        ds4_replay_sum,
+        ds4_payloads["weighted"],
+        ds4_payloads["routed_sum"],
+    )
+    _, routing_only_sum = replay_routed_sum(
+        poolside_payloads["down"], ds4_payloads["router_weights"]
+    )
+    _, expert_only_sum = replay_routed_sum(
+        ds4_payloads["down"], poolside_payloads["router_weights"]
+    )
+    counterfactual_decomposition = {
+        "reference": "poolside_routed_sum",
+        "arithmetic": "slot-order IEEE-754 binary32 multiply then add",
+        "poolside_replay": poolside_replay,
+        "ds4_replay": ds4_replay,
+        "routing_only": delta_metrics(
+            routing_only_sum, poolside_payloads["routed_sum"]
+        ),
+        "expert_only": delta_metrics(
+            expert_only_sum, poolside_payloads["routed_sum"]
+        ),
+        "combined": delta_metrics(
+            ds4_replay_sum, poolside_payloads["routed_sum"]
+        ),
+    }
+
     first_overall: dict[str, Any] | None = None
     for stage in ROOT_STAGES:
         first_overall = stages[stage.name]["first_mismatch"]
@@ -596,6 +720,7 @@ def build_report(
             "expert_mid": EXPERT_MID,
         },
         "stages": stages,
+        "counterfactual_decomposition": counterfactual_decomposition,
         "first_overall_mismatch": first_overall,
         "first_routed_expert_mismatch": first_routed,
         "microscope": {

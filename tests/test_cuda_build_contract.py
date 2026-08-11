@@ -199,6 +199,7 @@ LAGUNA_MOE_RESIDUAL_AUTO_FILES = {
 LAGUNA_C7_ORACLE_PRODUCER = ROOT / "tests/oracle-producers/laguna-c7"
 LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "capture_poolside_laguna_moe.sh",
+    "compare_laguna_moe_execution.py",
     "poolside-l2-callback.patch",
     "probe_ds4_laguna_moe.c",
     "probe_poolside_laguna_moe.cpp",

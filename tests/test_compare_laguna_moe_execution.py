@@ -137,7 +137,13 @@ class SyntheticCapture:
             "purpose": "synthetic comparator contract",
             "poolside_commit": "synthetic",
             "poolside_sources": {},
-            "model": {"bytes": 1, "sha256": "00" * 32},
+            "model": {
+                "bytes": 68248759648,
+                "sha256": (
+                    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438e"
+                    "ccb72196a1c4147a"
+                ),
+            },
             "origin": {
                 "token": 513,
                 "layer": 1,
@@ -200,13 +206,47 @@ class SyntheticCapture:
             "schema": "laguna-token513-direct-capture-run/v1",
             "token": 513,
             "layer": 1,
-            "model": {"bytes": 1, "sha256": "00" * 32},
-            "prefix": {"count": 512, "bytes": 2048, "sha256": "11" * 32},
+            "model": {
+                "bytes": 68248759648,
+                "sha256": (
+                    "e163b2c98908809a71245d6bb68b2226994d9969cb2a438e"
+                    "ccb72196a1c4147a"
+                ),
+            },
+            "prefix": {
+                "count": 512,
+                "bytes": 2048,
+                "sha256": (
+                    "569aa6394783e0f17558db421ba26480d7a530d44dd2219bc"
+                    "c9aac2c09a3b559"
+                ),
+            },
             "resume_token": 3612,
-            "device": {"name": "synthetic", "compute_capability": "0.0"},
+            "device": {
+                "name": "NVIDIA GB10",
+                "compute_capability": "12.1",
+                "driver": "580.126.09",
+            },
             "runtimes": {
-                "poolside": {"commit": "synthetic"},
-                "ds4": {"commit": "synthetic"},
+                "poolside": {
+                    "commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+                    "producer_source_sha256": "33" * 32,
+                    "producer_binary_sha256": "44" * 32,
+                },
+                "ds4": {
+                    "capture_code_commit": (
+                        "1d009d4f134af0f069730702a6247c077e18fdbd"
+                    ),
+                    "capture_probe_binary_sha256": "55" * 32,
+                },
+            },
+            "controls": {
+                "release_probe_binary_sha256": "66" * 32,
+                "hook_probe_binary_sha256": "77" * 32,
+                "release_vs_hook_null": "bit-exact",
+                "hook_null_vs_hook_active": "bit-exact",
+                "logits_bytes": 401408,
+                "logits_sha256": "88" * 32,
             },
             "captures": {
                 "poolside": {"artifacts": poolside_artifacts},
@@ -594,6 +634,52 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("run manifest artifact hash", result.stderr)
             self.assertFalse(json_out.exists())
+
+    def test_rejects_altered_pinned_run_identity(self) -> None:
+        mutations = {
+            "model": lambda manifest: manifest["model"].update(
+                {"sha256": "ff" * 32}
+            ),
+            "prefix": lambda manifest: manifest["prefix"].update(
+                {"sha256": "ff" * 32}
+            ),
+            "device": lambda manifest: manifest["device"].update(
+                {"name": "different GPU"}
+            ),
+            "poolside": lambda manifest: manifest["runtimes"][
+                "poolside"
+            ].update({"commit": "f" * 40}),
+            "ds4": lambda manifest: manifest["runtimes"]["ds4"].update(
+                {"capture_code_commit": "f" * 40}
+            ),
+            "control": lambda manifest: manifest["controls"].update(
+                {"release_vs_hook_null": "not-exact"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                capture = SyntheticCapture(root)
+                manifest = json.loads(
+                    capture.run_manifest.read_text(encoding="utf-8")
+                )
+                mutate(manifest)
+                capture.run_manifest.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                json_out = root / "report.json"
+                result = subprocess.run(
+                    capture.command(json_out),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("run manifest", result.stderr)
+                self.assertFalse(json_out.exists())
 
 
 if __name__ == "__main__":

@@ -1144,7 +1144,9 @@ class CudaBuildContractTest(unittest.TestCase):
         launch = function_body("static int glm_poolside_routed_moe_q4_launch(")
         self.assertIn(
             "const bool poolside_mmvq = !mmq && n_tokens == 1u &&\n"
-            "        cuda_poolside_mmvq_requested();",
+            "        n_total_expert == 256u && n_expert == 10u &&\n"
+            "        expert_in_dim == 3072u && expert_mid_dim == 1024u &&\n"
+            "        out_dim == 3072u && cuda_poolside_mmvq_requested();",
             launch,
         )
         self.assertIn(

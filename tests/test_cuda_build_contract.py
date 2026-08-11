@@ -200,8 +200,10 @@ LAGUNA_C7_ORACLE_PRODUCER = ROOT / "tests/oracle-producers/laguna-c7"
 LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "capture_poolside_laguna_moe.sh",
     "compare_laguna_moe_execution.py",
+    "poolside-token513-layer1-capture.json",
     "poolside-l2-callback.patch",
     "probe_ds4_laguna_moe.c",
+    "probe_poolside_laguna_token513_moe.cpp",
     "probe_poolside_laguna_moe.cpp",
     "short.tokens.i32",
     "token513-layer1-comparison.json",

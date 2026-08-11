@@ -2694,6 +2694,60 @@ class CudaBuildContractTest(unittest.TestCase):
             r"for\s*\([^)]*\bj\b[^)]*read_only_count[^)]*\)",
         )
 
+    def test_laguna_compact_prefill_uses_the_shared_batch_kernel(self) -> None:
+        self.assertIn(
+            "ds4_gpu_laguna_compact_routed_moe_batch_tensor(", GPU_HEADER
+        )
+
+        batch = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
+            "ds4.c",
+        )
+        self.assertIn("ds4_gpu_laguna_compact *compact", batch)
+        self.assertIn(
+            "ds4_gpu_laguna_compact_routed_moe_batch_tensor(", batch
+        )
+
+        sync = source_function_body(
+            DS4_SOURCE,
+            "static int ds4_session_sync_internal(ds4_session *s,\n"
+            "                                     const ds4_tokens *prompt,\n"
+            "                                     bool allow_exact_context,\n"
+            "                                     char *err,\n"
+            "                                     size_t errlen) {",
+            "ds4.c",
+        )
+        laguna_start = sync.find("if (ds4_session_is_laguna(s)) {")
+        glm_start = sync.find("if (ds4_session_is_glm(s)) {", laguna_start)
+        self.assertGreaterEqual(laguna_start, 0)
+        self.assertGreater(glm_start, laguna_start)
+        laguna = sync[laguna_start:glm_start]
+        self.assertNotRegex(
+            laguna,
+            r"if\s*\(e->laguna_compact\)\s*\{[^{}]*\bn\s*=\s*1u\s*;",
+        )
+
+        wrapper = source_function_body(
+            CUDA_SOURCE,
+            'extern "C" ds4_gpu_laguna_exec_result\n'
+            "ds4_gpu_laguna_compact_routed_moe_batch_tensor(",
+            "CUDA",
+        )
+        enter_at = wrapper.find("cuda_laguna_compact_exec_enter(")
+        core_at = wrapper.find("cuda_laguna_compact_routed_moe", enter_at + 1)
+        leave_at = wrapper.find("cuda_laguna_compact_exec_leave(", core_at)
+        self.assertGreaterEqual(enter_at, 0)
+        self.assertGreater(core_at, enter_at)
+        self.assertGreater(leave_at, core_at)
+
+        launch = source_function_body(
+            CUDA_SOURCE,
+            "static int glm_poolside_routed_moe_q4_launch(",
+            "CUDA",
+        )
+        self.assertNotIn("n_tokens != 1u", launch)
+
     def test_laguna_decode_capture_binds_release_and_hook_logits(self) -> None:
         producer = (
             ROOT

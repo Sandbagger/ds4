@@ -20,6 +20,7 @@ COMPARATOR = (
 
 F32_ONE = 0x3F800000
 F32_TWO = 0x40000000
+F32_TEN = 0x41200000
 
 STAGES = {
     "router_logits": ("layer-01-router-logits.f32", 256),
@@ -72,11 +73,10 @@ class SyntheticCapture:
             for _, (filename, count) in STAGES.items():
                 (directory / filename).write_bytes(f32_payload(count))
 
-        # Semantic execution order is slot-major. A late stage in slot 0 must
-        # beat an early stage in slot 1, even though gate precedes weighted in
-        # the per-stage list.
+        # Semantic execution order is slot-major. Up in slot 0 must beat gate
+        # in slot 1, even though gate precedes up in the per-stage list.
         replace_f32(
-            self.ds4 / STAGES["weighted"][0],
+            self.ds4 / STAGES["up"][0],
             2,
             F32_TWO,
         )
@@ -109,11 +109,11 @@ class SyntheticCapture:
             "origin": {
                 "token": 513,
                 "layer": 1,
-                "projection": "gate",
-                "selected_slot": 1,
-                "expert": 145,
-                "row": 0,
-                "tensor": "synthetic.gate",
+                "projection": "up",
+                "selected_slot": 0,
+                "expert": 144,
+                "row": 2,
+                "tensor": "synthetic.up",
                 "tensor_absolute_model_offset": 0,
                 "row_absolute_model_offset": 0,
                 "activation_callback": "ffn_norm-1",
@@ -128,7 +128,7 @@ class SyntheticCapture:
             "oracle": {
                 "value": 1.0,
                 "poolside_float32_bits": "0x3f800000",
-                "ds4_serial_float32_bits": "0x3f800001",
+                "ds4_serial_float32_bits": "0x40000000",
                 "quantized_operands_fp64": 1.0,
             },
             "files": {
@@ -201,7 +201,7 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                 ],
             )
             expected_first = {
-                "stage": "weighted",
+                "stage": "up",
                 "slot": 0,
                 "expert": 144,
                 "poolside_expert": 144,
@@ -223,17 +223,17 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             self.assertEqual(gate["first_mismatch"]["expert"], 145)
             self.assertEqual(gate["first_mismatch"]["row"], 0)
 
-            weighted = report["stages"]["weighted"]
-            self.assertEqual(weighted["equal_count"], 10 * 3072 - 1)
-            self.assertEqual(weighted["mismatch_count"], 1)
+            up = report["stages"]["up"]
+            self.assertEqual(up["equal_count"], 10 * 1024 - 1)
+            self.assertEqual(up["mismatch_count"], 1)
             for stage in (
                 "ffn_norm",
                 "router_logits",
                 "selected",
                 "router_weights",
-                "up",
                 "swiglu",
                 "down",
+                "weighted",
                 "routed_sum",
                 "shared",
                 "combined",
@@ -241,13 +241,13 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                 self.assertEqual(report["stages"][stage]["mismatch_count"], 0)
 
             microscope = report["microscope"]
-            self.assertEqual(microscope["origin"]["selected_slot"], 1)
-            self.assertEqual(microscope["origin"]["expert"], 145)
+            self.assertEqual(microscope["origin"]["selected_slot"], 0)
+            self.assertEqual(microscope["origin"]["expert"], 144)
             self.assertEqual(
                 microscope["direct_output_binding"],
                 {
                     "poolside_bits": "0x3f800000",
-                    "ds4_bits": "0x3f800001",
+                    "ds4_bits": "0x40000000",
                     "poolside_matches_oracle": True,
                     "ds4_matches_oracle": True,
                     "poolside_matches_fixture_output": True,
@@ -256,7 +256,7 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             self.assertTrue(microscope["input_binding"]["ffn_norm_exact"])
             self.assertTrue(microscope["input_binding"]["q8_1_exact"])
             self.assertIn(
-                "first_overall_mismatch stage=weighted slot=0 expert=144 row=2",
+                "first_overall_mismatch stage=up slot=0 expert=144 row=2",
                 first.stdout,
             )
             self.assertNotIn("largest", first.stdout.lower())
@@ -288,6 +288,72 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("does not match microscope", result.stderr)
                 self.assertFalse(json_out.exists())
+
+    def test_rejects_microscope_selected_expert_not_bound_to_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture = SyntheticCapture(root)
+            selected_path = capture.ds4 / "layer-01-router-selected.i32"
+            selected = list(struct.unpack("<10i", selected_path.read_bytes()))
+            selected[0] = 143
+            selected_path.write_bytes(struct.pack("<10i", *selected))
+
+            json_out = root / "report.json"
+            result = subprocess.run(
+                capture.command(json_out),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("selected expert", result.stderr)
+            self.assertFalse(json_out.exists())
+
+    def test_rejects_direct_output_not_bound_to_microscope_oracle(self) -> None:
+        for runtime in ("poolside", "ds4"):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                capture = SyntheticCapture(root)
+                directory = getattr(capture, runtime)
+                replace_f32(directory / STAGES["up"][0], 2, F32_ONE + 7)
+
+                json_out = root / "report.json"
+                result = subprocess.run(
+                    capture.command(json_out),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("direct output", result.stderr)
+                self.assertFalse(json_out.exists())
+
+    def test_rejects_microscope_coordinate_after_first_routed_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture = SyntheticCapture(root)
+            replace_f32(capture.ds4 / STAGES["up"][0], 3, F32_TWO)
+            manifest_path = capture.microscope / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["origin"]["row"] = 3
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            json_out = root / "report.json"
+            result = subprocess.run(
+                capture.command(json_out),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("first routed mismatch", result.stderr)
+            self.assertFalse(json_out.exists())
 
 
 if __name__ == "__main__":

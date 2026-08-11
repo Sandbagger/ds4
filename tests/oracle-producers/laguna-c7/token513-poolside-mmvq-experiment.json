@@ -1,0 +1,272 @@
+{
+  "schema": "laguna-poolside-mmvq-experiment/v1",
+  "status": "qualified_opt_in",
+  "identity": {
+    "model": {
+      "bytes": 68248759648,
+      "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+    },
+    "prefix": {
+      "tokens": 512,
+      "bytes": 2048,
+      "sha256": "569aa6394783e0f17558db421ba26480d7a530d44dd2219bcc9aac2c09a3b559"
+    },
+    "resume_token": 3612,
+    "device": {
+      "name": "NVIDIA GB10",
+      "compute_capability": "12.1",
+      "driver": "580.126.09"
+    },
+    "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+    "ds4_capture_implementation_commit": "373d990b28b9d8b11ea6a623ab34c1ba284df526",
+    "ds4_final_implementation_commit": "1d2106150868aa4fcc32332f8da021fac24d99a8",
+    "ds4_cuda_source_sha256": "3937d54a4c539b57e0973d2c6fca2d7f20cfa1cf38a8d8d102fb06566cc8512d"
+  },
+  "feature": {
+    "environment": "DS4_MM_VQ_REDUCTION",
+    "experimental_value": "poolside",
+    "default": "serial",
+    "configuration_lifetime": "read once at CUDA initialization",
+    "tokens": 1,
+    "weight_type": "Q4_K",
+    "activation_type": "Q8_1",
+    "laguna_shape": {
+      "experts_total": 256,
+      "experts_used": 10,
+      "expert_input": 3072,
+      "expert_mid": 1024,
+      "output": 3072
+    },
+    "scope_caveat": "The production gate is Laguna-shaped rather than model-hash-bound and applies to any one-token routed invocation, including a one-token sync/checkpoint call. Another force-resident GLM Q4_K model with the same dimensions would opt in if the environment value is set.",
+    "unchanged_paths": [
+      "router F32 projection",
+      "Q8_1 quantizer",
+      "column L2 rescaling",
+      "shared expert",
+      "multi-token MMQ",
+      "default serial MMVQ"
+    ]
+  },
+  "numerical": {
+    "case": "token 513, layer 1 direct capture followed through final logits",
+    "unchanged_router": {
+      "router_logit_mismatch_count": 164,
+      "router_logit_l2_delta": 1.161526159638469e-06,
+      "selected_id_mismatch_count": 0,
+      "routing_weight_mismatch_count": 2,
+      "routing_weight_l2_delta": 5.3726900748371916e-08
+    },
+    "serial_vs_poolside": {
+      "gate": {"mismatch_count": 8683, "l2_delta": 1.7963662003639136e-06},
+      "up": {"mismatch_count": 8775, "l2_delta": 1.8130926314184475e-06},
+      "swiglu": {"mismatch_count": 9490, "l2_delta": 1.3960283425007135e-07},
+      "col_l2": {"mismatch_count": 3, "l2_delta": 3.161013638317052e-08},
+      "down_input": {"mismatch_count": 9443, "l2_delta": 0.028465066111034904},
+      "down": {"mismatch_count": 26336, "l2_delta": 2.8835693050599806e-07},
+      "weighted": {"mismatch_count": 26498, "l2_delta": 9.873062541593009e-08},
+      "routed_sum": {"mismatch_count": 2690, "l2_delta": 1.0707281135244065e-07},
+      "combined_moe": {"mismatch_count": 2408, "l2_delta": 1.1243075016719302e-07},
+      "layer_1": {"mismatch_count": 1052, "l2_delta": 1.8313432626110132e-07},
+      "final_logits": {
+        "mismatch_count": 100352,
+        "l2_delta": 35.63575131923614,
+        "max_absolute_delta": 0.49067890644073486,
+        "sha256": "e837bc5b6ad4dbfe74e17a1d4e7552eaae6756c46f30c4548c00d63c6e7d21c2"
+      }
+    },
+    "poolside_reduction_vs_poolside": {
+      "gate": {"mismatch_count": 0, "l2_delta": 0.0},
+      "up": {"mismatch_count": 0, "l2_delta": 0.0},
+      "swiglu": {"mismatch_count": 0, "l2_delta": 0.0},
+      "col_l2": {"mismatch_count": 0, "l2_delta": 0.0},
+      "down_input": {"mismatch_count": 0, "l2_delta": 0.0},
+      "down": {"mismatch_count": 0, "l2_delta": 0.0},
+      "weighted": {"mismatch_count": 5822, "l2_delta": 3.4727823651265586e-08},
+      "routed_sum": {"mismatch_count": 1851, "l2_delta": 4.508155154480043e-08},
+      "combined_moe": {"mismatch_count": 1393, "l2_delta": 5.557283260667565e-08},
+      "layer_1": {"mismatch_count": 403, "l2_delta": 9.109839246151957e-08},
+      "final_logits": {
+        "mismatch_count": 100352,
+        "l2_delta": 37.42493333725273,
+        "max_absolute_delta": 0.5864992141723633,
+        "sha256": "e077258890d64d369e81fa72940049f0b69a9293fb46bd92364a81ed90fff98f"
+      }
+    },
+    "checkpoint_ratios_candidate_over_serial": {
+      "layer_1": 0.49744029053099115,
+      "layer_2": 0.5963470870514224,
+      "layer_3": 0.5230913943439505,
+      "layer_33": 0.8832262262781684,
+      "layer_45": 0.9876018901428545,
+      "layer_46": 1.0824927815251604,
+      "layer_47": 1.071169789117344,
+      "final_logits": 1.050207500944446
+    },
+    "capture_hashes": {
+      "poolside_gate": "5563a95ae9d46efe1e451414ae0134535a8ac483f39f35a6b3e2592b8e621140",
+      "candidate_gate": "5563a95ae9d46efe1e451414ae0134535a8ac483f39f35a6b3e2592b8e621140",
+      "poolside_final_logits": "d984734d99380848364f70fe0bb7fbb6c99d1bdf52cfc4116ecba84f6aa468d4"
+    },
+    "interpretation": "The expert primitive is exact and layer-1 error is halved. The unchanged router residual is later amplified; one frozen final-logit L2 is 5.02% worse, so local arithmetic parity is not monotonic end-to-end parity."
+  },
+  "behavior": {
+    "steps": 32,
+    "reference": {
+      "runtime": "Poolside llama.cpp",
+      "greedy_matching_prefix": 32,
+      "top1_match_count": 32,
+      "teacher_nll_total": 0.000895354029463391,
+      "teacher_nll_avg": 2.797981342073097e-05,
+      "continuation_sha256": "24c8392c6936174264048072bcdef4c6ccfb79f26e8ddca7e5d03b9f7f31db07",
+      "output_set_sha256": "41328b85ebcdfc9563247c9430c03923a900f0de035714b4b2d70956a024061f",
+      "output_set_hash_algorithm": "SHA-256 over lexicographically sorted records UTF-8 basename || NUL || raw 32-byte SHA-256(file contents)",
+      "producer_source_sha256": "b6b74b6abd430ccb17d7f9bb459c67c5fc306d00252cc6c0066068af68a2c5f5",
+      "producer_binary_sha256": "9ac26a76830a329a55d8157d59206d9f94c6f1db5d1e343223d1866bbbb6d9e4",
+      "runtime_libraries_sha256": {
+        "libllama.so": "70970301a664fe2cd5f56f93ff1afbcab84d64ed7a8b606ed718cb056c68b68a",
+        "libggml.so": "a3074ac0d00e6fb2684e3311c3bd6bbf39d226a8011858f0bd3f2dfca14172f1",
+        "libggml-base.so": "6007aceeea846f5a71764017187e3eab7c7aa176d6a8e080e9391d9e9dbfbf3e",
+        "libggml-cuda.so": "6df1a06155341d0767828594f074bb8a0ff90a565fea5bd2ed0fcf2af5bcc888"
+      },
+      "runtime_seconds": 347.849783134,
+      "gpu_peak_mib": 65410
+    },
+    "serial": {
+      "greedy_matching_prefix": 32,
+      "top1_match_count": 32,
+      "top20_exact_steps": 0,
+      "top20_same_position_avg": 8.6875,
+      "top20_set_overlap_avg": 18.375,
+      "top20_set_overlap_min": 12,
+      "top20_ordered_prefix_avg": 4.5,
+      "teacher_nll_total": 0.001039062641588373,
+      "teacher_nll_excess_vs_reference": 0.00014370861212498198,
+      "json_sha256": "550fb033a0d8b46f14cc488494a7468aa1074bc1ffafb9ddd4b4f698d9120200"
+    },
+    "poolside_reduction": {
+      "greedy_matching_prefix": 32,
+      "top1_match_count": 32,
+      "top20_exact_steps": 0,
+      "top20_same_position_avg": 8.21875,
+      "top20_set_overlap_avg": 18.46875,
+      "top20_set_overlap_min": 15,
+      "top20_ordered_prefix_avg": 4.4375,
+      "teacher_nll_total": 0.0009044693227018286,
+      "teacher_nll_excess_vs_reference": 9.115293238437516e-06,
+      "json_sha256": "30f08a7667eaaea9989f79b531656bb64ef4cb20f0c0fe94250ef09624523286"
+    },
+    "candidate_excess_nll_reduction_fraction": 0.9365710022269923,
+    "ds4_run_metadata_sha256": "cd7d6eae850821b753ffe01f2aa795166108e5141cb01ca030f5da97ccaf1dcb",
+    "gpu_peak_mib": 96506,
+    "exclusive_runs": true,
+    "wall_time_comparison_valid": false,
+    "wall_time_caveat": "Serial ran first and candidate second with materially different model-startup cache state; use paired decode and Nsight results for performance."
+  },
+  "performance": {
+    "paired_runs": 3,
+    "steady_decode": {
+      "serial_tokens_per_second": [1.56, 1.56, 1.56],
+      "candidate_tokens_per_second": [1.62, 1.62, 1.62],
+      "serial_median": 1.56,
+      "candidate_median": 1.62,
+      "candidate_to_serial_ratio": 1.0384615384615385
+    },
+    "first_token_ms": {
+      "serial": [623.132, 624.444, 624.264],
+      "candidate": [606.748, 612.29, 602.458],
+      "serial_median": 624.264,
+      "candidate_median": 606.748,
+      "candidate_improvement_fraction": 0.028058641856650333
+    },
+    "paired_run_artifact_caveat": "The original console CSV artifacts were on reboot-cleared scratch storage. Values were preserved in the experiment transcript; final Nsight reports below are locally retained and content-addressed.",
+    "nsys": {
+      "version": "2025.3.2",
+      "serial_report_sha256": "ddc02877259de7471750f2bbedfe143b28fe6d69b40741325742d18fc55a4678",
+      "candidate_report_sha256": "dc8609df1e6bd72cc591497c3f474e4f62b2d65b1c2870b3106d543556849007",
+      "release_probe_binary_sha256": "a9529ea20cebf4fab115290791daad2329a55b60f2e29eb94f2d3a4721a35eec",
+      "serial_logits_sha256": "e837bc5b6ad4dbfe74e17a1d4e7552eaae6756c46f30c4548c00d63c6e7d21c2",
+      "candidate_logits_sha256": "e077258890d64d369e81fa72940049f0b69a9293fb46bd92364a81ed90fff98f",
+      "targeted_launches_per_token": {
+        "serial": 94,
+        "candidate": 94
+      },
+      "serial": {
+        "gate_up": {
+          "instances": 47,
+          "grid": [4, 10, 1],
+          "block": [256, 1, 1],
+          "avg_us": 339.087659574468,
+          "total_ms": 15.93712,
+          "registers_per_thread": 96,
+          "static_shared_bytes": 0
+        },
+        "down": {
+          "instances": 47,
+          "grid": [12, 1, 1],
+          "block": [256, 1, 1],
+          "avg_us": 563.681361702128,
+          "total_ms": 26.493024,
+          "registers_per_thread": 43,
+          "static_shared_bytes": 0
+        },
+        "combined_avg_us_per_layer": 902.769021276596,
+        "combined_total_ms": 42.430144,
+        "effective_q4_payload_gb_per_second": 58.80148603785081
+      },
+      "candidate": {
+        "gate_up": {
+          "instances": 47,
+          "grid": [1024, 10, 1],
+          "block": [32, 4, 1],
+          "avg_us": 263.948936170213,
+          "total_ms": 12.4056,
+          "registers_per_thread": 62,
+          "static_shared_bytes": 768
+        },
+        "down": {
+          "instances": 47,
+          "grid": [768, 1, 1],
+          "block": [32, 4, 1],
+          "avg_us": 185.75114893617,
+          "total_ms": 8.730304,
+          "registers_per_thread": 48,
+          "static_shared_bytes": 1536
+        },
+        "combined_avg_us_per_layer": 449.700085106383,
+        "combined_total_ms": 21.135904,
+        "effective_q4_payload_gb_per_second": 118.04347332387582
+      },
+      "combined_kernel_speedup": 2.0074913284996003,
+      "combined_kernel_time_reduction_fraction": 0.5018658433023467,
+      "q4_weight_payload_bytes_per_layer": 53084160,
+      "q4_weight_payload_bytes_per_token": 2494955520,
+      "payload_bandwidth_caveat": "Effective Q4 payload bandwidth divides complete Q4_K block bytes, including scales, d, and dmin, by kernel duration. It is not a DRAM-counter measurement, cannot distinguish cache traffic from DRAM traffic, and omits activations, outputs, and other traffic from its numerator."
+    },
+    "hardware_counters": {
+      "available": false,
+      "actual_occupancy": null,
+      "memory_bandwidth": null,
+      "reason": "Nsight Compute counters are disabled for this user (RmProfilingAdminOnly / ERR_NVGPUCTRPERM). Nsight Systems supplied launch resources and timings but not achieved occupancy or DRAM bytes."
+    },
+    "gpu_peak_mib": 96532,
+    "exclusive_profiles": true
+  },
+  "decision": {
+    "default_changed": false,
+    "keep_feature_gate": true,
+    "verdict": "The Poolside-order implementation is a successful compatibility and GB10 performance experiment: expert arithmetic is exact, excess 32-step NLL falls 93.7%, targeted kernel time halves, and paired decode throughput does not regress. Keep it opt-in until broader coding-planner evals establish task-level quality.",
+    "next": [
+      "Build the independent F32 router reduction microscope.",
+      "Run candidate-versus-serial planner/orchestrator evals on the existing DS4 suite.",
+      "Only then decide whether Poolside-order MMVQ becomes Laguna's default."
+    ]
+  },
+  "raw_artifacts": {
+    "committed": false,
+    "local_root": "/private/tmp/laguna-mmvq-analysis.3n8mgM",
+    "poolside_behavior": "poolside-behavior",
+    "ds4_behavior": "ds4-behavior",
+    "nsys": "nsys",
+    "retention_caveat": "Raw captures and profiles are scratch artifacts. This result records hashes for key retained outputs and profiles plus an aggregate Poolside behavior-set hash; it does not hash every intermediate tensor. The tracked producers make the runs reproducible."
+  }
+}

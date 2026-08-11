@@ -148,6 +148,12 @@ Q4K_MMVQ_MICROSCOPE_FILES = {
         "6bea612b1933fa44f45d2731a553d098ccf4cd5e63a45ddee24f81793606244b",
     ),
 }
+F32_MMVF_MICROSCOPE_TEST_PATH = (
+    ROOT / "tests/test_cuda_f32_mmvf_microscope.c"
+)
+F32_MMVF_MICROSCOPE_FIXTURE = (
+    ROOT / "tests/test-vectors/f32-mmvf-microscope-auto"
+)
 LAGUNA_Q4_L2_AUTO_FIXTURE = ROOT / "tests/test-vectors/laguna-q4-l2-auto"
 LAGUNA_Q4_L2_AUTO_FILES = {
     "mid-pair0.f32": (
@@ -208,6 +214,8 @@ LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "probe_poolside_laguna_token513_moe.cpp",
     "probe_poolside_laguna_moe.cpp",
     "short.tokens.i32",
+    "token513-poolside-mmvq-experiment.json",
+    "token513-router-quality-proxies.json",
     "token513-layer1-comparison.json",
     "token513-layer1-run.json",
     "verify_poolside_laguna_moe.py",
@@ -425,6 +433,22 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_score_official_compiles_c_before_cuda_link(self) -> None:
+        object_rule = (
+            "gguf-tools/quality-testing/score_official.o: "
+            "gguf-tools/quality-testing/score_official.c ds4.h\n"
+            "\t$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) "
+            "-I. -c -o $@ $<"
+        )
+        self.assertIn(object_rule, MAKEFILE)
+        cuda_link_rule = (
+            "gguf-tools/quality-testing/score_official: "
+            "gguf-tools/quality-testing/score_official.o "
+            "$(CORE_OBJS) rax.o\n"
+            "\t$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)"
+        )
+        self.assertIn(cuda_link_rule, MAKEFILE)
+
     def test_laguna_attention_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1091,6 +1115,110 @@ class CudaBuildContractTest(unittest.TestCase):
             hook,
         )
 
+    def test_f32_mmvf_microscope_is_generic_pinned_and_wired(self) -> None:
+        test_path = F32_MMVF_MICROSCOPE_TEST_PATH
+        manifest_path = F32_MMVF_MICROSCOPE_FIXTURE / "manifest.json"
+        weight_path = F32_MMVF_MICROSCOPE_FIXTURE / "weight-row.f32"
+        self.assertTrue(test_path.is_file())
+        self.assertTrue(manifest_path.is_file())
+        self.assertTrue(weight_path.is_file())
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["schema"], "f32-mmvf-microscope-fixture/v1"
+        )
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["poolside_sources"],
+            {
+                "ggml/src/ggml-cuda/mmvf.cu": (
+                    "23b580ce14a45e71cc9be31047301d502"
+                    "be74a832084c16662985f93f533ba1c"
+                ),
+                "ggml/src/ggml-cuda/common.cuh": (
+                    "a977b50f7479df092bf3c441ba88e451"
+                    "9803b5f0df5a640fd7fb0874e64b9b4c"
+                ),
+            },
+        )
+        self.assertEqual(
+            manifest["shape"],
+            {"input_elements": 3072, "row_bytes": 12288},
+        )
+        self.assertEqual(
+            manifest["origin"],
+            {
+                "token": 513,
+                "layer": 1,
+                "stage": "router_logits",
+                "row": 0,
+                "expert": 0,
+                "tensor": "blk.1.ffn_gate_inp.weight",
+                "tensor_absolute_model_offset": 1802551136,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"],
+            {
+                "poolside_float32_bits": "0xbea377ba",
+                "ds4_serial_float32_bits": "0xbea377b8",
+                "operands_fp64": -0.31927273880611085,
+            },
+        )
+
+        weight = weight_path.read_bytes()
+        self.assertEqual(len(weight), 12288)
+        self.assertEqual(
+            hashlib.sha256(weight).hexdigest(),
+            "4b2e76f429c40ab67023a7500cd2eb25"
+            "e0fd820de9d550025642b172452b16b1",
+        )
+        input_path = Q4K_MMVQ_MICROSCOPE_FIXTURE / "input.f32"
+        self.assertEqual(
+            hashlib.sha256(input_path.read_bytes()).hexdigest(),
+            "eabe89d1d9a4bdc660e5759c2a20d347"
+            "d4dedaec1e617a44f3244cfe7985ef0e",
+        )
+
+        source = test_path.read_text(encoding="utf-8")
+        self.assertNotIn("laguna", source.lower())
+        for required in (
+            "ds4_gpu_test_f32_mmvf_microscope_tensor(",
+            "DS4_SERIAL_EXPECTED_BITS",
+            "POOLSIDE_EXPECTED_BITS",
+            '"weight-row.f32"',
+            '"../q4k-mmvq-microscope-auto/input.f32"',
+        ):
+            self.assertIn(required, source)
+        self.assertIn(
+            "tests/test_cuda_f32_mmvf_microscope:", MAKEFILE
+        )
+        self.assertIn(
+            "ds4_gpu_test_f32_mmvf_microscope_tensor(", GPU_HEADER
+        )
+
+        poolside_kernel = function_body(
+            "__global__ static void f32_mmvf_poolside_microscope_kernel("
+        )
+        self.assertIn("const float2 *weight2", poolside_kernel)
+        self.assertIn("const float2 *activation2", poolside_kernel)
+        self.assertRegex(poolside_kernel, r"col2\s*\+=\s*256u")
+        self.assertGreaterEqual(poolside_kernel.count("sum +="), 3)
+        self.assertRegex(
+            poolside_kernel,
+            r"for \(uint32_t offset = 16u; offset > 0u; offset >>= 1u\)",
+        )
+        hook = function_body(
+            'extern "C" int ds4_gpu_test_f32_mmvf_microscope_tensor('
+        )
+        self.assertIn("matmul_f32_kernel<<<1, 256>>>", hook)
+        self.assertIn(
+            "f32_mmvf_poolside_microscope_kernel<<<1, 256, ", hook
+        )
+
     def test_laguna_decode_poolside_mmvq_is_opt_in_and_narrow(self) -> None:
         selector = function_body(
             "static bool cuda_poolside_mmvq_requested(void)"
@@ -1102,6 +1230,8 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', refresh)
         self.assertIn('strcmp(reduction, "poolside") == 0', refresh)
+        init = function_body('extern "C" int ds4_gpu_init_multi(')
+        self.assertIn("cuda_decode_dispatch_env_refresh();", init)
 
         fragment_signature = (
             "dev_dot_q4_K_q8_1_poolside_mmvq_fragment("

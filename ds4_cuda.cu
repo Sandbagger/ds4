@@ -27248,6 +27248,85 @@ dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
 }
 
 #ifdef DS4_TEST_HOOKS
+__global__ static void f32_mmvf_poolside_microscope_kernel(
+        float *value,
+        const float *weight,
+        const float *activation,
+        uint32_t input_elements) {
+    const uint32_t tid = threadIdx.x;
+    const float2 *weight2 = (const float2 *)weight;
+    const float2 *activation2 = (const float2 *)activation;
+    const uint32_t input_pairs = input_elements / 2u;
+    float sum = 0.0f;
+    for (uint32_t col2 = tid; col2 < input_pairs; col2 += 256u) {
+        const float2 w = weight2[col2];
+        const float2 x = activation2[col2];
+        sum += w.x * x.x;
+        sum += w.y * x.y;
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    }
+
+    extern __shared__ float warp_sums[];
+    if (tid < 32u) warp_sums[tid] = 0.0f;
+    __syncthreads();
+    if ((tid & 31u) == 0u) warp_sums[tid / 32u] = sum;
+    __syncthreads();
+    if (tid < 32u) {
+        sum = warp_sums[tid];
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+        }
+        if (tid == 0u) value[0] = sum;
+    }
+}
+
+extern "C" int ds4_gpu_test_f32_mmvf_microscope_tensor(
+        ds4_gpu_tensor *values,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements) {
+    if (!values || !weight_row || !activation ||
+        !values->ptr || !weight_row->ptr || !activation->ptr ||
+        input_elements == 0u || (input_elements & 1u) != 0u ||
+        values->bytes < 2u * sizeof(float) ||
+        weight_row->bytes < (uint64_t)input_elements * sizeof(float) ||
+        activation->bytes < (uint64_t)input_elements * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(values);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(weight_row) != tier ||
+        ds4_tensor_device_idx(activation) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "F32 MMVF microscope get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    matmul_f32_kernel<<<1, 256>>>(
+        (float *)values->ptr,
+        (const float *)weight_row->ptr,
+        (const float *)activation->ptr,
+        input_elements, 1u, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "F32 MMVF microscope serial launch")) {
+        return 0;
+    }
+    f32_mmvf_poolside_microscope_kernel<<<1, 256, 32u * sizeof(float)>>>(
+        (float *)values->ptr + 1u,
+        (const float *)weight_row->ptr,
+        (const float *)activation->ptr,
+        input_elements);
+    return cuda_ok(cudaGetLastError(),
+                   "F32 MMVF microscope Poolside launch");
+}
+
 __global__ static void q4_k_mmvq_serial_microscope_kernel(
         float *values,
         const cuda_block_q4_K *weight_row,

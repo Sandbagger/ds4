@@ -1,0 +1,349 @@
+{
+  "schema": "laguna-router-quality-proxies/v1",
+  "date": "2026-08-11",
+  "identity": {
+    "model": {
+      "bytes": 68248759648,
+      "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+    },
+    "device": "NVIDIA GB10",
+    "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+    "poolside_mmvq_feature": {
+      "environment": "DS4_MM_VQ_REDUCTION",
+      "experimental_value": "poolside",
+      "default": "serial"
+    },
+    "production_feature_commit": "1d2106150868aa4fcc32332f8da021fac24d99a8",
+    "router_microscope_commit": "64c7e7651a6e1fd3d15d8f59a4fb7dfa4c22d869",
+    "evaluation_source_state": "b9e0e54e28edad728062589c06567b65fbbe5b32"
+  },
+  "router_microscope": {
+    "origin": {
+      "token": 513,
+      "layer": 1,
+      "stage": "router_logits",
+      "row": 0,
+      "expert": 0,
+      "tensor": "blk.1.ffn_gate_inp.weight"
+    },
+    "input": {
+      "elements": 3072,
+      "bytes": 12288,
+      "sha256": "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e"
+    },
+    "weight_row": {
+      "bytes": 12288,
+      "absolute_model_offset": 1802551136,
+      "sha256": "4b2e76f429c40ab67023a7500cd2eb25e0fd820de9d550025642b172452b16b1"
+    },
+    "ds4_bits": "0xbea377b8",
+    "poolside_bits": "0xbea377ba",
+    "direct_ds4_capture_bits": "0xbea377b8",
+    "direct_poolside_capture_bits": "0xbea377ba",
+    "ds4_value": -0.3192727565765381,
+    "poolside_value": -0.31927281618118286,
+    "binary64_reference": {
+      "sequential_c_value": -0.31927273880611073,
+      "fixture_manifest_value": -0.31927273880611085,
+      "caveat": "The last binary64 bits differ because the two host calculations use different reduction implementations; neither is claimed as an exact mathematical oracle."
+    },
+    "ds4_abs_error_vs_fp64": 1.7770427351848639e-08,
+    "poolside_abs_error_vs_fp64": 7.7375072127239264e-08,
+    "cause": "f32_reduction_topology",
+    "causal_scope": "captured_row_0_scalar",
+    "direct_capture_unequal_router_logits": 164,
+    "all_unequal_router_logits_explained": false,
+    "production_change_recommended": false,
+    "reason": "The diagnostic reproduces both direct capture bits, but DS4 is closer to the binary64 reference for this scalar and the selected experts were unchanged.",
+    "poolside_sources": {
+      "ggml/src/ggml-cuda/mmvf.cu": "23b580ce14a45e71cc9be31047301d502be74a832084c16662985f93f533ba1c",
+      "ggml/src/ggml-cuda/common.cuh": "a977b50f7479df092bf3c441ba88e4519803b5f0df5a640fd7fb0874e64b9b4c"
+    },
+    "bindings": {
+      "direct_run_json_sha256": "c25eb57c4b84859856b42e1f3b2333e5fa38dface30da5a25e9a7d8004ab9a3e",
+      "direct_comparison_json_sha256": "17614d19cce3f95941b4d8a8babd3bcfc7ae791086efbacc2a4155bc2d37b708",
+      "microscope_manifest_sha256": "b05ec00900c9bbdbe66c95ca5f89a1644200d8bf669692154ccfecb14fd9486f",
+      "microscope_source_sha256": "2fbdc4985f465767288b1f5bf575a3b8bcc2c31936dfa410dc6d0b9bff705909"
+    }
+  },
+  "quality_proxy": {
+    "name": "Laguna OpenRouter official-continuation proxy",
+    "kind": "model-quality proxy",
+    "hosted_target": "poolside/laguna-s-2.1",
+    "cases": 100,
+    "continuation_limit_tokens": 24,
+    "scored_tokens": 2342,
+    "unchanged_prefill_control_positions": 100,
+    "candidate_sensitive_scored_positions": 2242,
+    "first_token_metric": {
+      "path": "unchanged_multi_token_prefill",
+      "stored_value": "boolean_match_against_hosted_target",
+      "predicted_token_ids_retained": false,
+      "candidate_quality_evidence": false
+    },
+    "greedy_lcp_metric": "Longest prefix for which each teacher-forced position's local argmax equals the hosted target; this is not a retained free-running continuation.",
+    "serial": {
+      "average_nll": 0.237165561,
+      "first_token_matches": 90,
+      "average_greedy_lcp": 11.09,
+      "greedy_lcp_total": 1109,
+      "tsv_sha256": "4e368fbdc0e93f475b28bf7d9ba4f4c4c58b0244a7b5290f3affe05fadfcaaae"
+    },
+    "poolside_reduction": {
+      "average_nll": 0.237731846,
+      "first_token_matches": 90,
+      "average_greedy_lcp": 10.84,
+      "greedy_lcp_total": 1084,
+      "tsv_sha256": "247166cd9b3780a1fbef41ebe14c830f1776007b59290b372da4e51a54fff649"
+    },
+    "comparison": {
+      "average_nll_delta_poolside_minus_serial": 0.000566285,
+      "relative_average_nll_change_percent": 0.239,
+      "lower_nll_is_better": true,
+      "case_total_nll_wins": {
+        "poolside_reduction": 51,
+        "serial": 49,
+        "ties": 0
+      },
+      "per_case_total_nll_delta_poolside_minus_serial": {
+        "mean": 0.01326240471,
+        "median": -0.005031956,
+        "sample_standard_deviation": 0.2308400009276394,
+        "source_columns": "Direct per-case nll totals from the two TSV files",
+        "population_inference_supported": false
+      },
+      "greedy_lcp_changes": {
+        "poolside_better": 2,
+        "serial_better": 7,
+        "ties": 91,
+        "total_delta_poolside_minus_serial": -25
+      },
+      "interpretation": "Small aggregate change with mixed case-level effects: Poolside wins slightly more cases, while aggregate NLL and mean target-prefix length are slightly worse."
+    },
+    "api_logprobs": {
+      "available": false,
+      "target_mae": null,
+      "top_n_agreement": null,
+      "note": "Zero-filled TSV columns and comparator output are unavailable sentinels, not measured agreement."
+    },
+    "execution": {
+      "repetitions_per_mode": 1,
+      "run_order": [
+        "serial",
+        "poolside_reduction"
+      ],
+      "context_tokens": 4096,
+      "ssd_streaming": false,
+      "full_residency": true,
+      "wall_time_comparable": false,
+      "memory_comparable": false,
+      "core_commands": {
+        "serial": "env -u DS4_MM_VQ_REDUCTION ./score_official MODEL MANIFEST serial.tsv 4096",
+        "poolside_reduction": "env DS4_MM_VQ_REDUCTION=poolside ./score_official MODEL MANIFEST poolside.tsv 4096"
+      }
+    },
+    "provenance": {
+      "scorer_binary_sha256": "f1277b1b2972ceed9743a89bdada1f7abf7782ae72ce89b089dceac8ebb65bdd",
+      "scorer_binary_retained_as": "/private/tmp/laguna-mmvq-analysis-20260811/quality-eval/score_official.bin",
+      "retained_hash_manifest_sha256": "c6178a2ddd252b14549a020a37f032c441a63d13bfe376c871e693a02b9a4628",
+      "compare_scores_py_sha256": "8e0d459c59be05b4dcf1dfa0a45b72010c95a60ea38a5bc3850f038972b92b06",
+      "manifest_sha256": "08a3cf844e41384e1eea7fae4553de6885e5080edcfb1992612c2bc79973f619",
+      "fixture_tree_sha256": "148f1023c3cd0d47fd9dccaf701ff315aedb0f3512d87389f2548f1136227cde",
+      "fixture_tree_hash_algorithm": "SHA-256 of the newline-delimited, relative-path shasum -a 256 records for all 301 files in C-locale path order",
+      "fixture_source_commit": "8a927009e61bd7e1ca370cd793c18b2749dbc03c",
+      "raw_artifacts_committed": false,
+      "retained_scratch": "/private/tmp/laguna-mmvq-analysis-20260811/quality-eval"
+    }
+  },
+  "capability_proxy": {
+    "name": "ds4-eval four-case qualification smoke",
+    "kind": "capability proxy",
+    "case_sequence": [
+      1,
+      2,
+      3,
+      76
+    ],
+    "requested_cases": 4,
+    "attempted_cases": 4,
+    "gradeable_cases": 4,
+    "reported_suite_denominator": 92,
+    "not_run": 88,
+    "repetitions_per_mode": 1,
+    "settings": {
+      "backend": "cuda",
+      "context_tokens": 32768,
+      "max_generated_tokens": 512,
+      "think_mode": "none",
+      "temperature": 0,
+      "top_p": 1,
+      "min_p": 0.05,
+      "seed": 1,
+      "ssd_streaming": false,
+      "full_residency": true
+    },
+    "serial": {
+      "passed": 4,
+      "generated_tokens_total": 1022,
+      "wall_seconds": 580.19,
+      "trace_sha256": "2a5ea28485570db376e89fc68e82c6cea80b2b056c2fa31955d63946cf37ba23",
+      "stdout_sha256": "bf8338c95f2003472cf43cb78735f9c756caf4c8a929ad409ec3b8d2142a4673",
+      "stderr_sha256": "fa6f6ef1ced3c81ae33553913839f9f02d73b8f791f24f3a0ce28a375c6a5245",
+      "cases": [
+        {
+          "case": 1,
+          "source": "GPQA Diamond",
+          "id": "recNu3MXkvWUzHZr9",
+          "status": "PASSED",
+          "picked": "B",
+          "expected": "B",
+          "prompt_tokens": 224,
+          "generated_tokens": 324,
+          "model_output_bytes": 791,
+          "model_output_sha256": "914c3b230b3b4bb493249687aca3e97629ff9ed16a6bc91157b4fdf4d4c39911"
+        },
+        {
+          "case": 2,
+          "source": "SuperGPQA",
+          "id": "001b51d76b4d422988f2c11f104a2c6c",
+          "status": "PASSED",
+          "picked": "C",
+          "expected": "C",
+          "prompt_tokens": 161,
+          "generated_tokens": 103,
+          "model_output_bytes": 427,
+          "model_output_sha256": "04396afb435dd373e06df71bc662645c0f256735fddaaf4f192764bc58f092af"
+        },
+        {
+          "case": 3,
+          "source": "AIME2025",
+          "id": "aime2025-01",
+          "status": "PASSED",
+          "picked": "70",
+          "expected": "70",
+          "prompt_tokens": 94,
+          "generated_tokens": 297,
+          "model_output_bytes": 575,
+          "model_output_sha256": "decc03578e9a93727f55e6ed72ded2613243ba69ba3c6c7903af7ef25e321eab"
+        },
+        {
+          "case": 76,
+          "source": "COMPSEC",
+          "id": "compsec-076",
+          "status": "PASSED",
+          "picked": "20",
+          "expected": "17-20",
+          "prompt_tokens": 466,
+          "generated_tokens": 298,
+          "model_output_bytes": 1044,
+          "model_output_sha256": "e90c62fd6990eb522ad5f650a3072d0e495c0c2470ebf223d82964f9d7fe187a"
+        }
+      ]
+    },
+    "poolside_reduction": {
+      "passed": 4,
+      "generated_tokens_total": 1049,
+      "wall_seconds": 575.01,
+      "trace_sha256": "284c50088059f9cad45cd2d86fffb80d877968a61440504eb2175d6c7a994d66",
+      "stdout_sha256": "53e26895146e2e0b32673d81b5edcf722ae4bec0b07280a296401f07c2b366be",
+      "stderr_sha256": "fbaa11096c6a5bf80cf1ad6d06322b90be8881558ed62ef351727802ee861f44",
+      "cases": [
+        {
+          "case": 1,
+          "source": "GPQA Diamond",
+          "id": "recNu3MXkvWUzHZr9",
+          "status": "PASSED",
+          "picked": "B",
+          "expected": "B",
+          "prompt_tokens": 224,
+          "generated_tokens": 313,
+          "model_output_bytes": 819,
+          "model_output_sha256": "599bcde13537d0b949696d05432d8e44b628cbfba49de3c8f2e47b94533f16ad"
+        },
+        {
+          "case": 2,
+          "source": "SuperGPQA",
+          "id": "001b51d76b4d422988f2c11f104a2c6c",
+          "status": "PASSED",
+          "picked": "C",
+          "expected": "C",
+          "prompt_tokens": 161,
+          "generated_tokens": 114,
+          "model_output_bytes": 491,
+          "model_output_sha256": "67f6bc2863c981de32d8c34cdfb0e448f7911fd9c4515575c44b1d3615471660"
+        },
+        {
+          "case": 3,
+          "source": "AIME2025",
+          "id": "aime2025-01",
+          "status": "PASSED",
+          "picked": "70",
+          "expected": "70",
+          "prompt_tokens": 94,
+          "generated_tokens": 277,
+          "model_output_bytes": 558,
+          "model_output_sha256": "602424fd4ee3e06805791e556bff1a21954ec9994fb3a8b02ec5cd2e7b1dd82d"
+        },
+        {
+          "case": 76,
+          "source": "COMPSEC",
+          "id": "compsec-076",
+          "status": "PASSED",
+          "picked": "20",
+          "expected": "17-20",
+          "prompt_tokens": 466,
+          "generated_tokens": 345,
+          "model_output_bytes": 1177,
+          "model_output_sha256": "56a404ce01b86aaec2d596df21d600cf009d311e930d5c565167af93ca59b015"
+        }
+      ]
+    },
+    "comparison": {
+      "status_exact_cases": 4,
+      "picked_answer_exact_cases": 4,
+      "model_output_exact_cases": 0,
+      "within_mode_output_reproducibility_control": false,
+      "interpretation": "All four accepted answers are stable, while every exact output differs between modes. With one run per mode, those differences are consistent with behavioral activity but are not isolated from run-to-run nondeterminism and do not show that either mode is more capable."
+    },
+    "execution": {
+      "run_order": [
+        "serial",
+        "poolside_reduction"
+      ],
+      "wall_time_comparable": false,
+      "memory_comparable": false,
+      "core_commands": {
+        "serial": "env -u DS4_MM_VQ_REDUCTION ./ds4-eval -m MODEL --cuda --ctx 32768 --tokens 512 --nothink --temp 0 --top-p 1 --min-p 0.05 --seed 1 --plain --case-sequence 1,2,3,76 --trace serial.trace",
+        "poolside_reduction": "env DS4_MM_VQ_REDUCTION=poolside ./ds4-eval -m MODEL --cuda --ctx 32768 --tokens 512 --nothink --temp 0 --top-p 1 --min-p 0.05 --seed 1 --plain --case-sequence 1,2,3,76 --trace poolside.trace"
+      },
+      "note": "Run order, startup cache state, and generated-token counts differ, so wall time is not a paired performance result."
+    },
+    "provenance": {
+      "ds4_eval_binary_sha256": "bd9f7d614d469fabe1ed9691a6237b92cb523507c16c6957b1b33d2ed3f56610",
+      "model_and_binary_hash_manifest_sha256": "10951039566c20b6a316778ebcc667075ccdaf85a10f370cbd4a74c0d26d551f",
+      "model_output_hash_algorithm": "SHA-256 of the exact byte count declared by each MODEL_OUTPUT_BEGIN trace record",
+      "raw_artifacts_committed": false,
+      "retained_scratch": "/private/tmp/laguna-mmvq-analysis-20260811/capability-eval"
+    }
+  },
+  "evaluation_scope": {
+    "planner_eval_available": false,
+    "planner_claim_supported": false,
+    "laguna_vs_flash_claim_supported": false,
+    "coding_task_verifier_used": false,
+    "tool_use_exercised": false,
+    "multi_turn_orchestration_exercised": false,
+    "co_residency_exercised": false,
+    "note": "These are model-quality and capability proxies, not a planner/orchestrator evaluation."
+  },
+  "decision": {
+    "default": "serial",
+    "experimental": "poolside",
+    "promote_poolside_to_default": false,
+    "change_router_arithmetic": false,
+    "decommission_flash": false,
+    "characterize_laguna_as_better_planner": false,
+    "reason": "The quality effect is small in aggregate and mixed across cases, the four-case smoke preserves answers but changes every between-mode output, and no verified planner workload was exercised.",
+    "next_required_evidence": "A verified coding/planner harness under the intended compact DS4 runtime, followed by an explicit Laguna-versus-Flash decision."
+  }
+}

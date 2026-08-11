@@ -68,6 +68,7 @@ class SyntheticCapture:
         self.ds4 = root / "ds4"
         self.microscope = root / "microscope"
         self.poolside_ffn_norm = root / "poolside-ffn-norm.f32"
+        self.run_manifest = root / "run-manifest.json"
         self.poolside.mkdir()
         self.ds4.mkdir()
         self.microscope.mkdir()
@@ -172,6 +173,54 @@ class SyntheticCapture:
             encoding="utf-8",
         )
 
+        def artifact(path: Path) -> dict[str, object]:
+            payload = path.read_bytes()
+            return {"bytes": len(payload), "sha256": sha256(payload)}
+
+        poolside_artifacts = {
+            "ffn_norm": artifact(self.poolside_ffn_norm),
+            "selected": artifact(
+                self.poolside / "layer-01-router-selected.i32"
+            ),
+        }
+        ds4_artifacts = {
+            "ffn_norm": artifact(self.ds4 / "layer-01-ffn-norm.f32"),
+            "selected": artifact(self.ds4 / "layer-01-router-selected.i32"),
+            "moe_input_q8_1": artifact(
+                self.ds4 / "layer-01-ffn-moe-input.q8_1"
+            ),
+            "down_input_q8_1": artifact(
+                self.ds4 / "layer-01-ffn-moe-down-input.q8_1"
+            ),
+        }
+        for name, (filename, _) in STAGES.items():
+            poolside_artifacts[name] = artifact(self.poolside / filename)
+            ds4_artifacts[name] = artifact(self.ds4 / filename)
+        run_manifest = {
+            "schema": "laguna-token513-direct-capture-run/v1",
+            "token": 513,
+            "layer": 1,
+            "model": {"bytes": 1, "sha256": "00" * 32},
+            "prefix": {"count": 512, "bytes": 2048, "sha256": "11" * 32},
+            "resume_token": 3612,
+            "device": {"name": "synthetic", "compute_capability": "0.0"},
+            "runtimes": {
+                "poolside": {"commit": "synthetic"},
+                "ds4": {"commit": "synthetic"},
+            },
+            "captures": {
+                "poolside": {"artifacts": poolside_artifacts},
+                "ds4": {"artifacts": ds4_artifacts},
+            },
+            "microscope_manifest_sha256": sha256(
+                (self.microscope / "manifest.json").read_bytes()
+            ),
+        }
+        self.run_manifest.write_text(
+            json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def command(self, json_out: Path) -> list[str]:
         return [
             sys.executable,
@@ -184,6 +233,8 @@ class SyntheticCapture:
             str(self.ds4),
             "--microscope-fixture",
             str(self.microscope),
+            "--run-manifest",
+            str(self.run_manifest),
             "--json-out",
             str(json_out),
         ]
@@ -217,6 +268,24 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             report = json.loads(first_json.read_text(encoding="utf-8"))
             self.assertEqual(
                 report["schema"], "laguna-moe-execution-comparison/v1"
+            )
+            self.assertTrue(report["run_manifest"]["captures_bound"])
+            self.assertEqual(report["run_manifest"]["token"], 513)
+            self.assertEqual(report["run_manifest"]["layer"], 1)
+            self.assertEqual(
+                report["routing"]["selected_ids"]["poolside"],
+                list(range(144, 154)),
+            )
+            self.assertEqual(
+                report["routing"]["weight_mismatches"],
+                [
+                    {
+                        "slot": 0,
+                        "expert": 144,
+                        "poolside_bits": "0x3f800000",
+                        "ds4_bits": "0x40000000",
+                    }
+                ],
             )
             self.assertEqual(
                 report["semantic_order"],
@@ -506,6 +575,24 @@ class CompareLagunaMoeExecutionTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("first routed mismatch", result.stderr)
             self.assertIn("'stage': 'col_l2'", result.stderr)
+            self.assertFalse(json_out.exists())
+
+    def test_rejects_capture_not_bound_to_run_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capture = SyntheticCapture(root)
+            replace_f32(capture.ds4 / STAGES["shared"][0], 7, F32_TWO)
+
+            json_out = root / "report.json"
+            result = subprocess.run(
+                capture.command(json_out),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("run manifest artifact hash", result.stderr)
             self.assertFalse(json_out.exists())
 
 

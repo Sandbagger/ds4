@@ -182,6 +182,28 @@ typedef struct {
     uint64_t bytes;
 } ds4_laguna_page_range;
 
+#define DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY 8u
+
+typedef struct {
+    int error_number;
+    uint64_t calls;
+    uint64_t bytes;
+} ds4_laguna_page_advice_errno_bucket;
+
+typedef struct {
+    uint64_t attempted_calls;
+    uint64_t attempted_bytes;
+    uint64_t successful_calls;
+    uint64_t successful_bytes;
+    uint64_t failed_calls;
+    uint64_t failed_bytes;
+    uint64_t touched_eligible_unique_pages;
+    uint64_t advised_unique_pages;
+    ds4_laguna_page_advice_errno_bucket
+        errno_buckets[DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY];
+    size_t errno_bucket_count;
+} ds4_laguna_page_advice_counters;
+
 #define DS4_LAGUNA_CACHE_SLOT_NONE UINT32_MAX
 
 typedef enum {
@@ -281,6 +303,32 @@ bool ds4_laguna_full_page_union(
     size_t output_capacity,
     size_t *output_count,
     uint64_t *output_bytes);
+
+/* `newly_touched_pages` and `newly_advised_pages` are deltas from the
+ * caller-owned interval unions. Counters saturate rather than wrap. A
+ * nonzero `error_number` records an attempted and failed call, coalesced by
+ * its positive errno value, and requires `newly_advised_pages == 0`. */
+bool ds4_laguna_page_advice_note_touched(
+    ds4_laguna_page_advice_counters *counters,
+    uint64_t newly_touched_pages);
+
+bool ds4_laguna_page_advice_note_result(
+    ds4_laguna_page_advice_counters *counters,
+    uint64_t attempted_bytes,
+    uint64_t newly_advised_pages,
+    int error_number);
+
+/* Compute the source-residency charge immediately before advice as the
+ * model-size-clamped maximum of an optional exact sample and the saturating
+ * sum of the retained post-advice sample plus the unique bytes touched since
+ * that sample. Failure leaves `charge_out` unchanged. */
+bool ds4_laguna_page_conservative_source_charge(
+    uint64_t model_size_bytes,
+    uint64_t prior_post_advice_resident_bytes,
+    uint64_t touched_since_sample_unique_bytes,
+    bool exact_sample_available,
+    uint64_t exact_sample_bytes,
+    uint64_t *charge_out);
 
 ds4_laguna_cache_status ds4_laguna_cache_policy_init(
     ds4_laguna_cache_policy *policy,

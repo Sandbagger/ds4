@@ -9,6 +9,7 @@
 #include "ds4_laguna_stream.h"
 #include "ds4_runtime.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -3291,6 +3292,150 @@ static void test_inward_page_union(void) {
                                        output, 1u, &output_count,
                                        &output_bytes),
           "insufficient fixed output capacity fails without allocation");
+
+    output_count = SIZE_MAX;
+    output_bytes = UINT64_MAX;
+    CHECK(ds4_laguna_full_page_union(NULL, 0, 4096u, NULL, 0,
+                                      &output_count, &output_bytes) &&
+              output_count == 0 && output_bytes == 0,
+          "an empty input has an empty full-page union");
+    const ds4_laguna_page_range empty_ranges[] = {
+        { 0u, 0u }, { 4096u, 0u },
+    };
+    CHECK(ds4_laguna_full_page_union(empty_ranges, 2u, 4096u,
+                                      output, 5u, &output_count,
+                                      &output_bytes) &&
+              output_count == 0 && output_bytes == 0,
+          "zero-byte source intervals remain empty");
+
+    const ds4_laguna_page_range adjacent_overlap[] = {
+        { 8192u, 8192u },
+        { 0u, 8192u },
+        { 4096u, 8192u },
+        { 4096u, 4096u },
+    };
+    CHECK(ds4_laguna_full_page_union(adjacent_overlap, 4u, 4096u,
+                                      output, 5u, &output_count,
+                                      &output_bytes) &&
+              output_count == 1u && output[0].offset == 0 &&
+              output[0].bytes == 16384u && output_bytes == 16384u,
+          "exact adjacent, overlapping, and duplicate page ranges canonicalize");
+}
+
+static const ds4_laguna_page_advice_errno_bucket *find_errno_bucket(
+        const ds4_laguna_page_advice_counters *counters,
+        int error_number) {
+    for (size_t i = 0; i < counters->errno_bucket_count; i++) {
+        if (counters->errno_buckets[i].error_number == error_number) {
+            return &counters->errno_buckets[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_page_advice_counters(void) {
+    ds4_laguna_page_advice_counters counters;
+    memset(&counters, 0, sizeof(counters));
+
+    CHECK(ds4_laguna_page_advice_note_touched(&counters, 3u) &&
+              counters.touched_eligible_unique_pages == 3u,
+          "touched coverage accepts a caller-deduplicated page delta");
+    CHECK(ds4_laguna_page_advice_note_result(
+              &counters, 8192u, 2u, 0) &&
+              counters.attempted_calls == 1u &&
+              counters.attempted_bytes == 8192u &&
+              counters.successful_calls == 1u &&
+              counters.successful_bytes == 8192u &&
+              counters.failed_calls == 0 &&
+              counters.failed_bytes == 0 &&
+              counters.advised_unique_pages == 2u,
+          "successful advice updates attempted, successful, and unique coverage");
+    CHECK(ds4_laguna_page_advice_note_result(
+              &counters, 4096u, 0, EIO) &&
+              ds4_laguna_page_advice_note_result(
+                  &counters, 4096u, 0, EIO) &&
+              ds4_laguna_page_advice_note_result(
+                  &counters, 4096u, 0, EINVAL),
+          "failed advice calls are accepted and bucketed by errno");
+    const ds4_laguna_page_advice_errno_bucket *eio =
+        find_errno_bucket(&counters, EIO);
+    const ds4_laguna_page_advice_errno_bucket *einval =
+        find_errno_bucket(&counters, EINVAL);
+    CHECK(counters.attempted_calls == 4u &&
+              counters.attempted_bytes == 20480u &&
+              counters.successful_calls == 1u &&
+              counters.successful_bytes == 8192u &&
+              counters.failed_calls == 3u &&
+              counters.failed_bytes == 12288u &&
+              counters.advised_unique_pages == 2u,
+          "a failed advice attempt is never reported as successful or advised");
+    CHECK(counters.errno_bucket_count == 2u && eio && einval &&
+              eio->calls == 2u && eio->bytes == 8192u &&
+              einval->calls == 1u && einval->bytes == 4096u,
+          "equal errno failures coalesce without losing call or byte totals");
+    const ds4_laguna_page_advice_counters before_invalid = counters;
+    CHECK(!ds4_laguna_page_advice_note_result(
+               &counters, 4096u, 1u, EIO) &&
+              memcmp(&counters, &before_invalid, sizeof(counters)) == 0,
+          "failed advice cannot claim newly advised pages or partially mutate counters");
+
+    memset(&counters, 0xff, sizeof(counters));
+    counters.errno_bucket_count = 0;
+    CHECK(ds4_laguna_page_advice_note_touched(&counters, 1u) &&
+              ds4_laguna_page_advice_note_result(
+                  &counters, 1u, 0, 0) &&
+              counters.touched_eligible_unique_pages == UINT64_MAX &&
+              counters.attempted_calls == UINT64_MAX &&
+              counters.attempted_bytes == UINT64_MAX &&
+              counters.successful_calls == UINT64_MAX &&
+              counters.successful_bytes == UINT64_MAX,
+          "page advice counters saturate instead of wrapping");
+}
+
+static void test_page_source_charge(void) {
+    uint64_t charge = UINT64_MAX;
+    CHECK(ds4_laguna_page_conservative_source_charge(
+              1000u, 100u, 50u, true, 400u, &charge) && charge == 400u,
+          "an exact pre-advice sample wins when above the conservative charge");
+    CHECK(ds4_laguna_page_conservative_source_charge(
+              1000u, 700u, 250u, true, 800u, &charge) && charge == 950u,
+          "retained post-advice residency plus touched union wins when larger");
+    CHECK(ds4_laguna_page_conservative_source_charge(
+              1000u, 900u, 200u, false, UINT64_MAX, &charge) &&
+              charge == 1000u,
+          "a conservative charge saturates at model size and ignores absent exact data");
+    CHECK(ds4_laguna_page_conservative_source_charge(
+              UINT64_MAX - 3u, UINT64_MAX - 10u, 50u,
+              false, 0, &charge) && charge == UINT64_MAX - 3u,
+          "conservative addition cannot wrap below the model-size ceiling");
+    charge = 73u;
+    CHECK(!ds4_laguna_page_conservative_source_charge(
+               1000u, 0, 0, false, 0, NULL) && charge == 73u,
+          "a missing charge output is rejected without disturbing caller state");
+
+    tracker_fixture f;
+    CHECK(tracker_fixture_init(&f),
+          "page high-water tracker initializes with a source-residency bound");
+    CHECK(ds4_laguna_page_conservative_source_charge(
+              100u, 70u, 40u, true, 80u, &charge) && charge == 100u &&
+              ds4_runtime_tracker_checkpoint_external(
+                  &f.tracker, charge, 0, 0) == DS4_RUNTIME_STATUS_OK &&
+              f.tracker.qualification_total_current == 100u &&
+              f.tracker.qualification_total_peak == 100u,
+          "the conservative pre-advice charge updates the simultaneous peak");
+    CHECK(ds4_laguna_page_conservative_source_charge(
+              100u, 20u, 0, true, 10u, &charge) && charge == 20u &&
+              ds4_runtime_tracker_checkpoint_external(
+                  &f.tracker, charge, 0, 0) == DS4_RUNTIME_STATUS_OK &&
+              f.tracker.qualification_total_current == 20u &&
+              f.tracker.qualification_total_peak == 100u,
+          "a lower post-advice sample cannot erase the pre-advice high-water");
+}
+
+static void test_page_ranges(void) {
+    test_inward_page_union();
+    test_page_advice_counters();
+    test_page_source_charge();
 }
 
 static void test_close_snapshot_clean_predicate(void) {
@@ -3367,7 +3512,6 @@ static void test_allocation(void) {
     test_tracker_relations();
     test_tracker_rejections();
     test_reduction_floor();
-    test_inward_page_union();
     test_close_snapshot_clean_predicate();
 }
 
@@ -3375,7 +3519,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s --case "
             "options|ledger|allocation|cache-policy|grouping|prefill-plan "
-            "[--case ...]\n",
+            "|page-ranges [--case ...]\n",
             argv0);
 }
 
@@ -3399,6 +3543,8 @@ int main(int argc, char **argv) {
             test_grouping();
         } else if (strcmp(argv[i + 1], "prefill-plan") == 0) {
             test_prefill_plan();
+        } else if (strcmp(argv[i + 1], "page-ranges") == 0) {
+            test_page_ranges();
         } else {
             usage(argv[0]);
             return 2;

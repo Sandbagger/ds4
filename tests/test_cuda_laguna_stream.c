@@ -800,6 +800,9 @@ static int open_fd_count(void) {
     return count;
 }
 
+static bool nvml_snapshot_contract(
+    const ds4_gpu_nvml_inventory_snapshot *snapshot);
+
 static bool proc_maps_has_readable_split_cover(
         const void *base,
         size_t bytes,
@@ -3017,18 +3020,26 @@ static int run_create_unwind_unsafe(void) {
     const bool fixture_ready =
         gpu_ready && source_ready && maps_ready && tracker_ready;
 
+    ds4_gpu_nvml_inventory_snapshot nvml_warmup;
+    memset(&nvml_warmup, 0, sizeof(nvml_warmup));
+    const bool nvml_warmed = fixture_ready &&
+        ds4_gpu_nvml_inventory_capture(&nvml_warmup) != 0 &&
+        nvml_snapshot_contract(&nvml_warmup);
+    CHECK(nvml_warmed,
+          "unsafe create-unwind warms process-lifetime NVML state before the descriptor baseline");
+
     const int fd_baseline = open_fd_count();
     const uint64_t attempts_before =
         ds4_gpu_test_laguna_compact_static_allocation_attempts();
     int created = 0;
-    if (fixture_ready) {
+    if (fixture_ready && nvml_warmed) {
         ds4_gpu_test_laguna_compact_fail_before_publish_once();
         ds4_gpu_test_laguna_compact_fail_release_once();
         created = ds4_gpu_laguna_compact_create(
             &context, fd, model_map, FIXTURE_MODEL_BYTES,
             &identity, &ledger, &plan, &runtime.tracker);
     }
-    CHECK(fixture_ready && !created && context == NULL,
+    CHECK(fixture_ready && nvml_warmed && !created && context == NULL,
           "failed unsafe pre-publication unwind returns no context");
     CHECK(fixture_ready &&
               ds4_gpu_test_laguna_compact_static_allocation_attempts() ==

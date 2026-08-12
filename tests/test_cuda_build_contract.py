@@ -2345,6 +2345,23 @@ class CudaBuildContractTest(unittest.TestCase):
             "repeated NVML captures must not unload and reload driver state",
         )
 
+    def test_unsafe_create_baselines_descriptors_after_nvml_warmup(
+        self,
+    ) -> None:
+        body = source_function_body(
+            LAGUNA_STREAM_TEST,
+            "static int run_create_unwind_unsafe(",
+            "tests/test_cuda_laguna_stream.c",
+        )
+        warmup = body.index(
+            "ds4_gpu_nvml_inventory_capture(&nvml_warmup)"
+        )
+        baseline = body.index("const int fd_baseline = open_fd_count()")
+        create = body.index("ds4_gpu_laguna_compact_create(", baseline)
+        self.assertLess(warmup, baseline)
+        self.assertLess(baseline, create)
+        self.assertIn("open_fd_count() == fd_baseline + 1", body)
+
     def test_external_checkpoint_scopes_and_restores_cuda_device_zero(
         self,
     ) -> None:

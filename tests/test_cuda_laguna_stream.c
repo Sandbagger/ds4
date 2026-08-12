@@ -39,6 +39,18 @@
 static int g_assertions;
 static int g_failures;
 
+/* Task 12 RED seam.  First use on an ACTIVE context resets page-advice
+ * telemetry and the retained post-advice residency to zero.  Each injection
+ * then applies to the next completed compact-cache transfer: page_size
+ * controls inward full-page selection, the two samples replace pre/post
+ * mincore results, and advice_errno makes exactly the next advice syscall
+ * fail when nonzero. */
+void ds4_gpu_test_laguna_compact_page_advice_inject(
+    uint64_t page_size,
+    uint64_t exact_pre_resident_bytes,
+    uint64_t exact_post_resident_bytes,
+    int advice_errno);
+
 /* Compile-only contract.  Runnable lifecycle behavior is driven separately
  * after this typed seam lands. */
 static void compile_typed_lifecycle_contract(
@@ -450,6 +462,9 @@ static void plan_prepare_cache(
         plan->owned_non_cache_bound_bytes;
     plan->planned_qualification_bytes = plan->owned_total_bound_bytes;
     plan->qualification_total_bound_bytes = plan->owned_total_bound_bytes;
+    plan->report_bounds[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] =
+        ledger->file_size;
+    plan->qualification_total_bound_bytes += ledger->file_size;
 
     plan->callsites[1].bound_bytes = payload;
     plan->callsites[4] = (ds4_runtime_callsite){
@@ -4594,6 +4609,163 @@ static int run_cache_io(void) {
     return result;
 }
 
+static bool page_advice_sequence_is_ordered(
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot) {
+    return snapshot && snapshot->page_advice_upload_completed_sequence != 0 &&
+        snapshot->page_advice_upload_completed_sequence <
+            snapshot->page_advice_precharge_sequence &&
+        snapshot->page_advice_precharge_sequence <
+            snapshot->page_advice_attempt_sequence &&
+        snapshot->page_advice_attempt_sequence <
+            snapshot->page_advice_post_sample_sequence &&
+        snapshot->page_advice_post_sample_sequence <
+            snapshot->page_advice_complete_sequence;
+}
+
+static int run_page_advice(void) {
+    cache_cuda_fixture fixture;
+    CHECK(cache_cuda_fixture_open(&fixture),
+          "page-advice fixture creates a compact CUDA context");
+    if (!fixture.context) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+
+    ds4_runtime_snapshot runtime_before;
+    ds4_runtime_allocation_record active_before[TRACKER_RECORD_CAPACITY];
+    memset(&runtime_before, 0, sizeof(runtime_before));
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &fixture.runtime.tracker, &runtime_before,
+              active_before, ARRAY_LEN(active_before)),
+          "page-advice captures the pre-load allocation baseline");
+
+    /* layer 1 / expert 0 has three 36-byte source views at offsets aligned
+     * to 16 bytes.  Inward rounding therefore makes exactly 32 bytes from
+     * each view eligible, with no overlaps: 96 unique bytes total. */
+    ds4_gpu_test_laguna_compact_page_advice_inject(
+        16u, 128u, 16u, 0);
+    ds4_laguna_cache_handle first = {0};
+    ds4_laguna_cache_acquire_outcome outcome =
+        DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(1u, 0u),
+              &first, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "real cache miss completes before source-page disposal");
+
+    ds4_gpu_laguna_compact_test_snapshot success;
+    memset(&success, 0, sizeof(success));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &success),
+          "successful page advice is visible in the compact snapshot");
+    CHECK(success.page_advice_touched_eligible_unique_bytes == 96u &&
+              success.page_advice_attempted_calls == 3u &&
+              success.page_advice_attempted_bytes == 96u &&
+              success.page_advice_successful_calls == 3u &&
+              success.page_advice_successful_bytes == 96u &&
+              success.page_advice_failed_calls == 0u &&
+              success.page_advice_failed_bytes == 0u &&
+              success.page_advice_advised_unique_bytes == 96u,
+          "successful load accounts the exact touched, attempted, and advised union");
+    CHECK(success.page_advice_precharge_source_resident_bytes == 128u &&
+              success.page_advice_post_source_resident_bytes == 16u,
+          "exact pre-advice sample wins the conservative source charge");
+    CHECK(page_advice_sequence_is_ordered(&success) &&
+              success.page_advice_complete_monotonic_ns != 0,
+          "upload completion strictly precedes charge, advice, post-sample, and completion");
+
+    ds4_runtime_snapshot runtime_after_success;
+    ds4_runtime_allocation_record
+        active_after_success[TRACKER_RECORD_CAPACITY];
+    memset(&runtime_after_success, 0, sizeof(runtime_after_success));
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &fixture.runtime.tracker, &runtime_after_success,
+              active_after_success, ARRAY_LEN(active_after_success)) &&
+              runtime_after_success.report_current[
+                  DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] == 16u &&
+              runtime_after_success.report_peak[
+                  DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] == 128u &&
+              runtime_after_success.qualification_total_peak >=
+                  runtime_before.owned_total_current + 128u,
+          "lower post-advice residency cannot erase the pre-advice qualification peak");
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, first) == DS4_LAGUNA_CACHE_OK,
+          "successful page-advice load releases its cache reservation");
+
+    /* The prior post sample (16) plus expert 1's 48 new eligible bytes wins
+     * over the injected exact pre-sample (32), producing a charge of 64. */
+    ds4_gpu_test_laguna_compact_page_advice_inject(
+        16u, 32u, 8u, EINVAL);
+    ds4_laguna_cache_handle invalid = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(1u, 1u),
+              &invalid, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "advice failure does not misreport a completed CUDA upload as a load failure");
+    ds4_gpu_laguna_compact_test_snapshot after_einval;
+    memset(&after_einval, 0, sizeof(after_einval));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &after_einval) &&
+              after_einval.page_advice_touched_eligible_unique_bytes == 144u &&
+              after_einval.page_advice_attempted_calls == 6u &&
+              after_einval.page_advice_attempted_bytes == 144u &&
+              after_einval.page_advice_failed_calls == 1u &&
+              after_einval.page_advice_failed_bytes == 16u &&
+              after_einval.page_advice_errno_einval_calls == 1u &&
+              after_einval.page_advice_successful_calls == 5u &&
+              after_einval.page_advice_successful_bytes == 128u &&
+              after_einval.page_advice_advised_unique_bytes == 128u,
+          "EINVAL counts as attempted and failed, never successful or advised");
+    CHECK(after_einval.page_advice_precharge_source_resident_bytes == 64u &&
+              after_einval.page_advice_post_source_resident_bytes == 8u &&
+              page_advice_sequence_is_ordered(&after_einval) &&
+              after_einval.page_advice_complete_monotonic_ns >
+                  success.page_advice_complete_monotonic_ns,
+          "conservative prior-plus-touch charge and ordered completion survive advice failure");
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, invalid) == DS4_LAGUNA_CACHE_OK,
+          "EINVAL page-advice load releases its cache reservation");
+
+    ds4_gpu_test_laguna_compact_page_advice_inject(
+        16u, 4u, 4u, EIO);
+    ds4_laguna_cache_handle io = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(2u, 0u),
+              &io, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "second injected advice failure follows another real cache load");
+    ds4_gpu_laguna_compact_test_snapshot after_eio;
+    memset(&after_eio, 0, sizeof(after_eio));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(
+              fixture.context, &after_eio) &&
+              after_eio.page_advice_touched_eligible_unique_bytes == 240u &&
+              after_eio.page_advice_attempted_calls == 9u &&
+              after_eio.page_advice_attempted_bytes == 240u &&
+              after_eio.page_advice_failed_calls == 2u &&
+              after_eio.page_advice_failed_bytes == 48u &&
+              after_eio.page_advice_errno_einval_calls == 1u &&
+              after_eio.page_advice_errno_eio_calls == 1u &&
+              after_eio.page_advice_successful_calls == 7u &&
+              after_eio.page_advice_successful_bytes == 192u &&
+              after_eio.page_advice_advised_unique_bytes == 192u,
+          "EIO has a distinct failure bucket and preserves exact byte reconciliation");
+    CHECK(after_eio.page_advice_attempted_calls ==
+              after_eio.page_advice_successful_calls +
+                  after_eio.page_advice_failed_calls &&
+              after_eio.page_advice_attempted_bytes ==
+              after_eio.page_advice_successful_bytes +
+                  after_eio.page_advice_failed_bytes,
+          "attempted page advice reconciles exactly into success and failure");
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, io) == DS4_LAGUNA_CACHE_OK,
+          "EIO page-advice load releases its cache reservation");
+
+    cache_cuda_fixture_close(&fixture);
+    return g_failures == 0 ? 0 : 1;
+}
+
 static int run_cache_faults(void) {
     cache_cuda_fixture fixture;
     CHECK(cache_cuda_fixture_open(&fixture),
@@ -5338,7 +5510,7 @@ static void usage(const char *program) {
             "model-cleanup-release-unsafe|"
             "model-teardown-second-recoverable|cache-validation|cache-io|"
             "cache-faults|cache-unsafe|cache-unsafe-race|"
-            "prefill-allocation\n",
+            "prefill-allocation|page-advice\n",
             program);
 }
 
@@ -5382,6 +5554,8 @@ int main(int argc, char **argv) {
         rc = run_cache_unsafe_race();
     } else if (strcmp(argv[2], "prefill-allocation") == 0) {
         rc = run_prefill_allocation();
+    } else if (strcmp(argv[2], "page-advice") == 0) {
+        rc = run_page_advice();
     } else {
         usage(argv[0]);
         return 2;

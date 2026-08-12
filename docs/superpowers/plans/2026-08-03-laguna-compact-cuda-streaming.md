@@ -936,7 +936,17 @@ production `/tmp/ds4.lock` before any verifier or cold-preparation work, and
 lets every model child acquire that same production lock. Checkpoint D remains
 open until the gate is run in a DGX maintenance window with the production
 instance lock available; isolated-lock hardware diagnostics are not promoted
-as acceptance evidence.
+as acceptance evidence. A pre-window `cuda-regression` build also exposed that
+standalone CUDA link rules omitted the now-required `ds4_laguna_stream.o` cache
+policy implementation. Commits `e14f78a` and `4c19b17` add the regression
+contract and repair every direct CUDA link; the maintenance-window run must use
+that exact or a descendant revision rather than the older DGX diagnostic tree.
+The final 8,192-token diagnostic also showed all 146 live allocation records
+and every owned category byte-identical across the two 4,096-token chunks;
+only model-source and qualification telemetry advanced. Commit `4f73226`
+therefore removes the invalid test-only comparison of current owned bytes with
+a historical source peak while retaining the simultaneous footprint and exact
+record checks.
 
 ```sh
 DS4_TEST_MODEL="$LAGUNA_MODEL" \

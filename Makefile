@@ -175,6 +175,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_laguna_kernels tests/test_cuda_laguna_stream
 	./tests/cuda_long_context_smoke
 	env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
+	./tests/test_cuda_laguna_stream --case nvml-fd-stability
 	./tests/test_cuda_laguna_stream --case startup
 endif
 

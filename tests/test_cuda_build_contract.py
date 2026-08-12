@@ -3360,6 +3360,7 @@ class CudaBuildContractTest(unittest.TestCase):
         completed = subprocess.run(
             [
                 "make",
+                "--no-print-directory",
                 "-n",
                 "UNAME_S=Linux",
                 "-o",
@@ -3431,6 +3432,7 @@ class CudaBuildContractTest(unittest.TestCase):
         completed = subprocess.run(
             [
                 "make",
+                "--no-print-directory",
                 "-n",
                 "UNAME_S=Linux",
                 "-o",
@@ -3473,6 +3475,7 @@ class CudaBuildContractTest(unittest.TestCase):
         completed = subprocess.run(
             [
                 "make",
+                "--no-print-directory",
                 "-n",
                 "UNAME_S=Linux",
                 "-o",
@@ -3522,7 +3525,9 @@ class CudaBuildContractTest(unittest.TestCase):
                 tokenizer_sentinel = (
                     f"LAGUNA_{mode.upper()}_TOKENIZER_MAKE_EXPANDED"
                 )
-                arguments = ["make", "-n", "UNAME_S=Linux"]
+                arguments = [
+                    "make", "--no-print-directory", "-n", "UNAME_S=Linux"
+                ]
                 for prerequisite in prerequisites:
                     arguments.extend(("-o", prerequisite))
                 arguments.extend(

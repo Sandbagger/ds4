@@ -48655,6 +48655,20 @@ static bool laguna_graph_diag_checkpoint_i32(
 }
 #endif
 
+static ds4_gpu_laguna_exec_result laguna_graph_finish_compact(
+        ds4_gpu_laguna_compact    *compact,
+        ds4_gpu_laguna_exec_result current) {
+    if (!compact) return current;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const ds4_gpu_laguna_exec_result finished =
+        ds4_gpu_laguna_compact_finish_graph(compact);
+    return finished == DS4_GPU_LAGUNA_EXEC_SUCCESS ?
+        current : DS4_GPU_LAGUNA_EXEC_UNSAFE;
+#else
+    return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+#endif
+}
+
 static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
@@ -49224,6 +49238,9 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
                                  logits_out,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    execution_result = laguna_graph_finish_compact(
+        compact, execution_result);
+    if (execution_result == DS4_GPU_LAGUNA_EXEC_UNSAFE) ok = false;
 #ifdef DS4_TEST_HOOKS
     ds4_gpu_tensor_free(moe_capture);
 #endif
@@ -49832,6 +49849,9 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(
                                  logits_out,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    execution_result = laguna_graph_finish_compact(
+        compact, execution_result);
+    if (execution_result == DS4_GPU_LAGUNA_EXEC_UNSAFE) ok = false;
     if (ok && (!live_progress || logits_out != NULL)) {
         laguna_graph_report_prefill_display_progress(display_progress,
                                                       display_progress_ud,

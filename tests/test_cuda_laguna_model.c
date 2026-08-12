@@ -467,7 +467,7 @@ static bool verify_streamed_cache_contract(
         compact.routed_payload_bytes <= compact.cache_payload_bytes;
     const bool graph_accounting_exact =
         runtime.violation == DS4_RUNTIME_VIOLATION_NONE &&
-        runtime_required == 21u && runtime.active_record_count == 21u &&
+        runtime_required == 22u && runtime.active_record_count == 22u &&
         runtime.category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] == 0 &&
         runtime.category_current[DS4_RUNTIME_CATEGORY_KV_STATE] == 0 &&
         runtime.category_peak[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
@@ -714,7 +714,7 @@ static bool live_prefill_accounting_exact(
     return ds4_test_engine_laguna_runtime_snapshot(
                engine, snapshot, records, 256u, required_out) &&
         snapshot->violation == DS4_RUNTIME_VIOLATION_NONE &&
-        *required_out == 145u && snapshot->active_record_count == 145u &&
+        *required_out == 146u && snapshot->active_record_count == 146u &&
         snapshot->category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
             UINT64_C(1537052680) &&
         snapshot->category_current[DS4_RUNTIME_CATEGORY_KV_STATE] ==
@@ -723,6 +723,84 @@ static bool live_prefill_accounting_exact(
             UINT64_C(1537052680) &&
         snapshot->category_peak[DS4_RUNTIME_CATEGORY_KV_STATE] ==
             UINT64_C(1686110208);
+}
+
+static bool runtime_allocation_state_equal(
+        const ds4_runtime_snapshot *before,
+        const ds4_runtime_snapshot *after) {
+    if (!before || !after ||
+        memcmp(before->category_bounds, after->category_bounds,
+               sizeof(before->category_bounds)) != 0 ||
+        memcmp(before->category_current, after->category_current,
+               sizeof(before->category_current)) != 0 ||
+        memcmp(before->category_peak, after->category_peak,
+               sizeof(before->category_peak)) != 0 ||
+        memcmp(before->report_bounds, after->report_bounds,
+               sizeof(before->report_bounds)) != 0 ||
+        before->owned_total_bound_bytes != after->owned_total_bound_bytes ||
+        before->owned_total_current != after->owned_total_current ||
+        before->owned_total_peak != after->owned_total_peak ||
+        before->qualification_total_bound_bytes !=
+            after->qualification_total_bound_bytes ||
+        before->violation != after->violation ||
+        before->active_record_count != after->active_record_count) {
+        return false;
+    }
+    const ds4_runtime_report physical_reports[] = {
+        DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT,
+        DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED,
+        DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED,
+    };
+    const ds4_runtime_snapshot *snapshots[] = { before, after };
+    for (size_t snapshot_index = 0;
+         snapshot_index < sizeof(snapshots) / sizeof(snapshots[0]);
+         snapshot_index++) {
+        const ds4_runtime_snapshot *snapshot = snapshots[snapshot_index];
+        uint64_t expected_qualification = snapshot->owned_total_current;
+        for (size_t report_index = 0;
+             report_index < sizeof(physical_reports) /
+                 sizeof(physical_reports[0]);
+             report_index++) {
+            const uint64_t bytes =
+                snapshot->report_current[physical_reports[report_index]];
+            if (expected_qualification > UINT64_MAX - bytes) return false;
+            expected_qualification += bytes;
+        }
+        if (snapshot->report_current[
+                    DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] >
+                snapshot->report_bounds[
+                    DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
+            snapshot->report_peak[
+                    DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] <
+                snapshot->report_current[
+                    DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
+            snapshot->owned_total_current > UINT64_MAX -
+                snapshot->report_peak[
+                    DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
+            snapshot->qualification_total_current !=
+                expected_qualification ||
+            snapshot->qualification_total_peak <
+                snapshot->qualification_total_current ||
+            snapshot->qualification_total_peak <
+                snapshot->owned_total_current +
+                    snapshot->report_peak[
+                        DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
+            snapshot->qualification_total_peak >
+                snapshot->qualification_total_bound_bytes) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (i == DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT) continue;
+        if (before->report_current[i] != after->report_current[i] ||
+            before->report_peak[i] != after->report_peak[i]) {
+            return false;
+        }
+    }
+    return after->report_peak[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] >=
+            before->report_peak[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] &&
+        after->qualification_total_peak >= before->qualification_total_peak &&
+        after->event_sequence >= before->event_sequence;
 }
 
 /* This is deliberately an allocation/scheduling proof, not a replacement
@@ -781,7 +859,7 @@ static bool run_prefill_8192(
         ok = fail_message("live prefill accounting after sync", "prefill-8192");
     }
     if (ok && (before_required != after_required ||
-               memcmp(&before, &after, sizeof(before)) != 0 ||
+               !runtime_allocation_state_equal(&before, &after) ||
                memcmp(before_records, after_records,
                       before_required * sizeof(before_records[0])) != 0)) {
         ok = fail_message("prefill allocations changed across chunks",
@@ -793,7 +871,7 @@ static bool run_prefill_8192(
     if (ok) {
         fprintf(stderr,
                 "prefill-8192 chunks=4096+4096 graph=%llu kv=%llu "
-                "owners=145 PASS\n",
+                "owners=146 PASS\n",
                 (unsigned long long)before.category_current[
                     DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH],
                 (unsigned long long)before.category_current[

@@ -2772,6 +2772,112 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertNotIn("n_tokens != 1u", launch)
 
+    def test_laguna_compact_graph_final_disposal_is_typed_and_balanced(self) -> None:
+        self.assertIn(
+            "ds4_gpu_laguna_compact_finish_graph(", GPU_HEADER
+        )
+        self.assertIn(
+            "cancelled or\n * recoverable graph result", GPU_HEADER
+        )
+
+        finish = source_function_body(
+            CUDA_SOURCE,
+            'extern "C" ds4_gpu_laguna_exec_result\n'
+            "ds4_gpu_laguna_compact_finish_graph(",
+            "CUDA",
+        )
+        mutex_at = finish.find("g_laguna_compact_exec_mutex")
+        enter_at = finish.find("cuda_laguna_compact_exec_enter(")
+        sync_at = finish.find("cudaDeviceSynchronize()", enter_at)
+        compact_lock_at = finish.find("g_laguna_compact_mutex", sync_at)
+        flush_at = finish.find(
+            "cuda_laguna_compact_page_flush_pending_locked(", compact_lock_at
+        )
+        leave_at = finish.find("cuda_laguna_compact_exec_leave(", flush_at)
+        self.assertGreaterEqual(mutex_at, 0)
+        self.assertGreater(enter_at, mutex_at)
+        self.assertGreater(sync_at, enter_at)
+        self.assertGreater(compact_lock_at, sync_at)
+        self.assertGreater(flush_at, compact_lock_at)
+        self.assertGreater(leave_at, flush_at)
+        entered_body = finish.find("ds4_gpu_laguna_exec_result result", enter_at)
+        self.assertGreater(entered_body, enter_at)
+        self.assertNotIn("return", finish[entered_body:leave_at])
+        self.assertIn("DS4_GPU_LAGUNA_EXEC_UNSAFE", finish)
+        self.assertNotIn("DS4_GPU_LAGUNA_EXEC_CANCELLED", finish)
+        self.assertNotIn("DS4_GPU_LAGUNA_EXEC_RECOVERABLE", finish)
+
+        for signature in (
+            'extern "C" ds4_gpu_laguna_exec_result\n'
+            "ds4_gpu_laguna_compact_routed_moe_one_tensor(",
+            'extern "C" ds4_gpu_laguna_exec_result\n'
+            "ds4_gpu_laguna_compact_routed_moe_batch_tensor(",
+        ):
+            with self.subTest(wrapper=signature):
+                wrapper = source_function_body(CUDA_SOURCE, signature, "CUDA")
+                wrapper_mutex = wrapper.find("g_laguna_compact_exec_mutex")
+                wrapper_enter = wrapper.find(
+                    "cuda_laguna_compact_exec_enter(", wrapper_mutex
+                )
+                wrapper_core = wrapper.find(
+                    "cuda_laguna_compact_routed_moe", wrapper_enter + 1
+                )
+                wrapper_leave = wrapper.find(
+                    "cuda_laguna_compact_exec_leave(", wrapper_core
+                )
+                self.assertGreaterEqual(wrapper_mutex, 0)
+                self.assertGreater(wrapper_enter, wrapper_mutex)
+                self.assertGreater(wrapper_core, wrapper_enter)
+                self.assertGreater(wrapper_leave, wrapper_core)
+
+        self.assertEqual(
+            CUDA_SOURCE.count("cuda_laguna_compact_exec_enter("),
+            4,
+            "every execution-lease caller must share the exec mutex contract",
+        )
+
+        finish_adapter = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_finish_compact(",
+            "ds4.c",
+        )
+        self.assertIn("if (!compact) return current;", finish_adapter)
+        self.assertIn("ds4_gpu_laguna_compact_finish_graph(compact)", finish_adapter)
+        self.assertRegex(
+            finish_adapter,
+            r"finished\s*==\s*DS4_GPU_LAGUNA_EXEC_SUCCESS\s*\?\s*"
+            r"current\s*:\s*DS4_GPU_LAGUNA_EXEC_UNSAFE",
+        )
+
+        for signature in (
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
+        ):
+            with self.subTest(graph=signature):
+                graph = source_function_body(DS4_SOURCE, signature, "ds4.c")
+                finish_calls = [
+                    match.start()
+                    for match in re.finditer(
+                        r"laguna_graph_finish_compact\s*\(", graph
+                    )
+                ]
+                self.assertEqual(len(finish_calls), 1)
+                finish_call = finish_calls[0]
+                command_end = graph.rfind("ds4_gpu_end_commands()", 0, finish_call)
+                fallback = graph.find(
+                    "if (!ok && execution_result == "
+                    "DS4_GPU_LAGUNA_EXEC_SUCCESS)",
+                    finish_call,
+                )
+                self.assertGreaterEqual(command_end, 0)
+                self.assertGreater(finish_call, command_end)
+                self.assertGreater(fallback, finish_call)
+                self.assertIn(
+                    "execution_result == DS4_GPU_LAGUNA_EXEC_UNSAFE",
+                    graph[finish_call:fallback],
+                )
+                self.assertIn("ok = false", graph[finish_call:fallback])
+
     def test_laguna_graph_does_not_synthesize_unlatched_unsafe(self) -> None:
         for signature in (
             "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",

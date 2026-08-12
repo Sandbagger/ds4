@@ -127,13 +127,63 @@ static bool inherited_model_fd(int *out, bool *set) {
     return true;
 }
 
+static bool cold_prepare_model_fd(
+        int fd,
+        uint64_t page_size,
+        uint64_t *resident_bytes_out) {
+    if (fd < 0 || page_size == 0 || !resident_bytes_out) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        posix_fadvise(fd, 0, st.st_size, POSIX_FADV_DONTNEED) != 0) {
+        return false;
+    }
+    const uint64_t model_size = (uint64_t)st.st_size;
+    void *mapping = mmap(NULL, (size_t)model_size, PROT_READ,
+                         MAP_PRIVATE, fd, 0);
+    if (mapping == MAP_FAILED) return false;
+    unsigned char residency[65536];
+    uint64_t resident = 0;
+    uint64_t offset = 0;
+    bool ok = true;
+    while (offset < model_size) {
+        const uint64_t remaining = model_size - offset;
+        uint64_t pages = remaining / page_size;
+        if (remaining % page_size != 0) pages++;
+        if (pages > sizeof(residency)) pages = sizeof(residency);
+        uint64_t span = pages * page_size;
+        if (span > remaining) span = remaining;
+        memset(residency, 0, (size_t)pages);
+        if (mincore((char *)mapping + offset,
+                    (size_t)span, residency) != 0) {
+            ok = false;
+            break;
+        }
+        for (uint64_t page = 0; page < pages; page++) {
+            if ((residency[page] & 1u) == 0) continue;
+            const uint64_t page_offset = page * page_size;
+            const uint64_t page_bytes = page_size < remaining - page_offset ?
+                page_size : remaining - page_offset;
+            if (resident > UINT64_MAX - page_bytes) {
+                ok = false;
+                break;
+            }
+            resident += page_bytes;
+        }
+        if (!ok) break;
+        offset += span;
+    }
+    if (munmap(mapping, (size_t)model_size) != 0) ok = false;
+    if (ok) *resident_bytes_out = resident;
+    return ok;
+}
+
 enum {
     FIXTURE_TENSOR_COUNT = 8,
     FIXTURE_MODEL_BYTES = 1152,
     TRACKER_RECORD_CAPACITY = 16,
     PINNED_OWNER_COUNT = 6,
     PINNED_LEDGER_OWNER_COUNT = 3,
-    PINNED_ACTIVE_RECORD_COUNT = 21,
+    PINNED_ACTIVE_RECORD_COUNT = 22,
 };
 
 typedef enum {
@@ -439,6 +489,9 @@ static void plan_prepare_cache(
         ledger->expert_entry_count * sizeof(uint32_t);
     const uint64_t device_entry_to_slot = entry_to_slot;
     const uint64_t slot_state = 2u * sizeof(ds4_laguna_cache_slot);
+    const uint64_t page_advice_state =
+        (ledger->static_parent_count + 3u * ledger->expert_entry_count) *
+        3u * sizeof(ds4_laguna_page_range);
 
     plan->profile_id = "synthetic-cache-io";
     plan->configured_cache_bytes = payload;
@@ -455,9 +508,11 @@ static void plan_prepare_cache(
             slot_state;
     plan->owned_category_bounds[
         DS4_RUNTIME_CATEGORY_PINNED_STAGING] = staging;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] =
+        page_advice_state;
     plan->owned_total_bound_bytes +=
         payload + route_hotness + entry_to_slot + device_entry_to_slot +
-        slot_state + staging;
+        slot_state + staging + page_advice_state;
     plan->owned_non_cache_bound_bytes =
         plan->owned_total_bound_bytes - payload;
     plan->qualification_non_cache_bound_bytes =
@@ -510,7 +565,14 @@ static void plan_prepare_cache(
             .bound_bytes = ledger->slot_stride_bytes,
         };
     }
-    plan->callsite_count = 12u;
+    plan->callsites[12] = (ds4_runtime_callsite){
+        .id = DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
+        .name = "laguna.page_advice_state",
+        .category = DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        .domain = DS4_RUNTIME_DOMAIN_HOST,
+        .bound_bytes = page_advice_state,
+    };
+    plan->callsite_count = 13u;
 }
 
 static bool tracker_fixture_init(
@@ -1072,6 +1134,7 @@ static bool pinned_runtime_inventory_reconciles(
     size_t host_entry_to_slot_count = 0;
     size_t device_entry_to_slot_count = 0;
     size_t slot_state_count = 0;
+    size_t page_advice_state_count = 0;
     bool staging_seen[4] = {false, false, false, false};
     const uint64_t route_hotness_bytes = UINT64_C(12032) * sizeof(uint64_t);
     const uint64_t entry_to_slot_bytes = UINT64_C(12032) * sizeof(uint32_t);
@@ -1163,6 +1226,19 @@ static bool pinned_runtime_inventory_reconciles(
                 return false;
             }
             slot_state_count++;
+        } else if (record->callsite_id ==
+                       DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER) {
+            if (!compact->page_advice_state_live ||
+                !owned_record_matches(
+                    record,
+                    (uint64_t)(uintptr_t)compact->page_advice_state,
+                    compact->page_advice_state_bytes,
+                    DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
+                    DS4_RUNTIME_CATEGORY_OTHER_HOST,
+                    DS4_RUNTIME_DOMAIN_HOST)) {
+                return false;
+            }
+            page_advice_state_count++;
         } else if (record->callsite_id >=
                        DS4_LAGUNA_CALLSITE_PINNED_STAGING_0 &&
                    record->callsite_id <=
@@ -1210,7 +1286,8 @@ static bool pinned_runtime_inventory_reconciles(
         mapping_count != 1 || inventory_count != PINNED_OWNER_COUNT ||
         cache_payload_count != 1 || route_hotness_count != 1 ||
         host_entry_to_slot_count != 1 ||
-        device_entry_to_slot_count != 1 || slot_state_count != 1) {
+        device_entry_to_slot_count != 1 || slot_state_count != 1 ||
+        page_advice_state_count != 1) {
         return false;
     }
     for (size_t i = 0; i < ARRAY_LEN(staging_seen); i++) {
@@ -1237,6 +1314,9 @@ static bool pinned_runtime_inventory_reconciles(
             expected_owned, compact->pinned_staging_bytes,
             &expected_owned) ||
         !checked_add_u64_test(
+            expected_owned, compact->page_advice_state_bytes,
+            &expected_owned) ||
+        !checked_add_u64_test(
             expected_owned, owner_bytes, &expected_owned) ||
         charged_bytes != expected_owned) {
         return false;
@@ -1254,7 +1334,11 @@ static bool pinned_runtime_inventory_reconciles(
         } else if (i == DS4_RUNTIME_CATEGORY_PINNED_STAGING) {
             expected = compact->pinned_staging_bytes;
         } else if (i == DS4_RUNTIME_CATEGORY_OTHER_HOST) {
-            expected = owner_bytes;
+            if (!checked_add_u64_test(
+                    owner_bytes, compact->page_advice_state_bytes,
+                    &expected)) {
+                return false;
+            }
         }
         if (runtime->category_current[i] != expected ||
             runtime->category_peak[i] != expected ||
@@ -1263,19 +1347,45 @@ static bool pinned_runtime_inventory_reconciles(
         }
     }
     for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
-        const uint64_t expected =
-            i == DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ?
-                compact->model_size : 0;
+        if (i == DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT) {
+            if (runtime->report_current[i] !=
+                    compact->page_advice_post_source_resident_bytes ||
+                runtime->report_peak[i] <
+                    compact->page_advice_precharge_source_resident_bytes ||
+                runtime->report_peak[i] < runtime->report_current[i] ||
+                runtime->report_peak[i] > runtime->report_bounds[i]) {
+                return false;
+            }
+            continue;
+        }
+        const uint64_t expected = i ==
+                DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ?
+            compact->model_size : 0;
         if (runtime->report_current[i] != expected ||
             runtime->report_peak[i] != expected ||
             runtime->report_current[i] > runtime->report_bounds[i]) {
             return false;
         }
     }
+    const uint64_t source_current = runtime->report_current[
+        DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT];
+    const uint64_t source_peak = runtime->report_peak[
+        DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT];
+    uint64_t expected_qualification_current = 0;
+    uint64_t expected_qualification_peak = 0;
+    if (!checked_add_u64_test(
+            expected_owned, source_current,
+            &expected_qualification_current) ||
+        !checked_add_u64_test(
+            expected_owned, source_peak,
+            &expected_qualification_peak)) {
+        return false;
+    }
     return runtime->owned_total_current == expected_owned &&
         runtime->owned_total_peak == expected_owned &&
-        runtime->qualification_total_current == expected_owned &&
-        runtime->qualification_total_peak == expected_owned &&
+        runtime->qualification_total_current ==
+            expected_qualification_current &&
+        runtime->qualification_total_peak == expected_qualification_peak &&
         runtime->owned_total_current <= runtime->owned_total_bound_bytes &&
         runtime->qualification_total_current <=
             runtime->qualification_total_bound_bytes;
@@ -3302,6 +3412,9 @@ static int run_model_startup(pinned_model_case model_case) {
               compact.static_offset_bytes == 6512 &&
               compact.static_range_count == 673 &&
               compact.static_slab_bytes == UINT64_C(4374164480) &&
+              compact.page_advice_state_live &&
+              compact.page_advice_state != NULL &&
+              compact.page_advice_state_bytes == UINT64_C(1764912) &&
               compact.cache_payload_live && compact.cache_policy_live &&
               compact.device_entry_to_slot_live &&
               compact.cache_payload_bytes != 0 &&
@@ -3402,7 +3515,7 @@ static int run_model_startup(pinned_model_case model_case) {
     CHECK(runtime_captured &&
               record_required == PINNED_ACTIVE_RECORD_COUNT &&
               runtime.active_record_count == PINNED_ACTIVE_RECORD_COUNT,
-          "pinned runtime snapshot exposes twenty-one active records");
+          "pinned runtime snapshot exposes twenty-two active records");
     uint64_t tracked_ledger_bytes = 0;
     CHECK(runtime_captured && ledger_owners_captured &&
               pinned_ledger_records_match(
@@ -4102,9 +4215,13 @@ static bool cache_snapshot_keeps_fixed_allocations(
     return baseline && snapshot && snapshot->cache_payload_live &&
         snapshot->cache_policy_live &&
         snapshot->device_entry_to_slot_live &&
+        snapshot->page_advice_state_live &&
         snapshot->cache_payload == baseline->cache_payload &&
         snapshot->cache_slots == baseline->cache_slots &&
         snapshot->device_entry_to_slot == baseline->device_entry_to_slot &&
+        snapshot->page_advice_state == baseline->page_advice_state &&
+        snapshot->page_advice_state_bytes ==
+            baseline->page_advice_state_bytes &&
         snapshot->cache_payload_bytes == baseline->cache_payload_bytes &&
         snapshot->cache_slot_count == baseline->cache_slot_count &&
         snapshot->cache_slot_stride_bytes ==
@@ -4304,9 +4421,15 @@ static int run_cache_io(void) {
           "public and CUDA snapshot layouts remain byte-identical");
     CHECK(initial.cache_payload_live && initial.cache_policy_live &&
               initial.device_entry_to_slot_live &&
+              initial.page_advice_state_live &&
               initial.cache_payload != NULL &&
               initial.cache_slots != NULL &&
               initial.device_entry_to_slot != NULL &&
+              initial.page_advice_state != NULL &&
+              initial.page_advice_state_bytes ==
+                  (fixture.ledger.static_parent_count +
+                       3u * fixture.ledger.expert_entry_count) *
+                      3u * sizeof(ds4_laguna_page_range) &&
               initial.cache_payload_bytes ==
                   fixture.plan.cache_payload_bytes &&
               initial.cache_payload_bytes <=
@@ -4342,14 +4465,36 @@ static int run_cache_io(void) {
               &fixture.runtime.tracker, &runtime_before,
               active_before, ARRAY_LEN(active_before)) &&
               runtime_before.violation == DS4_RUNTIME_VIOLATION_NONE &&
-              runtime_before.active_record_count == 15u &&
+              runtime_before.active_record_count == 16u &&
               runtime_before.category_current[
                   DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] ==
                   fixture.plan.cache_payload_bytes &&
               runtime_before.category_current[
                   DS4_RUNTIME_CATEGORY_PINNED_STAGING] ==
-                  4u * fixture.plan.staging_buffer_bytes,
+                  4u * fixture.plan.staging_buffer_bytes &&
+              runtime_before.category_current[
+                  DS4_RUNTIME_CATEGORY_OTHER_HOST] ==
+                  initial.page_advice_state_bytes,
           "fixed cache and staging allocations reconcile through the tracker");
+    const ds4_runtime_allocation_record *page_advice_state_record = NULL;
+    size_t page_advice_state_record_count = 0;
+    for (size_t i = 0; i < runtime_before.active_record_count; i++) {
+        if (active_before[i].callsite_id !=
+                DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER) {
+            continue;
+        }
+        page_advice_state_record = &active_before[i];
+        page_advice_state_record_count++;
+    }
+    CHECK(page_advice_state_record_count == 1u &&
+              owned_record_matches(
+                  page_advice_state_record,
+                  (uint64_t)(uintptr_t)initial.page_advice_state,
+                  initial.page_advice_state_bytes,
+                  DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
+                  DS4_RUNTIME_CATEGORY_OTHER_HOST,
+                  DS4_RUNTIME_DOMAIN_HOST),
+          "page-advice state has one exact fixed host allocation record");
 
     ds4_laguna_cache_handle first = {0};
     ds4_laguna_cache_acquire_outcome outcome =
@@ -5041,12 +5186,30 @@ static int run_model_page_advice(void) {
     int model_fd = -1;
     bool model_fd_set = false;
     if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
+    bool close_model_fd = false;
+    if (!model_fd_set) {
+        model_fd = open(model, O_RDONLY | O_CLOEXEC);
+        model_fd_set = model_fd >= 0;
+        close_model_fd = model_fd_set;
+    }
 
     const long system_page_size = sysconf(_SC_PAGESIZE);
     CHECK(system_page_size > 0,
           "model page advice obtains the real system page size");
-    if (system_page_size <= 0) return 1;
+    if (system_page_size <= 0 || !model_fd_set) {
+        if (close_model_fd) close(model_fd);
+        return 1;
+    }
     const uint64_t page_size = (uint64_t)system_page_size;
+    uint64_t cold_resident_bytes = UINT64_MAX;
+    const bool cold_prepared = cold_prepare_model_fd(
+        model_fd, page_size, &cold_resident_bytes);
+    CHECK(cold_prepared && cold_resident_bytes == 0u,
+          "qualification cold-prepares and verifies only the exact model inode");
+    if (!cold_prepared || cold_resident_bytes != 0u) {
+        if (close_model_fd) close(model_fd);
+        return 1;
+    }
 
     saved_environment saved;
     save_and_clear_forbidden_environment(&saved);
@@ -5067,6 +5230,7 @@ static int run_model_page_advice(void) {
           "real Laguna model opens for page-advice qualification");
     if (!engine) {
         restore_forbidden_environment(&saved);
+        if (close_model_fd) close(model_fd);
         return 1;
     }
 
@@ -5124,9 +5288,12 @@ static int run_model_page_advice(void) {
           "static advice preserves its simultaneous source precharge peak");
 
     ds4_tokens tokens = {0};
-    const int token_id = ds4_token_user(engine);
-    if (token_id >= 0) ds4_tokens_push(&tokens, token_id);
-    CHECK(token_id >= 0 && tokens.len == 1,
+    /* Laguna's GGUF has no dedicated user-control token.  Vocabulary ID 0
+     * is an ordinary, frozen in-range embedding row and keeps this case to
+     * exactly one routed token without invoking chat-template tokenization. */
+    const int token_id = 0;
+    ds4_tokens_push(&tokens, token_id);
+    CHECK(tokens.len == 1 && tokens.v[0] == token_id,
           "model page advice stages exactly one valid token");
 
     ds4_session *session = NULL;
@@ -5183,10 +5350,12 @@ static int run_model_page_advice(void) {
     CHECK(routed_captured &&
               routed.page_advice_upload_completed_sequence >
                   startup.page_advice_complete_sequence &&
+              routed.page_advice_complete_sequence ==
+                  startup.page_advice_complete_sequence + 25u &&
               routed.page_advice_complete_monotonic_ns >
                   startup.page_advice_complete_monotonic_ns &&
               page_advice_sequence_is_ordered(&routed),
-          "routed advice completes only after its CUDA upload synchronization");
+          "routed advice uses four bounded batches plus one graph-tail drain after CUDA synchronization");
 
     ds4_runtime_snapshot live_runtime;
     ds4_runtime_allocation_record
@@ -5216,6 +5385,25 @@ static int run_model_page_advice(void) {
     ds4_session_free(session);
     ds4_tokens_free(&tokens);
     ds4_engine_close(engine);
+    ds4_test_laguna_compact_close_observation close_observation;
+    ds4_gpu_laguna_compact_test_snapshot nonidle;
+    ds4_runtime_snapshot closed_runtime;
+    memset(&close_observation, 0, sizeof(close_observation));
+    memset(&nonidle, 0, sizeof(nonidle));
+    memset(&closed_runtime, 0, sizeof(closed_runtime));
+    CHECK(ds4_test_laguna_compact_close_observation_get(
+              &close_observation) &&
+              close_observation.first_destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_OK &&
+              close_observation.destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_OK &&
+              close_observation.destroy_attempt_count == 1u &&
+              !close_observation.engine_retained &&
+              !ds4_gpu_test_laguna_compact_nonidle_snapshot(&nonidle) &&
+              ds4_test_laguna_last_close_snapshot(&closed_runtime) &&
+              runtime_snapshot_is_clean(&closed_runtime),
+          "real page-advice teardown releases every compact owner cleanly");
+    if (close_model_fd) close(model_fd);
     restore_forbidden_environment(&saved);
     return g_failures == 0 ? 0 : 1;
 }
@@ -5574,7 +5762,7 @@ static int run_cache_unsafe(void) {
             tracker_records_baseline);
     CHECK(baseline_captured &&
               tracker_baseline.violation == DS4_RUNTIME_VIOLATION_NONE &&
-              tracker_baseline.active_record_count == 15u &&
+              tracker_baseline.active_record_count == 16u &&
               fixed_baseline.cache_payload_allocation_attempts == 1u &&
               fixed_baseline.pinned_staging_allocation_attempts == 4u &&
               fixed_baseline.pinned_staging_live_count == 4u &&
@@ -6033,7 +6221,7 @@ int main(int argc, char **argv) {
         }
         const int case_assertions = g_assertions - assertions_before;
         const int case_failures = g_failures - failures_before;
-        if (case_failures == 0) {
+        if (rc == 0 && case_failures == 0) {
             fprintf(stderr,
                     "test_cuda_laguna_stream %s PASS (%d assertions)\n",
                     name, case_assertions);

@@ -231,6 +231,13 @@ ds4_gpu_laguna_compact_routed_moe_batch_tensor(
         ds4_gpu_laguna_cancel_fn cancel,
         void *userdata);
 
+/* Drain source-page disposal accumulated by routed layers after the caller's
+ * whole Laguna graph is quiescent.  This is mandatory even on a cancelled or
+ * recoverable graph result; an accounting or synchronization failure poisons
+ * the compact context and returns UNSAFE. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_finish_graph(ds4_gpu_laguna_compact *ctx);
+
 #ifdef DS4_TEST_HOOKS
 typedef enum {
     DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
@@ -309,6 +316,47 @@ typedef struct {
     uint64_t opportunistic_range_allocated_bytes;
     uint64_t legacy_model_range_count;
     uint64_t legacy_model_arena_count;
+    void *page_advice_state;
+    bool page_advice_state_live;
+    uint64_t page_advice_state_bytes;
+    uint64_t page_advice_touched_eligible_unique_bytes;
+    uint64_t page_advice_touched_eligible_unique_pages;
+    uint64_t page_advice_advised_unique_bytes;
+    uint64_t page_advice_advised_unique_pages;
+    uint64_t page_advice_attempted_calls;
+    uint64_t page_advice_attempted_bytes;
+    uint64_t page_advice_successful_calls;
+    uint64_t page_advice_successful_bytes;
+    uint64_t page_advice_failed_calls;
+    uint64_t page_advice_failed_bytes;
+    ds4_laguna_page_advice_errno_bucket
+        page_advice_errno_buckets[
+            DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY];
+    size_t page_advice_errno_bucket_count;
+    uint64_t page_advice_errno_einval_calls;
+    uint64_t page_advice_errno_einval_bytes;
+    uint64_t page_advice_errno_eio_calls;
+    uint64_t page_advice_errno_eio_bytes;
+    uint64_t page_advice_fadvise_attempted_calls;
+    uint64_t page_advice_fadvise_attempted_bytes;
+    uint64_t page_advice_fadvise_successful_calls;
+    uint64_t page_advice_fadvise_successful_bytes;
+    uint64_t page_advice_fadvise_failed_calls;
+    uint64_t page_advice_fadvise_failed_bytes;
+    uint64_t page_advice_madvise_attempted_calls;
+    uint64_t page_advice_madvise_attempted_bytes;
+    uint64_t page_advice_madvise_successful_calls;
+    uint64_t page_advice_madvise_successful_bytes;
+    uint64_t page_advice_madvise_failed_calls;
+    uint64_t page_advice_madvise_failed_bytes;
+    uint64_t page_advice_precharge_source_resident_bytes;
+    uint64_t page_advice_post_source_resident_bytes;
+    uint64_t page_advice_upload_completed_sequence;
+    uint64_t page_advice_precharge_sequence;
+    uint64_t page_advice_attempt_sequence;
+    uint64_t page_advice_post_sample_sequence;
+    uint64_t page_advice_complete_sequence;
+    uint64_t page_advice_complete_monotonic_ns;
 } ds4_gpu_laguna_compact_test_snapshot;
 
 /* Test-only proof that every routed projection consumed by compact Laguna
@@ -350,6 +398,12 @@ void ds4_gpu_test_laguna_compact_resume_cache_load(void);
 void ds4_gpu_test_laguna_compact_pause_cache_begin_once(void);
 int ds4_gpu_test_laguna_compact_wait_cache_begin_paused(void);
 void ds4_gpu_test_laguna_compact_resume_cache_begin(void);
+void ds4_gpu_test_laguna_compact_page_advice_inject(
+        uint64_t page_size,
+        uint64_t exact_pre_resident_bytes,
+        uint64_t exact_post_resident_bytes,
+        int fadvise_errno,
+        int madvise_errno);
 uint64_t ds4_gpu_test_laguna_compact_snapshot_size(void);
 ds4_laguna_cache_status ds4_gpu_test_laguna_compact_cache_reserve_loading(
         ds4_gpu_laguna_compact *ctx,

@@ -1043,6 +1043,67 @@ class ColdPreparationContractTest(unittest.TestCase):
                             model_arg, plan_arg, plan_sha256, **kwargs
                         )
 
+    def test_parent_directory_symlinks_are_not_traversed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            real = directory / "real"
+            real.mkdir()
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(real)
+            via_symlink = directory / "via-symlink"
+            via_symlink.symlink_to(real, target_is_directory=True)
+            kwargs = {
+                "advise": lambda descriptor, offset, length: None,
+                "sample_residency": lambda descriptor, file_size, page_size: 0,
+            }
+            for label, model_arg, plan_arg in (
+                (
+                    "model parent",
+                    via_symlink / model.name,
+                    plan_path,
+                ),
+                (
+                    "plan parent",
+                    model,
+                    via_symlink / plan_path.name,
+                ),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(
+                        ValueError, "symlink|without following|traversal"
+                    ):
+                        TOOL.cold_prepare_from_plan(
+                            model_arg, plan_arg, plan_sha256, **kwargs
+                        )
+
+    def test_host_page_size_mismatch_fails_before_any_advice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp)
+            )
+            advice_calls: list[tuple[int, int]] = []
+            observed_error: ValueError | None = None
+            with mock.patch.object(TOOL.mmap, "PAGESIZE", 8192):
+                try:
+                    TOOL.cold_prepare_from_plan(
+                        model,
+                        plan_path,
+                        plan_sha256,
+                        advise=lambda descriptor, offset, length: advice_calls.append(
+                            (offset, length)
+                        ),
+                        sample_residency=lambda descriptor, file_size, page_size: 0,
+                    )
+                except ValueError as exc:
+                    observed_error = exc
+
+            self.assertEqual(
+                advice_calls,
+                [],
+                "host page-size validation must precede the first cache advice",
+            )
+            self.assertIsNotNone(observed_error)
+            self.assertRegex(str(observed_error), "host page|page size")
+
     def test_plan_ranges_must_be_a_complete_normalized_safe_union(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
@@ -1176,6 +1237,49 @@ class ColdPreparationContractTest(unittest.TestCase):
                     "failed_bytes": "8192",
                     "errno_buckets": {"EIO": 1},
                 },
+            )
+
+    def test_location_aware_residency_rejects_only_hot_eligible_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp)
+            )
+            page_size = 4096
+            page_count = 8
+            safe_page = bytearray(page_count)
+            safe_page[1] = 1
+            unavoidable_page = bytearray(page_count)
+            unavoidable_page[0] = 1
+            kwargs = {
+                "advise": lambda descriptor, offset, length: None,
+            }
+
+            with self.assertRaisesRegex(
+                ValueError, "eligible.*resident|resident.*eligible"
+            ):
+                TOOL.cold_prepare_from_plan(
+                    model,
+                    plan_path,
+                    plan_sha256,
+                    sample_residency=lambda descriptor, file_size, observed_page_size: bytes(
+                        safe_page
+                    ),
+                    **kwargs,
+                )
+
+            result = TOOL.cold_prepare_from_plan(
+                model,
+                plan_path,
+                plan_sha256,
+                sample_residency=lambda descriptor, file_size, observed_page_size: bytes(
+                    unavoidable_page
+                ),
+                **kwargs,
+            )
+            self.assertEqual(result["resident_bytes_after"], str(page_size))
+            self.assertLessEqual(
+                int(result["resident_bytes_after"]),
+                int(result["unavoidable_bytes"]),
             )
 
     def test_descriptor_identity_change_during_measurement_is_invalid(self) -> None:
@@ -1328,6 +1432,68 @@ class NvmlCheckpointContractTest(unittest.TestCase):
         self.assertEqual(
             set(process["required"]), {"pid", "used_gpu_memory_bytes"}
         )
+
+    def test_schema_and_validator_share_one_nvml_byte_representation(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(
+            {
+                "$schema": schema["$schema"],
+                "$ref": "#/$defs/nvml_process",
+                "$defs": schema["$defs"],
+            }
+        )
+        cases = [
+            {"pid": self.DS4_PID, "used_gpu_memory_bytes": "6442450944"},
+            {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30},
+        ]
+        shared_acceptance = 0
+        for process in cases:
+            schema_accepts = validator.is_valid(process)
+            other_usage = "1073741824" if isinstance(
+                process["used_gpu_memory_bytes"], str
+            ) else 1 << 30
+            other = {
+                "pid": self.OTHER_PID,
+                "used_gpu_memory_bytes": other_usage,
+            }
+            checkpoint = _nvml_inventory([other, process])
+            try:
+                TOOL.validate_nvml_checkpoint(
+                    _nvml_inventory([other]),
+                    checkpoint,
+                    copy.deepcopy(checkpoint),
+                    ds4_pid=self.DS4_PID,
+                    gpu_uuid=HOST_IDENTITY["gpu_uuid"],
+                )
+            except ValueError:
+                validator_accepts = False
+            else:
+                validator_accepts = True
+            with self.subTest(value=process["used_gpu_memory_bytes"]):
+                self.assertEqual(schema_accepts, validator_accepts)
+            shared_acceptance += int(schema_accepts and validator_accepts)
+        self.assertEqual(
+            shared_acceptance,
+            1,
+            "exactly one canonical NVML byte representation must be accepted",
+        )
+
+    def test_nvml_unknown_usage_sentinel_is_schema_invalid(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(
+            {
+                "$schema": schema["$schema"],
+                "$ref": "#/$defs/nvml_process",
+                "$defs": schema["$defs"],
+            }
+        )
+        candidates = [
+            {"pid": self.DS4_PID, "used_gpu_memory_bytes": str((1 << 64) - 1)},
+            {"pid": self.DS4_PID, "used_gpu_memory_bytes": (1 << 64) - 1},
+        ]
+        for process in candidates:
+            with self.subTest(value=process["used_gpu_memory_bytes"]):
+                self.assertFalse(validator.is_valid(process))
 
 
 if __name__ == "__main__":

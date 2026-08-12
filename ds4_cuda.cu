@@ -900,7 +900,18 @@ static int cuda_laguna_nvml_symbol(
 static int cuda_laguna_nvml_open(ds4_nvml_api *api) {
     if (!api) return 0;
     memset(api, 0, sizeof(*api));
-    api->library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+#if !defined(RTLD_NODELETE)
+    /* Repeated external-attribution captures require a loader contract that
+     * cannot leak process descriptors across NVML unload/reload cycles. */
+    return 0;
+#else
+    /* NVIDIA's DSO leaves an eventfd behind on each unload/reload cycle even
+     * after a successful nvmlShutdown().  Keep its process state mapped while
+     * preserving balanced NVML initialization and loader references. */
+    api->library = dlopen(
+        "libnvidia-ml.so.1",
+        RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+#endif
     if (!api->library ||
         !cuda_laguna_nvml_symbol(
             api->library, "nvmlInit_v2",

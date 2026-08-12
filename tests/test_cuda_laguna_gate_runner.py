@@ -252,6 +252,25 @@ os.execvp(command[0], command)
 
 
 class LagunaGateRunnerTest(unittest.TestCase):
+    def test_c7_cold_prepares_exact_fd_before_compact_model_children(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("cold_prepare_retained_fd()", source)
+        self.assertIn("os.posix_fadvise(9, 0, size", source)
+        expected_calls = (
+            ("model-streamed-short", "--mode streamed --case short"),
+            ("model-streamed-prefill-8192", "--mode streamed --case prefill-8192"),
+            ("stream-model-startup", "--case model-startup"),
+            ("stream-model-page-advice", "--case model-page-advice"),
+            ("stream-model-teardown-unsafe", "--case model-teardown-unsafe"),
+        )
+        for label, child_fragment in expected_calls:
+            with self.subTest(label=label):
+                needle = f"cold_prepare_retained_fd {label}"
+                cold_at = source.find(needle)
+                self.assertGreaterEqual(cold_at, 0)
+                child_at = source.find(child_fragment, cold_at + len(needle))
+                self.assertGreater(child_at, cold_at)
+
     def clean_gate_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         for name in (

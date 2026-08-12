@@ -38,6 +38,18 @@ assert_retained_identity() {
     fi
 }
 
+cold_prepare_retained_fd() {
+    local child=$1
+    python3 -c '
+import os
+if not hasattr(os, "posix_fadvise"):
+    raise SystemExit(0)
+size = os.fstat(9).st_size
+os.posix_fadvise(9, 0, size, os.POSIX_FADV_DONTNEED)
+' || die "cannot cold-prepare retained descriptor before $child"
+    assert_retained_identity "coldprep-$child"
+}
+
 hash_retained_fd() {
     python3 -c '
 import sys
@@ -186,10 +198,12 @@ fi
 assert_retained_identity kernels
 
 if [ "$mode" = c7 ]; then
+    cold_prepare_retained_fd model-streamed-short
     timeout --kill-after=5s 900s "$model_child" \
         --mode streamed --case short
     assert_retained_identity model-streamed-short
 
+    cold_prepare_retained_fd model-streamed-prefill-8192
     timeout --kill-after=5s 1800s "$model_child" \
         --mode streamed --case prefill-8192
     assert_retained_identity model-streamed-prefill-8192
@@ -207,12 +221,15 @@ if [ "$mode" = c7 ]; then
     timeout --kill-after=5s 60s "$stream_child" --case teardown-unsafe
     assert_retained_identity stream-teardown-unsafe
 
+    cold_prepare_retained_fd stream-model-startup
     timeout --kill-after=5s 60s "$stream_child" --case model-startup
     assert_retained_identity stream-model-startup
 
+    cold_prepare_retained_fd stream-model-page-advice
     timeout --kill-after=5s 900s "$stream_child" --case model-page-advice
     assert_retained_identity stream-model-page-advice
 
+    cold_prepare_retained_fd stream-model-teardown-unsafe
     timeout --kill-after=5s 60s "$stream_child" --case model-teardown-unsafe
     assert_retained_identity stream-model-teardown-unsafe
 

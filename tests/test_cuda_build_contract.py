@@ -2330,6 +2330,21 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertNotIn("strcmp(snapshot->api_identity", body)
 
+    def test_nvml_loader_retains_process_state_across_captures(self) -> None:
+        body = function_body("static int cuda_laguna_nvml_open(")
+        self.assertRegex(
+            body,
+            r"#if\s+!defined\(RTLD_NODELETE\)\s+"
+            r"(?:/\*[\s\S]*?\*/\s+)?return 0;\s+#else",
+            "loaders without no-delete support must fail NVML capture closed",
+        )
+        self.assertRegex(
+            body,
+            r'dlopen\(\s*"libnvidia-ml\.so\.1"\s*,\s*'
+            r"RTLD_NOW\s*\|\s*RTLD_LOCAL\s*\|\s*RTLD_NODELETE\s*\)",
+            "repeated NVML captures must not unload and reload driver state",
+        )
+
     def test_external_checkpoint_scopes_and_restores_cuda_device_zero(
         self,
     ) -> None:

@@ -12,6 +12,7 @@
     "prompts",
     "sampling",
     "execution",
+    "qualification_preflight",
     "profiles",
     "eval_case_ids"
   ],
@@ -102,6 +103,7 @@
     },
     "sampling": { "$ref": "#/$defs/sampling" },
     "execution": { "$ref": "#/$defs/execution" },
+    "qualification_preflight": { "$ref": "#/$defs/qualification_preflight" },
     "profiles": {
       "type": "array",
       "const": [
@@ -272,15 +274,29 @@
         "^(?:E[A-Z0-9_]+|UNKNOWN)$": { "type": "integer", "minimum": 1 }
       }
     },
+    "qualification_page_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offset", "bytes"],
+      "properties": {
+        "offset": { "$ref": "#/$defs/uint64" },
+        "bytes": { "$ref": "#/$defs/positive_uint64" }
+      }
+    },
     "cold_preparation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["plan_sha256", "ledger_sha256", "model_identity", "page_size", "eligible_calls", "eligible_bytes", "attempted_calls", "attempted_bytes", "successful_calls", "successful_bytes", "failed_calls", "failed_bytes", "errno_buckets", "resident_bytes_after", "unavoidable_bytes"],
+      "required": ["plan_sha256", "ledger_sha256", "model_identity", "page_size", "eligible_ranges", "eligible_calls", "eligible_bytes", "attempted_calls", "attempted_bytes", "successful_calls", "successful_bytes", "failed_calls", "failed_bytes", "errno_buckets", "resident_bytes_after", "unavoidable_bytes"],
       "properties": {
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "ledger_sha256": { "$ref": "#/$defs/sha256" },
         "model_identity": { "$ref": "#/$defs/qualification_model_identity" },
         "page_size": { "$ref": "#/$defs/positive_uint64" },
+        "eligible_ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/qualification_page_range" }
+        },
         "eligible_calls": { "type": "integer", "minimum": 0 },
         "eligible_bytes": { "$ref": "#/$defs/uint64" },
         "attempted_calls": { "type": "integer", "minimum": 0 },
@@ -320,6 +336,29 @@
           "type": "array",
           "items": { "$ref": "#/$defs/nvml_process" }
         }
+      }
+    },
+    "nvml_pre_child": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture_phase", "captured_at_unix_ns", "library_version", "inventory", "inventory_sha256"],
+      "properties": {
+        "capture_phase": { "const": "pre-child-before-cuda-initialization" },
+        "captured_at_unix_ns": { "$ref": "#/$defs/positive_uint64" },
+        "library_version": { "$ref": "#/$defs/identity" },
+        "inventory": { "$ref": "#/$defs/nvml_process_inventory" },
+        "inventory_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "qualification_preflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cold_preparation", "cold_preparation_sha256", "nvml_pre_child", "binding_sha256"],
+      "properties": {
+        "cold_preparation": { "$ref": "#/$defs/cold_preparation" },
+        "cold_preparation_sha256": { "$ref": "#/$defs/sha256" },
+        "nvml_pre_child": { "$ref": "#/$defs/nvml_pre_child" },
+        "binding_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "tokenizer_runtime": {

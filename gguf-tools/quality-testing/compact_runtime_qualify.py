@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -89,8 +90,22 @@ IJSON_SAFE_INTEGER_MAX = (1 << 53) - 1
 QUALIFICATION_PLAN_MAX_BYTES = 256 << 20
 UNAVOIDABLE_RESIDENCY_LIMIT_BYTES = 2 << 30
 NVML_COMPUTE_API = "nvmlDeviceGetComputeRunningProcesses_v2"
+NVML_SUCCESS = 0
+NVML_ERROR_INSUFFICIENT_SIZE = 7
+NVML_VERSION_BUFFER_SIZE = 128
+NVML_DEVICE_UUID_BUFFER_SIZE = 96
+NVML_PROCESS_COUNT_LIMIT = 1 << 20
 
 TokenCounter = Callable[[bytes], int]
+
+
+class _NvmlProcessInfoV2(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_uint),
+        ("usedGpuMemory", ctypes.c_ulonglong),
+        ("gpuInstanceId", ctypes.c_uint),
+        ("computeInstanceId", ctypes.c_uint),
+    ]
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -545,7 +560,7 @@ def _validate_profiles(value: Any) -> None:
 def validate_manifest(value: Mapping[str, Any]) -> None:
     required = {
         "schema", "model", "host", "prompt_source", "prompts", "sampling",
-        "execution", "profiles", "eval_case_ids",
+        "execution", "qualification_preflight", "profiles", "eval_case_ids",
     }
     manifest = _mapping(value, "manifest", required)
     if manifest["schema"] != SCHEMA_ID:
@@ -556,6 +571,12 @@ def validate_manifest(value: Mapping[str, Any]) -> None:
     _validate_prompts(manifest["prompts"])
     _validate_sampling(manifest["sampling"])
     _validate_execution(manifest["execution"])
+    _validate_qualification_preflight(
+        manifest["qualification_preflight"],
+        model_identity=manifest["model"],
+        host_identity=manifest["host"],
+        runtime_identity=manifest["prompt_source"]["tokenizer_runtime"],
+    )
     _validate_profiles(manifest["profiles"])
     eval_ids = _list(manifest["eval_case_ids"], "eval_case_ids")
     if eval_ids != list(EVAL_CASE_IDS):
@@ -1165,6 +1186,10 @@ def cold_prepare_from_plan(
             "ledger_sha256": plan["ledger_sha256"],
             "model_identity": dict(model),
             "page_size": str(page_size),
+            "eligible_ranges": [
+                {"offset": str(offset), "bytes": str(length)}
+                for offset, length in normalized_ranges
+            ],
             **report,
             "resident_bytes_after": str(resident_bytes),
             "unavoidable_bytes": str(unavoidable_bytes),
@@ -1260,6 +1285,425 @@ def validate_nvml_checkpoint(
         "ds4_pid": ds4_pid,
         "ds4_process_bytes": str(after[ds4_pid]),
     }
+
+
+def _validate_cold_preparation(value: Any) -> Mapping[str, Any]:
+    required = {
+        "plan_sha256",
+        "ledger_sha256",
+        "model_identity",
+        "page_size",
+        "eligible_ranges",
+        "eligible_calls",
+        "eligible_bytes",
+        "attempted_calls",
+        "attempted_bytes",
+        "successful_calls",
+        "successful_bytes",
+        "failed_calls",
+        "failed_bytes",
+        "errno_buckets",
+        "resident_bytes_after",
+        "unavoidable_bytes",
+    }
+    cold = _mapping(value, "qualification preflight cold preparation", required)
+    _sha256(cold["plan_sha256"], "cold-preparation plan SHA-256")
+    _sha256(cold["ledger_sha256"], "cold-preparation ledger SHA-256")
+    model = _qualification_model(cold["model_identity"])
+    model_size = _uint64_int(
+        model["size_bytes"], "cold-preparation model size", positive=True
+    )
+    page_size = _uint64_int(
+        cold["page_size"], "cold-preparation page size", positive=True
+    )
+    if page_size & (page_size - 1):
+        raise ValueError("cold-preparation page size must be a power of two")
+    normalized, eligible_bytes = _validated_advice_ranges(
+        cold["eligible_ranges"], page_size=page_size, model_size=model_size
+    )
+    expected_ranges = [
+        {"offset": str(offset), "bytes": str(length)}
+        for offset, length in normalized
+    ]
+    if cold["eligible_ranges"] != expected_ranges:
+        raise ValueError("cold-preparation eligible ranges are not canonical")
+
+    counts = {
+        key: _integer(cold[key], f"cold-preparation {key}")
+        for key in (
+            "eligible_calls",
+            "attempted_calls",
+            "successful_calls",
+            "failed_calls",
+        )
+    }
+    if any(count < 0 for count in counts.values()):
+        raise ValueError("cold-preparation call counts must be nonnegative")
+    byte_counts = {
+        key: _uint64_int(cold[key], f"cold-preparation {key}")
+        for key in (
+            "eligible_bytes",
+            "attempted_bytes",
+            "successful_bytes",
+            "failed_bytes",
+        )
+    }
+    if counts["eligible_calls"] != len(normalized):
+        raise ValueError("cold-preparation eligible call count is inconsistent")
+    if byte_counts["eligible_bytes"] != eligible_bytes:
+        raise ValueError("cold-preparation eligible byte count is inconsistent")
+    if (
+        counts["attempted_calls"] != counts["eligible_calls"]
+        or byte_counts["attempted_bytes"] != eligible_bytes
+        or counts["successful_calls"] + counts["failed_calls"]
+        != counts["attempted_calls"]
+        or byte_counts["successful_bytes"] + byte_counts["failed_bytes"]
+        != byte_counts["attempted_bytes"]
+    ):
+        raise ValueError("cold-preparation attempt accounting is inconsistent")
+    if counts["failed_calls"] != 0 or byte_counts["failed_bytes"] != 0:
+        raise ValueError("cold-preparation evidence contains an advice failure")
+    if (
+        counts["successful_calls"] != counts["eligible_calls"]
+        or byte_counts["successful_bytes"] != eligible_bytes
+    ):
+        raise ValueError("cold-preparation coverage is incomplete")
+    buckets = _mapping(cold["errno_buckets"], "cold-preparation errno buckets", set())
+    if buckets:
+        raise ValueError("successful cold-preparation evidence has errno buckets")
+
+    mapped_bytes = ((model_size + page_size - 1) // page_size) * page_size
+    unavoidable_bytes = _uint64_int(
+        cold["unavoidable_bytes"], "cold-preparation unavoidable bytes"
+    )
+    if unavoidable_bytes != mapped_bytes - eligible_bytes:
+        raise ValueError("cold-preparation unavoidable byte count is inconsistent")
+    if unavoidable_bytes > UNAVOIDABLE_RESIDENCY_LIMIT_BYTES:
+        raise ValueError("cold-preparation unavoidable residency exceeds the 2 GiB limit")
+    resident_bytes = _uint64_int(
+        cold["resident_bytes_after"], "cold-preparation resident bytes"
+    )
+    if resident_bytes > unavoidable_bytes:
+        raise ValueError("cold-preparation resident bytes exceed unavoidable coverage")
+    return cold
+
+
+def _canonical_nvml_inventory(
+    value: Any,
+    label: str,
+    *,
+    gpu_uuid: str,
+) -> dict[str, Any]:
+    by_pid = _nvml_inventory_by_pid(value, label, gpu_uuid=gpu_uuid)
+    return {
+        "api": NVML_COMPUTE_API,
+        "gpu_uuid": gpu_uuid,
+        "processes": [
+            {"pid": pid, "used_gpu_memory_bytes": str(by_pid[pid])}
+            for pid in sorted(by_pid)
+        ],
+    }
+
+
+def collect_nvml_pre_child(gpu_uuid: str) -> dict[str, Any]:
+    """Collect one process inventory through NVML without touching CUDA."""
+    if not isinstance(gpu_uuid, str) or not GPU_UUID_RE.fullmatch(gpu_uuid):
+        raise ValueError("pre-child NVML GPU UUID is invalid")
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError as exc:
+        raise ValueError(f"cannot load libnvidia-ml.so.1: {exc}") from exc
+    try:
+        init = nvml.nvmlInit_v2
+        shutdown = nvml.nvmlShutdown
+        get_version = nvml.nvmlSystemGetNVMLVersion
+        get_device = nvml.nvmlDeviceGetHandleByUUID
+        get_device_uuid = nvml.nvmlDeviceGetUUID
+        get_processes = nvml.nvmlDeviceGetComputeRunningProcesses_v2
+    except AttributeError as exc:
+        raise ValueError(f"NVML lacks the required v2 process API: {exc}") from exc
+
+    init.argtypes = []
+    init.restype = ctypes.c_int
+    shutdown.argtypes = []
+    shutdown.restype = ctypes.c_int
+    get_version.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    get_version.restype = ctypes.c_int
+    get_device.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+    get_device.restype = ctypes.c_int
+    get_device_uuid.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]
+    get_device_uuid.restype = ctypes.c_int
+    get_processes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(_NvmlProcessInfoV2),
+    ]
+    get_processes.restype = ctypes.c_int
+
+    initialized = False
+    primary_error: BaseException | None = None
+    try:
+        rc = init()
+        if rc != NVML_SUCCESS:
+            raise ValueError(f"nvmlInit_v2 failed with NVML status {rc}")
+        initialized = True
+
+        version_buffer = ctypes.create_string_buffer(NVML_VERSION_BUFFER_SIZE)
+        rc = get_version(version_buffer, ctypes.c_uint(len(version_buffer)))
+        if rc != NVML_SUCCESS:
+            raise ValueError(
+                f"nvmlSystemGetNVMLVersion failed with NVML status {rc}"
+            )
+        try:
+            library_version = version_buffer.value.decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("NVML library version is not ASCII") from exc
+        _string(library_version, "NVML library version")
+
+        device = ctypes.c_void_p()
+        rc = get_device(gpu_uuid.encode("ascii"), ctypes.byref(device))
+        if rc != NVML_SUCCESS or not device.value:
+            raise ValueError(
+                f"nvmlDeviceGetHandleByUUID failed with NVML status {rc}"
+            )
+        uuid_buffer = ctypes.create_string_buffer(NVML_DEVICE_UUID_BUFFER_SIZE)
+        rc = get_device_uuid(device, uuid_buffer, ctypes.c_uint(len(uuid_buffer)))
+        if rc != NVML_SUCCESS:
+            raise ValueError(f"nvmlDeviceGetUUID failed with NVML status {rc}")
+        try:
+            observed_uuid = uuid_buffer.value.decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("NVML device UUID is not ASCII") from exc
+        if observed_uuid != gpu_uuid:
+            raise ValueError("NVML device UUID does not match the requested GPU")
+
+        count = ctypes.c_uint(0)
+        rc = get_processes(device, ctypes.byref(count), None)
+        if rc == NVML_SUCCESS and count.value == 0:
+            raw_inventory = {
+                "api": NVML_COMPUTE_API,
+                "gpu_uuid": gpu_uuid,
+                "processes": [],
+            }
+        else:
+            if rc not in (NVML_SUCCESS, NVML_ERROR_INSUFFICIENT_SIZE):
+                raise ValueError(
+                    f"{NVML_COMPUTE_API} count query failed with NVML status {rc}"
+                )
+            records: list[dict[str, Any]] | None = None
+            for _attempt in range(4):
+                capacity = count.value
+                if capacity == 0 or capacity > NVML_PROCESS_COUNT_LIMIT:
+                    raise ValueError("NVML process count is outside the qualification bound")
+                array = (_NvmlProcessInfoV2 * capacity)()
+                returned = ctypes.c_uint(capacity)
+                rc = get_processes(device, ctypes.byref(returned), array)
+                if rc == NVML_ERROR_INSUFFICIENT_SIZE:
+                    count = returned
+                    continue
+                if rc != NVML_SUCCESS:
+                    raise ValueError(
+                        f"{NVML_COMPUTE_API} failed with NVML status {rc}"
+                    )
+                if returned.value > capacity:
+                    raise ValueError("NVML returned more process records than allocated")
+                records = [
+                    {
+                        "pid": int(array[index].pid),
+                        "used_gpu_memory_bytes": str(
+                            int(array[index].usedGpuMemory)
+                        ),
+                    }
+                    for index in range(returned.value)
+                ]
+                break
+            if records is None:
+                raise ValueError("NVML process inventory did not stabilize")
+            raw_inventory = {
+                "api": NVML_COMPUTE_API,
+                "gpu_uuid": gpu_uuid,
+                "processes": records,
+            }
+
+        inventory = _canonical_nvml_inventory(
+            raw_inventory, "pre-child NVML inventory", gpu_uuid=gpu_uuid
+        )
+        return {
+            "library_version": library_version,
+            "inventory": inventory,
+        }
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if initialized:
+            shutdown_rc = shutdown()
+            if shutdown_rc != NVML_SUCCESS and primary_error is None:
+                raise ValueError(
+                    f"nvmlShutdown failed with NVML status {shutdown_rc}"
+                )
+
+
+def _qualification_binding_payload(
+    cold_preparation: Mapping[str, Any],
+    nvml_pre_child: Mapping[str, Any],
+    runtime_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "cold_preparation": dict(cold_preparation),
+        "nvml_pre_child": dict(nvml_pre_child),
+        "runtime": {
+            "source_revision": runtime_identity["source_revision"],
+            "executable_sha256": runtime_identity["executable_sha256"],
+        },
+    }
+
+
+def freeze_qualification_preflight(
+    cold_preparation: Mapping[str, Any],
+    *,
+    gpu_uuid: str,
+    runtime_identity: Mapping[str, Any],
+    captured_at_unix_ns: str,
+    nvml_query: Callable[[str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze already-collected cold evidence and one no-CUDA NVML query."""
+    if not isinstance(gpu_uuid, str) or not GPU_UUID_RE.fullmatch(gpu_uuid):
+        raise ValueError("qualification preflight GPU UUID is invalid")
+    frozen_runtime = loads_strict(
+        canonical_json_bytes(runtime_identity).decode("utf-8")
+    )
+    _validate_runtime(frozen_runtime)
+    _decimal(
+        captured_at_unix_ns,
+        "qualification preflight capture timestamp",
+        positive=True,
+    )
+    frozen_cold = loads_strict(
+        canonical_json_bytes(cold_preparation).decode("utf-8")
+    )
+    cold = _validate_cold_preparation(frozen_cold)
+    if not callable(nvml_query):
+        raise ValueError("qualification preflight NVML query is not callable")
+    query = _mapping(
+        nvml_query(gpu_uuid),
+        "qualification preflight NVML query result",
+        {"library_version", "inventory"},
+    )
+    library_version = _string(
+        query["library_version"], "qualification preflight NVML library version"
+    )
+    inventory = _canonical_nvml_inventory(
+        query["inventory"], "qualification preflight NVML inventory", gpu_uuid=gpu_uuid
+    )
+    nvml_pre_child = {
+        "capture_phase": "pre-child-before-cuda-initialization",
+        "captured_at_unix_ns": captured_at_unix_ns,
+        "library_version": library_version,
+        "inventory": inventory,
+        "inventory_sha256": _sha256_bytes(canonical_json_bytes(inventory)),
+    }
+    result = {
+        "cold_preparation": cold,
+        "cold_preparation_sha256": _sha256_bytes(
+            canonical_json_bytes(cold)
+        ),
+        "nvml_pre_child": nvml_pre_child,
+        "binding_sha256": _sha256_bytes(
+            canonical_json_bytes(
+                _qualification_binding_payload(
+                    cold, nvml_pre_child, frozen_runtime
+                )
+            )
+        ),
+    }
+    return result
+
+
+def _validate_qualification_preflight(
+    value: Any,
+    *,
+    model_identity: Mapping[str, Any],
+    host_identity: Mapping[str, Any],
+    runtime_identity: Mapping[str, Any],
+) -> None:
+    preflight = _mapping(
+        value,
+        "qualification_preflight",
+        {
+            "cold_preparation",
+            "cold_preparation_sha256",
+            "nvml_pre_child",
+            "binding_sha256",
+        },
+    )
+    cold = _validate_cold_preparation(preflight["cold_preparation"])
+    cold_digest = _sha256(
+        preflight["cold_preparation_sha256"],
+        "qualification preflight cold-preparation SHA-256",
+    )
+    if cold_digest != _sha256_bytes(canonical_json_bytes(cold)):
+        raise ValueError("qualification preflight cold-preparation digest mismatch")
+    expected_model = {
+        key: model_identity[key]
+        for key in (
+            "device",
+            "filename",
+            "inode",
+            "mtime_ns",
+            "repository",
+            "revision",
+            "sha256",
+            "size_bytes",
+        )
+    }
+    _require_identity_match(cold["model_identity"], expected_model, "cold model")
+
+    nvml = _mapping(
+        preflight["nvml_pre_child"],
+        "qualification preflight NVML baseline",
+        {
+            "capture_phase",
+            "captured_at_unix_ns",
+            "library_version",
+            "inventory",
+            "inventory_sha256",
+        },
+    )
+    if nvml["capture_phase"] != "pre-child-before-cuda-initialization":
+        raise ValueError("qualification preflight NVML capture phase is invalid")
+    _decimal(
+        nvml["captured_at_unix_ns"],
+        "qualification preflight NVML capture timestamp",
+        positive=True,
+    )
+    _string(
+        nvml["library_version"], "qualification preflight NVML library version"
+    )
+    gpu_uuid = host_identity["gpu_uuid"]
+    canonical_inventory = _canonical_nvml_inventory(
+        nvml["inventory"],
+        "qualification preflight NVML inventory",
+        gpu_uuid=gpu_uuid,
+    )
+    if nvml["inventory"] != canonical_inventory:
+        raise ValueError("qualification preflight NVML inventory is not PID-sorted")
+    inventory_digest = _sha256(
+        nvml["inventory_sha256"], "qualification preflight NVML inventory SHA-256"
+    )
+    if inventory_digest != _sha256_bytes(canonical_json_bytes(canonical_inventory)):
+        raise ValueError("qualification preflight NVML inventory digest mismatch")
+
+    binding_digest = _sha256(
+        preflight["binding_sha256"], "qualification preflight binding SHA-256"
+    )
+    expected_binding = _sha256_bytes(
+        canonical_json_bytes(
+            _qualification_binding_payload(cold, nvml, runtime_identity)
+        )
+    )
+    if binding_digest != expected_binding:
+        raise ValueError("qualification preflight binding digest mismatch")
 
 
 def _oracle_tokenizer_revision() -> str:
@@ -1564,7 +2008,27 @@ def _validate_fixed_sources(seed: bytes) -> None:
         raise ValueError("benchmark prompt generator does not match pinned provenance")
 
 
-def build_manifest(
+def _validate_prepared_manifest(value: Mapping[str, Any]) -> None:
+    required = {
+        "schema", "model", "host", "prompt_source", "prompts", "sampling",
+        "execution", "profiles", "eval_case_ids",
+    }
+    prepared = _mapping(value, "prepared manifest", required)
+    if prepared["schema"] != SCHEMA_ID:
+        raise ValueError("prepared manifest schema is not supported")
+    _validate_model(prepared["model"])
+    _validate_host(prepared["host"])
+    _validate_prompt_source(prepared["prompt_source"])
+    _validate_prompts(prepared["prompts"])
+    _validate_sampling(prepared["sampling"])
+    _validate_execution(prepared["execution"])
+    _validate_profiles(prepared["profiles"])
+    eval_ids = _list(prepared["eval_case_ids"], "prepared eval_case_ids")
+    if eval_ids != list(EVAL_CASE_IDS):
+        raise ValueError("prepared eval_case_ids are not pinned")
+
+
+def prepare_manifest(
     model_path: Path | str,
     *,
     token_counter: TokenCounter | None = None,
@@ -1573,6 +2037,7 @@ def build_manifest(
     runtime_identity: Mapping[str, Any] | None = None,
     seed_bytes: bytes | None = None,
 ) -> dict[str, Any]:
+    """Complete every model read and tokenizer subprocess before cold preparation."""
     model_path = Path(model_path)
     seed = seed_bytes if seed_bytes is not None else SEED_PATH.read_bytes()
     _validate_fixed_sources(seed)
@@ -1610,7 +2075,7 @@ def build_manifest(
         ):
             raise ValueError("pinned model identity changed during manifest construction")
 
-    manifest: dict[str, Any] = {
+    prepared: dict[str, Any] = {
         "schema": SCHEMA_ID,
         "model": model,
         "host": host,
@@ -1654,8 +2119,58 @@ def build_manifest(
         ],
         "eval_case_ids": list(EVAL_CASE_IDS),
     }
+    _validate_prepared_manifest(prepared)
+    return prepared
+
+
+def finalize_manifest(
+    prepared_manifest: Mapping[str, Any],
+    qualification_preflight: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Purely bind frozen preflight evidence into already-prepared static bytes."""
+    prepared = loads_strict(
+        canonical_json_bytes(prepared_manifest).decode("utf-8")
+    )
+    _validate_prepared_manifest(prepared)
+    frozen_preflight = loads_strict(
+        canonical_json_bytes(qualification_preflight).decode("utf-8")
+    )
+    _validate_qualification_preflight(
+        frozen_preflight,
+        model_identity=prepared["model"],
+        host_identity=prepared["host"],
+        runtime_identity=prepared["prompt_source"]["tokenizer_runtime"],
+    )
+    manifest = dict(prepared)
+    manifest["qualification_preflight"] = frozen_preflight
     validate_manifest(manifest)
     return manifest
+
+
+def build_manifest(
+    model_path: Path | str,
+    *,
+    token_counter: TokenCounter | None = None,
+    host_identity: Mapping[str, Any] | None = None,
+    model_identity: Mapping[str, Any] | None = None,
+    runtime_identity: Mapping[str, Any] | None = None,
+    seed_bytes: bytes | None = None,
+    qualification_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convenience API for callers that already hold trusted preflight evidence."""
+    if qualification_preflight is None:
+        raise ValueError(
+            "qualification preflight evidence is required; capture it before manifest build"
+        )
+    prepared = prepare_manifest(
+        model_path,
+        token_counter=token_counter,
+        host_identity=host_identity,
+        model_identity=model_identity,
+        runtime_identity=runtime_identity,
+        seed_bytes=seed_bytes,
+    )
+    return finalize_manifest(prepared, qualification_preflight)
 
 
 def _require_identity_match(
@@ -1771,6 +2286,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build = actions.add_parser("build", help="build the immutable reference manifest")
     build.add_argument("--model", required=True, type=Path)
     build.add_argument("--output", required=True, type=Path)
+    build.add_argument("--qualification-plan", required=True, type=Path)
+    build.add_argument(
+        "--trusted-qualification-plan-sha256",
+        required=True,
+        help=(
+            "plan digest received over the controlling harness channel from "
+            "the plan-producing DS4 invocation"
+        ),
+    )
     verify = actions.add_parser("verify", help="verify an immutable reference manifest")
     verify.add_argument("--manifest", required=True, type=Path)
     return parser.parse_args(argv)
@@ -1780,7 +2304,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         if args.action == "build":
-            value = build_manifest(args.model)
+            prepared = prepare_manifest(args.model)
+            cold_preparation = cold_prepare_from_plan(
+                args.model,
+                args.qualification_plan,
+                args.trusted_qualification_plan_sha256,
+            )
+            runtime_identity = prepared["prompt_source"]["tokenizer_runtime"]
+            host_identity = prepared["host"]
+            nvml_capture = collect_nvml_pre_child(host_identity["gpu_uuid"])
+            captured_at_unix_ns = str(time.time_ns())
+            preflight = freeze_qualification_preflight(
+                cold_preparation,
+                gpu_uuid=host_identity["gpu_uuid"],
+                runtime_identity=runtime_identity,
+                captured_at_unix_ns=captured_at_unix_ns,
+                nvml_query=lambda gpu_uuid: nvml_capture,
+            )
+            value = finalize_manifest(prepared, preflight)
             write_manifest_atomic(args.output, value)
             print(f"manifest_sha256={manifest_sha256(value)} output={args.output}")
             return 0

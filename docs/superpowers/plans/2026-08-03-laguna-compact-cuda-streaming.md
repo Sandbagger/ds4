@@ -905,39 +905,52 @@ git commit -m "test: measure exact-inode and external compact footprint"
 - Modify: `gguf-tools/quality-testing/test_compact_runtime_qualify.py`
 - Modify: `Makefile`
 
-- [ ] **Step 1: Add RED warm-growth and pressure cases**
+- [x] **Step 1: Add RED warm-growth and pressure cases**
 
-After one warm-up, run three create/prefill/decode/free cycles and require every current owned category to return within 64 MiB of the first post-warm result with no monotonically growing category. Run the same prompt cold then warm; require identical accepted output, increased cache hits, and routed model-file bytes no greater than cold. Add a 4K-context/two-session profile with interleaved misses, forced eviction, one cancellation, and a batch working set larger than `slot_count`.
+After one warm-up, run three create/prefill/decode/free cycles and require every current owned category to return within 64 MiB of the first post-warm result with no monotonically growing category. Run the same prompt cold then warm; require identical accepted output, increased cache hits, and routed model-file bytes no greater than cold. Because the canonical exact-cache profile deliberately admits one live graph session, exercise the additional pressure shape as a separate synthetic 4K/two-logical-actor cache profile with interleaved misses, forced eviction, one cancellation, and a batch working set larger than `slot_count`; do not present it as public two-session graph support.
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 ```sh
 make tests/test_cuda_laguna_stream tests/test_cuda_laguna_model
 DS4_TEST_MODEL="$LAGUNA_MODEL" \
-  ./tests/test_cuda_laguna_stream --case warm-stability --case session-pressure
+  ./tests/test_cuda_laguna_stream --case session-pressure
+DS4_TEST_MODEL="$LAGUNA_MODEL" \
+  ./tests/test_cuda_laguna_model --mode streamed --case warm-stability
 ```
 
 Expected: at least one lifetime counter, cache pin, or allocation teardown assertion is absent or fails under forced pressure.
 
-- [ ] **Step 3: Fix lifetime ownership at the narrowest seam**
+- [x] **Step 3: Fix lifetime ownership at the narrowest seam**
 
 Make engine-lifetime cache allocations survive session churn, while all session/request graph, KV, pins, temporary grouping state, cancellation state, and request telemetry return to their declared baseline. Keep engine lifetime and session lifetime categories distinct. Do not clear monotonic cache/I/O counters between sessions.
 
-- [ ] **Step 4: Add the focused CUDA target**
+- [x] **Step 4: Add the focused CUDA target**
 
 Define `make test-cuda-laguna-streaming` to run pure policy, compact CUDA startup/I/O/fault/advice/stability/pressure, and streamed oracle suites. Keep `test-cuda-laguna-resident` separate so the baseline remains independently executable.
 
 - [ ] **Step 5: Reach checkpoint D**
 
+The focused gate now refuses a custom `DS4_LOCK_FILE`, preflights the
+production `/tmp/ds4.lock` before any verifier or cold-preparation work, and
+lets every model child acquire that same production lock. Checkpoint D remains
+open until the gate is run in a DGX maintenance window with the production
+instance lock available; isolated-lock hardware diagnostics are not promoted
+as acceptance evidence.
+
 ```sh
-DS4_TEST_MODEL="$LAGUNA_MODEL" make test-cuda-laguna-streaming
+DS4_TEST_MODEL="$LAGUNA_MODEL" \
+DS4_QUALIFICATION_PLAN="$LAGUNA_QUALIFICATION_PLAN" \
+DS4_QUALIFICATION_PLAN_SHA256="$LAGUNA_QUALIFICATION_PLAN_SHA256" \
+LAGUNA_TOKENIZER_RUNTIME_COMMIT="$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
+  make test-cuda-laguna-streaming
 make cuda-regression
 make test
 ```
 
 Expected: all pass; pressure changes I/O/timing/eviction counters only, every slot/pin/capacity invariant reconciles, and no accepted output changes.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```sh
 git add tests/test_cuda_laguna_stream.c tests/test_cuda_laguna_model.c \

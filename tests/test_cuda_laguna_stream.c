@@ -12,6 +12,7 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 #include "ds4_laguna_stream.h"
+#include "ds4_plan_io.h"
 #include "ds4_runtime.h"
 
 #include <cuda_runtime.h>
@@ -28,6 +29,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -5408,6 +5410,476 @@ static int run_model_page_advice(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
+static bool nvml_snapshot_string_valid(const char *value, size_t capacity) {
+    return value && capacity != 0u && value[0] != '\0' &&
+        memchr(value, '\0', capacity) != NULL;
+}
+
+static const ds4_runtime_nvml_process_sample *nvml_snapshot_process(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot,
+        uint32_t pid) {
+    if (!snapshot || pid == 0u ||
+        snapshot->process_count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return NULL;
+    }
+    const ds4_runtime_nvml_process_sample *found = NULL;
+    for (size_t i = 0; i < snapshot->process_count; i++) {
+        if (snapshot->processes[i].pid != pid) continue;
+        if (found) return NULL;
+        found = &snapshot->processes[i];
+    }
+    return found;
+}
+
+static ds4_runtime_nvml_process_sample *nvml_snapshot_process_mutable(
+        ds4_gpu_nvml_inventory_snapshot *snapshot,
+        uint32_t pid) {
+    return (ds4_runtime_nvml_process_sample *)
+        nvml_snapshot_process(snapshot, pid);
+}
+
+static bool nvml_snapshot_contract(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot) {
+    if (!snapshot || snapshot->api_version != 2u ||
+        strcmp(snapshot->api_identity,
+               "nvmlDeviceGetComputeRunningProcesses_v2") != 0 ||
+        !nvml_snapshot_string_valid(
+            snapshot->library_version,
+            sizeof(snapshot->library_version)) ||
+        !nvml_snapshot_string_valid(
+            snapshot->device_uuid, sizeof(snapshot->device_uuid)) ||
+        strncmp(snapshot->device_uuid, "GPU-", 4u) != 0 ||
+        snapshot->process_count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return false;
+    }
+    for (size_t i = 0; i < snapshot->process_count; i++) {
+        if (snapshot->processes[i].pid == 0u) return false;
+        for (size_t j = i + 1u; j < snapshot->process_count; j++) {
+            if (snapshot->processes[i].pid == snapshot->processes[j].pid) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool nvml_snapshot_binding_equal(
+        const ds4_gpu_nvml_inventory_snapshot *a,
+        const ds4_gpu_nvml_inventory_snapshot *b) {
+    return nvml_snapshot_contract(a) && nvml_snapshot_contract(b) &&
+        a->api_version == b->api_version &&
+        strcmp(a->api_identity, b->api_identity) == 0 &&
+        strcmp(a->library_version, b->library_version) == 0 &&
+        strcmp(a->device_uuid, b->device_uuid) == 0;
+}
+
+static int hexadecimal_nibble(char byte) {
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    return -1;
+}
+
+static bool capture_running_build_identity(
+        uint8_t out[DS4_RUNTIME_BUILD_IDENTITY_BYTES]) {
+    if (!out) return false;
+    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = {0};
+    char error[192] = {0};
+    bool ok = fstat(fd, &st) == 0 && st.st_size > 0 &&
+        ds4_plan_io_sha256_fd(
+            fd, (uint64_t)st.st_size, digest, error, sizeof(error));
+    if (close(fd) != 0) ok = false;
+    if (!ok) {
+        if (error[0]) {
+            fprintf(stderr, "FAIL: hash running executable: %s\n", error);
+        }
+        return false;
+    }
+    for (size_t i = 0; i < DS4_RUNTIME_BUILD_IDENTITY_BYTES; i++) {
+        const int high = hexadecimal_nibble(digest[2u * i]);
+        const int low = hexadecimal_nibble(digest[2u * i + 1u]);
+        if (high < 0 || low < 0) return false;
+        out[i] = (uint8_t)((unsigned)high * 16u + (unsigned)low);
+    }
+    return digest[2u * DS4_RUNTIME_BUILD_IDENTITY_BYTES] == '\0';
+}
+
+static bool nvml_snapshot_set_own_bytes(
+        ds4_gpu_nvml_inventory_snapshot *snapshot,
+        uint32_t own_pid,
+        uint64_t used_bytes) {
+    ds4_runtime_nvml_process_sample *process =
+        nvml_snapshot_process_mutable(snapshot, own_pid);
+    if (!process) return false;
+    process->used_bytes = used_bytes;
+    process->used_bytes_known = true;
+    return true;
+}
+
+static bool nvml_snapshots_add_or_change_peer(
+        const ds4_gpu_nvml_inventory_snapshot *frozen,
+        ds4_gpu_nvml_inventory_snapshot *before,
+        ds4_gpu_nvml_inventory_snapshot *inside,
+        ds4_gpu_nvml_inventory_snapshot *after,
+        uint32_t own_pid) {
+    if (!frozen || !before || !inside || !after) return false;
+    for (size_t i = 0; i < frozen->process_count; i++) {
+        const ds4_runtime_nvml_process_sample *baseline =
+            &frozen->processes[i];
+        if (baseline->pid == own_pid || !baseline->used_bytes_known ||
+            baseline->used_bytes > UINT64_MAX - 4096u) {
+            continue;
+        }
+        const uint64_t changed = baseline->used_bytes + 4096u;
+        ds4_runtime_nvml_process_sample *before_peer =
+            nvml_snapshot_process_mutable(before, baseline->pid);
+        ds4_runtime_nvml_process_sample *inside_peer =
+            nvml_snapshot_process_mutable(inside, baseline->pid);
+        ds4_runtime_nvml_process_sample *after_peer =
+            nvml_snapshot_process_mutable(after, baseline->pid);
+        if (!before_peer || !inside_peer || !after_peer) return false;
+        before_peer->used_bytes = changed;
+        inside_peer->used_bytes = changed;
+        after_peer->used_bytes = changed;
+        before_peer->used_bytes_known = true;
+        inside_peer->used_bytes_known = true;
+        after_peer->used_bytes_known = true;
+        return true;
+    }
+
+    if (before->process_count >= DS4_GPU_NVML_PROCESS_CAPACITY ||
+        inside->process_count >= DS4_GPU_NVML_PROCESS_CAPACITY ||
+        after->process_count >= DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return false;
+    }
+    uint32_t peer_pid = UINT32_MAX;
+    while (peer_pid != 0u &&
+           (peer_pid == own_pid || nvml_snapshot_process(frozen, peer_pid) ||
+            nvml_snapshot_process(before, peer_pid) ||
+            nvml_snapshot_process(inside, peer_pid) ||
+            nvml_snapshot_process(after, peer_pid))) {
+        peer_pid--;
+    }
+    if (peer_pid == 0u) return false;
+    const ds4_runtime_nvml_process_sample peer = {
+        .pid = peer_pid,
+        .used_bytes = 4096u,
+        .used_bytes_known = true,
+    };
+    before->processes[before->process_count++] = peer;
+    inside->processes[inside->process_count++] = peer;
+    after->processes[after->process_count++] = peer;
+    return true;
+}
+
+/* Live Task 13 integration.  Python owns descriptor-bound safe-union cold
+ * preparation, so this case intentionally does not issue whole-file advice.
+ * It consumes an inherited qualification fd when supplied, captures NVML
+ * before the first CUDA call, and then proves the engine's synchronized
+ * checkpoint binds real process/model evidence to the runtime tracker. */
+static int run_external_attribution(void) {
+    const char *model = getenv("DS4_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
+        return 1;
+    }
+
+    ds4_gpu_nvml_inventory_snapshot frozen_pre_child;
+    memset(&frozen_pre_child, 0, sizeof(frozen_pre_child));
+    /* This must remain the first operation capable of consulting the GPU. */
+    const bool frozen_captured =
+        ds4_gpu_nvml_inventory_capture(&frozen_pre_child) != 0;
+    CHECK(frozen_captured && nvml_snapshot_contract(&frozen_pre_child),
+          "pre-child inventory uses immutable process-scoped NVML v2");
+    const uint32_t own_pid = (uint32_t)getpid();
+    CHECK(frozen_captured && own_pid != 0u &&
+              nvml_snapshot_process(&frozen_pre_child, own_pid) == NULL,
+          "pre-child NVML capture creates no CUDA context for this process");
+    if (!frozen_captured || !nvml_snapshot_contract(&frozen_pre_child) ||
+        own_pid == 0u ||
+        nvml_snapshot_process(&frozen_pre_child, own_pid) != NULL) {
+        return 1;
+    }
+
+    uint8_t build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES] = {0};
+    CHECK(capture_running_build_identity(build_identity),
+          "qualification harness hashes the running executable before CUDA init");
+
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
+    bool close_model_fd = false;
+    if (!model_fd_set) {
+        model_fd = open(model, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        model_fd_set = model_fd >= 0;
+        close_model_fd = model_fd_set;
+    }
+    ds4_laguna_file_identity opened_identity;
+    memset(&opened_identity, 0, sizeof(opened_identity));
+    CHECK(model_fd_set && capture_file_identity(model_fd, &opened_identity),
+          "external attribution binds the already-opened model descriptor");
+    if (!model_fd_set || opened_identity.size_bytes == 0u) {
+        if (close_model_fd) close(model_fd);
+        return 1;
+    }
+
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    CHECK(system_page_size > 0 &&
+              ((uint64_t)system_page_size &
+               ((uint64_t)system_page_size - 1u)) == 0u,
+          "external attribution obtains a power-of-two system page size");
+    if (system_page_size <= 0) {
+        if (close_model_fd) close(model_fd);
+        return 1;
+    }
+    const uint64_t page_size = (uint64_t)system_page_size;
+    CHECK(opened_identity.size_bytes % page_size != 0u,
+          "pinned Laguna artifact has a partial final page for ceil accounting");
+
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    const ds4_engine_options options = {
+        .model_path = model,
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = 32768,
+        .prefill_chunk = 4096,
+        .session_slots = 1,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes =
+            UINT64_C(8) * 1024u * 1024u * 1024u,
+        .ssd_streaming_cache_bytes_set = true,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = true,
+    };
+    ds4_engine *engine = NULL;
+    CHECK(ds4_engine_open(&engine, &options) == 0 && engine != NULL,
+          "real Laguna compact engine opens after pre-child inventory capture");
+    if (!engine) goto cleanup;
+
+    ds4_gpu_laguna_compact_test_snapshot compact;
+    memset(&compact, 0, sizeof(compact));
+    const bool compact_captured =
+        ds4_gpu_test_laguna_compact_active_snapshot(&compact);
+    CHECK(compact_captured && compact.model_map != NULL &&
+              compact.model_size == opened_identity.size_bytes &&
+              identities_equal(&compact.model_identity, &opened_identity),
+          "external checkpoint starts from the exact compact fd/mapping identity");
+    if (!compact_captured || !compact.model_map || compact.model_size == 0u) {
+        goto cleanup_engine;
+    }
+
+    /* Demand full-page tail accounting: faulting the final file byte makes the
+     * partial last page resident, but the physical charge is one whole page. */
+    const volatile unsigned char tail_byte =
+        ((const volatile unsigned char *)compact.model_map)[
+            compact.model_size - 1u];
+    (void)tail_byte;
+    CHECK(cudaDeviceSynchronize() == cudaSuccess,
+          "external checkpoint begins with all compact CUDA work synchronized");
+
+    ds4_engine_laguna_external_checkpoint_observation real;
+    memset(&real, 0, sizeof(real));
+    const ds4_runtime_status real_status =
+        ds4_engine_laguna_external_checkpoint(
+            engine, &frozen_pre_child, build_identity, &real);
+    CHECK(real_status == DS4_RUNTIME_STATUS_OK &&
+              real.sample.failure == DS4_RUNTIME_EXTERNAL_FAILURE_NONE &&
+              real.sample.attributed_valid &&
+              real.sample.attributed_generation != 0u,
+          "live synchronized external checkpoint reconciles successfully");
+
+    const ds4_runtime_nvml_process_sample *inside_process =
+        nvml_snapshot_process(&real.inside_ds4, own_pid);
+    CHECK(nvml_snapshot_binding_equal(
+              &frozen_pre_child, &real.checkpoint_before) &&
+              nvml_snapshot_binding_equal(
+                  &frozen_pre_child, &real.inside_ds4) &&
+              nvml_snapshot_binding_equal(
+                  &frozen_pre_child, &real.checkpoint_after),
+          "all live inventories bind one NVML v2 symbol, library, and GPU UUID");
+    CHECK(inside_process && inside_process->used_bytes_known &&
+              real.sample.process_id == own_pid &&
+              real.sample.nvml_process_bytes == inside_process->used_bytes &&
+              real.sample.nvml_process_bytes >=
+                  real.sample.tracked_cuda_physical_bytes &&
+              real.sample.cuda_library_unattributed_bytes ==
+                  real.sample.nvml_process_bytes -
+                      real.sample.tracked_cuda_physical_bytes,
+          "process-scoped inside-DS4 NVML bytes are the CUDA attribution source");
+    CHECK(real.sample.tracked_cuda_physical_baseline_bytes == 0u &&
+              real.sample.nvml_process_baseline_present &&
+              real.sample.nvml_process_baseline_bytes != 0u,
+          "pre-allocation baseline still charges an existing CUDA context/library");
+    CHECK(strcmp(real.sample.nvml_library_version,
+                 frozen_pre_child.library_version) == 0 &&
+              strcmp(real.sample.device_uuid,
+                     frozen_pre_child.device_uuid) == 0 &&
+              real.sample.nvml_api_version == frozen_pre_child.api_version &&
+              real.sample.unrelated_process_inventory_stable,
+          "committed sample preserves raw NVML identity and peer stability");
+
+    const uint64_t rounded_model_bytes =
+        (opened_identity.size_bytes + page_size - 1u) & ~(page_size - 1u);
+    CHECK(identities_equal(&real.model_identity, &opened_identity) &&
+              real.model_map_base == (uint64_t)(uintptr_t)compact.model_map &&
+              real.model_map_bytes == compact.model_size &&
+              real.model_file_offset == 0u,
+          "smaps/mincore evidence names the exact descriptor mapping at file offset zero");
+    CHECK(real.sample.smaps_model_device_major ==
+                  (uint32_t)major((dev_t)opened_identity.device) &&
+              real.sample.smaps_model_device_minor ==
+                  (uint32_t)minor((dev_t)opened_identity.device) &&
+              real.sample.smaps_model_inode == opened_identity.inode &&
+              real.sample.smaps_model_vma_count != 0u,
+          "smaps model VMAs bind the opened descriptor device and inode");
+    CHECK(real.model_source_page_size == page_size &&
+              real.model_source_mapped_page_bytes == rounded_model_bytes &&
+              real.model_source_resident_bytes >= page_size &&
+              real.model_source_resident_bytes % page_size == 0u &&
+              real.model_source_resident_bytes <= rounded_model_bytes,
+          "mincore charges every resident bit as one full physical page including the tail");
+
+    const uint64_t unattributed_limit =
+        UINT64_C(512) * 1024u * 1024u;
+    CHECK(real.sample.host_library_unattributed_bytes <=
+                  unattributed_limit &&
+              real.sample.cuda_library_unattributed_bytes <=
+                  unattributed_limit,
+          "live host and CUDA residuals each satisfy the exact 512 MiB ceiling");
+    CHECK(memcmp(real.observed_build_identity, build_identity,
+                 sizeof(build_identity)) == 0,
+          "live checkpoint binds the executable digest observed by the harness");
+
+    ds4_runtime_snapshot real_runtime;
+    ds4_runtime_allocation_record
+        real_records[MODEL_PAGE_ADVICE_RECORD_CAPACITY];
+    size_t real_required = 0u;
+    memset(&real_runtime, 0, sizeof(real_runtime));
+    memset(real_records, 0, sizeof(real_records));
+    CHECK(ds4_test_engine_laguna_runtime_snapshot(
+              engine, &real_runtime, real_records,
+              ARRAY_LEN(real_records), &real_required) &&
+              real_required != 0u &&
+              memcmp(&real_runtime.external_sample,
+                     &real.sample, sizeof(real.sample)) == 0 &&
+              real_runtime.report_current[
+                  DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ==
+                  real.model_source_resident_bytes,
+          "engine runtime snapshot publishes the complete reconciled live sample");
+
+    /* Force all three own-process values to differ.  Peers and every non-NVML
+     * evidence source remain real, proving the inside capture is selected
+     * rather than either harness bracket or a device-wide free-memory delta. */
+    ds4_gpu_nvml_inventory_snapshot injected_before = real.inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot injected_inside = real.inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot injected_after = real.inside_ds4;
+    uint64_t before_bytes = 0u;
+    uint64_t inside_bytes = 0u;
+    uint64_t after_bytes = 0u;
+    const bool injected_values_ready = inside_process &&
+        checked_add_u64_test(
+            inside_process->used_bytes, page_size, &before_bytes) &&
+        checked_add_u64_test(
+            inside_process->used_bytes, 2u * page_size, &inside_bytes) &&
+        checked_add_u64_test(
+            inside_process->used_bytes, 3u * page_size, &after_bytes) &&
+        nvml_snapshot_set_own_bytes(
+            &injected_before, own_pid, before_bytes) &&
+        nvml_snapshot_set_own_bytes(
+            &injected_inside, own_pid, inside_bytes) &&
+        nvml_snapshot_set_own_bytes(
+            &injected_after, own_pid, after_bytes);
+    CHECK(injected_values_ready &&
+              ds4_test_engine_laguna_external_checkpoint_inject_nvml_once(
+                  &injected_before, &injected_inside, &injected_after),
+          "test seam freezes three distinct one-shot own-process NVML values");
+
+    ds4_engine_laguna_external_checkpoint_observation selected;
+    memset(&selected, 0, sizeof(selected));
+    const ds4_runtime_status selected_status = injected_values_ready
+        ? ds4_engine_laguna_external_checkpoint(
+              engine, &frozen_pre_child, build_identity, &selected)
+        : DS4_RUNTIME_STATUS_UNSAFE;
+    CHECK(selected_status == DS4_RUNTIME_STATUS_OK &&
+              selected.sample.attributed_valid &&
+              selected.sample.nvml_process_bytes == inside_bytes &&
+              selected.sample.nvml_process_bytes != before_bytes &&
+              selected.sample.nvml_process_bytes != after_bytes &&
+              selected.sample.attributed_generation ==
+                  real.sample.attributed_generation + 1u,
+          "only the exact inside-DS4 NVML value advances external attribution");
+
+    ds4_runtime_snapshot committed_runtime;
+    ds4_runtime_allocation_record
+        committed_records[MODEL_PAGE_ADVICE_RECORD_CAPACITY];
+    size_t committed_required = 0u;
+    memset(&committed_runtime, 0, sizeof(committed_runtime));
+    memset(committed_records, 0, sizeof(committed_records));
+    CHECK(ds4_test_engine_laguna_runtime_snapshot(
+              engine, &committed_runtime, committed_records,
+              ARRAY_LEN(committed_records), &committed_required) &&
+              memcmp(&committed_runtime.external_sample,
+                     &selected.sample, sizeof(selected.sample)) == 0,
+          "successful injected-source checkpoint commits one new generation");
+
+    ds4_gpu_nvml_inventory_snapshot failed_before = selected.inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot failed_inside = selected.inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot failed_after = selected.inside_ds4;
+    const bool peer_changed = nvml_snapshots_add_or_change_peer(
+        &frozen_pre_child, &failed_before, &failed_inside, &failed_after,
+        own_pid);
+    CHECK(peer_changed &&
+              ds4_test_engine_laguna_external_checkpoint_inject_nvml_once(
+                  &failed_before, &failed_inside, &failed_after),
+          "test seam injects a narrow-window-stable peer change from pre-child baseline");
+
+    ds4_engine_laguna_external_checkpoint_observation rejected;
+    memset(&rejected, 0, sizeof(rejected));
+    const ds4_runtime_status rejected_status = peer_changed
+        ? ds4_engine_laguna_external_checkpoint(
+              engine, &frozen_pre_child, build_identity, &rejected)
+        : DS4_RUNTIME_STATUS_OK;
+    CHECK(rejected_status == DS4_RUNTIME_STATUS_UNSAFE &&
+              !rejected.sample.attributed_valid &&
+              rejected.sample.failure ==
+                  DS4_RUNTIME_EXTERNAL_FAILURE_UNRELATED_PROCESS_CHANGED,
+          "peer appearance or byte change since pre-child invalidates the checkpoint");
+
+    ds4_runtime_snapshot failed_runtime;
+    ds4_runtime_allocation_record
+        failed_records[MODEL_PAGE_ADVICE_RECORD_CAPACITY];
+    size_t failed_required = 0u;
+    memset(&failed_runtime, 0, sizeof(failed_runtime));
+    memset(failed_records, 0, sizeof(failed_records));
+    CHECK(ds4_test_engine_laguna_runtime_snapshot(
+              engine, &failed_runtime, failed_records,
+              ARRAY_LEN(failed_records), &failed_required) &&
+              failed_required == committed_required &&
+              memcmp(&failed_runtime.external_sample,
+                     &committed_runtime.external_sample,
+                     sizeof(failed_runtime.external_sample)) == 0 &&
+              memcmp(failed_runtime.report_current,
+                     committed_runtime.report_current,
+                     sizeof(failed_runtime.report_current)) == 0 &&
+              failed_runtime.qualification_total_current ==
+                  committed_runtime.qualification_total_current &&
+              failed_runtime.qualification_total_peak ==
+                  committed_runtime.qualification_total_peak &&
+              failed_runtime.violation ==
+                  DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION,
+          "failed checkpoint preserves the last sample/totals and latches attribution unsafe");
+
+cleanup_engine:
+    ds4_engine_close(engine);
+cleanup:
+    restore_forbidden_environment(&saved);
+    if (close_model_fd) close(model_fd);
+    return g_failures == 0 ? 0 : 1;
+}
+
 static int run_cache_faults(void) {
     cache_cuda_fixture fixture;
     CHECK(cache_cuda_fixture_open(&fixture),
@@ -6153,7 +6625,8 @@ static void usage(const char *program) {
             "model-cleanup-release-unsafe|"
             "model-teardown-second-recoverable|cache-validation|cache-io|"
             "cache-faults|cache-unsafe|cache-unsafe-race|"
-            "prefill-allocation|page-advice|model-page-advice\n",
+            "prefill-allocation|page-advice|model-page-advice|"
+            "external-attribution\n",
             program);
 }
 
@@ -6195,6 +6668,8 @@ static int run_named_case(const char *name) {
         return run_page_advice();
     } else if (strcmp(name, "model-page-advice") == 0) {
         return run_model_page_advice();
+    } else if (strcmp(name, "external-attribution") == 0) {
+        return run_external_attribution();
     }
     return -1;
 }

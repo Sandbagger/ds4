@@ -279,6 +279,7 @@ fi
 assert_retained_identity verifier
 
 if [ "$mode" = streaming ]; then
+    cold_prepare_exact_fd stream-startup
     stream_cases=(
         startup
         cache-validation

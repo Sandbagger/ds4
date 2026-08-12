@@ -10,9 +10,12 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import ctypes
+import errno
 import hashlib
 import json
 import math
+import mmap
 import os
 import platform
 import re
@@ -83,6 +86,9 @@ PLACEHOLDER_RE = re.compile(
 )
 UINT64_MAX = (1 << 64) - 1
 IJSON_SAFE_INTEGER_MAX = (1 << 53) - 1
+QUALIFICATION_PLAN_MAX_BYTES = 256 << 20
+UNAVOIDABLE_RESIDENCY_LIMIT_BYTES = 2 << 30
+NVML_COMPUTE_API = "nvmlDeviceGetComputeRunningProcesses_v2"
 
 TokenCounter = Callable[[bytes], int]
 
@@ -663,6 +669,533 @@ def _same_stat(first: os.stat_result, second: os.stat_result) -> bool:
         second.st_size,
         second.st_mtime_ns,
     )
+
+
+def _uint64_int(value: Any, label: str, *, positive: bool = False) -> int:
+    return int(_decimal(value, label, positive=positive))
+
+
+def _open_regular_nofollow(path: Path | str, label: str) -> tuple[int, os.stat_result]:
+    source = Path(path)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError(f"{label} cannot be opened without following symlinks")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"{label} cannot be opened without following symlinks: {exc}"
+        ) from exc
+    try:
+        identity = os.fstat(descriptor)
+        if not stat.S_ISREG(identity.st_mode):
+            raise ValueError(f"{label} must be an opened regular file")
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_regular_nofollow(path: Path | str, label: str) -> bytes:
+    descriptor, before = _open_regular_nofollow(path, label)
+    try:
+        if before.st_size <= 0 or before.st_size > QUALIFICATION_PLAN_MAX_BYTES:
+            raise ValueError(f"{label} size is outside the qualification bound")
+        payload = bytearray()
+        offset = 0
+        while offset < before.st_size:
+            try:
+                chunk = os.pread(
+                    descriptor,
+                    min(8 << 20, before.st_size - offset),
+                    offset,
+                )
+            except OSError as exc:
+                raise ValueError(f"cannot read opened {label}: {exc}") from exc
+            if not chunk:
+                raise ValueError(f"opened {label} ended before its recorded size")
+            payload.extend(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+        if not _same_stat(before, after):
+            raise ValueError(f"{label} identity changed while reading")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
+def _qualification_model(value: Any) -> Mapping[str, Any]:
+    required = {
+        "device",
+        "filename",
+        "inode",
+        "mtime_ns",
+        "repository",
+        "revision",
+        "sha256",
+        "size_bytes",
+    }
+    model = _mapping(value, "qualification plan model", required)
+    if model["filename"] != MODEL_FILENAME:
+        raise ValueError("qualification plan model filename is not Laguna")
+    if model["repository"] != MODEL_REPOSITORY:
+        raise ValueError("qualification plan model repository is not pinned")
+    if model["revision"] != MODEL_REVISION:
+        raise ValueError("qualification plan model revision is not pinned")
+    _sha256(model["sha256"], "qualification plan model SHA-256")
+    for key in ("device", "inode", "mtime_ns", "size_bytes"):
+        _decimal(
+            model[key],
+            f"qualification plan model {key}",
+            positive=True,
+        )
+    return model
+
+
+def _ledger_safe_page_ranges(
+    ledger: Any,
+    *,
+    page_size: int,
+    model_size: int,
+) -> list[tuple[int, int]]:
+    if not isinstance(ledger, Mapping):
+        raise ValueError("qualification plan ledger must be an object")
+    if "file_size" not in ledger or "tensor_ranges" not in ledger:
+        raise ValueError("qualification plan ledger lacks file size or tensor ranges")
+    ledger_size_text = _decimal(
+        ledger["file_size"], "qualification plan ledger file size", positive=True
+    )
+    if int(ledger_size_text) != model_size:
+        raise ValueError("qualification plan ledger and model sizes do not match")
+    tensors = _list(ledger["tensor_ranges"], "qualification plan tensor ranges")
+    if not tensors:
+        raise ValueError("qualification plan tensor range ledger is empty")
+
+    source_ranges: list[tuple[int, int]] = []
+    safe_ranges: list[tuple[int, int]] = []
+    for index, raw in enumerate(tensors):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"qualification tensor range {index} must be an object")
+        missing = {"class", "source_offset", "source_bytes"} - set(raw)
+        if missing:
+            raise ValueError(
+                f"qualification tensor range {index} lacks {sorted(missing)[0]}"
+            )
+        if raw["class"] not in {"STATIC", "ROUTED_EXPERT"}:
+            raise ValueError(f"qualification tensor range {index} has an unknown class")
+        offset = _uint64_int(
+            raw["source_offset"], f"qualification tensor range {index} offset"
+        )
+        length = _uint64_int(
+            raw["source_bytes"],
+            f"qualification tensor range {index} bytes",
+            positive=True,
+        )
+        end = offset + length
+        if end > UINT64_MAX or end > model_size:
+            raise ValueError(f"qualification tensor range {index} exceeds the model")
+        source_ranges.append((offset, end))
+        safe_start = ((offset + page_size - 1) // page_size) * page_size
+        safe_end = (end // page_size) * page_size
+        if safe_end > safe_start:
+            safe_ranges.append((safe_start, safe_end))
+
+    source_ranges.sort()
+    for index in range(1, len(source_ranges)):
+        if source_ranges[index][0] < source_ranges[index - 1][1]:
+            raise ValueError("qualification tensor ranges overlap")
+
+    safe_ranges.sort()
+    union: list[tuple[int, int]] = []
+    for start, end in safe_ranges:
+        if not union or start > union[-1][1]:
+            union.append((start, end))
+        elif end > union[-1][1]:
+            union[-1] = (union[-1][0], end)
+    return union
+
+
+def _validated_advice_ranges(
+    ranges: Any,
+    *,
+    page_size: int,
+    model_size: int,
+) -> tuple[list[tuple[int, int]], int]:
+    if type(page_size) is not int or page_size <= 0:
+        raise ValueError("page size must be a positive integer")
+    if page_size & (page_size - 1):
+        raise ValueError("page size must be a power of two")
+    if type(model_size) is not int or model_size <= 0 or model_size > UINT64_MAX:
+        raise ValueError("model size must be a positive uint64")
+    records = _list(ranges, "safe page ranges")
+    normalized: list[tuple[int, int]] = []
+    total = 0
+    previous_end = -1
+    for index, value in enumerate(records):
+        record = _mapping(value, f"safe page range {index}", {"bytes", "offset"})
+        offset = _uint64_int(record["offset"], f"safe page range {index} offset")
+        length = _uint64_int(
+            record["bytes"], f"safe page range {index} bytes", positive=True
+        )
+        end = offset + length
+        if offset % page_size or length % page_size:
+            raise ValueError(f"safe page range {index} is not page aligned")
+        if end > UINT64_MAX or end > model_size:
+            raise ValueError(f"safe page range {index} exceeds the model")
+        if offset <= previous_end:
+            raise ValueError("safe page ranges are not a normalized union")
+        total += length
+        if total > UINT64_MAX:
+            raise ValueError("safe page range coverage overflows uint64")
+        normalized.append((offset, length))
+        previous_end = end
+    return normalized, total
+
+
+def _validate_qualification_plan(
+    value: Any,
+) -> tuple[Mapping[str, Any], list[Mapping[str, Any]], int, int, int]:
+    required = {
+        "allocation",
+        "ledger",
+        "ledger_sha256",
+        "model",
+        "page_cache",
+        "schema",
+    }
+    plan = _mapping(value, "qualification plan", required)
+    if plan["schema"] != "ds4.laguna.qualification-plan/v1":
+        raise ValueError("qualification plan schema is not supported")
+    if not isinstance(plan["allocation"], Mapping):
+        raise ValueError("qualification plan allocation must be an object")
+
+    ledger_digest = _sha256(
+        plan["ledger_sha256"], "qualification plan ledger SHA-256"
+    )
+    observed_ledger_digest = _sha256_bytes(canonical_json_bytes(plan["ledger"]))
+    if observed_ledger_digest != ledger_digest:
+        raise ValueError("qualification plan ledger digest mismatch")
+
+    model = _qualification_model(plan["model"])
+    model_size = _uint64_int(
+        model["size_bytes"], "qualification plan model size", positive=True
+    )
+    page_cache = _mapping(
+        plan["page_cache"],
+        "qualification plan page cache",
+        {
+            "eligible_unique_bytes",
+            "mapped_page_bytes",
+            "page_size",
+            "ranges",
+            "unavoidable_bytes",
+        },
+    )
+    page_size = _uint64_int(
+        page_cache["page_size"], "qualification plan page size", positive=True
+    )
+    if page_size & (page_size - 1):
+        raise ValueError("qualification plan page size must be a power of two")
+    mapped_page_bytes = _uint64_int(
+        page_cache["mapped_page_bytes"],
+        "qualification plan mapped page bytes",
+        positive=True,
+    )
+    expected_mapped = ((model_size + page_size - 1) // page_size) * page_size
+    if expected_mapped > UINT64_MAX or mapped_page_bytes != expected_mapped:
+        raise ValueError("qualification plan mapped page coverage is inconsistent")
+
+    normalized, covered_bytes = _validated_advice_ranges(
+        page_cache["ranges"], page_size=page_size, model_size=model_size
+    )
+    eligible_bytes = _uint64_int(
+        page_cache["eligible_unique_bytes"],
+        "qualification plan eligible bytes",
+    )
+    if eligible_bytes != covered_bytes:
+        raise ValueError("qualification plan eligible coverage does not match its ranges")
+    if eligible_bytes > mapped_page_bytes:
+        raise ValueError("qualification plan eligible coverage exceeds the mapping")
+    unavoidable_bytes = mapped_page_bytes - eligible_bytes
+    recorded_unavoidable = _uint64_int(
+        page_cache["unavoidable_bytes"],
+        "qualification plan unavoidable bytes",
+    )
+    if recorded_unavoidable != unavoidable_bytes:
+        raise ValueError("qualification plan unavoidable residency is inconsistent")
+    if unavoidable_bytes > UNAVOIDABLE_RESIDENCY_LIMIT_BYTES:
+        raise ValueError("unavoidable residency exceeds the 2 GiB limit")
+
+    expected_union = _ledger_safe_page_ranges(
+        plan["ledger"], page_size=page_size, model_size=model_size
+    )
+    observed_union = [(offset, offset + length) for offset, length in normalized]
+    if observed_union != expected_union:
+        raise ValueError("page cache does not match the ledger safe tensor union")
+    ranges = _list(page_cache["ranges"], "qualification plan safe page ranges")
+    return model, ranges, page_size, model_size, unavoidable_bytes
+
+
+def _posix_fadvise_dontneed(descriptor: int, offset: int, length: int) -> None:
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        raise OSError(errno.ENOSYS, "posix_fadvise DONTNEED is unavailable")
+    os.posix_fadvise(descriptor, offset, length, os.POSIX_FADV_DONTNEED)
+
+
+def advise_safe_page_ranges(
+    descriptor: int,
+    ranges: Any,
+    *,
+    page_size: int,
+    model_size: int,
+    advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
+) -> dict[str, Any]:
+    """Advise every validated safe range and retain exact failure accounting."""
+    if type(descriptor) is not int or descriptor < 0:
+        raise ValueError("cold-preparation descriptor is invalid")
+    normalized, eligible_bytes = _validated_advice_ranges(
+        ranges, page_size=page_size, model_size=model_size
+    )
+    report: dict[str, Any] = {
+        "eligible_calls": len(normalized),
+        "eligible_bytes": str(eligible_bytes),
+        "attempted_calls": 0,
+        "attempted_bytes": "0",
+        "successful_calls": 0,
+        "successful_bytes": "0",
+        "failed_calls": 0,
+        "failed_bytes": "0",
+        "errno_buckets": {},
+    }
+    attempted_bytes = 0
+    successful_bytes = 0
+    failed_bytes = 0
+    for offset, length in normalized:
+        report["attempted_calls"] += 1
+        attempted_bytes += length
+        try:
+            advise(descriptor, offset, length)
+        except OSError as exc:
+            report["failed_calls"] += 1
+            failed_bytes += length
+            bucket = errno.errorcode.get(exc.errno, "UNKNOWN")
+            buckets = report["errno_buckets"]
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+        else:
+            report["successful_calls"] += 1
+            successful_bytes += length
+    report["attempted_bytes"] = str(attempted_bytes)
+    report["successful_bytes"] = str(successful_bytes)
+    report["failed_bytes"] = str(failed_bytes)
+    return report
+
+
+def sample_exact_inode_residency(
+    descriptor: int,
+    file_size: int,
+    page_size: int,
+) -> int:
+    """Count resident pages for one opened inode through mincore(2)."""
+    if page_size != mmap.PAGESIZE:
+        raise ValueError("qualification plan page size differs from the host page size")
+    if file_size <= 0:
+        raise ValueError("cannot sample an empty model inode")
+    page_count = (file_size + page_size - 1) // page_size
+    vector = (ctypes.c_ubyte * page_count)()
+    mapping = mmap.mmap(
+        descriptor,
+        file_size,
+        flags=mmap.MAP_PRIVATE,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    anchor = None
+    try:
+        anchor = ctypes.c_char.from_buffer(mapping)
+        libc = ctypes.CDLL(None, use_errno=True)
+        mincore = libc.mincore
+        mincore.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_ubyte),
+        ]
+        mincore.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        if mincore(ctypes.addressof(anchor), file_size, vector) != 0:
+            number = ctypes.get_errno()
+            raise OSError(number, os.strerror(number))
+        return sum(1 for value in vector if value & 1) * page_size
+    finally:
+        del anchor
+        mapping.close()
+
+
+def _model_identity_matches(
+    recorded: Mapping[str, Any],
+    observed: os.stat_result,
+) -> None:
+    for key, actual in (
+        ("device", observed.st_dev),
+        ("inode", observed.st_ino),
+        ("size_bytes", observed.st_size),
+        ("mtime_ns", observed.st_mtime_ns),
+    ):
+        if recorded[key] != str(actual):
+            raise ValueError(f"model identity mismatch: {key}")
+
+
+def cold_prepare_from_plan(
+    model_path: Path | str,
+    plan_path: Path | str,
+    expected_plan_sha256: str,
+    *,
+    advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
+    sample_residency: Callable[[int, int, int], int] = sample_exact_inode_residency,
+) -> dict[str, Any]:
+    """Cold-prepare only the plan's descriptor-bound, safe full-page union."""
+    expected_digest = _sha256(
+        expected_plan_sha256, "expected qualification plan SHA-256"
+    )
+    plan_bytes = _read_regular_nofollow(plan_path, "qualification plan")
+    observed_digest = _sha256_bytes(plan_bytes)
+    if observed_digest != expected_digest:
+        raise ValueError("qualification plan digest mismatch")
+    try:
+        plan_text = plan_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("qualification plan is not UTF-8") from exc
+    plan = loads_strict(plan_text)
+    if not isinstance(plan, Mapping):
+        raise ValueError("qualification plan root must be an object")
+    if canonical_json_bytes(plan) != plan_bytes:
+        raise ValueError("qualification plan bytes are not canonical")
+    model, ranges, page_size, model_size, unavoidable_bytes = (
+        _validate_qualification_plan(plan)
+    )
+
+    descriptor, before = _open_regular_nofollow(model_path, "model")
+    try:
+        if Path(model_path).name != model["filename"]:
+            raise ValueError("opened model filename does not match the plan")
+        _model_identity_matches(model, before)
+        report = advise_safe_page_ranges(
+            descriptor,
+            ranges,
+            page_size=page_size,
+            model_size=model_size,
+            advise=advise,
+        )
+        after_advice = os.fstat(descriptor)
+        if not _same_stat(before, after_advice):
+            raise ValueError("model identity changed during cold preparation")
+        resident_bytes = sample_residency(descriptor, model_size, page_size)
+        if (
+            type(resident_bytes) is not int
+            or resident_bytes < 0
+            or resident_bytes > ((model_size + page_size - 1) // page_size) * page_size
+            or resident_bytes % page_size != 0
+        ):
+            raise ValueError("exact-inode residency sample is invalid")
+        after_sample = os.fstat(descriptor)
+        if not _same_stat(before, after_sample):
+            raise ValueError("model identity changed during residency measurement")
+        _model_identity_matches(model, after_sample)
+        result = {
+            "plan_sha256": observed_digest,
+            "ledger_sha256": plan["ledger_sha256"],
+            "model_identity": dict(model),
+            "page_size": str(page_size),
+            **report,
+            "resident_bytes_after": str(resident_bytes),
+            "unavoidable_bytes": str(unavoidable_bytes),
+        }
+        if report["failed_calls"] != 0:
+            raise ValueError(
+                "cold-preparation advice failed; evidence is invalid: "
+                f"{report['errno_buckets']}"
+            )
+        return result
+    finally:
+        os.close(descriptor)
+
+
+def _nvml_inventory_by_pid(
+    value: Any,
+    label: str,
+    *,
+    gpu_uuid: str,
+) -> dict[int, int]:
+    inventory = _mapping(value, label, {"api", "gpu_uuid", "processes"})
+    if inventory["api"] != NVML_COMPUTE_API:
+        raise ValueError(f"{label} NVML API/version does not match {NVML_COMPUTE_API}")
+    if inventory["gpu_uuid"] != gpu_uuid:
+        raise ValueError(f"{label} GPU UUID does not match the qualification device")
+    processes = _list(inventory["processes"], f"{label} NVML processes")
+    by_pid: dict[int, int] = {}
+    for index, raw in enumerate(processes):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{label} NVML process {index} must be an object")
+        if "used_gpu_memory_bytes" not in raw:
+            raise ValueError(f"{label} NVML process {index} usage is missing")
+        process = _mapping(
+            raw,
+            f"{label} NVML process {index}",
+            {"pid", "used_gpu_memory_bytes"},
+        )
+        pid = _integer(process["pid"], f"{label} NVML process {index} PID")
+        if pid <= 0 or pid > 0xFFFFFFFF:
+            raise ValueError(f"{label} NVML process {index} PID is invalid")
+        usage = process["used_gpu_memory_bytes"]
+        if type(usage) is not int or usage < 0:
+            raise ValueError(f"{label} NVML process {index} usage is missing")
+        if usage == UINT64_MAX:
+            raise ValueError(f"{label} NVML process {index} usage is unknown")
+        if usage > UINT64_MAX:
+            raise ValueError(f"{label} NVML process {index} usage is invalid")
+        if pid in by_pid:
+            raise ValueError(f"{label} contains duplicate NVML process PID {pid}")
+        by_pid[pid] = usage
+    return by_pid
+
+
+def validate_nvml_checkpoint(
+    frozen_inventory: Any,
+    before_inventory: Any,
+    after_inventory: Any,
+    *,
+    ds4_pid: int,
+    gpu_uuid: str,
+) -> dict[str, Any]:
+    """Validate one process-scoped NVML v2 checkpoint without baseline math."""
+    if type(ds4_pid) is not int or ds4_pid <= 0 or ds4_pid > 0xFFFFFFFF:
+        raise ValueError("DS4 PID is invalid")
+    if not isinstance(gpu_uuid, str) or not GPU_UUID_RE.fullmatch(gpu_uuid):
+        raise ValueError("qualification GPU UUID is invalid")
+    frozen = _nvml_inventory_by_pid(
+        frozen_inventory, "frozen pre-child inventory", gpu_uuid=gpu_uuid
+    )
+    before = _nvml_inventory_by_pid(
+        before_inventory, "checkpoint-before inventory", gpu_uuid=gpu_uuid
+    )
+    after = _nvml_inventory_by_pid(
+        after_inventory, "checkpoint-after inventory", gpu_uuid=gpu_uuid
+    )
+    if ds4_pid in frozen:
+        raise ValueError("DS4 PID already exists in the frozen pre-child inventory")
+    if ds4_pid not in before or ds4_pid not in after:
+        raise ValueError("DS4 NVML process usage is missing")
+    before_other = {pid: usage for pid, usage in before.items() if pid != ds4_pid}
+    after_other = {pid: usage for pid, usage in after.items() if pid != ds4_pid}
+    if before_other != frozen or after_other != frozen:
+        raise ValueError("unrelated NVML process inventory changed")
+    if before[ds4_pid] != after[ds4_pid]:
+        raise ValueError("DS4 NVML process usage changed during the checkpoint")
+    return {
+        "api": NVML_COMPUTE_API,
+        "gpu_uuid": gpu_uuid,
+        "ds4_pid": ds4_pid,
+        "ds4_process_bytes": str(after[ds4_pid]),
+    }
 
 
 def _oracle_tokenizer_revision() -> str:

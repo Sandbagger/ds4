@@ -250,6 +250,72 @@
         "io": { "$ref": "#/$defs/io" }
       }
     },
+    "qualification_model_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "filename", "inode", "mtime_ns", "repository", "revision", "sha256", "size_bytes"],
+      "properties": {
+        "device": { "$ref": "#/$defs/positive_uint64" },
+        "filename": { "const": "laguna-s-2.1-Q4_K_M.gguf" },
+        "inode": { "$ref": "#/$defs/positive_uint64" },
+        "mtime_ns": { "$ref": "#/$defs/positive_uint64" },
+        "repository": { "const": "poolside/Laguna-S-2.1-GGUF" },
+        "revision": { "const": "706fa69799926b6afde1af9e24ca2a4923f110a1" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "$ref": "#/$defs/positive_uint64" }
+      }
+    },
+    "errno_buckets": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^(?:E[A-Z0-9_]+|UNKNOWN)$": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "cold_preparation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_sha256", "ledger_sha256", "model_identity", "page_size", "eligible_calls", "eligible_bytes", "attempted_calls", "attempted_bytes", "successful_calls", "successful_bytes", "failed_calls", "failed_bytes", "errno_buckets", "resident_bytes_after", "unavoidable_bytes"],
+      "properties": {
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "ledger_sha256": { "$ref": "#/$defs/sha256" },
+        "model_identity": { "$ref": "#/$defs/qualification_model_identity" },
+        "page_size": { "$ref": "#/$defs/positive_uint64" },
+        "eligible_calls": { "type": "integer", "minimum": 0 },
+        "eligible_bytes": { "$ref": "#/$defs/uint64" },
+        "attempted_calls": { "type": "integer", "minimum": 0 },
+        "attempted_bytes": { "$ref": "#/$defs/uint64" },
+        "successful_calls": { "type": "integer", "minimum": 0 },
+        "successful_bytes": { "$ref": "#/$defs/uint64" },
+        "failed_calls": { "type": "integer", "minimum": 0 },
+        "failed_bytes": { "$ref": "#/$defs/uint64" },
+        "errno_buckets": { "$ref": "#/$defs/errno_buckets" },
+        "resident_bytes_after": { "$ref": "#/$defs/uint64" },
+        "unavoidable_bytes": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "nvml_process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "used_gpu_memory_bytes"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "used_gpu_memory_bytes": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "nvml_process_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "gpu_uuid", "processes"],
+      "properties": {
+        "api": { "const": "nvmlDeviceGetComputeRunningProcesses_v2" },
+        "gpu_uuid": { "type": "string", "pattern": "^(?!GPU-00000000-0000-0000-0000-000000000000$)GPU-[0-9A-Fa-f-]{36}$" },
+        "processes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nvml_process" }
+        }
+      }
+    },
     "tokenizer_runtime": {
       "type": "object",
       "additionalProperties": false,

@@ -29911,8 +29911,7 @@ static int glm_poolside_routed_moe_q4_launch(
     if (compact &&
         (!compact->payload_base || !compact->slot_indices ||
          !compact->input_q8_scratch || !compact->mid_q8_scratch ||
-         !compact->l2_scratch || compact->slot_stride == 0u ||
-         n_tokens != 1u)) {
+         !compact->l2_scratch || compact->slot_stride == 0u)) {
         return 0;
     }
     const int tier = ds4_tensor_device_idx(out);
@@ -30068,7 +30067,7 @@ static int glm_poolside_routed_moe_q4_launch(
     if (capture) {
         if (!capture->ptr || ds4_tensor_device_idx(capture) != tier ||
             capture->bytes < DS4_GPU_GLM_MOE_CAPTURE_BYTES ||
-            n_tokens != 1u || n_expert != 10u ||
+            n_tokens > 1u || n_expert != 10u ||
             expert_in_dim != 3072u || expert_mid_dim != 1024u ||
             out_dim != 3072u ||
             input_q8_bytes != DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_BYTES ||
@@ -30289,7 +30288,7 @@ enum {
     CUDA_LAGUNA_ROUTED_INPUT_DIM = 3072u,
     CUDA_LAGUNA_ROUTED_MID_DIM = 1024u,
     CUDA_LAGUNA_ROUTED_OUTPUT_DIM = 3072u,
-    CUDA_LAGUNA_ROUTED_AUX_SLOT_OFFSET = 64u,
+    CUDA_LAGUNA_ROUTED_AUX_ALIGNMENT = 64u,
 };
 
 static int cuda_laguna_compact_exec_epoch_matches_locked(
@@ -30377,7 +30376,8 @@ static ds4_gpu_laguna_exec_result cuda_laguna_compact_exec_unsafe(
 static ds4_laguna_cache_status cuda_laguna_compact_exec_note_routes(
         ds4_gpu_laguna_compact *ctx,
         uint64_t execution_epoch,
-        const ds4_laguna_expert_key *keys) {
+        const ds4_laguna_expert_key *keys,
+        size_t key_count) {
     std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     if (!cuda_laguna_compact_exec_epoch_matches_locked(
             ctx, execution_epoch) ||
@@ -30387,56 +30387,34 @@ static ds4_laguna_cache_status cuda_laguna_compact_exec_note_routes(
     }
     const ds4_laguna_cache_status status =
         ds4_laguna_cache_policy_note_routes(
-            &ctx->cache_policy, keys, CUDA_LAGUNA_ROUTED_SELECTED);
+            &ctx->cache_policy, keys, key_count);
     if (status == DS4_LAGUNA_CACHE_UNSAFE) ctx->cache_unsafe = 1;
     return status;
 }
 
 #ifdef DS4_TEST_HOOKS
-static int cuda_laguna_compact_exec_range_contains(
-        const void *base,
-        uint64_t base_bytes,
-        const void *ptr,
-        uint64_t bytes) {
-    if (!base || !ptr || bytes == 0u || base_bytes < bytes) return 0;
-    const uintptr_t begin = (uintptr_t)base;
-    const uintptr_t address = (uintptr_t)ptr;
-    if (begin > UINTPTR_MAX - base_bytes ||
-        address < begin || address > UINTPTR_MAX - bytes) {
-        return 0;
-    }
-    return address + bytes <= begin + base_bytes;
-}
-
-static void cuda_laguna_compact_exec_record_origin(
+/* The caller invokes this only after every unique projection view has been
+ * range-checked against the fixed cache payload.  Record route occurrences,
+ * rather than unique cache views, so batch deduplication does not weaken the
+ * pair-by-pair origin audit. */
+static void cuda_laguna_compact_exec_record_cache_origins(
         ds4_gpu_laguna_compact *ctx,
         uint64_t execution_epoch,
-        const void *ptr,
-        uint64_t bytes) {
+        uint64_t projection_count) {
     std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     if (!cuda_laguna_compact_exec_epoch_matches_locked(
             ctx, execution_epoch) ||
         ctx->active_execution_count == 0u) {
         return;
     }
-    cuda_laguna_compact_counter_increment(
-        &ctx->routed_origin.routed_projection_requests);
-    uint64_t *classification = &ctx->routed_origin.unknown_resolutions;
-    if (cuda_laguna_compact_exec_range_contains(
-            ctx->cache_payload, ctx->cache_payload_bytes, ptr, bytes)) {
-        classification = &ctx->routed_origin.engine_slot_resolutions;
-    } else if (cuda_laguna_compact_exec_range_contains(
-                   ctx->static_slab, ctx->static_slab_bytes, ptr, bytes)) {
-        classification = &ctx->routed_origin.static_slab_resolutions;
-    } else if (cuda_laguna_compact_exec_range_contains(
-                   ctx->model_map, ctx->model_size, ptr, bytes)) {
-        classification = &ctx->routed_origin.model_mapping_resolutions;
-    }
-    cuda_laguna_compact_counter_increment(classification);
+    cuda_laguna_compact_counter_add(
+        &ctx->routed_origin.routed_projection_requests, projection_count);
+    cuda_laguna_compact_counter_add(
+        &ctx->routed_origin.engine_slot_resolutions, projection_count);
 }
 #else
-static void cuda_laguna_compact_exec_record_origin(
-        ds4_gpu_laguna_compact *, uint64_t, const void *, uint64_t) {
+static void cuda_laguna_compact_exec_record_cache_origins(
+        ds4_gpu_laguna_compact *, uint64_t, uint64_t) {
 }
 #endif
 
@@ -30560,7 +30538,7 @@ static int cuda_laguna_compact_exec_ranges_isolated(
 }
 
 static ds4_gpu_laguna_exec_result
-cuda_laguna_compact_routed_moe_one_tensor_core(
+cuda_laguna_compact_routed_moe_batch_tensor_core(
         ds4_gpu_laguna_compact *ctx,
         uint64_t execution_epoch,
         ds4_gpu_tensor *out,
@@ -30580,30 +30558,40 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         uint32_t n_total_expert,
         uint32_t n_selected,
         const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
         ds4_gpu_laguna_cancel_fn cancel,
         void *userdata) {
+    const uint64_t pair_count =
+        (uint64_t)n_tokens * CUDA_LAGUNA_ROUTED_SELECTED;
     const uint64_t input_q8_bytes =
-        (uint64_t)(CUDA_LAGUNA_ROUTED_INPUT_DIM / 32u) *
+        (uint64_t)n_tokens *
+        (CUDA_LAGUNA_ROUTED_INPUT_DIM / 32u) *
         sizeof(poolside_q8_1_block);
     const uint64_t mid_q8_bytes =
-        (uint64_t)CUDA_LAGUNA_ROUTED_SELECTED *
+        pair_count *
         (CUDA_LAGUNA_ROUTED_MID_DIM / 32u) *
         sizeof(poolside_q8_1_block);
-    const uint64_t l2_bytes =
-        CUDA_LAGUNA_ROUTED_SELECTED * sizeof(float);
-    const uint64_t descriptor_bytes =
-        CUDA_LAGUNA_ROUTED_SELECTED * sizeof(uint32_t);
-    const uint64_t aux_bytes =
-        CUDA_LAGUNA_ROUTED_AUX_SLOT_OFFSET + descriptor_bytes;
+    const uint64_t l2_bytes = pair_count * sizeof(float);
+    const uint64_t descriptor_bytes = pair_count * sizeof(uint32_t);
+    const uint64_t descriptor_offset =
+        (l2_bytes + CUDA_LAGUNA_ROUTED_AUX_ALIGNMENT - 1u) &
+        ~(uint64_t)(CUDA_LAGUNA_ROUTED_AUX_ALIGNMENT - 1u);
+    const uint64_t aux_bytes = descriptor_offset + descriptor_bytes;
     const uint64_t output_bytes =
-        (uint64_t)CUDA_LAGUNA_ROUTED_OUTPUT_DIM * sizeof(float);
+        (uint64_t)n_tokens * CUDA_LAGUNA_ROUTED_OUTPUT_DIM *
+        sizeof(float);
     const uint64_t mid_bytes =
-        (uint64_t)CUDA_LAGUNA_ROUTED_SELECTED *
+        pair_count *
         CUDA_LAGUNA_ROUTED_MID_DIM * sizeof(float);
-    const uint64_t weights_bytes =
-        CUDA_LAGUNA_ROUTED_SELECTED * sizeof(float);
+    const uint64_t weights_bytes = pair_count * sizeof(float);
     const uint64_t input_bytes =
-        (uint64_t)CUDA_LAGUNA_ROUTED_INPUT_DIM * sizeof(float);
+        (uint64_t)n_tokens * CUDA_LAGUNA_ROUTED_INPUT_DIM * sizeof(float);
+    const uint64_t route_key_offset =
+        (descriptor_bytes + alignof(ds4_laguna_expert_key) - 1u) &
+        ~(uint64_t)(alignof(ds4_laguna_expert_key) - 1u);
+    const uint64_t route_key_bytes =
+        pair_count * sizeof(ds4_laguna_expert_key);
+    const uint64_t staging_bytes = route_key_offset + route_key_bytes;
     if (!ctx || !out || !mid || !input_q8_scratch ||
         !mid_q8_scratch || !aux_scratch || !selected || !weights || !x ||
         !out->ptr || !mid->ptr || !input_q8_scratch->ptr ||
@@ -30615,6 +30603,10 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         out_dim != CUDA_LAGUNA_ROUTED_OUTPUT_DIM ||
         n_total_expert != CUDA_LAGUNA_ROUTED_TOTAL_EXPERT ||
         n_selected != CUDA_LAGUNA_ROUTED_SELECTED ||
+        n_tokens == 0u || n_tokens > 65535u || !ctx->plan ||
+        n_tokens > ctx->plan->prefill_rows ||
+        !ctx->pinned_staging[3] ||
+        staging_bytes > ctx->plan->staging_buffer_bytes ||
         out->bytes < output_bytes || mid->bytes < mid_bytes ||
         selected->bytes < descriptor_bytes ||
         weights->bytes < weights_bytes || x->bytes < input_bytes ||
@@ -30657,7 +30649,7 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
     }
     uint32_t *slot_descriptor = (uint32_t *)(
-        (char *)aux_scratch->ptr + CUDA_LAGUNA_ROUTED_AUX_SLOT_OFFSET);
+        (char *)aux_scratch->ptr + descriptor_offset);
     if ((((uintptr_t)input_q8_scratch->ptr) & 15u) != 0u ||
         (((uintptr_t)mid_q8_scratch->ptr) & 15u) != 0u ||
         (((uintptr_t)aux_scratch->ptr) & 3u) != 0u ||
@@ -30679,46 +30671,88 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         return DS4_GPU_LAGUNA_EXEC_CANCELLED;
     }
 
-    int32_t selected_host[CUDA_LAGUNA_ROUTED_SELECTED];
-    cudaError_t error = cudaMemcpy(
-        selected_host, selected->ptr, (size_t)descriptor_bytes,
-        cudaMemcpyDeviceToHost);
-    if (error != cudaSuccess) {
-        (void)cudaGetLastError();
-        return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
-    }
-    ds4_laguna_expert_key keys[CUDA_LAGUNA_ROUTED_SELECTED];
-    for (uint32_t i = 0u; i < CUDA_LAGUNA_ROUTED_SELECTED; i++) {
-        if (selected_host[i] < 0 ||
-            (uint32_t)selected_host[i] >=
-                CUDA_LAGUNA_ROUTED_TOTAL_EXPERT) {
-            return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
+    ds4_laguna_expert_key unique_keys[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT];
+    size_t unique_count = 0u;
+    ds4_laguna_cache_status noted = DS4_LAGUNA_CACHE_UNSAFE;
+    cudaError_t error = cudaSuccess;
+    {
+        /* Staging buffer three is also the cache directory upload buffer.
+         * Hold the compact mutex across the selected read, validation, and
+         * route-note call so no cache transition can overwrite it. */
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_exec_epoch_matches_locked(
+                ctx, execution_epoch) ||
+            ctx->active_execution_count == 0u ||
+            !cuda_laguna_compact_cache_active_locked(ctx)) {
+            return cuda_laguna_compact_exec_unsafe(
+                ctx, execution_epoch);
         }
-        for (uint32_t j = 0u; j < i; j++) {
-            if (selected_host[j] == selected_host[i]) {
-                return cuda_laguna_compact_exec_unsafe(
-                    ctx, execution_epoch);
+        int32_t *selected_host =
+            (int32_t *)ctx->pinned_staging[3];
+        ds4_laguna_expert_key *route_keys =
+            (ds4_laguna_expert_key *)(
+                (char *)ctx->pinned_staging[3] + route_key_offset);
+        error = cudaMemcpy(
+            selected_host, selected->ptr, (size_t)descriptor_bytes,
+            cudaMemcpyDeviceToHost);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &ctx->cuda_copy_failures);
+            return cuda_laguna_compact_exec_unsafe(
+                ctx, execution_epoch);
+        }
+        bool seen[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT] = {false};
+        for (uint32_t token = 0u; token < n_tokens; token++) {
+            const uint64_t row =
+                (uint64_t)token * CUDA_LAGUNA_ROUTED_SELECTED;
+            for (uint32_t slot = 0u;
+                 slot < CUDA_LAGUNA_ROUTED_SELECTED;
+                 slot++) {
+                const uint64_t pair = row + slot;
+                const int32_t expert = selected_host[pair];
+                if (expert < 0 ||
+                    (uint32_t)expert >=
+                        CUDA_LAGUNA_ROUTED_TOTAL_EXPERT) {
+                    return cuda_laguna_compact_exec_unsafe(
+                        ctx, execution_epoch);
+                }
+                for (uint32_t earlier = 0u;
+                     earlier < slot;
+                     earlier++) {
+                    if (selected_host[row + earlier] == expert) {
+                        return cuda_laguna_compact_exec_unsafe(
+                            ctx, execution_epoch);
+                    }
+                }
+                route_keys[pair].layer_id = layer_id;
+                route_keys[pair].expert_id = (uint32_t)expert;
+                if (!seen[(uint32_t)expert]) {
+                    seen[(uint32_t)expert] = true;
+                    unique_keys[unique_count++] = route_keys[pair];
+                }
             }
         }
-        keys[i].layer_id = layer_id;
-        keys[i].expert_id = (uint32_t)selected_host[i];
+        noted = cuda_laguna_compact_exec_note_routes(
+            ctx, execution_epoch, route_keys, (size_t)pair_count);
     }
     if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
         return DS4_GPU_LAGUNA_EXEC_CANCELLED;
     }
-    const ds4_laguna_cache_status noted =
-        cuda_laguna_compact_exec_note_routes(
-            ctx, execution_epoch, keys);
     if (noted != DS4_LAGUNA_CACHE_OK) {
         return noted == DS4_LAGUNA_CACHE_UNSAFE ?
             cuda_laguna_compact_exec_unsafe(ctx, execution_epoch) :
             DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
     }
+    if (unique_count > ctx->plan->slot_count) {
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
 
-    ds4_laguna_cache_handle handles[CUDA_LAGUNA_ROUTED_SELECTED];
+    ds4_laguna_cache_handle handles[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT];
     memset(handles, 0, sizeof(handles));
     size_t handle_count = 0u;
-    for (uint32_t i = 0u; i < CUDA_LAGUNA_ROUTED_SELECTED; i++) {
+    for (size_t i = 0u; i < unique_count; i++) {
         if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
             return cuda_laguna_compact_exec_release(
                 ctx, execution_epoch, handles, handle_count,
@@ -30728,7 +30762,7 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
             DS4_LAGUNA_CACHE_ACQUIRE_NONE;
         ds4_laguna_cache_status status =
             ds4_gpu_laguna_compact_cache_begin(
-                ctx, keys[i], &handles[handle_count], &outcome);
+                ctx, unique_keys[i], &handles[handle_count], &outcome);
         if (status != DS4_LAGUNA_CACHE_OK) {
             return cuda_laguna_compact_exec_release(
                 ctx, execution_epoch, handles, handle_count,
@@ -30780,7 +30814,10 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         }
     }
 
-    uint32_t slot_indices[CUDA_LAGUNA_ROUTED_SELECTED];
+    uint32_t slot_for_expert[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT];
+    for (size_t i = 0u; i < CUDA_LAGUNA_ROUTED_TOTAL_EXPERT; i++) {
+        slot_for_expert[i] = DS4_LAGUNA_CACHE_SLOT_NONE;
+    }
     uint64_t projection_offsets[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
     const uint64_t expert_bytes =
         ctx->ledger ? ctx->ledger->routed_projection_expert_bytes : 0u;
@@ -30808,7 +30845,7 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         DS4_LAGUNA_ROUTED_PROJECTION_UP,
         DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
     };
-    for (uint32_t i = 0u; i < CUDA_LAGUNA_ROUTED_SELECTED; i++) {
+    for (size_t i = 0u; i < unique_count; i++) {
         const ds4_laguna_cache_handle handle = handles[i];
         if (handle.slot_index >= ctx->plan->slot_count ||
             handle.entry_index >= ctx->ledger->expert_entry_count) {
@@ -30816,7 +30853,7 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
                 ctx, execution_epoch, handles, handle_count,
                 DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
         }
-        slot_indices[i] = handle.slot_index;
+        slot_for_expert[unique_keys[i].expert_id] = handle.slot_index;
         const ds4_laguna_expert_entry *entry =
             &ctx->ledger->expert_entries[handle.entry_index];
         const ds4_laguna_expert_view *views[3] = {
@@ -30828,8 +30865,6 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
             const int view_ok = ds4_gpu_laguna_compact_cache_view(
                 ctx, handle, projections[projection],
                 &device_ptr, &bytes);
-            cuda_laguna_compact_exec_record_origin(
-                ctx, execution_epoch, device_ptr, bytes);
             const uint64_t slot_offset =
                 (uint64_t)handle.slot_index *
                 ctx->plan->slot_stride_bytes;
@@ -30860,15 +30895,57 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         }
     }
 
-    error = cudaMemcpy(
-        slot_descriptor, slot_indices, (size_t)descriptor_bytes,
-        cudaMemcpyHostToDevice);
-    if (error != cudaSuccess) {
-        (void)cudaGetLastError();
-        return cuda_laguna_compact_exec_release(
-            ctx, execution_epoch, handles, handle_count,
-            DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+    {
+        /* Cache completion may have used staging[3] for directory mirrors.
+         * Read selected IDs again, then convert them in place to the physical
+         * token-major slot descriptor while the shared staging owner is held. */
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_exec_epoch_matches_locked(
+                ctx, execution_epoch) ||
+            ctx->active_execution_count == 0u ||
+            !cuda_laguna_compact_cache_active_locked(ctx)) {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+        }
+        int32_t *selected_host =
+            (int32_t *)ctx->pinned_staging[3];
+        error = cudaMemcpy(
+            selected_host, selected->ptr, (size_t)descriptor_bytes,
+            cudaMemcpyDeviceToHost);
+        if (error == cudaSuccess) {
+            uint32_t *descriptor_host =
+                (uint32_t *)ctx->pinned_staging[3];
+            for (uint64_t pair = 0u; pair < pair_count; pair++) {
+                const int32_t expert = selected_host[pair];
+                if (expert < 0 ||
+                    (uint32_t)expert >=
+                        CUDA_LAGUNA_ROUTED_TOTAL_EXPERT ||
+                    slot_for_expert[(uint32_t)expert] ==
+                        DS4_LAGUNA_CACHE_SLOT_NONE) {
+                    return cuda_laguna_compact_exec_release(
+                        ctx, execution_epoch, handles, handle_count,
+                        DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+                }
+                descriptor_host[pair] =
+                    slot_for_expert[(uint32_t)expert];
+            }
+            error = cudaMemcpy(
+                slot_descriptor, descriptor_host,
+                (size_t)descriptor_bytes, cudaMemcpyHostToDevice);
+        }
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &ctx->cuda_copy_failures);
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+        }
     }
+    cuda_laguna_compact_exec_record_cache_origins(
+        ctx, execution_epoch, pair_count * 3u);
     if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
         return cuda_laguna_compact_exec_release(
             ctx, execution_epoch, handles, handle_count,
@@ -30898,7 +30975,7 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
         expert_bytes, down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_selected,
-        x, 1u, n_selected * expert_mid_dim, &compact
+        x, n_tokens, n_selected * expert_mid_dim, &compact
 #ifdef DS4_TEST_HOOKS
         , NULL
 #endif
@@ -30915,6 +30992,48 @@ cuda_laguna_compact_routed_moe_one_tensor_core(
     if (result == DS4_GPU_LAGUNA_EXEC_SUCCESS &&
         cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
         result = DS4_GPU_LAGUNA_EXEC_CANCELLED;
+    }
+    return result;
+}
+
+extern "C" ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_batch_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata) {
+    uint64_t execution_epoch = 0u;
+    if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    ds4_gpu_laguna_exec_result result =
+        cuda_laguna_compact_routed_moe_batch_tensor_core(
+            ctx, execution_epoch, out, mid,
+            input_q8_scratch, mid_q8_scratch, aux_scratch,
+            layer_id, gate_type, up_type, down_type,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_selected, x,
+            n_tokens, cancel, userdata);
+    if (!cuda_laguna_compact_exec_leave(
+            ctx, execution_epoch, &result)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
     return result;
 }
@@ -30946,13 +31065,13 @@ ds4_gpu_laguna_compact_routed_moe_one_tensor(
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
     ds4_gpu_laguna_exec_result result =
-        cuda_laguna_compact_routed_moe_one_tensor_core(
+        cuda_laguna_compact_routed_moe_batch_tensor_core(
             ctx, execution_epoch, out, mid,
             input_q8_scratch, mid_q8_scratch, aux_scratch,
             layer_id, gate_type, up_type, down_type,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_selected, x,
-            cancel, userdata);
+            1u, cancel, userdata);
     if (!cuda_laguna_compact_exec_leave(
             ctx, execution_epoch, &result)) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;

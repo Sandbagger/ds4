@@ -43,6 +43,7 @@ typedef enum {
 typedef enum {
     MODEL_CASE_ALL,
     MODEL_CASE_SHORT,
+    MODEL_CASE_SWA,
     MODEL_CASE_CONTINUATION,
 } model_case_selection;
 
@@ -75,6 +76,7 @@ static const char *model_mode_name(model_mode mode) {
 static const char *model_case_name(model_case_selection selected) {
     switch (selected) {
         case MODEL_CASE_SHORT: return "short";
+        case MODEL_CASE_SWA: return "swa-513";
         case MODEL_CASE_CONTINUATION: return "continuation";
         case MODEL_CASE_ALL: return "all";
     }
@@ -84,7 +86,7 @@ static const char *model_case_name(model_case_selection selected) {
 static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s [--mode resident|streamed "
-            "--case short|continuation|all]\n"
+            "--case short|swa-513|continuation|all]\n"
             "       --case all is currently resident-only\n",
             program);
 }
@@ -116,6 +118,8 @@ static bool parse_selection(
             case_seen = true;
             if (strcmp(argv[i + 1], "short") == 0) {
                 *selected = MODEL_CASE_SHORT;
+            } else if (strcmp(argv[i + 1], "swa-513") == 0) {
+                *selected = MODEL_CASE_SWA;
             } else if (strcmp(argv[i + 1], "continuation") == 0) {
                 *selected = MODEL_CASE_CONTINUATION;
             } else if (strcmp(argv[i + 1], "all") == 0) {
@@ -1107,6 +1111,12 @@ int main(int argc, char **argv) {
         ok = run_short(
             engine, &fixtures.cases[0],
             mode == MODEL_MODE_STREAMED ? &streamed_routed_tokens : NULL);
+    }
+    if (ok && selected == MODEL_CASE_SWA) {
+        ok = run_raw_frontier(
+                engine, "swa-513", "swa-513.prompt", 513, 1024,
+                &fixtures.cases[1], NULL, false);
+        if (mode == MODEL_MODE_STREAMED) streamed_routed_tokens = 513u;
     }
     if (ok && selected == MODEL_CASE_CONTINUATION) {
         ok = run_raw_frontier(

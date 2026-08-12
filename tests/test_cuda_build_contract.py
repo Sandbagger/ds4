@@ -2248,7 +2248,7 @@ class CudaBuildContractTest(unittest.TestCase):
         diagnostic_guard = main.find(
             "if (ok && selected == MODEL_CASE_ALL && !diagnostic_mode) {"
         )
-        swa_case = main.find('engine, "swa-513"')
+        swa_case = main.find('engine, "swa-513"', diagnostic_guard)
         self.assertGreaterEqual(diagnostic_guard, 0)
         self.assertGreater(swa_case, diagnostic_guard)
         suite_end = main.find(

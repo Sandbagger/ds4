@@ -203,6 +203,34 @@ ds4_gpu_laguna_compact_routed_moe_one_tensor(
         ds4_gpu_laguna_cancel_fn cancel,
         void *userdata);
 
+/* Batched Q4_K routed execution through the same fixed compact cache.  The
+ * selected/weight tensors are token-major with ten entries per token; all
+ * unique experts for one routed layer remain pinned through the synchronous
+ * shared batch-kernel launch. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_batch_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata);
+
 #ifdef DS4_TEST_HOOKS
 typedef enum {
     DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,

@@ -48509,14 +48509,12 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
 #endif
     if (!g || !model || !weights || token < 0 ||
         token >= (int)DS4_N_VOCAB || pos >= g->ctx_size) {
-        return compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE :
-                         DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
     }
 
     const int detail_layer = laguna_graph_diag_detail_layer();
     if (detail_layer < 0) {
-        return compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE :
-                         DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
     }
 
 #ifdef DS4_TEST_HOOKS
@@ -49057,7 +49055,6 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
     }
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) {
         ok = false;
-        if (compact) execution_result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits,
@@ -49069,8 +49066,7 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
     ds4_gpu_tensor_free(moe_capture);
 #endif
     if (!ok && execution_result == DS4_GPU_LAGUNA_EXEC_SUCCESS) {
-        execution_result = compact ? DS4_GPU_LAGUNA_EXEC_UNSAFE :
-                                     DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+        execution_result = DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
     }
     return ok ? DS4_GPU_LAGUNA_EXEC_SUCCESS : execution_result;
 }
@@ -49098,7 +49094,7 @@ static void laguna_graph_report_prefill_display_progress(
                      total);
 }
 
-static bool laguna_graph_forward_batch(
+static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
         const ds4_weights    *weights,
@@ -49106,21 +49102,30 @@ static bool laguna_graph_forward_batch(
         uint32_t              n_tokens,
         uint32_t              pos0,
         float                *logits_out,
+        ds4_gpu_laguna_compact *compact,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void                 *cancel_ud,
         ds4_session_progress_fn display_progress,
         void                 *display_progress_ud,
         int                   display_total) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)cancel;
+    (void)cancel_ud;
+#endif
     if (!g || !model || !weights || !tokens || n_tokens == 0 ||
         n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
-        return false;
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
     }
     const int detail_layer = laguna_graph_diag_detail_layer();
-    if (detail_layer < 0) return false;
+    if (detail_layer < 0) {
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
 
     uint32_t *token_ids = xmalloc((size_t)n_tokens * sizeof(*token_ids));
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (tokens[i] < 0 || tokens[i] >= (int)DS4_N_VOCAB) {
             free(token_ids);
-            return false;
+            return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
         }
         token_ids[i] = (uint32_t)tokens[i];
     }
@@ -49129,7 +49134,9 @@ static bool laguna_graph_forward_batch(
                                    token_ids,
                                    (uint64_t)n_tokens * sizeof(*token_ids)) != 0;
     free(token_ids);
-    if (!ok) return false;
+    if (!ok) {
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
 
     laguna_graph_report_prefill_display_progress(display_progress,
                                                   display_progress_ud,
@@ -49152,6 +49159,8 @@ static bool laguna_graph_forward_batch(
     const bool live_progress = display_progress != NULL && n_tokens >= 32u;
     uint32_t completed_layers = 0;
     const char *failed_stage = "embedding";
+    ds4_gpu_laguna_exec_result execution_result =
+        DS4_GPU_LAGUNA_EXEC_SUCCESS;
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_tokens_quant_tensor(g->cur,
@@ -49456,35 +49465,66 @@ static bool laguna_graph_forward_batch(
                 l->ffn_down_exps->dim[1] * down_row_bytes;
             if (ok) {
                 failed_stage = "routed experts";
-                ok = ds4_gpu_glm_routed_moe_batch_tensor(
-                        g->ffn_out,
-                        g->routed_mid,
-                        model->map,
-                        model->size,
-                        l->ffn_gate_exps->abs_offset,
-                        l->ffn_up_exps->abs_offset,
-                        l->ffn_down_exps->abs_offset,
-                        l->ffn_gate_exps->type,
-                        l->ffn_up_exps->type,
-                        l->ffn_down_exps->type,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        up_expert_bytes,
-                        up_row_bytes,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        DS4_N_EMBD,
-                        DS4_N_FF_EXP,
-                        DS4_N_EMBD,
-                        g->router_selected,
-                        g->router_weights,
-                        DS4_N_EXPERT,
-                        DS4_N_EXPERT_USED,
-                        il,
-                        g->ffn_norm,
-                        n_tokens,
-                        DS4_N_EXPERT_USED * DS4_N_FF_EXP,
-                        true) != 0;
+                if (compact) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+                    execution_result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+#else
+                    execution_result =
+                        ds4_gpu_laguna_compact_routed_moe_batch_tensor(
+                            compact,
+                            g->ffn_out,
+                            g->routed_mid,
+                            g->ffn_gate,
+                            g->ffn_up,
+                            g->ffn_mid,
+                            il,
+                            l->ffn_gate_exps->type,
+                            l->ffn_up_exps->type,
+                            l->ffn_down_exps->type,
+                            DS4_N_EMBD,
+                            DS4_N_FF_EXP,
+                            DS4_N_EMBD,
+                            g->router_selected,
+                            g->router_weights,
+                            DS4_N_EXPERT,
+                            DS4_N_EXPERT_USED,
+                            g->ffn_norm,
+                            n_tokens,
+                            cancel,
+                            cancel_ud);
+#endif
+                    ok = execution_result == DS4_GPU_LAGUNA_EXEC_SUCCESS;
+                } else {
+                    ok = ds4_gpu_glm_routed_moe_batch_tensor(
+                            g->ffn_out,
+                            g->routed_mid,
+                            model->map,
+                            model->size,
+                            l->ffn_gate_exps->abs_offset,
+                            l->ffn_up_exps->abs_offset,
+                            l->ffn_down_exps->abs_offset,
+                            l->ffn_gate_exps->type,
+                            l->ffn_up_exps->type,
+                            l->ffn_down_exps->type,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            up_expert_bytes,
+                            up_row_bytes,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            DS4_N_EMBD,
+                            DS4_N_FF_EXP,
+                            DS4_N_EMBD,
+                            g->router_selected,
+                            g->router_weights,
+                            DS4_N_EXPERT,
+                            DS4_N_EXPERT_USED,
+                            il,
+                            g->ffn_norm,
+                            n_tokens,
+                            DS4_N_EXPERT_USED * DS4_N_FF_EXP,
+                            true) != 0;
+                }
             }
             if (ok) {
                 failed_stage = "shared expert gate/up";
@@ -49620,7 +49660,9 @@ static bool laguna_graph_forward_batch(
                     g->logits, 1, DS4_N_VOCAB, -1, "logits");
         }
     }
-    if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
+    if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) {
+        ok = false;
+    }
     ds4_gpu_tensor_free(last);
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits,
@@ -49638,7 +49680,10 @@ static bool laguna_graph_forward_batch(
                                                       true);
     }
     ds4_gpu_set_tensor_matmul_suppressed(false);
-    return ok;
+    if (!ok && execution_result == DS4_GPU_LAGUNA_EXEC_SUCCESS) {
+        execution_result = DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
+    return ok ? DS4_GPU_LAGUNA_EXEC_SUCCESS : execution_result;
 }
 
 static int generate_laguna_metal_argmax(
@@ -49675,7 +49720,11 @@ static int generate_laguna_metal_argmax(
                                             logits : NULL,
                                         NULL,
                                         NULL,
-                                        prompt->len);
+                                        NULL,
+                                        NULL,
+                                        NULL,
+                                        prompt->len) ==
+             DS4_GPU_LAGUNA_EXEC_SUCCESS;
         i += (int)n;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
     }
@@ -64160,37 +64209,41 @@ static int ds4_session_sync_internal(ds4_session *s,
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             uint32_t n = (uint32_t)(prompt->len - i);
-            if (e->laguna_compact) {
-                /* Task 9 streams one routed decision at a time.  Stable
-                 * over-capacity grouping for batch prefill lands in Task 10. */
-                n = 1u;
-            } else if (n > s->laguna_graph.prefill_cap) {
+            if (n > s->laguna_graph.prefill_cap) {
                 n = s->laguna_graph.prefill_cap;
             }
+            if (e->laguna_compact && e->prefill_chunk != 0u &&
+                n > e->prefill_chunk) {
+                n = e->prefill_chunk;
+            }
             const bool last = i + (int)n == prompt->len;
+            const bool checkpoint_logits = last || e->laguna_compact;
             const ds4_gpu_laguna_exec_result result = n == 1u ?
                 laguna_graph_forward_token(&s->laguna_graph,
                                            &e->model,
                                            &e->weights,
                                            prompt->v[i],
                                            (uint32_t)i,
-                                           last ? s->logits : NULL,
+                                           checkpoint_logits ? s->logits : NULL,
                                            e->laguna_compact,
                                            e->laguna_compact ?
                                                ds4_session_cancelled_cb : NULL,
                                            e->laguna_compact ? s : NULL) :
-                (laguna_graph_forward_batch(&s->laguna_graph,
-                                            &e->model,
-                                            &e->weights,
-                                            prompt->v + i,
-                                            n,
-                                            (uint32_t)i,
-                                            last ? s->logits : NULL,
-                                            s->display_progress,
-                                            s->display_progress_ud,
-                                            prompt->len) ?
-                     DS4_GPU_LAGUNA_EXEC_SUCCESS :
-                     DS4_GPU_LAGUNA_EXEC_RECOVERABLE);
+                laguna_graph_forward_batch(&s->laguna_graph,
+                                           &e->model,
+                                           &e->weights,
+                                           prompt->v + i,
+                                           n,
+                                           (uint32_t)i,
+                                           checkpoint_logits ?
+                                               s->logits : NULL,
+                                           e->laguna_compact,
+                                           e->laguna_compact ?
+                                               ds4_session_cancelled_cb : NULL,
+                                           e->laguna_compact ? s : NULL,
+                                           s->display_progress,
+                                           s->display_progress_ud,
+                                           prompt->len);
             if (result != DS4_GPU_LAGUNA_EXEC_SUCCESS) {
                 if (result == DS4_GPU_LAGUNA_EXEC_CANCELLED) {
                     snprintf(err, errlen, "interrupted");
@@ -64218,7 +64271,9 @@ static int ds4_session_sync_internal(ds4_session *s,
             for (uint32_t j = 0; j < n; j++) {
                 token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
             }
-            if (last) last_checkpoint_len_with_logits = s->checkpoint.len;
+            if (checkpoint_logits) {
+                last_checkpoint_len_with_logits = s->checkpoint.len;
+            }
             i += (int)n;
             if (s->progress) {
                 s->progress(s->progress_ud,

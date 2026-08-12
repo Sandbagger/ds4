@@ -268,7 +268,7 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_runtime.o
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_cuda_laguna_kernels.o: tests/test_cuda_laguna_kernels.c ds4_gpu.h ds4_laguna_plan.h
@@ -277,7 +277,7 @@ tests/test_cuda_laguna_kernels.o: tests/test_cuda_laguna_kernels.c ds4_gpu.h ds4
 tests/ds4_cuda_laguna_kernels_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_cuda.cu
 
-tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_runtime.o
+tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-kernels: tests/test_cuda_laguna_kernels
@@ -286,7 +286,7 @@ test-cuda-laguna-kernels: tests/test_cuda_laguna_kernels
 tests/test_cuda_q4k_mmvq_microscope.o: tests/test_cuda_q4k_mmvq_microscope.c ds4_gpu.h ds4_laguna_plan.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_q4k_mmvq_microscope: tests/test_cuda_q4k_mmvq_microscope.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_runtime.o
+tests/test_cuda_q4k_mmvq_microscope: tests/test_cuda_q4k_mmvq_microscope.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-q4k-mmvq-microscope: tests/test_cuda_q4k_mmvq_microscope
@@ -295,7 +295,7 @@ test-cuda-q4k-mmvq-microscope: tests/test_cuda_q4k_mmvq_microscope
 tests/test_cuda_f32_mmvf_microscope.o: tests/test_cuda_f32_mmvf_microscope.c ds4_gpu.h ds4_laguna_plan.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_f32_mmvf_microscope: tests/test_cuda_f32_mmvf_microscope.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_runtime.o
+tests/test_cuda_f32_mmvf_microscope: tests/test_cuda_f32_mmvf_microscope.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-f32-mmvf-microscope: tests/test_cuda_f32_mmvf_microscope
@@ -402,19 +402,19 @@ ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o ds4_runtime.o
+tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h ds4_laguna_plan.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o ds4_runtime.o
+tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o ds4_runtime.o
+tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h

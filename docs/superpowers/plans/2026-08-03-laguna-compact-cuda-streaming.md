@@ -814,11 +814,11 @@ git commit -m "feat: make compact runtime page disposal exact and measured"
 - Modify: `schemas/compact-runtime-benchmark-v1.schema.json`
 - Modify: `Makefile`
 
-- [ ] **Step 1: Add RED sparse-file and attribution-fixture tests**
+- [x] **Step 1: Add RED sparse-file and attribution-fixture tests**
 
 Build sparse temporary GGUF-like files with page-aligned and shared-boundary tensor ranges. Test qualification-only cold preparation over every safe full page, exact `st_dev/st_ino/st_size/st_mtime_ns` binding, no symlink traversal, metadata/shared-boundary exclusion, duplicate-range unioning, `mincore` bit counting, advice failures, identity changes before/after measurement, and a derived unavoidable-residency value above 2 GiB. Add recorded `/proc/self/smaps` fixtures with model-inode VMAs, tracked host/pinned/managed ranges, overlapping tracked ranges, shared-library/stack/heap PSS, and malformed/overflow fields. Add synthetic process-scoped NVML inventories in which DS4 already owns CUDA context/library bytes before its first tracked model allocation, tracked allocations later grow, an unrelated process changes only between checkpoints, and NVML reports missing/unknown bytes. Mock only syscall/CUDA/NVML inputs in unit tests; keep all range/de-duplication arithmetic real.
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 ```sh
 make tests/test_runtime tests/test_cuda_laguna_stream
@@ -828,11 +828,11 @@ python3 gguf-tools/quality-testing/test_compact_runtime_qualify.py -v
 
 Expected: missing cold-preparation, smaps/CUDA attribution, or external-checkpoint APIs.
 
-- [ ] **Step 3: Implement descriptor-bound cold preparation**
+- [x] **Step 3: Implement descriptor-bound cold preparation**
 
 Verify the qualification-plan digest and its opened-model identity, then consume its normalized safe full-page range union; do not rediscover tensor roles in Python. Open the pinned model without following symlinks, `fstat` it, issue advice without `drop_caches`, synchronize an exact-inode `mincore` sample, and `fstat` again. Emit eligible/attempted/successful/failed call and byte counts plus errno buckets. Treat identity change, advice failure, incomplete coverage, ledger/plan mismatch, or an unavoidable bound above 2 GiB as invalid evidence.
 
-- [ ] **Step 4: Produce de-duplicated external-memory samples**
+- [x] **Step 4: Produce de-duplicated external-memory samples**
 
 Before launching the child, the harness records a device-UUID-scoped NVML
 process inventory without creating a CUDA context. Inside DS4, before any
@@ -860,7 +860,7 @@ peak at the checkpoint. Expose the raw process-scoped NVML, `cudaMemGetInfo`,
 smaps identity/counters, and reconciled values through
 `ds4_runtime_snapshot`.
 
-- [ ] **Step 5: Detect unrelated CUDA baseline changes**
+- [x] **Step 5: Detect unrelated CUDA baseline changes**
 
 Freeze one NVML API/version and the full pre-child per-process inventory in the
 manifest. At every checkpoint, compare every non-DS4 PID's allocation with
@@ -872,7 +872,7 @@ checkpoint window. The harness neither charges nor forgives those bytes.
 Match the DS4 PID, GPU UUID, and build identity explicitly; use DS4's
 process-scoped NVML value as the CUDA attribution source.
 
-- [ ] **Step 6: Make cold-preparation and live attribution tests green**
+- [x] **Step 6: Make cold-preparation and live attribution tests green**
 
 ```sh
 ./tests/test_runtime --case external-attribution
@@ -885,7 +885,7 @@ make test-laguna-compact-python
 
 Expected: sparse-file coverage, tamper/identity, boundary-page, 2-GiB cap, conservative-high-water, smaps de-duplication, CUDA reconciliation, unrelated-process invalidation, and both 512-MiB ceiling cases pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```sh
 git add ds4_runtime.h ds4_runtime.c ds4_gpu.h ds4_cuda.cu ds4.h ds4.c \

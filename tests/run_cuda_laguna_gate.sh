@@ -314,6 +314,7 @@ if [ "$mode" = streaming ]; then
     assert_retained_identity model-streamed-warm-stability
 
     hash_retained_fd
+    cold_prepare_exact_fd stream-final
     exit 0
 fi
 

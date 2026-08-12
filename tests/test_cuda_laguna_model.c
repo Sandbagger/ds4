@@ -1039,6 +1039,10 @@ static bool runtime_allocation_state_equal(
         DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED,
     };
     const ds4_runtime_snapshot *snapshots[] = { before, after };
+    /* qualification_total_peak is a simultaneous high-water sample.  The
+     * source report peak can predate session graph/KV ownership, so combining
+     * that historical peak with current ownership would invent a footprint
+     * that never existed. */
     for (size_t snapshot_index = 0;
          snapshot_index < sizeof(snapshots) / sizeof(snapshots[0]);
          snapshot_index++) {
@@ -1061,17 +1065,10 @@ static bool runtime_allocation_state_equal(
                     DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] <
                 snapshot->report_current[
                     DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
-            snapshot->owned_total_current > UINT64_MAX -
-                snapshot->report_peak[
-                    DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
             snapshot->qualification_total_current !=
                 expected_qualification ||
             snapshot->qualification_total_peak <
                 snapshot->qualification_total_current ||
-            snapshot->qualification_total_peak <
-                snapshot->owned_total_current +
-                    snapshot->report_peak[
-                        DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] ||
             snapshot->qualification_total_peak >
                 snapshot->qualification_total_bound_bytes) {
             return false;

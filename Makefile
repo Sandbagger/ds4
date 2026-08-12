@@ -474,6 +474,8 @@ tests/probe_ds4_laguna_behavior: tests/probe_ds4_laguna_behavior.o ds4.o ds4_gpu
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-model: tests/test_cuda_laguna_model
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode streamed --case short
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode streamed --case prefill-8192
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode resident --case all
 
 tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h
@@ -492,6 +494,7 @@ test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-faults
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-unsafe
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-unsafe-race
+	timeout 60s ./tests/test_cuda_laguna_stream --case prefill-allocation
 	timeout 60s ./tests/test_cuda_laguna_stream --case create-unwind-unsafe
 	timeout 60s ./tests/test_cuda_laguna_stream --case teardown-unsafe
 

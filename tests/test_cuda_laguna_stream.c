@@ -39,27 +39,6 @@
 static int g_assertions;
 static int g_failures;
 
-/* Task 11 production seam.  This stays local until the implementation lands:
- * the CUDA fixture must exercise the real Laguna graph allocator without a
- * model, then return copy-only accounting from both sides of graph teardown. */
-#define DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT 48u
-typedef struct {
-    uint32_t context_tokens;
-    uint32_t graph_prefill_cap;
-    uint32_t session_prefill_cap;
-    uint32_t layer_count;
-    uint32_t cache_caps[DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT];
-    uint64_t scratch_tensor_bytes;
-    uint64_t kv_tensor_bytes;
-    ds4_runtime_snapshot allocated;
-    ds4_runtime_snapshot released;
-} ds4_test_laguna_prefill_allocation_snapshot;
-
-extern bool ds4_test_laguna_prefill_allocation(
-        uint32_t context_tokens,
-        uint32_t prefill_rows,
-        ds4_test_laguna_prefill_allocation_snapshot *out);
-
 /* Compile-only contract.  Runnable lifecycle behavior is driven separately
  * after this typed seam lands. */
 static void compile_typed_lifecycle_contract(
@@ -5241,6 +5220,22 @@ static int run_prefill_allocation(void) {
     static const uint64_t expected_kv_bytes = UINT64_C(1686110208);
     static const uint64_t expected_total_bytes = UINT64_C(3223162888);
 
+    int device_count = 0;
+    CHECK(cudaGetDeviceCount(&device_count) == cudaSuccess &&
+              device_count >= 1,
+          "prefill allocation test has a visible CUDA device");
+    if (device_count < 1) return 1;
+    CHECK(ds4_gpu_init() != 0,
+          "prefill allocation test initializes the CUDA backend");
+    if (g_failures != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+
+    ds4_test_model_shape_state shape_before;
+    ds4_test_model_shape_state shape_after;
+    ds4_test_model_shape_state_get(&shape_before);
+
     ds4_test_laguna_prefill_allocation_snapshot invalid;
     ds4_test_laguna_prefill_allocation_snapshot invalid_before;
     memset(&invalid, 0xa5, sizeof(invalid));
@@ -5262,6 +5257,9 @@ static int run_prefill_allocation(void) {
     CHECK(ds4_test_laguna_prefill_allocation(
               context_tokens, prefill_rows, &snapshot),
           "model-free compact Laguna graph allocation succeeds on CUDA");
+    ds4_test_model_shape_state_get(&shape_after);
+    CHECK(memcmp(&shape_before, &shape_after, sizeof(shape_before)) == 0,
+          "prefill allocation restores the process model-shape state");
     CHECK(snapshot.context_tokens == context_tokens &&
               snapshot.graph_prefill_cap == prefill_rows &&
               snapshot.session_prefill_cap == prefill_rows,
@@ -5326,6 +5324,7 @@ static int run_prefill_allocation(void) {
                   expected_total_bytes,
           "graph teardown clears current ownership while retaining exact peaks");
 
+    ds4_gpu_cleanup();
     return g_failures == 0 ? 0 : 1;
 }
 

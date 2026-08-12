@@ -99,7 +99,13 @@ def main():
         if sys.argv[1:] != ["--case", "all"]:
             raise SystemExit(f"kernel argv mismatch: {sys.argv[1:]!r}")
     elif role == "model":
-        if sys.argv[1:]:
+        if sys.argv[1:] == ["--mode", "streamed", "--case", "short"]:
+            case = "short"
+        elif sys.argv[1:] == [
+            "--mode", "streamed", "--case", "prefill-8192"
+        ]:
+            case = "prefill-8192"
+        elif sys.argv[1:]:
             raise SystemExit(f"model argv mismatch: {sys.argv[1:]!r}")
     else:
         allowed_cases = {
@@ -107,6 +113,7 @@ def main():
             "teardown-unsafe",
             "model-startup",
             "model-teardown-unsafe",
+            "prefill-allocation",
         }
         if len(sys.argv) != 3 or sys.argv[1] != "--case":
             raise SystemExit(f"stream argv mismatch: {sys.argv[1:]!r}")
@@ -688,11 +695,14 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 [
                     ("verifier", None),
                     ("kernels", None),
+                    ("model", "short"),
+                    ("model", "prefill-8192"),
                     ("model", None),
                     ("stream", "startup"),
                     ("stream", "teardown-unsafe"),
                     ("stream", "model-startup"),
                     ("stream", "model-teardown-unsafe"),
+                    ("stream", "prefill-allocation"),
                 ],
             )
             verifier_argv = records[0]["argv"]
@@ -702,15 +712,23 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 verifier_argv[tokenizer_index + 1], PINNED_TOKENIZER_COMMIT
             )
             self.assertEqual(records[1]["argv"], ["--case", "all"])
-            self.assertEqual(records[2]["argv"], [])
-            for record in records[3:]:
+            self.assertEqual(
+                records[2]["argv"],
+                ["--mode", "streamed", "--case", "short"],
+            )
+            self.assertEqual(
+                records[3]["argv"],
+                ["--mode", "streamed", "--case", "prefill-8192"],
+            )
+            self.assertEqual(records[4]["argv"], [])
+            for record in records[5:]:
                 self.assertEqual(
                     record["argv"], ["--case", record["case"]]
                 )
             self.assertEqual(
                 records[-1]["case"],
-                "model-teardown-unsafe",
-                "model teardown unsafe must be the final gate child",
+                "prefill-allocation",
+                "exact prefill allocation must be the final gate child",
             )
             self.assertEqual(
                 len({record["pid"] for record in records}),
@@ -756,7 +774,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 json.loads(line)
                 for line in timeout_log.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(records), 7)
+            self.assertEqual(len(records), 10)
             verifier = records[0]
             self.assertEqual(verifier["kill_after"], "5s")
             self.assertEqual(verifier["duration"], "180s")
@@ -765,13 +783,35 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 Path(verifier["command"][1]).name,
                 "compare_laguna_logits.py",
             )
-            model = next(
-                record for record in records if record["selector"] == "model"
+            models = [
+                record
+                for record in records
+                if record["selector"] in (
+                    "model", "model:short", "model:prefill-8192"
+                )
+            ]
+            self.assertEqual(
+                [record["selector"] for record in models],
+                ["model:short", "model:prefill-8192", "model"],
             )
-            self.assertEqual(model["kill_after"], "5s")
-            self.assertEqual(model["duration"], "900s")
+            self.assertEqual(models[0]["kill_after"], "5s")
+            self.assertEqual(models[0]["duration"], "900s")
+            self.assertEqual(models[1]["kill_after"], "5s")
+            self.assertEqual(models[1]["duration"], "1800s")
+            self.assertEqual(models[2]["kill_after"], "5s")
+            self.assertEqual(models[2]["duration"], "900s")
+            self.assertEqual(
+                models[0]["command"][1:],
+                ["--mode", "streamed", "--case", "short"],
+            )
+            self.assertEqual(
+                models[1]["command"][1:],
+                ["--mode", "streamed", "--case", "prefill-8192"],
+            )
             for record in records[1:]:
-                if record["selector"] == "model":
+                if record["selector"] in (
+                    "model", "model:short", "model:prefill-8192"
+                ):
                     continue
                 with self.subTest(selector=record["selector"]):
                     self.assertEqual(record["kill_after"], "5s")
@@ -814,6 +854,8 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 [
                     ("verifier", None),
                     ("kernels", None),
+                    ("model", "short"),
+                    ("model", "prefill-8192"),
                     ("model", None),
                     ("stream", "startup"),
                 ],
@@ -885,6 +927,8 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 [
                     ("verifier", None),
                     ("kernels", None),
+                    ("model", "short"),
+                    ("model", "prefill-8192"),
                     ("model", None),
                     ("stream", "startup"),
                 ],

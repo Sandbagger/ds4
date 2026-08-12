@@ -12,6 +12,20 @@ static bool add_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return true;
 }
 
+bool ds4_runtime_checked_affine_bytes(
+        uint64_t rows,
+        uint64_t per_row_bytes,
+        uint64_t fixed_bytes,
+        uint64_t *bytes_out) {
+    if (!bytes_out || (rows != 0 && per_row_bytes > UINT64_MAX / rows)) {
+        return false;
+    }
+    const uint64_t row_bytes = rows * per_row_bytes;
+    if (fixed_bytes > UINT64_MAX - row_bytes) return false;
+    *bytes_out = row_bytes + fixed_bytes;
+    return true;
+}
+
 static bool range_end(uint64_t base, uint64_t bytes, uint64_t *end) {
     return bytes != 0 && add_u64(base, bytes, end);
 }
@@ -398,6 +412,47 @@ ds4_runtime_status ds4_runtime_tracker_allocate(
     record->relation = DS4_RUNTIME_RELATION_OWNED_ALLOCATION;
     recompute(tracker);
     return status(tracker);
+}
+
+ds4_runtime_status ds4_runtime_tracker_allocate_next(
+        ds4_runtime_tracker *tracker,
+        uint8_t producer_namespace,
+        uint32_t callsite_id,
+        uint64_t base,
+        uint64_t requested_bytes,
+        uint64_t charged_bytes,
+        uint64_t *allocation_id_out) {
+    if (!tracker) return DS4_RUNTIME_STATUS_UNSAFE;
+    if (!allocation_id_out) {
+        latch(tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+        return status(tracker);
+    }
+    if (status(tracker) != DS4_RUNTIME_STATUS_OK) {
+        return DS4_RUNTIME_STATUS_UNSAFE;
+    }
+
+    const uint64_t sequence_mask = UINT64_C(0x00ffffffffffffff);
+    const uint64_t previous_sequence =
+        tracker->issued_sequence_high_water[producer_namespace];
+    if (previous_sequence >= sequence_mask) {
+        latch(tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+        return status(tracker);
+    }
+    const uint64_t allocation_id =
+        ((uint64_t)producer_namespace << 56) | (previous_sequence + 1u);
+    const bool allocation_id_already_known =
+        find_record(tracker, allocation_id) != NULL;
+    const ds4_runtime_status result = ds4_runtime_tracker_allocate(
+        tracker, allocation_id, callsite_id, base,
+        requested_bytes, charged_bytes);
+    const ds4_runtime_allocation_record *record =
+        find_record(tracker, allocation_id);
+    if (result == DS4_RUNTIME_STATUS_OK ||
+        (!allocation_id_already_known && record && record->live &&
+         record->relation == DS4_RUNTIME_RELATION_OWNED_ALLOCATION)) {
+        *allocation_id_out = allocation_id;
+    }
+    return result;
 }
 
 ds4_runtime_status ds4_runtime_tracker_replay_owned(

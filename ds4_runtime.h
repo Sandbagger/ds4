@@ -154,6 +154,14 @@ typedef struct {
     uint64_t charged_bytes;
 } ds4_runtime_owned_descriptor;
 
+/* Compute rows * per_row_bytes + fixed_bytes without overflowing. Failure
+ * leaves bytes_out unchanged. */
+bool ds4_runtime_checked_affine_bytes(
+    uint64_t rows,
+    uint64_t per_row_bytes,
+    uint64_t fixed_bytes,
+    uint64_t *bytes_out);
+
 ds4_runtime_status ds4_runtime_tracker_init(
     ds4_runtime_tracker *tracker,
     const ds4_runtime_tracker_config *config);
@@ -165,6 +173,20 @@ ds4_runtime_status ds4_runtime_tracker_allocate(
     uint64_t base,
     uint64_t requested_bytes,
     uint64_t charged_bytes);
+
+/* Allocate with the next sequence in producer_namespace. The returned ID is
+ * monotonically increasing within that namespace, including across record
+ * release and tombstone reuse. On failure allocation_id_out is unchanged
+ * unless the underlying allocation was committed before a bound violation
+ * was detected, in which case it receives the live record's ID. */
+ds4_runtime_status ds4_runtime_tracker_allocate_next(
+    ds4_runtime_tracker *tracker,
+    uint8_t producer_namespace,
+    uint32_t callsite_id,
+    uint64_t base,
+    uint64_t requested_bytes,
+    uint64_t charged_bytes,
+    uint64_t *allocation_id_out);
 
 ds4_runtime_status ds4_runtime_tracker_replay_owned(
     ds4_runtime_tracker *tracker,

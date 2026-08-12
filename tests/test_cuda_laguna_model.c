@@ -45,6 +45,7 @@ typedef enum {
     MODEL_CASE_SHORT,
     MODEL_CASE_SWA,
     MODEL_CASE_CONTINUATION,
+    MODEL_CASE_PREFILL_8192,
 } model_case_selection;
 
 typedef struct {
@@ -62,6 +63,13 @@ typedef struct {
     int continuation[CONTINUATION_COUNT];
 } oracle_fixtures;
 
+typedef struct {
+    int count;
+    int current[4];
+    int total[4];
+    bool overflow;
+} prefill_progress_capture;
+
 static const char *case_ids[] = {
     "short",
     "swa-513",
@@ -78,6 +86,7 @@ static const char *model_case_name(model_case_selection selected) {
         case MODEL_CASE_SHORT: return "short";
         case MODEL_CASE_SWA: return "swa-513";
         case MODEL_CASE_CONTINUATION: return "continuation";
+        case MODEL_CASE_PREFILL_8192: return "prefill-8192";
         case MODEL_CASE_ALL: return "all";
     }
     return "unknown";
@@ -86,7 +95,8 @@ static const char *model_case_name(model_case_selection selected) {
 static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s [--mode resident|streamed "
-            "--case short|swa-513|continuation|all]\n"
+            "--case short|swa-513|continuation|prefill-8192|all]\n"
+            "       --case prefill-8192 is streamed-only\n"
             "       --case all is currently resident-only\n",
             program);
 }
@@ -122,6 +132,8 @@ static bool parse_selection(
                 *selected = MODEL_CASE_SWA;
             } else if (strcmp(argv[i + 1], "continuation") == 0) {
                 *selected = MODEL_CASE_CONTINUATION;
+            } else if (strcmp(argv[i + 1], "prefill-8192") == 0) {
+                *selected = MODEL_CASE_PREFILL_8192;
             } else if (strcmp(argv[i + 1], "all") == 0) {
                 *selected = MODEL_CASE_ALL;
             } else {
@@ -132,7 +144,9 @@ static bool parse_selection(
         }
     }
     return mode_seen && case_seen &&
-        !(*mode == MODEL_MODE_STREAMED && *selected == MODEL_CASE_ALL);
+        !(*mode == MODEL_MODE_STREAMED && *selected == MODEL_CASE_ALL) &&
+        !(*mode == MODEL_MODE_RESIDENT &&
+          *selected == MODEL_CASE_PREFILL_8192);
 }
 
 static bool fail_message(const char *what, const char *detail) {
@@ -398,6 +412,7 @@ static bool compare_session_oracle(
 }
 
 static bool verify_streamed_cache_contract(
+        ds4_engine *engine,
         const char *scenario,
         uint64_t routed_tokens) {
     ds4_gpu_laguna_compact_test_snapshot compact;
@@ -409,6 +424,19 @@ static bool verify_streamed_cache_contract(
     }
     if (!ds4_gpu_test_laguna_compact_routed_origin_snapshot(&origins)) {
         return fail_message("streamed routed-origin audit is unavailable", scenario);
+    }
+    ds4_runtime_snapshot runtime;
+    ds4_runtime_allocation_record runtime_records[256];
+    size_t runtime_required = 0;
+    memset(&runtime, 0, sizeof(runtime));
+    memset(runtime_records, 0, sizeof(runtime_records));
+    if (!ds4_test_engine_laguna_runtime_snapshot(
+            engine,
+            &runtime,
+            runtime_records,
+            sizeof(runtime_records) / sizeof(runtime_records[0]),
+            &runtime_required)) {
+        return fail_message("streamed runtime snapshot is unavailable", scenario);
     }
 
     const bool no_fallback =
@@ -437,11 +465,22 @@ static bool verify_streamed_cache_contract(
         !compact.cache_unsafe &&
         compact.routed_payload_bytes != 0 &&
         compact.routed_payload_bytes <= compact.cache_payload_bytes;
-    const bool ok = no_fallback && origin_exact && cache_healthy;
+    const bool graph_accounting_exact =
+        runtime.violation == DS4_RUNTIME_VIOLATION_NONE &&
+        runtime_required == 21u && runtime.active_record_count == 21u &&
+        runtime.category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] == 0 &&
+        runtime.category_current[DS4_RUNTIME_CATEGORY_KV_STATE] == 0 &&
+        runtime.category_peak[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
+            UINT64_C(1537052680) &&
+        runtime.category_peak[DS4_RUNTIME_CATEGORY_KV_STATE] ==
+            UINT64_C(1686110208);
+    const bool ok = no_fallback && origin_exact && cache_healthy &&
+        graph_accounting_exact;
     fprintf(stderr,
             "%s cache-origin requests=%llu engine_slots=%llu "
             "static=%llu model_map=%llu managed=%llu request=%llu "
-            "unknown=%llu hits=%llu misses=%llu loads=%llu/%llu %s\n",
+            "unknown=%llu hits=%llu misses=%llu loads=%llu/%llu "
+            "graph_peak=%llu kv_peak=%llu live=%zu %s\n",
             scenario,
             (unsigned long long)origins.routed_projection_requests,
             (unsigned long long)origins.engine_slot_resolutions,
@@ -454,6 +493,11 @@ static bool verify_streamed_cache_contract(
             (unsigned long long)compact.cache_acquire_misses,
             (unsigned long long)compact.cache_load_successes,
             (unsigned long long)compact.cache_load_failures,
+            (unsigned long long)runtime.category_peak[
+                DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH],
+            (unsigned long long)runtime.category_peak[
+                DS4_RUNTIME_CATEGORY_KV_STATE],
+            runtime.active_record_count,
             ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -465,8 +509,18 @@ static bool create_and_sync(
         ds4_session **out,
         const char *scenario) {
     char err[256] = {0};
-    if (ds4_session_create(out, engine, context) != 0) {
+    const uint32_t configured_chunk = ds4_engine_prefill_chunk(engine);
+    const int session_context = configured_chunk != 0 ? 32768 : context;
+    if (ds4_session_create(out, engine, session_context) != 0) {
         return fail_message("session create", scenario);
+    }
+    const int expected_cap = configured_chunk != 0 ?
+        (int)configured_chunk :
+        (session_context < 16384 ? session_context : 16384);
+    if (ds4_session_prefill_cap(*out) != expected_cap) {
+        ds4_session_free(*out);
+        *out = NULL;
+        return fail_message("session prefill cap", scenario);
     }
     if (ds4_session_sync(*out, tokens, err, sizeof(err)) != 0) {
         fprintf(stderr, "FAIL: %s session sync: %s\n", scenario, err);
@@ -632,6 +686,122 @@ static bool run_raw_frontier(
     return ok;
 }
 
+static void capture_prefill_progress(
+        void *userdata,
+        const char *event,
+        int current,
+        int total) {
+    prefill_progress_capture *capture = userdata;
+    if (!capture || !event || strcmp(event, "prefill_chunk") != 0) return;
+    if (capture->count >= (int)(sizeof(capture->current) /
+                                sizeof(capture->current[0]))) {
+        capture->overflow = true;
+        return;
+    }
+    capture->current[capture->count] = current;
+    capture->total[capture->count] = total;
+    capture->count++;
+}
+
+static bool live_prefill_accounting_exact(
+        ds4_engine *engine,
+        ds4_runtime_snapshot *snapshot,
+        ds4_runtime_allocation_record records[256],
+        size_t *required_out) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    memset(records, 0, 256u * sizeof(records[0]));
+    *required_out = 0;
+    return ds4_test_engine_laguna_runtime_snapshot(
+               engine, snapshot, records, 256u, required_out) &&
+        snapshot->violation == DS4_RUNTIME_VIOLATION_NONE &&
+        *required_out == 145u && snapshot->active_record_count == 145u &&
+        snapshot->category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
+            UINT64_C(1537052680) &&
+        snapshot->category_current[DS4_RUNTIME_CATEGORY_KV_STATE] ==
+            UINT64_C(1686110208) &&
+        snapshot->category_peak[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
+            UINT64_C(1537052680) &&
+        snapshot->category_peak[DS4_RUNTIME_CATEGORY_KV_STATE] ==
+            UINT64_C(1686110208);
+}
+
+/* This is deliberately an allocation/scheduling proof, not a replacement
+ * Poolside oracle. The existing YaRN numerical fixture remains authoritative;
+ * this case isolates whether the fixed 4K graph can process two real chunks
+ * without reallocating or changing the durable 32K KV ownership. */
+static bool run_prefill_8192(
+        ds4_engine *engine,
+        uint64_t *routed_tokens) {
+    ds4_tokens tokens = {0};
+    if (!tokenize_raw_fixture(
+            engine, "yarn-8193.prompt", 8193, &tokens)) {
+        return false;
+    }
+    tokens.len = 8192;
+    if (routed_tokens) *routed_tokens = (uint64_t)tokens.len;
+
+    ds4_session *session = NULL;
+    char err[256] = {0};
+    bool ok = ds4_session_create(&session, engine, 32768) == 0;
+    if (!ok) ok = fail_message("session create", "prefill-8192");
+    if (ok && ds4_session_prefill_cap(session) != 4096) {
+        ok = fail_message("session prefill cap", "prefill-8192");
+    }
+
+    ds4_runtime_snapshot before;
+    ds4_runtime_snapshot after;
+    ds4_runtime_allocation_record before_records[256];
+    ds4_runtime_allocation_record after_records[256];
+    size_t before_required = 0;
+    size_t after_required = 0;
+    if (ok && !live_prefill_accounting_exact(
+                  engine, &before, before_records, &before_required)) {
+        ok = fail_message("live prefill accounting before sync", "prefill-8192");
+    }
+
+    prefill_progress_capture progress = {0};
+    if (ok) {
+        ds4_session_set_progress(session, capture_prefill_progress, &progress);
+        if (ds4_session_sync(session, &tokens, err, sizeof(err)) != 0) {
+            ok = fail_message("two-chunk session sync", err);
+        }
+        ds4_session_set_progress(session, NULL, NULL);
+    }
+    if (ok && (progress.overflow || progress.count != 2 ||
+               progress.current[0] != 4096 ||
+               progress.current[1] != 8192 ||
+               progress.total[0] != 8192 || progress.total[1] != 8192)) {
+        ok = fail_message("two-chunk progress boundaries", "prefill-8192");
+    }
+    if (ok && ds4_session_pos(session) != 8192) {
+        ok = fail_message("two-chunk checkpoint position", "prefill-8192");
+    }
+    if (ok && !live_prefill_accounting_exact(
+                  engine, &after, after_records, &after_required)) {
+        ok = fail_message("live prefill accounting after sync", "prefill-8192");
+    }
+    if (ok && (before_required != after_required ||
+               memcmp(&before, &after, sizeof(before)) != 0 ||
+               memcmp(before_records, after_records,
+                      before_required * sizeof(before_records[0])) != 0)) {
+        ok = fail_message("prefill allocations changed across chunks",
+                          "prefill-8192");
+    }
+
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    if (ok) {
+        fprintf(stderr,
+                "prefill-8192 chunks=4096+4096 graph=%llu kv=%llu "
+                "owners=145 PASS\n",
+                (unsigned long long)before.category_current[
+                    DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH],
+                (unsigned long long)before.category_current[
+                    DS4_RUNTIME_CATEGORY_KV_STATE]);
+    }
+    return ok;
+}
+
 static void session_state_free(session_state *state) {
     if (!state) return;
     free(state->logits);
@@ -711,6 +881,10 @@ static bool run_deep_exact_context(
 
     if (ok && ds4_session_create(&session, engine, 32768) != 0) {
         ok = fail_message("session create", "deep-32768");
+    }
+    if (ok && ds4_session_prefill_cap(session) !=
+                  (ds4_engine_prefill_chunk(engine) != 0 ? 4096 : 16384)) {
+        ok = fail_message("session prefill cap", "deep-32768");
     }
     if (ok) {
         seed_logits = calloc(LAGUNA_VOCAB, sizeof(*seed_logits));
@@ -1127,6 +1301,9 @@ int main(int argc, char **argv) {
             streamed_routed_tokens = 8193u + CONTINUATION_COUNT;
         }
     }
+    if (ok && selected == MODEL_CASE_PREFILL_8192) {
+        ok = run_prefill_8192(engine, &streamed_routed_tokens);
+    }
     if (ok && selected == MODEL_CASE_ALL && !diagnostic_mode) {
         if (ok) {
             ok = run_raw_frontier(
@@ -1147,7 +1324,7 @@ int main(int argc, char **argv) {
     if (mode == MODEL_MODE_STREAMED) {
         const bool cache_contract =
             verify_streamed_cache_contract(
-                model_case_name(selected), streamed_routed_tokens);
+                engine, model_case_name(selected), streamed_routed_tokens);
         ok = cache_contract && ok;
     }
 
@@ -1156,6 +1333,13 @@ int main(int argc, char **argv) {
     if (!ok) return 1;
     if (diagnostic_mode) return 0;
     if (selected != MODEL_CASE_ALL) {
+        if (selected == MODEL_CASE_PREFILL_8192) {
+            fprintf(stderr,
+                    "test_cuda_laguna_model PASS "
+                    "contract=allocation-schedule mode=%s case=%s\n",
+                    model_mode_name(mode), model_case_name(selected));
+            return 0;
+        }
         fprintf(stderr,
                 "test_cuda_laguna_model PASS oracle=poolside mode=%s case=%s\n",
                 model_mode_name(mode), model_case_name(selected));

@@ -2460,6 +2460,28 @@ class CudaBuildContractTest(unittest.TestCase):
             "the compact guard must route through ds4_session_create",
         )
 
+    def test_laguna_compact_engine_close_preserves_live_sessions(self) -> None:
+        body = source_function_body(
+            DS4_SOURCE, "void ds4_engine_close(ds4_engine *e) {", "ds4.c"
+        )
+        active_check = body.find("exact_cache_active_sessions")
+        compact_destroy = body.find("ds4_gpu_laguna_compact_destroy(")
+        self.assertGreaterEqual(
+            active_check,
+            0,
+            "engine close must inspect live exact-cache sessions",
+        )
+        self.assertGreater(
+            compact_destroy,
+            active_check,
+            "live sessions must be rejected before compact CUDA teardown",
+        )
+        self.assertRegex(
+            body[:compact_destroy],
+            r"exact_cache_active_sessions\s*!=\s*0[^}]*return\s*;",
+            "engine close must retain the compact engine while a session lives",
+        )
+
     def test_laguna_session_eval_argmax_uses_session_eval_path(self) -> None:
         body = source_function_body(
             DS4_SOURCE, "int ds4_session_eval_argmax(", "ds4.c"

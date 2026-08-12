@@ -2149,6 +2149,11 @@ static void test_prefill_plan(void) {
               plan.total_bytes == plan.raw_bytes + plan.compressed_bytes +
                                       plan.scratch_bytes,
           "4K Laguna plan reconciles its exact KV and scratch total");
+    CHECK(ds4_test_graph_context_memory_bytes(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA,
+              context_rows,
+              4096u) == expected_total_bytes,
+          "Laguna graph estimator matches the exact 4K allocation plan");
 
     memset(&plan, 0, sizeof(plan));
     CHECK(ds4_test_laguna_prefill_plan(
@@ -2202,6 +2207,104 @@ static void test_prefill_plan(void) {
               1u, 1u, UINT64_MAX, &affine_bytes) &&
               affine_bytes == addition_before,
           "checked affine sizing rejects addition overflow without output mutation");
+
+    const ds4_runtime_callsite graph_owner_site = {
+        .id = 77u,
+        .name = "test.graph.owner",
+        .category = DS4_RUNTIME_CATEGORY_OTHER_HOST,
+        .domain = DS4_RUNTIME_DOMAIN_HOST,
+        .bound_bytes = 16u,
+    };
+    ds4_runtime_allocation_record owner_record[1];
+    ds4_runtime_tracker owner_tracker;
+    ds4_runtime_tracker_config owner_config = {
+        .callsites = &graph_owner_site,
+        .callsite_count = 1u,
+        .records = owner_record,
+        .record_capacity = 1u,
+        .owned_total_bound_bytes = 16u,
+        .qualification_total_bound_bytes = 16u,
+    };
+    owner_config.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 16u;
+    memset(owner_record, 0, sizeof(owner_record));
+    CHECK(ds4_runtime_tracker_init(&owner_tracker, &owner_config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "monotonic owner tracker initializes");
+    uint64_t first_owner_id = 0;
+    uint64_t second_owner_id = 0;
+    CHECK(ds4_runtime_tracker_allocate_next(
+              &owner_tracker, UINT8_C(0x4f), graph_owner_site.id,
+              UINT64_C(0x1000), 8u, 8u, &first_owner_id) ==
+              DS4_RUNTIME_STATUS_OK &&
+              first_owner_id == UINT64_C(0x4f00000000000001),
+          "first graph owner receives namespace sequence one");
+    CHECK(ds4_runtime_tracker_release(&owner_tracker, first_owner_id) ==
+              DS4_RUNTIME_STATUS_OK &&
+              ds4_runtime_tracker_allocate_next(
+                  &owner_tracker, UINT8_C(0x4f), graph_owner_site.id,
+                  UINT64_C(0x2000), 8u, 8u, &second_owner_id) ==
+                  DS4_RUNTIME_STATUS_OK &&
+              second_owner_id == UINT64_C(0x4f00000000000002) &&
+              owner_tracker.record_count == 1u,
+          "released graph owner reuses its tombstone with a monotonic ID");
+    CHECK(ds4_runtime_tracker_release(&owner_tracker, second_owner_id) ==
+              DS4_RUNTIME_STATUS_OK,
+          "second graph owner releases cleanly");
+    uint64_t rejected_owner_id = UINT64_C(0xa5a5a5a5a5a5a5a5);
+    CHECK(ds4_runtime_tracker_allocate_next(
+              &owner_tracker, UINT8_C(0x4f), 999u,
+              UINT64_C(0x3000), 8u, 8u, &rejected_owner_id) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              rejected_owner_id == UINT64_C(0xa5a5a5a5a5a5a5a5) &&
+              owner_tracker.issued_sequence_high_water[UINT8_C(0x4f)] == 2u,
+          "pre-commit owner failure preserves output and sequence high-water");
+
+    ds4_runtime_allocation_record bound_record[1];
+    ds4_runtime_tracker bound_tracker;
+    ds4_runtime_tracker_config bound_config = owner_config;
+    bound_config.records = bound_record;
+    bound_config.callsites = &graph_owner_site;
+    bound_config.owned_total_bound_bytes = 4u;
+    bound_config.qualification_total_bound_bytes = 4u;
+    bound_config.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 4u;
+    ds4_runtime_callsite tight_site = graph_owner_site;
+    tight_site.bound_bytes = 4u;
+    bound_config.callsites = &tight_site;
+    memset(bound_record, 0, sizeof(bound_record));
+    CHECK(ds4_runtime_tracker_init(&bound_tracker, &bound_config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "bound-failure owner tracker initializes");
+    uint64_t committed_owner_id = 0;
+    CHECK(ds4_runtime_tracker_allocate_next(
+              &bound_tracker, UINT8_C(0x4f), tight_site.id,
+              UINT64_C(0x4000), 8u, 8u, &committed_owner_id) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              committed_owner_id == UINT64_C(0x4f00000000000001) &&
+              bound_record[0].live,
+          "post-commit bound failure returns the live owner ID");
+    CHECK(ds4_runtime_tracker_release(
+              &bound_tracker, committed_owner_id) ==
+              DS4_RUNTIME_STATUS_UNSAFE && !bound_record[0].live,
+          "latched bound failure still permits exact owner cleanup");
+
+    ds4_runtime_allocation_record exhausted_record[1];
+    ds4_runtime_tracker exhausted_tracker;
+    ds4_runtime_tracker_config exhausted_config = owner_config;
+    exhausted_config.records = exhausted_record;
+    memset(exhausted_record, 0, sizeof(exhausted_record));
+    CHECK(ds4_runtime_tracker_init(&exhausted_tracker, &exhausted_config) ==
+              DS4_RUNTIME_STATUS_OK,
+          "exhausted owner tracker initializes");
+    exhausted_tracker.issued_sequence_high_water[UINT8_C(0x4f)] =
+        UINT64_C(0x00ffffffffffffff);
+    uint64_t exhausted_owner_id = UINT64_C(0x1122334455667788);
+    CHECK(ds4_runtime_tracker_allocate_next(
+              &exhausted_tracker, UINT8_C(0x4f), graph_owner_site.id,
+              UINT64_C(0x5000), 8u, 8u, &exhausted_owner_id) ==
+              DS4_RUNTIME_STATUS_UNSAFE &&
+              exhausted_owner_id == UINT64_C(0x1122334455667788) &&
+              exhausted_tracker.violation == DS4_RUNTIME_VIOLATION_OVERFLOW,
+          "owner sequence exhaustion fails without mutating the output ID");
 }
 
 static void test_allocation_profiles(void) {

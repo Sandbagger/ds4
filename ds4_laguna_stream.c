@@ -1439,8 +1439,9 @@ bool ds4_laguna_allocation_plan_make(
         return set_error(err, errlen, "allocation plan KV arithmetic overflow");
     }
     uint64_t graph_bytes = 0;
-    if (!mul_u64(spec->prefill_rows, UINT64_C(375156), &graph_bytes) ||
-        !add_u64(graph_bytes, UINT64_C(413704), &graph_bytes)) {
+    if (!ds4_runtime_checked_affine_bytes(
+            spec->prefill_rows, UINT64_C(375156), UINT64_C(413704),
+            &graph_bytes)) {
         return set_error(err, errlen,
                          "allocation plan graph arithmetic overflow");
     }

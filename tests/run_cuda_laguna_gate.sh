@@ -186,6 +186,14 @@ fi
 assert_retained_identity kernels
 
 if [ "$mode" = c7 ]; then
+    timeout --kill-after=5s 900s "$model_child" \
+        --mode streamed --case short
+    assert_retained_identity model-streamed-short
+
+    timeout --kill-after=5s 1800s "$model_child" \
+        --mode streamed --case prefill-8192
+    assert_retained_identity model-streamed-prefill-8192
+
     timeout --kill-after=5s 900s "$model_child"
 else
     "$model_child"
@@ -204,6 +212,9 @@ if [ "$mode" = c7 ]; then
 
     timeout --kill-after=5s 60s "$stream_child" --case model-teardown-unsafe
     assert_retained_identity stream-model-teardown-unsafe
+
+    timeout --kill-after=5s 60s "$stream_child" --case prefill-allocation
+    assert_retained_identity stream-prefill-allocation
 fi
 
 hash_retained_fd

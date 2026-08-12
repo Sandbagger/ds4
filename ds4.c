@@ -5239,6 +5239,42 @@ static bool ds4_laguna_graph_context_bound(
     return total != 0;
 }
 
+static bool ds4_laguna_prefill_memory_plan(
+        uint32_t context_tokens,
+        uint32_t prefill_rows,
+        ds4_context_memory *out) {
+    if (!out || context_tokens == 0 || prefill_rows == 0 ||
+        prefill_rows > context_tokens) {
+        return false;
+    }
+
+    ds4_context_memory plan = {0};
+    plan.prefill_cap = prefill_rows;
+    plan.raw_cap = context_tokens;
+    plan.comp_cap = context_tokens < DS4_N_SWA ?
+        context_tokens : DS4_N_SWA;
+
+    const uint64_t kv_row_bytes =
+        2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t cap = ds4_laguna_layer_is_swa(il) ?
+            plan.comp_cap : context_tokens;
+        if (!ds4_runtime_checked_affine_bytes(
+                cap, kv_row_bytes, plan.raw_bytes, &plan.raw_bytes)) {
+            return false;
+        }
+    }
+    if (!ds4_runtime_checked_affine_bytes(
+            prefill_rows, UINT64_C(375156), UINT64_C(413704),
+            &plan.scratch_bytes) ||
+        !ds4_runtime_checked_affine_bytes(
+            1u, plan.scratch_bytes, plan.raw_bytes, &plan.total_bytes)) {
+        return false;
+    }
+    *out = plan;
+    return true;
+}
+
 static bool ds4_graph_context_bounds_make(
         uint32_t context_tokens,
         uint32_t prefill_chunk,
@@ -35979,36 +36015,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             return m;
         }
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-            const uint64_t kv_row_bytes =
-                2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
-            m.prefill_cap = 1;
-            m.raw_cap = ctx;
-            m.comp_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
-            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                const uint32_t cap = ds4_laguna_layer_is_swa(il) ?
-                    m.comp_cap : ctx;
-                m.raw_bytes += (uint64_t)cap * kv_row_bytes;
-            }
-
-            const uint64_t q_dim =
-                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-            const uint64_t kv_dim =
-                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-            const uint64_t ffn_max = DS4_N_FF_DENSE >
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
-                DS4_N_FF_DENSE :
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-            uint64_t scratch_f32 = 9ull * DS4_N_EMBD +
-                                   2ull * q_dim +
-                                   2ull * kv_dim +
-                                   DS4_N_HEAD +
-                                   3ull * ffn_max +
-                                   (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP +
-                                   2ull * DS4_N_EXPERT +
-                                   2ull * DS4_N_EXPERT_USED +
-                                   DS4_N_VOCAB;
-            m.scratch_bytes = scratch_f32 * sizeof(float);
-            m.total_bytes = m.raw_bytes + m.scratch_bytes;
+            const uint32_t rows = ssd_streaming && prefill_chunk != 0 ?
+                prefill_chunk : (ctx < 16384u ? ctx : 16384u);
+            (void)ds4_laguna_prefill_memory_plan(ctx, rows, &m);
             return m;
         }
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx,
@@ -36443,7 +36452,7 @@ typedef struct {
 } ds4_engine_tp_state;
 
 enum {
-    DS4_LAGUNA_RUNTIME_RECORD_CAPACITY = 64,
+    DS4_LAGUNA_RUNTIME_RECORD_CAPACITY = 256,
     DS4_LAGUNA_INVENTORY_RECORD_COUNT = 6,
 };
 
@@ -48022,11 +48031,21 @@ static int generate_glm_metal_argmax(
  * full-attention and sliding-window layers with different query geometry.
  * Keep this graph separate from DeepSeek's compressed-attention graph and
  * GLM's DSA graph so their mature scheduling paths remain untouched. */
+enum {
+    DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT = 28,
+    DS4_LAGUNA_GRAPH_OWNER_CAPACITY =
+        DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT + 2 * DS4_MAX_LAYER,
+};
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t prefill_cap;
     uint64_t scratch_bytes;
     uint64_t kv_bytes;
+    ds4_runtime_tracker *runtime_tracker;
+    uint64_t runtime_record_ids[DS4_LAGUNA_GRAPH_OWNER_CAPACITY];
+    bool runtime_records_live[DS4_LAGUNA_GRAPH_OWNER_CAPACITY];
+    uint32_t runtime_record_count;
 
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *cur;
@@ -48061,8 +48080,121 @@ typedef struct {
     uint32_t cache_cap[DS4_MAX_LAYER];
 } ds4_laguna_gpu_graph;
 
+static bool laguna_graph_tracker_record_live(
+        const ds4_runtime_tracker *tracker,
+        uint64_t record_id) {
+    if (!tracker || record_id == 0) return false;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (tracker->records[i].id == record_id) {
+            return tracker->records[i].live;
+        }
+    }
+    return false;
+}
+
+static bool laguna_graph_tracker_preflight(
+        ds4_runtime_tracker *tracker,
+        const ds4_context_memory *plan) {
+    if (!tracker) return true;
+    if (!plan || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        tracker->category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] !=
+            plan->scratch_bytes ||
+        tracker->category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] !=
+            plan->raw_bytes ||
+        tracker->category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] != 0 ||
+        tracker->category_current[DS4_RUNTIME_CATEGORY_KV_STATE] != 0) {
+        return false;
+    }
+
+    size_t live_records = 0;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (tracker->records[i].live) live_records++;
+    }
+    const size_t required = DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT +
+        2u * DS4_N_LAYER;
+    if (live_records > tracker->record_capacity ||
+        required > tracker->record_capacity - live_records) {
+        return false;
+    }
+
+    bool graph_site = false;
+    bool kv_site = false;
+    for (size_t i = 0; i < tracker->callsite_count; i++) {
+        const ds4_runtime_callsite *site = &tracker->callsites[i];
+        if (site->id == DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH) {
+            graph_site = site->category ==
+                    DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH &&
+                site->domain == DS4_RUNTIME_DOMAIN_CUDA_DEVICE &&
+                site->bound_bytes == plan->scratch_bytes;
+        } else if (site->id == DS4_LAGUNA_CALLSITE_KV_STATE) {
+            kv_site = site->category == DS4_RUNTIME_CATEGORY_KV_STATE &&
+                site->domain == DS4_RUNTIME_DOMAIN_CUDA_DEVICE &&
+                site->bound_bytes == plan->raw_bytes;
+        }
+    }
+    return graph_site && kv_site;
+}
+
+static bool laguna_graph_track_tensor(
+        ds4_laguna_gpu_graph *g,
+        ds4_gpu_tensor *tensor,
+        uint64_t bytes,
+        uint32_t callsite_id) {
+    if (!g || !tensor || ds4_gpu_tensor_bytes(tensor) != bytes) return false;
+    if (!g->runtime_tracker) return true;
+    if (g->runtime_record_count >= DS4_LAGUNA_GRAPH_OWNER_CAPACITY) {
+        return false;
+    }
+    void *base = ds4_gpu_tensor_contents(tensor);
+    if (!base) return false;
+
+    uint64_t record_id = 0;
+    const ds4_runtime_status status = ds4_runtime_tracker_allocate_next(
+        g->runtime_tracker,
+        UINT8_C(0x4f),
+        callsite_id,
+        (uint64_t)(uintptr_t)base,
+        bytes,
+        bytes,
+        &record_id);
+    if (record_id != 0) {
+        const uint32_t index = g->runtime_record_count++;
+        g->runtime_record_ids[index] = record_id;
+        g->runtime_records_live[index] = true;
+    }
+    return status == DS4_RUNTIME_STATUS_OK;
+}
+
+static bool laguna_graph_release_tracker(ds4_laguna_gpu_graph *g) {
+    if (!g || !g->runtime_tracker) return true;
+    bool released = true;
+    for (uint32_t i = g->runtime_record_count; i > 0; i--) {
+        const uint32_t index = i - 1u;
+        if (!g->runtime_records_live[index]) continue;
+        const uint64_t record_id = g->runtime_record_ids[index];
+        const ds4_runtime_status status = ds4_runtime_tracker_release(
+            g->runtime_tracker, record_id);
+        if (!laguna_graph_tracker_record_live(
+                g->runtime_tracker, record_id)) {
+            g->runtime_records_live[index] = false;
+        } else {
+            released = false;
+        }
+        if (status != DS4_RUNTIME_STATUS_OK) {
+            fprintf(stderr,
+                    "ds4: Laguna graph tracker release %u failed\n",
+                    index);
+        }
+    }
+    return released;
+}
+
 static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     if (!g) return;
+    /* Physical ownership is dropped before its tracker record. The legacy
+     * tensor-free ABI is void, so this proves temporal ordering and normal
+     * CUDA teardown, but not a driver-level cudaFree failure; extending that
+     * proof requires a checked tensor-free API. */
 #define DS4_LAGUNA_FREE(name) do { \
         ds4_gpu_tensor_free(g->name); \
         g->name = NULL; \
@@ -48103,17 +48235,31 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
         g->value_cache[il] = NULL;
         g->cache_cap[il] = 0;
     }
+    if (!laguna_graph_release_tracker(g)) {
+        fprintf(stderr,
+                "ds4: Laguna graph ownership remains tracker-live after "
+                "physical free; engine teardown will fail closed\n");
+    }
     memset(g, 0, sizeof(*g));
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+static bool laguna_graph_alloc(
+        ds4_laguna_gpu_graph *g,
+        uint32_t ctx_size,
+        uint32_t prefill_rows,
+        ds4_runtime_tracker *tracker) {
+    ds4_context_memory memory_plan;
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
+        !ds4_laguna_prefill_memory_plan(
+            ctx_size, prefill_rows, &memory_plan) ||
+        !laguna_graph_tracker_preflight(tracker, &memory_plan) ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
     }
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
-    g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
+    g->prefill_cap = prefill_rows;
+    g->runtime_tracker = tracker;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -48127,7 +48273,9 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
 #define DS4_LAGUNA_ALLOC(name, bytes) do { \
         const uint64_t ds4_laguna_bytes_ = (uint64_t)(bytes); \
         g->name = ds4_gpu_tensor_alloc(ds4_laguna_bytes_); \
-        if (!g->name) goto fail; \
+        if (!g->name || !laguna_graph_track_tensor( \
+                g, g->name, ds4_laguna_bytes_, \
+                DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH)) goto fail; \
         g->scratch_bytes += ds4_laguna_bytes_; \
     } while (0)
     DS4_LAGUNA_ALLOC(tokens, rows * sizeof(uint32_t));
@@ -48183,9 +48331,23 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
             (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
         g->key_cache[il] = ds4_gpu_tensor_alloc(bytes);
         g->value_cache[il] = ds4_gpu_tensor_alloc(bytes);
-        if (!g->key_cache[il] || !g->value_cache[il]) goto fail;
+        if (!g->key_cache[il] ||
+            !laguna_graph_track_tensor(
+                g, g->key_cache[il], bytes,
+                DS4_LAGUNA_CALLSITE_KV_STATE) ||
+            !g->value_cache[il] ||
+            !laguna_graph_track_tensor(
+                g, g->value_cache[il], bytes,
+                DS4_LAGUNA_CALLSITE_KV_STATE)) {
+            goto fail;
+        }
         g->cache_cap[il] = cap;
         g->kv_bytes += 2u * bytes;
+    }
+
+    if (g->scratch_bytes != memory_plan.scratch_bytes ||
+        g->kv_bytes != memory_plan.raw_bytes) {
+        goto fail;
     }
 
     fprintf(stderr,
@@ -49703,7 +49865,12 @@ static int generate_laguna_metal_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size)) return 1;
+    const uint32_t legacy_prefill_rows = (uint32_t)ctx_size < 16384u ?
+        (uint32_t)ctx_size : 16384u;
+    if (!laguna_graph_alloc(
+            &g, (uint32_t)ctx_size, legacy_prefill_rows, NULL)) {
+        return 1;
+    }
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -49977,10 +50144,16 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         uint32_t    prefill_chunk,
         bool        ssd_streaming) {
     (void)backend;
-    (void)prefill_chunk;
-    (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+
+    if (ds4_backend_uses_graph(backend) &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        const uint32_t rows = ssd_streaming && prefill_chunk != 0 ?
+            prefill_chunk : (ctx < 16384u ? ctx : 16384u);
+        (void)ds4_laguna_prefill_memory_plan(ctx, rows, &m);
+        return m;
+    }
 
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
@@ -59438,6 +59611,214 @@ uint64_t ds4_test_graph_context_memory_bytes(
     return memory.total_bytes;
 }
 
+bool ds4_test_laguna_prefill_plan(
+        uint32_t context_tokens,
+        uint32_t configured_prefill_rows,
+        ds4_context_memory *out) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    uint32_t saved_ratios[DS4_MAX_LAYER];
+    uint32_t saved_heads[DS4_MAX_LAYER];
+    memcpy(saved_ratios, g_ds4_compress_ratios, sizeof(saved_ratios));
+    memcpy(saved_heads, g_ds4_head_counts, sizeof(saved_heads));
+    g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g_ds4_head_counts[il] = (il % 4u) == 0 ? 48u : 72u;
+    }
+    const bool ok = ds4_laguna_prefill_memory_plan(
+        context_tokens, configured_prefill_rows, out);
+    g_ds4_shape = saved_shape;
+    memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
+    memcpy(g_ds4_head_counts, saved_heads, sizeof(saved_heads));
+    return ok;
+}
+
+bool ds4_test_checked_affine_bytes(
+        uint64_t rows,
+        uint64_t bytes_per_row,
+        uint64_t fixed_bytes,
+        uint64_t *out) {
+    return ds4_runtime_checked_affine_bytes(
+        rows, bytes_per_row, fixed_bytes, out);
+}
+
+#ifndef DS4_NO_GPU
+bool ds4_test_laguna_prefill_allocation(
+        uint32_t context_tokens,
+        uint32_t prefill_rows,
+        ds4_test_laguna_prefill_allocation_snapshot *out) {
+    if (!out || context_tokens == 0 || prefill_rows == 0 ||
+        prefill_rows > context_tokens) {
+        return false;
+    }
+
+    const ds4_shape saved_shape = g_ds4_shape;
+    uint32_t saved_ratios[DS4_MAX_LAYER];
+    uint32_t saved_heads[DS4_MAX_LAYER];
+    memcpy(saved_ratios, g_ds4_compress_ratios, sizeof(saved_ratios));
+    memcpy(saved_heads, g_ds4_head_counts, sizeof(saved_heads));
+    g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g_ds4_head_counts[il] = (il % 4u) == 0 ? 48u : 72u;
+    }
+
+    bool ok = false;
+    ds4_context_memory memory_plan;
+    if (!ds4_laguna_prefill_memory_plan(
+            context_tokens, prefill_rows, &memory_plan)) {
+        goto restore_shape;
+    }
+
+    ds4_runtime_callsite callsites[2] = {
+        {
+            .id = DS4_LAGUNA_CALLSITE_KV_STATE,
+            .name = "laguna.kv_state",
+            .category = DS4_RUNTIME_CATEGORY_KV_STATE,
+            .domain = DS4_RUNTIME_DOMAIN_CUDA_DEVICE,
+            .bound_bytes = memory_plan.raw_bytes,
+        },
+        {
+            .id = DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH,
+            .name = "laguna.graph_scratch",
+            .category = DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH,
+            .domain = DS4_RUNTIME_DOMAIN_CUDA_DEVICE,
+            .bound_bytes = memory_plan.scratch_bytes,
+        },
+    };
+    ds4_engine *engine = calloc(1, sizeof(*engine));
+    if (!engine) goto restore_shape;
+    ds4_runtime_tracker_config tracker_config = {
+        .callsites = callsites,
+        .callsite_count = sizeof(callsites) / sizeof(callsites[0]),
+        .records = engine->laguna_runtime_records,
+        .record_capacity = DS4_LAGUNA_RUNTIME_RECORD_CAPACITY,
+        .owned_total_bound_bytes = memory_plan.total_bytes,
+        .qualification_total_bound_bytes = memory_plan.total_bytes,
+    };
+    tracker_config.category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] =
+        memory_plan.raw_bytes;
+    tracker_config.category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] =
+        memory_plan.scratch_bytes;
+    if (ds4_runtime_tracker_init(
+            &engine->laguna_runtime_tracker, &tracker_config) !=
+        DS4_RUNTIME_STATUS_OK) {
+        goto free_engine;
+    }
+    engine->laguna_runtime_tracker_ready = true;
+    engine->backend = DS4_BACKEND_CUDA;
+    engine->metal_ready = true;
+    engine->laguna_compact_runtime = true;
+    engine->ssd_streaming_cache_bytes_set = true;
+    engine->laguna_allocation_plan.context_tokens = context_tokens;
+    engine->laguna_allocation_plan.prefill_rows = prefill_rows;
+    engine->exact_cache_context_limit = (int)context_tokens;
+    engine->exact_cache_session_limit = 1u;
+    if (pthread_mutex_init(&engine->exact_cache_session_mutex, NULL) != 0) {
+        goto free_engine;
+    }
+    engine->exact_cache_session_mutex_initialized = true;
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, (int)context_tokens) != 0 ||
+        !session || !session->laguna_graph_ready) {
+        goto free_session;
+    }
+    ds4_laguna_gpu_graph *graph = &session->laguna_graph;
+
+    ds4_test_laguna_prefill_allocation_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.context_tokens = context_tokens;
+    snapshot.graph_prefill_cap = graph->prefill_cap;
+    snapshot.session_prefill_cap = session->prefill_cap;
+    snapshot.layer_count = DS4_N_LAYER;
+
+    ds4_gpu_tensor *scratch_tensors[] = {
+        graph->tokens, graph->cur, graph->next, graph->attn_norm,
+        graph->q, graph->k, graph->v, graph->gate, graph->heads,
+        graph->attn_out, graph->after_attn, graph->ffn_norm,
+        graph->ffn_gate, graph->ffn_up, graph->ffn_mid, graph->ffn_out,
+        graph->shared_out, graph->routed_mid, graph->router_logits,
+        graph->router_probs, graph->router_selected,
+        graph->router_weights, graph->shared_selected,
+        graph->shared_weight, graph->staged_key, graph->staged_value,
+        graph->output_norm, graph->logits,
+    };
+    for (size_t i = 0;
+         i < sizeof(scratch_tensors) / sizeof(scratch_tensors[0]);
+         i++) {
+        if (!scratch_tensors[i] ||
+            !ds4_runtime_checked_affine_bytes(
+                1u,
+                ds4_gpu_tensor_bytes(scratch_tensors[i]),
+                snapshot.scratch_tensor_bytes,
+                &snapshot.scratch_tensor_bytes)) {
+            goto free_session;
+        }
+    }
+    if (snapshot.layer_count >
+        DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT) {
+        goto free_session;
+    }
+    for (uint32_t il = 0; il < snapshot.layer_count; il++) {
+        snapshot.cache_caps[il] = graph->cache_cap[il];
+        if (!graph->key_cache[il] || !graph->value_cache[il] ||
+            !ds4_runtime_checked_affine_bytes(
+                1u,
+                ds4_gpu_tensor_bytes(graph->key_cache[il]),
+                snapshot.kv_tensor_bytes,
+                &snapshot.kv_tensor_bytes) ||
+            !ds4_runtime_checked_affine_bytes(
+                1u,
+                ds4_gpu_tensor_bytes(graph->value_cache[il]),
+                snapshot.kv_tensor_bytes,
+                &snapshot.kv_tensor_bytes)) {
+            goto free_session;
+        }
+    }
+
+    ds4_runtime_allocation_record active_records[
+        DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT +
+        2u * DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT];
+    if (!ds4_runtime_tracker_snapshot_copy(
+            &engine->laguna_runtime_tracker,
+            &snapshot.allocated,
+            active_records,
+            sizeof(active_records) / sizeof(active_records[0]))) {
+        goto free_session;
+    }
+
+    ds4_session_free(session);
+    session = NULL;
+    if (!ds4_runtime_tracker_snapshot_copy(
+            &engine->laguna_runtime_tracker,
+            &snapshot.released,
+            NULL,
+            0) ||
+        engine->exact_cache_active_sessions != 0) {
+        goto free_session;
+    }
+    *out = snapshot;
+    ok = true;
+    goto free_session;
+
+free_session:
+    if (session) ds4_session_free(session);
+    if (engine->exact_cache_session_mutex_initialized) {
+        (void)pthread_mutex_destroy(&engine->exact_cache_session_mutex);
+        engine->exact_cache_session_mutex_initialized = false;
+    }
+free_engine:
+    free(engine);
+restore_shape:
+    g_ds4_shape = saved_shape;
+    memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
+    memcpy(g_ds4_head_counts, saved_heads, sizeof(saved_heads));
+    return ok;
+}
+#endif
+
 int ds4_test_session_read_logits(ds4_session *s, float *out,
                                  uint64_t out_bytes) {
     if (!s || !out ||
@@ -62094,6 +62475,32 @@ void ds4_engine_close(ds4_engine *e) {
            sizeof(g_ds4_test_laguna_last_close_snapshot));
     g_ds4_test_laguna_last_close_snapshot_valid = false;
 #endif
+    if (e->laguna_compact_runtime &&
+        e->exact_cache_session_mutex_initialized) {
+        if (pthread_mutex_lock(&e->exact_cache_session_mutex) != 0) {
+            fprintf(stderr,
+                    "ds4: compact Laguna session gate lock failed during "
+                    "engine close; retaining engine\n");
+            return;
+        }
+        if (e->exact_cache_active_sessions != 0) {
+            (void)pthread_mutex_unlock(&e->exact_cache_session_mutex);
+            fprintf(stderr,
+                    "ds4: compact Laguna engine close requires all sessions "
+                    "to be freed first; retaining engine and CUDA owners\n");
+#ifdef DS4_TEST_HOOKS
+            g_ds4_test_laguna_compact_close_observation.engine_retained =
+                true;
+#endif
+            return;
+        }
+        if (pthread_mutex_unlock(&e->exact_cache_session_mutex) != 0) {
+            fprintf(stderr,
+                    "ds4: compact Laguna session gate unlock failed during "
+                    "engine close; retaining engine\n");
+            return;
+        }
+    }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
     !defined(DS4_ROCM_BUILD)
 #ifdef DS4_TEST_HOOKS
@@ -62407,6 +62814,15 @@ static int ds4_engine_reserve_exact_cache_session(
     if (reserved_out) *reserved_out = false;
     if (!ds4_engine_exact_cache_session_limit_enabled(e)) return 0;
 
+    if (e->laguna_compact_runtime &&
+        (e->laguna_allocation_plan.context_tokens == 0 ||
+         ctx_size != (int)e->laguna_allocation_plan.context_tokens)) {
+        fprintf(stderr,
+                "ds4: compact Laguna sessions require the declared "
+                "%u-token context exactly\n",
+                e->laguna_allocation_plan.context_tokens);
+        return 2;
+    }
     if (e->exact_cache_context_limit <= 0 ||
         ctx_size > e->exact_cache_context_limit) {
         fprintf(stderr,
@@ -62504,12 +62920,23 @@ static int ds4_session_create_unchecked(
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size)) {
+        uint32_t prefill_rows = (uint32_t)ctx_size < 16384u ?
+            (uint32_t)ctx_size : 16384u;
+        ds4_runtime_tracker *tracker = NULL;
+        if (e->laguna_compact_runtime) {
+            prefill_rows = e->laguna_allocation_plan.prefill_rows;
+            tracker = &e->laguna_runtime_tracker;
+        }
+        if (!laguna_graph_alloc(
+                &s->laguna_graph,
+                (uint32_t)ctx_size,
+                prefill_rows,
+                tracker)) {
             free(s);
             return 1;
         }
         s->laguna_graph_ready = true;
-        s->prefill_cap = (uint32_t)ctx_size;
+        s->prefill_cap = s->laguna_graph.prefill_cap;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs =
             xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));

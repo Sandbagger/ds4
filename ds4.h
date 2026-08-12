@@ -656,6 +656,24 @@ bool ds4_test_checked_affine_bytes(
         uint64_t bytes_per_row,
         uint64_t fixed_bytes,
         uint64_t *out);
+#ifndef DS4_NO_GPU
+#define DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT 48u
+typedef struct {
+    uint32_t context_tokens;
+    uint32_t graph_prefill_cap;
+    uint32_t session_prefill_cap;
+    uint32_t layer_count;
+    uint32_t cache_caps[DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT];
+    uint64_t scratch_tensor_bytes;
+    uint64_t kv_tensor_bytes;
+    ds4_runtime_snapshot allocated;
+    ds4_runtime_snapshot released;
+} ds4_test_laguna_prefill_allocation_snapshot;
+bool ds4_test_laguna_prefill_allocation(
+        uint32_t context_tokens,
+        uint32_t prefill_rows,
+        ds4_test_laguna_prefill_allocation_snapshot *out);
+#endif
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

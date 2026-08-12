@@ -69,6 +69,7 @@ typedef enum {
     DS4_RUNTIME_VIOLATION_RELATION,
     DS4_RUNTIME_VIOLATION_NOT_LIVE,
     DS4_RUNTIME_VIOLATION_LIVE_RELATION,
+    DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION,
 } ds4_runtime_violation;
 
 typedef struct {
@@ -91,6 +92,105 @@ typedef struct {
     uint64_t owner_id;
     bool live;
 } ds4_runtime_allocation_record;
+
+enum {
+    DS4_RUNTIME_DEVICE_UUID_CAPACITY = 96,
+    DS4_RUNTIME_BUILD_IDENTITY_BYTES = 32,
+};
+
+typedef enum {
+    DS4_RUNTIME_EXTERNAL_FAILURE_NONE = 0,
+    DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT,
+    DS4_RUNTIME_EXTERNAL_FAILURE_SMAPS_PARSE,
+    DS4_RUNTIME_EXTERNAL_FAILURE_SMAPS_OVERFLOW,
+    DS4_RUNTIME_EXTERNAL_FAILURE_TRACKED_RANGE_OVERLAP,
+    DS4_RUNTIME_EXTERNAL_FAILURE_TRACKED_VMA_MISSING,
+    DS4_RUNTIME_EXTERNAL_FAILURE_DUPLICATE_ATTRIBUTION,
+    DS4_RUNTIME_EXTERNAL_FAILURE_NVML_API_MISMATCH,
+    DS4_RUNTIME_EXTERNAL_FAILURE_DEVICE_UUID_MISMATCH,
+    DS4_RUNTIME_EXTERNAL_FAILURE_PROCESS_ID_MISMATCH,
+    DS4_RUNTIME_EXTERNAL_FAILURE_BUILD_IDENTITY_MISMATCH,
+    DS4_RUNTIME_EXTERNAL_FAILURE_NVML_DUPLICATE_PID,
+    DS4_RUNTIME_EXTERNAL_FAILURE_NVML_PROCESS_MISSING,
+    DS4_RUNTIME_EXTERNAL_FAILURE_NVML_USAGE_UNKNOWN,
+    DS4_RUNTIME_EXTERNAL_FAILURE_UNRELATED_PROCESS_CHANGED,
+    DS4_RUNTIME_EXTERNAL_FAILURE_CUDA_NEGATIVE_GAP,
+    DS4_RUNTIME_EXTERNAL_FAILURE_HOST_UNATTRIBUTED_BOUND,
+    DS4_RUNTIME_EXTERNAL_FAILURE_CUDA_UNATTRIBUTED_BOUND,
+} ds4_runtime_external_failure;
+
+typedef struct {
+    uint32_t pid;
+    uint64_t used_bytes;
+    bool used_bytes_known;
+} ds4_runtime_nvml_process_sample;
+
+typedef struct {
+    uint32_t api_version;
+    const char *device_uuid;
+    const ds4_runtime_nvml_process_sample *processes;
+    size_t process_count;
+} ds4_runtime_nvml_inventory;
+
+typedef struct {
+    const char *smaps_text;
+    size_t smaps_text_bytes;
+    uint32_t model_device_major;
+    uint32_t model_device_minor;
+    uint64_t model_inode;
+    const ds4_runtime_allocation_record *attribution_records;
+    size_t attribution_record_count;
+
+    uint32_t expected_nvml_api_version;
+    const char *expected_device_uuid;
+    uint32_t own_pid;
+    const uint8_t *expected_build_identity;
+    const uint8_t *observed_build_identity;
+    size_t build_identity_bytes;
+    const char *baseline_device_uuid;
+    uint32_t baseline_process_id;
+    bool baseline_nvml_process_bytes_known;
+    uint64_t baseline_nvml_process_bytes;
+    uint64_t baseline_tracked_cuda_physical_bytes;
+    const ds4_runtime_nvml_inventory *pre_child_inventory;
+    const ds4_runtime_nvml_inventory *checkpoint_before_inventory;
+    const ds4_runtime_nvml_inventory *checkpoint_after_inventory;
+
+    bool cuda_mem_info_known;
+    uint64_t cuda_mem_free_bytes;
+    uint64_t cuda_mem_total_bytes;
+    uint64_t model_source_page_size;
+    uint64_t model_source_resident_bytes;
+    uint64_t model_source_mapped_page_bytes;
+} ds4_runtime_external_checkpoint_input;
+
+typedef struct {
+    ds4_runtime_external_failure failure;
+    uint64_t checkpoint_sequence;
+
+    uint32_t smaps_model_device_major;
+    uint32_t smaps_model_device_minor;
+    uint64_t smaps_model_inode;
+    uint64_t smaps_vma_count;
+    uint64_t smaps_total_pss_bytes;
+    uint64_t smaps_model_vma_count;
+    uint64_t smaps_model_pss_bytes;
+    uint64_t smaps_tracked_vma_count;
+    uint64_t smaps_tracked_pss_bytes;
+    uint64_t host_library_unattributed_bytes;
+
+    uint32_t nvml_api_version;
+    char device_uuid[DS4_RUNTIME_DEVICE_UUID_CAPACITY];
+    uint32_t process_id;
+    uint64_t nvml_process_baseline_bytes;
+    uint64_t tracked_cuda_physical_baseline_bytes;
+    uint64_t nvml_process_bytes;
+    uint64_t tracked_cuda_physical_bytes;
+    uint64_t cuda_library_unattributed_bytes;
+    uint64_t cuda_mem_free_bytes;
+    uint64_t cuda_mem_total_bytes;
+    bool unrelated_process_inventory_stable;
+} ds4_runtime_external_sample;
 
 typedef struct {
     const ds4_runtime_callsite *callsites;
@@ -125,6 +225,7 @@ typedef struct {
     uint64_t qualification_total_current;
     uint64_t qualification_total_peak;
     uint64_t event_sequence;
+    ds4_runtime_external_sample external_sample;
     ds4_runtime_violation violation;
 } ds4_runtime_tracker;
 
@@ -142,6 +243,7 @@ typedef struct {
     uint64_t qualification_total_current;
     uint64_t qualification_total_peak;
     uint64_t event_sequence;
+    ds4_runtime_external_sample external_sample;
     ds4_runtime_violation violation;
     size_t active_record_count;
 } ds4_runtime_snapshot;
@@ -231,6 +333,15 @@ ds4_runtime_status ds4_runtime_tracker_checkpoint_external(
     uint64_t model_source_resident_bytes,
     uint64_t host_library_unattributed_bytes,
     uint64_t cuda_library_unattributed_bytes);
+
+/* Reconcile one synchronized qualification checkpoint from recorded smaps,
+ * process-scoped NVML inventories, cudaMemGetInfo, and the live allocation
+ * attribution table.  The operation is transactional: a failed sample
+ * latches external attribution unsafe without committing report totals. */
+ds4_runtime_status ds4_runtime_tracker_checkpoint_attributed(
+    ds4_runtime_tracker *tracker,
+    const ds4_runtime_external_checkpoint_input *input,
+    ds4_runtime_external_sample *sample_out);
 
 /* Update only the model-source observation while retaining the most recent
  * host- and CUDA-library unattributed observations in the same checkpoint. */

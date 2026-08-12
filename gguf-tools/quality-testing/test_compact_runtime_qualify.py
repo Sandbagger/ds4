@@ -800,15 +800,32 @@ print("[" + ",".join(["0"] * count) + "]")
             model_bytes = model.read_bytes()
             output = Path(tmp) / "compact-runtime-benchmark-v1.json"
             events: list[object] = []
+            guard = {"cold_complete": False, "enforce": True}
             real_cold_prepare = TOOL.cold_prepare_from_plan
+            real_bind_model = TOOL.bind_model_identity
+            real_token_count = TOOL.RawDs4TokenCounter.__call__
+
+            def bind_model_for_cli(model_path: Path) -> dict[str, str]:
+                if guard["cold_complete"] and guard["enforce"]:
+                    raise AssertionError("model binding occurred after cold preparation")
+                events.append("model-access")
+                return real_bind_model(model_path)
+
+            def count_tokens_for_cli(
+                counter: object,
+                rendered: bytes,
+            ) -> int:
+                if guard["cold_complete"] and guard["enforce"]:
+                    raise AssertionError("tokenizer subprocess ran after cold preparation")
+                events.append("tokenizer-subprocess")
+                return real_token_count(counter, rendered)
 
             def cold_prepare_for_cli(
                 model_path: Path,
                 plan_path: Path,
                 expected_sha256: str,
             ) -> dict[str, object]:
-                events.append(("cold", model_path, plan_path, expected_sha256))
-                return real_cold_prepare(
+                result = real_cold_prepare(
                     model_path,
                     plan_path,
                     expected_sha256,
@@ -817,8 +834,15 @@ print("[" + ",".join(["0"] * count) + "]")
                         (file_size + page_size - 1) // page_size
                     ),
                 )
+                guard["cold_complete"] = True
+                events.append(("cold", model_path, plan_path, expected_sha256))
+                return result
 
             def collect_nvml_for_cli(gpu_uuid: str) -> dict[str, object]:
+                self.assertTrue(
+                    guard["cold_complete"],
+                    "pre-child NVML capture must follow cold preparation",
+                )
                 events.append(("nvml", gpu_uuid))
                 return {
                     "library_version": NVML_LIBRARY_VERSION,
@@ -834,6 +858,7 @@ print("[" + ",".join(["0"] * count) + "]")
                 }
 
             def capture_time_ns() -> int:
+                self.assertEqual(events[-1], ("nvml", HOST_IDENTITY["gpu_uuid"]))
                 events.append("clock")
                 return int(PRE_CHILD_CAPTURED_AT_UNIX_NS)
 
@@ -845,6 +870,15 @@ print("[" + ",".join(["0"] * count) + "]")
                 mock.patch.object(TOOL, "MODEL_SHA256", hashlib.sha256(model_bytes).hexdigest()),
                 mock.patch.object(
                     TOOL, "collect_host_identity", return_value=copy.deepcopy(HOST_IDENTITY)
+                ),
+                mock.patch.object(
+                    TOOL, "bind_model_identity", side_effect=bind_model_for_cli
+                ),
+                mock.patch.object(
+                    TOOL.RawDs4TokenCounter,
+                    "__call__",
+                    side_effect=count_tokens_for_cli,
+                    autospec=True,
                 ),
                 mock.patch.object(
                     TOOL, "cold_prepare_from_plan", side_effect=cold_prepare_for_cli
@@ -867,6 +901,7 @@ print("[" + ",".join(["0"] * count) + "]")
                     "log": invocation_log,
                     "model_bytes": model_bytes,
                     "events": events,
+                    "guard": guard,
                 }
 
     def fake_cli_build_argv(self, fixture: dict[str, object]) -> list[str]:
@@ -875,7 +910,7 @@ print("[" + ",".join(["0"] * count) + "]")
             "--model", str(fixture["model"]),
             "--output", str(fixture["output"]),
             "--qualification-plan", str(fixture["plan"]),
-            "--qualification-plan-sha256", str(fixture["plan_sha256"]),
+            "--trusted-qualification-plan-sha256", str(fixture["plan_sha256"]),
         ]
 
     def build_with_fake_cli(self, fixture: dict[str, object]) -> None:
@@ -884,6 +919,7 @@ print("[" + ",".join(["0"] * count) + "]")
                 TOOL.main(self.fake_cli_build_argv(fixture)),
                 0,
             )
+        fixture["guard"]["enforce"] = False
 
     def test_cli_build_and_verify_bind_and_retokenize_real_artifacts(self) -> None:
         with self.fake_cli_environment() as fixture:
@@ -894,27 +930,30 @@ print("[" + ",".join(["0"] * count) + "]")
                     TOOL.main(self.fake_cli_build_argv(fixture)),
                     0,
                 )
+                build_events = list(fixture["events"])
+                fixture["guard"]["enforce"] = False
                 self.assertEqual(
                     TOOL.main(["manifest", "verify", "--manifest", str(fixture["output"])]),
                     0,
                 )
             self.assertEqual(stderr.getvalue(), "")
             self.assertIn("manifest_sha256=", stdout.getvalue())
-            events = fixture["events"]
-            self.assertIsInstance(events, list)
-            self.assertEqual(
-                events[:3],
-                [
-                    (
-                        "cold",
-                        fixture["model"],
-                        fixture["plan"],
-                        fixture["plan_sha256"],
-                    ),
-                    ("nvml", HOST_IDENTITY["gpu_uuid"]),
-                    "clock",
-                ],
+            events = build_events
+            cold_event = (
+                "cold",
+                fixture["model"],
+                fixture["plan"],
+                fixture["plan_sha256"],
             )
+            cold_index = events.index(cold_event)
+            self.assertIn("model-access", events[:cold_index])
+            self.assertIn("tokenizer-subprocess", events[:cold_index])
+            self.assertEqual(
+                events[cold_index : cold_index + 3],
+                [cold_event, ("nvml", HOST_IDENTITY["gpu_uuid"]), "clock"],
+            )
+            self.assertNotIn("model-access", events[cold_index + 1 :])
+            self.assertNotIn("tokenizer-subprocess", events[cold_index + 1 :])
             manifest = TOOL.load_manifest(fixture["output"])
             self.assertEqual(
                 manifest["qualification_preflight"]["nvml_pre_child"]
@@ -1035,23 +1074,42 @@ print("[" + ",".join(["0"] * count) + "]")
         build = TOOL.parse_args([
             "manifest", "build", "--model", "/m", "--output", "/o",
             "--qualification-plan", "/p",
-            "--qualification-plan-sha256", "c" * 64,
+            "--trusted-qualification-plan-sha256", "c" * 64,
         ])
         verify = TOOL.parse_args(["manifest", "verify", "--manifest", "/m"])
         self.assertEqual((build.command, build.action), ("manifest", "build"))
         self.assertEqual(build.qualification_plan, Path("/p"))
-        self.assertEqual(build.qualification_plan_sha256, "c" * 64)
+        self.assertEqual(build.trusted_qualification_plan_sha256, "c" * 64)
         self.assertEqual((verify.command, verify.action), ("manifest", "verify"))
-        for missing in ("--qualification-plan", "--qualification-plan-sha256"):
+        for missing in (
+            "--qualification-plan",
+            "--trusted-qualification-plan-sha256",
+        ):
             argv = [
                 "manifest", "build", "--model", "/m", "--output", "/o",
                 "--qualification-plan", "/p",
-                "--qualification-plan-sha256", "c" * 64,
+                "--trusted-qualification-plan-sha256", "c" * 64,
             ]
             index = argv.index(missing)
             del argv[index : index + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
                 TOOL.parse_args(argv)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DS4_QUALIFICATION_PLAN": "/env/plan",
+                "DS4_QUALIFICATION_PLAN_SHA256": "c" * 64,
+            },
+        ), self.assertRaises(SystemExit):
+            TOOL.parse_args([
+                "manifest", "build", "--model", "/m", "--output", "/o"
+            ])
+        with self.assertRaises(SystemExit):
+            TOOL.parse_args([
+                "manifest", "build", "--model", "/m", "--output", "/o",
+                "--qualification-plan", "/p",
+                "--qualification-plan-sha256", "c" * 64,
+            ])
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
 
@@ -1685,6 +1743,7 @@ class NvmlCheckpointContractTest(unittest.TestCase):
 class NvmlPreChildCollectorContractTest(unittest.TestCase):
     def test_collector_uses_only_nvml_v2_and_returns_every_process_sorted(self) -> None:
         calls: list[object] = []
+        observed_device_uuid = [HOST_IDENTITY["gpu_uuid"]]
 
         class FakeFunction:
             def __init__(self, name: str, callback: Callable[..., int]) -> None:
@@ -1710,6 +1769,13 @@ class NvmlPreChildCollectorContractTest(unittest.TestCase):
             output._obj.value = 0x1234
             return 0
 
+        def device_uuid(device: object, buffer: object, capacity: object) -> int:
+            self.assertEqual(device.value, 0x1234)
+            encoded = observed_device_uuid[0].encode("ascii")
+            self.assertGreaterEqual(capacity.value, len(encoded) + 1)
+            buffer.value = encoded
+            return 0
+
         def processes(device: object, count: object, records: object) -> int:
             self.assertEqual(device.value, 0x1234)
             if records is None:
@@ -1731,6 +1797,7 @@ class NvmlPreChildCollectorContractTest(unittest.TestCase):
             nvmlDeviceGetHandleByUUID = FakeFunction(
                 "nvmlDeviceGetHandleByUUID", device_by_uuid
             )
+            nvmlDeviceGetUUID = FakeFunction("nvmlDeviceGetUUID", device_uuid)
             nvmlDeviceGetComputeRunningProcesses_v2 = FakeFunction(
                 "nvmlDeviceGetComputeRunningProcesses_v2", processes
             )
@@ -1766,9 +1833,16 @@ class NvmlPreChildCollectorContractTest(unittest.TestCase):
         )
         self.assertEqual(calls[0], "nvmlInit_v2")
         self.assertEqual(calls[-1], "nvmlShutdown")
+        self.assertEqual(calls.count("nvmlDeviceGetUUID"), 1)
         self.assertEqual(
             calls.count("nvmlDeviceGetComputeRunningProcesses_v2"), 2
         )
+
+        observed_device_uuid[0] = "GPU-ffffffff-ffff-ffff-ffff-ffffffffffff"
+        with mock.patch.object(TOOL.ctypes, "CDLL", side_effect=load_nvml):
+            with self.assertRaisesRegex(ValueError, "UUID|device"):
+                TOOL.collect_nvml_pre_child(HOST_IDENTITY["gpu_uuid"])
+        self.assertEqual(calls[-1], "nvmlShutdown")
 
 
 class QualificationPreflightManifestContractTest(unittest.TestCase):

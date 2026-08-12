@@ -7,9 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_ssd.h"
-#ifdef DS4_TEST_HOOKS
 #include "ds4_runtime.h"
-#endif
 
 /* Public engine boundary.
  *
@@ -61,6 +59,16 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
+#ifndef DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+#define DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+typedef struct ds4_gpu_nvml_inventory_snapshot
+    ds4_gpu_nvml_inventory_snapshot;
+#endif
+#ifndef DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+#define DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+typedef struct ds4_engine_laguna_external_checkpoint_observation
+    ds4_engine_laguna_external_checkpoint_observation;
+#endif
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 /* Cancellation callbacks run inside synchronous backend work.  They must be
@@ -248,6 +256,16 @@ int ds4_engine_write_qualification_plan(
         char *err,
         size_t errcap);
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+/* Explicit qualification checkpoint.  The caller must freeze `pre_child`
+ * before launching or initializing CUDA.  Compact CUDA implementations
+ * synchronize, measure exact model pages/smaps/process-scoped NVML, and
+ * transactionally publish one de-duplicated runtime sample. */
+ds4_runtime_status ds4_engine_laguna_external_checkpoint(
+        ds4_engine *engine,
+        const ds4_gpu_nvml_inventory_snapshot *pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        ds4_engine_laguna_external_checkpoint_observation *out);
 
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *

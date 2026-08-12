@@ -58943,6 +58943,86 @@ static int engine_install_gpu_placement(ds4_engine *e) {
 }
 #endif /* !DS4_NO_GPU */
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+static int ds4_hexadecimal_nibble(char byte) {
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    return -1;
+}
+
+static int ds4_running_executable_identity(
+        uint8_t out[DS4_RUNTIME_BUILD_IDENTITY_BYTES]) {
+    if (!out) return 0;
+    const int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat status;
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = {0};
+    char error[192] = {0};
+    int ok = fstat(fd, &status) == 0 && status.st_size > 0 &&
+        ds4_plan_io_sha256_fd(
+            fd, (uint64_t)status.st_size, digest,
+            error, sizeof(error));
+    if (close(fd) != 0) ok = 0;
+    if (!ok) return 0;
+    for (size_t i = 0; i < DS4_RUNTIME_BUILD_IDENTITY_BYTES; i++) {
+        const int high = ds4_hexadecimal_nibble(digest[2u * i]);
+        const int low = ds4_hexadecimal_nibble(digest[2u * i + 1u]);
+        if (high < 0 || low < 0) return 0;
+        out[i] = (uint8_t)((unsigned)high * 16u + (unsigned)low);
+    }
+    return digest[2u * DS4_RUNTIME_BUILD_IDENTITY_BYTES] == '\0';
+}
+#endif
+
+ds4_runtime_status ds4_engine_laguna_external_checkpoint(
+        ds4_engine *engine,
+        const ds4_gpu_nvml_inventory_snapshot *pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+    if (out) memset(out, 0, sizeof(*out));
+    if (!engine || !pre_child || !expected_build_identity || !out ||
+        engine->backend != DS4_BACKEND_CUDA ||
+        !engine->laguna_compact_runtime || !engine->laguna_compact ||
+        !engine->laguna_runtime_tracker_ready) {
+        if (engine && engine->laguna_runtime_tracker_ready &&
+            engine->laguna_runtime_tracker.violation ==
+                DS4_RUNTIME_VIOLATION_NONE) {
+            engine->laguna_runtime_tracker.violation =
+                DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION;
+        }
+        if (out) {
+            out->sample.failure =
+                DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT;
+        }
+        return DS4_RUNTIME_STATUS_UNSAFE;
+    }
+    uint8_t observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+    if (!ds4_running_executable_identity(observed_build_identity)) {
+        if (engine->laguna_runtime_tracker.violation ==
+            DS4_RUNTIME_VIOLATION_NONE) {
+            engine->laguna_runtime_tracker.violation =
+                DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION;
+        }
+        out->sample.failure = DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT;
+        return DS4_RUNTIME_STATUS_UNSAFE;
+    }
+    return ds4_gpu_laguna_compact_external_checkpoint(
+        engine->laguna_compact, pre_child,
+        expected_build_identity, observed_build_identity, out);
+#else
+    (void)engine;
+    (void)pre_child;
+    (void)expected_build_identity;
+    (void)out;
+    return DS4_RUNTIME_STATUS_UNSAFE;
+#endif
+}
+
 #ifdef DS4_TEST_HOOKS
 typedef struct {
     const char *name;
@@ -60132,8 +60212,10 @@ static bool ds4_engine_replay_laguna_inventory(
 static bool ds4_engine_laguna_compact_ownership_released(
         const ds4_engine *e) {
     if (!e || !e->laguna_runtime_tracker_ready ||
-        e->laguna_runtime_tracker.violation !=
-            DS4_RUNTIME_VIOLATION_NONE) {
+        (e->laguna_runtime_tracker.violation !=
+             DS4_RUNTIME_VIOLATION_NONE &&
+         e->laguna_runtime_tracker.violation !=
+             DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION)) {
         return false;
     }
     const void *bases[3] = {0};
@@ -60242,13 +60324,31 @@ static bool ds4_engine_laguna_compact_ownership_released(
             return false;
         }
     }
+    uint64_t external_reports = 0;
     for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
-        if (e->laguna_runtime_tracker.report_current[i] != 0) return false;
+        if (i == DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ||
+            i == DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED) {
+            if (e->laguna_runtime_tracker.report_current[i] != 0) {
+                return false;
+            }
+            continue;
+        }
+        if (e->laguna_runtime_tracker.violation ==
+                DS4_RUNTIME_VIOLATION_NONE &&
+            e->laguna_runtime_tracker.report_current[i] != 0) {
+            return false;
+        }
+        if (e->laguna_runtime_tracker.report_current[i] >
+            UINT64_MAX - external_reports) {
+            return false;
+        }
+        external_reports += e->laguna_runtime_tracker.report_current[i];
     }
     const uint64_t expected_total = ledger_bytes + inventory_bytes;
+    if (expected_total > UINT64_MAX - external_reports) return false;
     return e->laguna_runtime_tracker.owned_total_current == expected_total &&
         e->laguna_runtime_tracker.qualification_total_current ==
-            expected_total;
+            expected_total + external_reports;
 }
 #endif
 
@@ -62459,12 +62559,14 @@ static bool ds4_engine_laguna_release_record(
         release_status = ds4_runtime_tracker_release(
             &e->laguna_runtime_tracker, record_id);
     }
-    if (release_status != DS4_RUNTIME_STATUS_OK) {
+    const bool record_dead =
+        ds4_engine_laguna_record_is_dead(e, record_id);
+    if (release_status != DS4_RUNTIME_STATUS_OK && !record_dead) {
         fprintf(stderr,
                 "ds4: Laguna %s tracker release %zu failed\n",
                 owner_kind, owner_index);
     }
-    if (!ds4_engine_laguna_record_is_dead(e, record_id)) return false;
+    if (!record_dead) return false;
     *record_live = false;
     return true;
 }

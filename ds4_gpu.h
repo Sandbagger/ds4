@@ -94,6 +94,52 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Qualification-only process inventory.  Capture is self-contained and
+ * caller-owned: it dynamically queries NVML's process-scoped v2 API without
+ * initializing CUDA, then stores every returned PID in this flat value. */
+enum {
+    DS4_GPU_NVML_API_IDENTITY_CAPACITY = 64,
+    DS4_GPU_NVML_PROCESS_CAPACITY = 128,
+};
+
+struct ds4_gpu_nvml_inventory_snapshot {
+    uint32_t api_version;
+    char api_identity[DS4_GPU_NVML_API_IDENTITY_CAPACITY];
+    char library_version[DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY];
+    char device_uuid[DS4_RUNTIME_DEVICE_UUID_CAPACITY];
+    ds4_runtime_nvml_process_sample
+        processes[DS4_GPU_NVML_PROCESS_CAPACITY];
+    size_t process_count;
+};
+#ifndef DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+#define DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+typedef struct ds4_gpu_nvml_inventory_snapshot
+    ds4_gpu_nvml_inventory_snapshot;
+#endif
+
+struct ds4_engine_laguna_external_checkpoint_observation {
+    ds4_runtime_external_sample sample;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_before;
+    ds4_gpu_nvml_inventory_snapshot inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_after;
+    ds4_laguna_file_identity model_identity;
+    uint64_t model_map_base;
+    uint64_t model_map_bytes;
+    uint64_t model_file_offset;
+    uint64_t model_source_page_size;
+    uint64_t model_source_resident_bytes;
+    uint64_t model_source_mapped_page_bytes;
+    uint8_t observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+};
+#ifndef DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+#define DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+typedef struct ds4_engine_laguna_external_checkpoint_observation
+    ds4_engine_laguna_external_checkpoint_observation;
+#endif
+
+int ds4_gpu_nvml_inventory_capture(
+        ds4_gpu_nvml_inventory_snapshot *out);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
@@ -123,6 +169,14 @@ ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
         ds4_gpu_laguna_compact *ctx);
 bool ds4_gpu_laguna_compact_ownership_pending(
         const ds4_runtime_tracker *tracker);
+ds4_runtime_status ds4_gpu_laguna_compact_external_checkpoint(
+        ds4_gpu_laguna_compact *ctx,
+        const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const uint8_t
+            observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        ds4_engine_laguna_external_checkpoint_observation *out);
 
 /* Reserve one routed expert without performing SSD or CUDA work.  A cache hit
  * is returned already pinned.  LOAD_OWNER returns a lifecycle-bound LOADING
@@ -404,6 +458,10 @@ void ds4_gpu_test_laguna_compact_page_advice_inject(
         uint64_t exact_post_resident_bytes,
         int fadvise_errno,
         int madvise_errno);
+int ds4_test_engine_laguna_external_checkpoint_inject_nvml_once(
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_before,
+        const ds4_gpu_nvml_inventory_snapshot *inside_ds4,
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_after);
 uint64_t ds4_gpu_test_laguna_compact_snapshot_size(void);
 ds4_laguna_cache_status ds4_gpu_test_laguna_compact_cache_reserve_loading(
         ds4_gpu_laguna_compact *ctx,

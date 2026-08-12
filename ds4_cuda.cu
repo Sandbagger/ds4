@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
@@ -438,6 +439,36 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 typedef struct ds4_gpu_laguna_compact ds4_gpu_laguna_compact;
 
+enum {
+    DS4_GPU_NVML_API_IDENTITY_CAPACITY = 64,
+    DS4_GPU_NVML_PROCESS_CAPACITY = 128,
+};
+
+typedef struct ds4_gpu_nvml_inventory_snapshot {
+    uint32_t api_version;
+    char api_identity[DS4_GPU_NVML_API_IDENTITY_CAPACITY];
+    char library_version[DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY];
+    char device_uuid[DS4_RUNTIME_DEVICE_UUID_CAPACITY];
+    ds4_runtime_nvml_process_sample
+        processes[DS4_GPU_NVML_PROCESS_CAPACITY];
+    size_t process_count;
+} ds4_gpu_nvml_inventory_snapshot;
+
+typedef struct ds4_engine_laguna_external_checkpoint_observation {
+    ds4_runtime_external_sample sample;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_before;
+    ds4_gpu_nvml_inventory_snapshot inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_after;
+    ds4_laguna_file_identity model_identity;
+    uint64_t model_map_base;
+    uint64_t model_map_bytes;
+    uint64_t model_file_offset;
+    uint64_t model_source_page_size;
+    uint64_t model_source_resident_bytes;
+    uint64_t model_source_mapped_page_bytes;
+    uint8_t observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+} ds4_engine_laguna_external_checkpoint_observation;
+
 typedef enum {
     DS4_GPU_LAGUNA_DESTROY_OK = 0,
     DS4_GPU_LAGUNA_DESTROY_RECOVERABLE = 1,
@@ -593,6 +624,9 @@ struct ds4_gpu_laguna_compact {
     const ds4_laguna_ledger *ledger;
     const ds4_laguna_allocation_plan *plan;
     ds4_runtime_tracker *tracker;
+    ds4_gpu_nvml_inventory_snapshot nvml_baseline;
+    uint64_t baseline_tracked_cuda_physical_bytes;
+    int nvml_baseline_valid;
     char *static_slab;
     uint64_t static_slab_bytes;
     uint64_t static_source_copied_bytes;
@@ -728,6 +762,16 @@ static std::atomic<bool> g_laguna_compact_cache_cancel_requested{false};
 static std::atomic<uint64_t> g_laguna_compact_lifecycle_epoch{0};
 static std::atomic<uint64_t> g_laguna_compact_published_epoch{0};
 static std::atomic<uint64_t> g_laguna_compact_static_allocation_attempts;
+#ifdef DS4_TEST_HOOKS
+static std::mutex g_laguna_external_injection_mutex;
+static bool g_laguna_external_injection_armed;
+static ds4_gpu_nvml_inventory_snapshot
+    g_laguna_external_injected_before;
+static ds4_gpu_nvml_inventory_snapshot
+    g_laguna_external_injected_inside;
+static ds4_gpu_nvml_inventory_snapshot
+    g_laguna_external_injected_after;
+#endif
 static std::atomic<uint64_t> g_laguna_compact_next_tracker_id{
     UINT64_C(0x4d00000000000001)};
 static std::atomic<uint64_t> g_laguna_compact_legacy_full_map_register_bytes;
@@ -784,6 +828,306 @@ static const char *const g_laguna_compact_forbidden_env[] = {
     "DS4_CUDA_Q8_F16_CACHE_RESERVE_MB",
     "DS4_CUDA_STRICT_WEIGHT_CACHE",
 };
+
+/* Keep NVML optional at link time and avoid a build-time nvml.h dependency.
+ * These definitions are the stable v2 ABI exported by libnvidia-ml.so.1. */
+typedef struct nvmlDevice_st *ds4_nvml_device;
+typedef struct {
+    unsigned int pid;
+    unsigned long long used_gpu_memory;
+    unsigned int gpu_instance_id;
+    unsigned int compute_instance_id;
+} ds4_nvml_process_info_v2;
+
+static_assert(offsetof(ds4_nvml_process_info_v2, pid) == 0u,
+              "NVML v2 pid ABI offset");
+static_assert(offsetof(ds4_nvml_process_info_v2, used_gpu_memory) == 8u,
+              "NVML v2 used-memory ABI offset");
+static_assert(offsetof(ds4_nvml_process_info_v2, gpu_instance_id) == 16u,
+              "NVML v2 GPU-instance ABI offset");
+static_assert(offsetof(ds4_nvml_process_info_v2, compute_instance_id) == 20u,
+              "NVML v2 compute-instance ABI offset");
+static_assert(sizeof(ds4_nvml_process_info_v2) == 24u,
+              "NVML v2 process-info ABI size");
+
+typedef int (*ds4_nvml_init_v2_fn)(void);
+typedef int (*ds4_nvml_shutdown_fn)(void);
+typedef int (*ds4_nvml_system_version_fn)(char *, unsigned int);
+typedef int (*ds4_nvml_device_by_index_v2_fn)(
+    unsigned int, ds4_nvml_device *);
+typedef int (*ds4_nvml_device_by_uuid_fn)(
+    const char *, ds4_nvml_device *);
+typedef int (*ds4_nvml_device_uuid_fn)(
+    ds4_nvml_device, char *, unsigned int);
+typedef int (*ds4_nvml_compute_processes_v2_fn)(
+    ds4_nvml_device, unsigned int *, ds4_nvml_process_info_v2 *);
+
+typedef struct {
+    void *library;
+    ds4_nvml_init_v2_fn init_v2;
+    ds4_nvml_shutdown_fn shutdown;
+    ds4_nvml_system_version_fn system_version;
+    ds4_nvml_device_by_index_v2_fn device_by_index_v2;
+    ds4_nvml_device_by_uuid_fn device_by_uuid;
+    ds4_nvml_device_uuid_fn device_uuid;
+    ds4_nvml_compute_processes_v2_fn compute_processes_v2;
+} ds4_nvml_api;
+
+enum {
+    DS4_NVML_SUCCESS = 0,
+    DS4_NVML_ERROR_INSUFFICIENT_SIZE = 7,
+};
+
+static int cuda_laguna_nvml_symbol(
+        void *library, const char *name, void *target,
+        size_t target_size) {
+    if (!library || !name || !target || target_size != sizeof(void *)) {
+        return 0;
+    }
+    (void)dlerror();
+    void *symbol = dlsym(library, name);
+    if (!symbol || dlerror() != NULL) return 0;
+    memcpy(target, &symbol, target_size);
+    return 1;
+}
+
+static int cuda_laguna_nvml_open(ds4_nvml_api *api) {
+    if (!api) return 0;
+    memset(api, 0, sizeof(*api));
+    api->library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!api->library ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlInit_v2",
+            &api->init_v2, sizeof(api->init_v2)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlShutdown",
+            &api->shutdown, sizeof(api->shutdown)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlSystemGetNVMLVersion",
+            &api->system_version, sizeof(api->system_version)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetHandleByIndex_v2",
+            &api->device_by_index_v2, sizeof(api->device_by_index_v2)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetHandleByUUID",
+            &api->device_by_uuid, sizeof(api->device_by_uuid)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetUUID",
+            &api->device_uuid, sizeof(api->device_uuid)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetComputeRunningProcesses_v2",
+            &api->compute_processes_v2,
+            sizeof(api->compute_processes_v2))) {
+        if (api->library) (void)dlclose(api->library);
+        memset(api, 0, sizeof(*api));
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_laguna_nvml_close(ds4_nvml_api *api) {
+    if (!api) return;
+    if (api->library) (void)dlclose(api->library);
+    memset(api, 0, sizeof(*api));
+}
+
+static bool cuda_laguna_nvml_process_less(
+        const ds4_runtime_nvml_process_sample &a,
+        const ds4_runtime_nvml_process_sample &b) {
+    return a.pid < b.pid;
+}
+
+static int cuda_laguna_nvml_inventory_capture_bound(
+        const char *expected_device_uuid,
+        ds4_gpu_nvml_inventory_snapshot *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    ds4_nvml_api api;
+    if (!cuda_laguna_nvml_open(&api)) return 0;
+
+    int initialized = 0;
+    int ok = 0;
+    int result = DS4_NVML_SUCCESS;
+    unsigned int count = 0;
+    unsigned int capacity = 0;
+    ds4_nvml_device device = NULL;
+    ds4_nvml_process_info_v2
+        processes[DS4_GPU_NVML_PROCESS_CAPACITY];
+    memset(processes, 0, sizeof(processes));
+    if (api.init_v2() != DS4_NVML_SUCCESS) goto cleanup;
+    initialized = 1;
+    /* The initial pre-CUDA capture selects physical index 0.  Once compact
+     * admission proves that UUID is CUDA logical device 0, every subsequent
+     * capture resolves the immutable UUID directly rather than trusting that
+     * an NVML ordinal remains equivalent to a CUDA ordinal. */
+    if (api.system_version(
+            out->library_version,
+            (unsigned int)sizeof(out->library_version)) !=
+            DS4_NVML_SUCCESS ||
+        out->library_version[0] == '\0' ||
+        memchr(out->library_version, '\0',
+               sizeof(out->library_version)) == NULL ||
+        (expected_device_uuid
+             ? api.device_by_uuid(expected_device_uuid, &device)
+             : api.device_by_index_v2(0u, &device)) != DS4_NVML_SUCCESS ||
+        !device ||
+        api.device_uuid(
+            device, out->device_uuid,
+            (unsigned int)sizeof(out->device_uuid)) != DS4_NVML_SUCCESS ||
+        out->device_uuid[0] == '\0' ||
+        memchr(out->device_uuid, '\0', sizeof(out->device_uuid)) == NULL ||
+        (expected_device_uuid &&
+         strcmp(out->device_uuid, expected_device_uuid) != 0)) {
+        goto cleanup;
+    }
+
+    result = api.compute_processes_v2(device, &count, NULL);
+    if (result == DS4_NVML_SUCCESS && count == 0u) {
+        out->process_count = 0u;
+    } else {
+        if (result != DS4_NVML_ERROR_INSUFFICIENT_SIZE ||
+            count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+            goto cleanup;
+        }
+        capacity = DS4_GPU_NVML_PROCESS_CAPACITY;
+        result = api.compute_processes_v2(device, &capacity, processes);
+        if (result != DS4_NVML_SUCCESS ||
+            capacity > DS4_GPU_NVML_PROCESS_CAPACITY) {
+            goto cleanup;
+        }
+        out->process_count = capacity;
+        for (size_t i = 0; i < out->process_count; i++) {
+            if (processes[i].pid == 0u) goto cleanup;
+            out->processes[i].pid = processes[i].pid;
+            out->processes[i].used_bytes_known =
+                processes[i].used_gpu_memory != ULLONG_MAX;
+            out->processes[i].used_bytes =
+                out->processes[i].used_bytes_known
+                    ? (uint64_t)processes[i].used_gpu_memory : 0u;
+        }
+        std::sort(
+            out->processes,
+            out->processes + out->process_count,
+            cuda_laguna_nvml_process_less);
+        for (size_t i = 1; i < out->process_count; i++) {
+            if (out->processes[i - 1u].pid == out->processes[i].pid) {
+                goto cleanup;
+            }
+        }
+    }
+    out->api_version = 2u;
+    memcpy(out->api_identity,
+           "nvmlDeviceGetComputeRunningProcesses_v2",
+           sizeof("nvmlDeviceGetComputeRunningProcesses_v2"));
+    ok = 1;
+
+cleanup:
+    if (initialized && api.shutdown() != DS4_NVML_SUCCESS) ok = 0;
+    cuda_laguna_nvml_close(&api);
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
+}
+
+extern "C" int ds4_gpu_nvml_inventory_capture(
+        ds4_gpu_nvml_inventory_snapshot *out) {
+    return cuda_laguna_nvml_inventory_capture_bound(NULL, out);
+}
+
+static const ds4_runtime_nvml_process_sample *
+cuda_laguna_nvml_find_process(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot,
+        uint32_t pid) {
+    if (!snapshot || pid == 0u ||
+        snapshot->process_count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return NULL;
+    }
+    const ds4_runtime_nvml_process_sample *found = NULL;
+    for (size_t i = 0; i < snapshot->process_count; i++) {
+        if (snapshot->processes[i].pid != pid) continue;
+        if (found) return NULL;
+        found = &snapshot->processes[i];
+    }
+    return found;
+}
+
+static void cuda_laguna_nvml_inventory_view(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot,
+        ds4_runtime_nvml_inventory *view) {
+    if (!view) return;
+    memset(view, 0, sizeof(*view));
+    if (!snapshot) return;
+    view->api_version = snapshot->api_version;
+    view->library_version = snapshot->library_version;
+    view->device_uuid = snapshot->device_uuid;
+    view->processes = snapshot->processes;
+    view->process_count = snapshot->process_count;
+}
+
+static int cuda_laguna_tracker_cuda_physical_bytes(
+        const ds4_runtime_tracker *tracker,
+        uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0u;
+    if (!tracker || !tracker->records ||
+        !bytes_out ||
+        tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        tracker->record_count > tracker->record_capacity) {
+        return 0;
+    }
+    uint64_t bytes = 0u;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *record = &tracker->records[i];
+        if (!record->live ||
+            record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION) {
+            continue;
+        }
+        if ((record->domain == DS4_RUNTIME_DOMAIN_CUDA_DEVICE ||
+             record->domain == DS4_RUNTIME_DOMAIN_CUDA_MANAGED) &&
+            record->charged_bytes != 0u) {
+            if (bytes > UINT64_MAX - record->charged_bytes) return 0;
+            bytes += record->charged_bytes;
+        }
+    }
+    *bytes_out = bytes;
+    return 1;
+}
+
+static int cuda_laguna_hexadecimal_nibble(char byte) {
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    return -1;
+}
+
+static int cuda_laguna_nvml_uuid_bytes(
+        const char *text, unsigned char out[16]) {
+    if (!text || !out || strncmp(text, "GPU-", 4u) != 0) return 0;
+    const char *cursor = text + 4u;
+    size_t byte = 0u;
+    while (*cursor != '\0') {
+        if (*cursor == '-') {
+            cursor++;
+            continue;
+        }
+        if (byte >= 16u || cursor[1] == '\0') return 0;
+        const int high = cuda_laguna_hexadecimal_nibble(cursor[0]);
+        const int low = cuda_laguna_hexadecimal_nibble(cursor[1]);
+        if (high < 0 || low < 0) return 0;
+        out[byte++] = (unsigned char)((unsigned)high * 16u +
+                                     (unsigned)low);
+        cursor += 2u;
+    }
+    return byte == 16u;
+}
+
+static int cuda_laguna_cuda_uuid_matches_nvml(
+        int cuda_device, const char *nvml_uuid) {
+    unsigned char expected[16];
+    cudaDeviceProp properties;
+    memset(&properties, 0, sizeof(properties));
+    return cuda_laguna_nvml_uuid_bytes(nvml_uuid, expected) &&
+        cudaGetDeviceProperties(&properties, cuda_device) == cudaSuccess &&
+        memcmp(properties.uuid.bytes, expected, sizeof(expected)) == 0;
+}
 
 static int cuda_laguna_compact_environment_allowed(void) {
     for (size_t i = 0;
@@ -930,8 +1274,13 @@ static int cuda_laguna_compact_tracker_has_baseline(
         uint64_t ledger_array_bytes,
         size_t expected_live_count,
         size_t required_create_capacity,
+        int allow_external_attribution,
         size_t *live_count_out) {
-    if (!tracker || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+    if (!tracker ||
+        (tracker->violation != DS4_RUNTIME_VIOLATION_NONE &&
+         !(allow_external_attribution &&
+           tracker->violation ==
+               DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION)) ||
         !tracker->callsites || tracker->callsite_count == 0 ||
         !tracker->records || tracker->record_count > tracker->record_capacity) {
         return 0;
@@ -1033,11 +1382,24 @@ static int cuda_laguna_compact_tracker_has_baseline(
         }
         if (tracker->category_current[i] != expected) return 0;
     }
+    uint64_t expected_external = 0u;
     for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
-        if (tracker->report_current[i] != 0) return 0;
+        if (i == DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ||
+            i == DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED ||
+            !allow_external_attribution) {
+            if (tracker->report_current[i] != 0u) return 0;
+            continue;
+        }
+        if (tracker->report_current[i] >
+            UINT64_MAX - expected_external) {
+            return 0;
+        }
+        expected_external += tracker->report_current[i];
     }
+    if (expected_total > UINT64_MAX - expected_external) return 0;
     if (tracker->owned_total_current != expected_total ||
-        tracker->qualification_total_current != expected_total) {
+        tracker->qualification_total_current !=
+            expected_total + expected_external) {
         return 0;
     }
     if (live_count_out) *live_count_out = live_count;
@@ -1710,6 +2072,7 @@ static int cuda_laguna_compact_validate(
         !cuda_laguna_compact_tracker_has_baseline(
             tracker, ledger, ledger_array_bytes, 0,
             cache_geometry.enabled ? 13u : 3u,
+            0,
             baseline_live_record_count_out)) {
         return 0;
     }
@@ -1846,19 +2209,23 @@ static int cuda_laguna_compact_page_sample_exact_locked(
         ((uintptr_t)ctx->model_map & (uintptr_t)(page_size - 1u)) != 0) {
         return 0;
     }
+    if (ctx->model_size > UINT64_MAX - (page_size - 1u)) return 0;
+    const uint64_t mapped_page_bytes =
+        (ctx->model_size + page_size - 1u) & ~(page_size - 1u);
+    if (mapped_page_bytes == 0) return 0;
     /* Keep sampling allocation-free, but amortize a 68 GiB mapping over
-     * roughly 255 mincore calls rather than roughly 4,068 calls. */
+     * roughly 255 mincore calls rather than roughly 4,068 calls.  mincore
+     * reports physical pages, so a resident final partial file page is
+     * charged as one full system page, never as only the remaining bytes. */
     unsigned char residency[65536];
     uint64_t resident = 0;
     uint64_t offset = 0;
-    while (offset < ctx->model_size) {
-        const uint64_t remaining = ctx->model_size - offset;
+    while (offset < mapped_page_bytes) {
+        const uint64_t remaining = mapped_page_bytes - offset;
         uint64_t pages = remaining / page_size;
-        if (remaining % page_size != 0) pages++;
         if (pages > sizeof(residency)) pages = sizeof(residency);
         if (pages == 0 || pages > UINT64_MAX / page_size) return 0;
-        uint64_t span = pages * page_size;
-        if (span > remaining) span = remaining;
+        const uint64_t span = pages * page_size;
         if (span == 0 || span > SIZE_MAX ||
             offset > UINTPTR_MAX - (uintptr_t)ctx->model_map) {
             return 0;
@@ -1870,11 +2237,8 @@ static int cuda_laguna_compact_page_sample_exact_locked(
         }
         for (uint64_t page = 0; page < pages; page++) {
             if ((residency[page] & 1u) == 0) continue;
-            const uint64_t page_offset = page * page_size;
-            const uint64_t page_bytes = page_size < remaining - page_offset ?
-                page_size : remaining - page_offset;
-            if (resident > UINT64_MAX - page_bytes) return 0;
-            resident += page_bytes;
+            if (resident > mapped_page_bytes - page_size) return 0;
+            resident += page_size;
         }
         offset += span;
     }
@@ -2197,7 +2561,52 @@ static int cuda_laguna_compact_page_flush_pending_locked(
     uint64_t page_size = 0;
     return cuda_laguna_compact_system_page_size(&page_size) &&
         cuda_laguna_compact_page_flush_locked(
-            ctx, page_size, sample_pre);
+        ctx, page_size, sample_pre);
+}
+
+static int cuda_laguna_compact_tracker_record_dead(
+        const ds4_runtime_tracker *tracker,
+        uint64_t record_id,
+        ds4_runtime_relation expected_relation) {
+    if (!tracker || !tracker->records || record_id == 0u ||
+        tracker->record_count > tracker->record_capacity) {
+        return 0;
+    }
+    size_t matches = 0u;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *record = &tracker->records[i];
+        if (record->id != record_id) continue;
+        matches++;
+        if (record->live || record->relation != expected_relation) return 0;
+    }
+    return matches == 1u;
+}
+
+/* Runtime violations are historical and deliberately sticky.  Release still
+ * mutates a structurally valid record before returning UNSAFE, so teardown
+ * accepts that status only when the exact record is now uniquely dead. */
+static int cuda_laguna_compact_tracker_release_record(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t record_id) {
+    if (!ctx || !ctx->tracker) return 0;
+    const ds4_runtime_status result =
+        ds4_runtime_tracker_release(ctx->tracker, record_id);
+    return result == DS4_RUNTIME_STATUS_OK ||
+        cuda_laguna_compact_tracker_record_dead(
+            ctx->tracker, record_id,
+            DS4_RUNTIME_RELATION_OWNED_ALLOCATION);
+}
+
+static int cuda_laguna_compact_tracker_unmap_record(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t record_id) {
+    if (!ctx || !ctx->tracker) return 0;
+    const ds4_runtime_status result =
+        ds4_runtime_tracker_unmap_model(ctx->tracker, record_id);
+    return result == DS4_RUNTIME_STATUS_OK ||
+        cuda_laguna_compact_tracker_record_dead(
+            ctx->tracker, record_id,
+            DS4_RUNTIME_RELATION_MODEL_MAPPING);
 }
 
 /* g_laguna_compact_mutex must be held.  Physical allocations are destroyed
@@ -2254,9 +2663,8 @@ static int cuda_laguna_compact_release_locked(
             ctx->pinned_staging[i] = NULL;
         }
         if (ctx->tracker_pinned_staging_live[i]) {
-            if (ds4_runtime_tracker_release(
-                    ctx->tracker, ctx->pinned_staging_ids[i]) !=
-                    DS4_RUNTIME_STATUS_OK) {
+            if (!cuda_laguna_compact_tracker_release_record(
+                    ctx, ctx->pinned_staging_ids[i])) {
                 return 0;
             }
             ctx->tracker_pinned_staging_live[i] = 0;
@@ -2271,9 +2679,8 @@ static int cuda_laguna_compact_release_locked(
         ctx->device_entry_to_slot = NULL;
     }
     if (ctx->tracker_device_entry_to_slot_live) {
-        if (ds4_runtime_tracker_release(
-                ctx->tracker, ctx->device_entry_to_slot_id) !=
-                DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->device_entry_to_slot_id)) {
             return 0;
         }
         ctx->tracker_device_entry_to_slot_live = 0;
@@ -2281,9 +2688,8 @@ static int cuda_laguna_compact_release_locked(
     free(ctx->cache_slots);
     ctx->cache_slots = NULL;
     if (ctx->tracker_cache_slots_live) {
-        if (ds4_runtime_tracker_release(
-                ctx->tracker, ctx->cache_slots_id) !=
-                DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->cache_slots_id)) {
             return 0;
         }
         ctx->tracker_cache_slots_live = 0;
@@ -2291,9 +2697,8 @@ static int cuda_laguna_compact_release_locked(
     free(ctx->entry_to_slot);
     ctx->entry_to_slot = NULL;
     if (ctx->tracker_entry_to_slot_live) {
-        if (ds4_runtime_tracker_release(
-                ctx->tracker, ctx->entry_to_slot_id) !=
-                DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->entry_to_slot_id)) {
             return 0;
         }
         ctx->tracker_entry_to_slot_live = 0;
@@ -2301,9 +2706,8 @@ static int cuda_laguna_compact_release_locked(
     free(ctx->route_hotness);
     ctx->route_hotness = NULL;
     if (ctx->tracker_route_hotness_live) {
-        if (ds4_runtime_tracker_release(
-                ctx->tracker, ctx->route_hotness_id) !=
-                DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->route_hotness_id)) {
             return 0;
         }
         ctx->tracker_route_hotness_live = 0;
@@ -2317,9 +2721,8 @@ static int cuda_laguna_compact_release_locked(
         ctx->cache_payload = NULL;
     }
     if (ctx->tracker_cache_payload_live) {
-        if (ds4_runtime_tracker_release(
-                ctx->tracker, ctx->cache_payload_id) !=
-                DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->cache_payload_id)) {
             return 0;
         }
         ctx->tracker_cache_payload_live = 0;
@@ -2330,9 +2733,8 @@ static int cuda_laguna_compact_release_locked(
     ctx->page_advice_since_ranges = NULL;
     ctx->page_advice_advised_ranges = NULL;
     if (ctx->tracker_page_advice_state_live) {
-        if (ds4_runtime_tracker_release(
-                ctx->tracker, ctx->page_advice_state_id) !=
-                DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->page_advice_state_id)) {
             return 0;
         }
         ctx->tracker_page_advice_state_live = 0;
@@ -2349,8 +2751,8 @@ static int cuda_laguna_compact_release_locked(
         ctx->static_slab = NULL;
     }
     if (ctx->tracker_static_live) {
-        if (ds4_runtime_tracker_release(ctx->tracker, ctx->static_id) !=
-            DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->static_id)) {
             fprintf(stderr,
                     "ds4: compact Laguna static tracker release failed\n");
             return 0;
@@ -2360,8 +2762,8 @@ static int cuda_laguna_compact_release_locked(
     free(ctx->static_offsets);
     ctx->static_offsets = NULL;
     if (ctx->tracker_offsets_live) {
-        if (ds4_runtime_tracker_release(ctx->tracker, ctx->offsets_id) !=
-            DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->offsets_id)) {
             fprintf(stderr,
                     "ds4: compact Laguna offset tracker release failed\n");
             return 0;
@@ -2369,13 +2771,15 @@ static int cuda_laguna_compact_release_locked(
         ctx->tracker_offsets_live = 0;
     }
     if (ctx->tracker &&
+        ctx->tracker->violation !=
+            DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION &&
         ds4_runtime_tracker_checkpoint_model_source(ctx->tracker, 0) !=
             DS4_RUNTIME_STATUS_OK) {
         return 0;
     }
     if (ctx->tracker_mapping_live) {
-        if (ds4_runtime_tracker_unmap_model(
-                ctx->tracker, ctx->mapping_id) != DS4_RUNTIME_STATUS_OK) {
+        if (!cuda_laguna_compact_tracker_unmap_record(
+                ctx, ctx->mapping_id)) {
             fprintf(stderr,
                     "ds4: compact Laguna model-map tracker release failed\n");
             return 0;
@@ -2390,7 +2794,10 @@ static int cuda_laguna_compact_release_locked(
             ctx->ledger, ledger_array_parts, &ledger_array_bytes) ||
         !cuda_laguna_compact_tracker_has_baseline(
             ctx->tracker, ctx->ledger, ledger_array_bytes,
-            ctx->baseline_live_record_count, 0, NULL)) {
+            ctx->baseline_live_record_count, 0,
+            ctx->tracker->violation ==
+                DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION,
+            NULL)) {
         fprintf(stderr,
                 "ds4: compact Laguna baseline tracker reconciliation failed\n");
         return 0;
@@ -2629,16 +3036,37 @@ extern "C" int ds4_gpu_laguna_compact_create(
 #endif
     const int owned_fd = fcntl(model_fd, F_DUPFD_CLOEXEC, 0);
     uint64_t static_offset_bytes = 0;
+    uint64_t baseline_tracked_cuda_physical_bytes = 0;
     size_t baseline_live_record_count = 0;
     cuda_laguna_compact_cache_geometry cache_geometry;
+    ds4_gpu_nvml_inventory_snapshot nvml_baseline;
+    memset(&nvml_baseline, 0, sizeof(nvml_baseline));
     memset(&cache_geometry, 0, sizeof(cache_geometry));
     if (owned_fd < 0 || !cuda_laguna_compact_environment_allowed() ||
         !cuda_laguna_compact_validate(
             owned_fd, model_map, model_size, model_identity,
             ledger, plan, tracker,
             &static_offset_bytes, &baseline_live_record_count,
-            &cache_geometry)) {
+            &cache_geometry) ||
+        !cuda_laguna_tracker_cuda_physical_bytes(
+            tracker, &baseline_tracked_cuda_physical_bytes) ||
+        baseline_tracked_cuda_physical_bytes != 0u ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        !ds4_gpu_nvml_inventory_capture(&nvml_baseline) ||
+        !cuda_laguna_cuda_uuid_matches_nvml(
+            0, nvml_baseline.device_uuid)) {
         if (owned_fd >= 0) (void)close(owned_fd);
+        (void)cudaGetLastError();
+        g_laguna_compact_state.store(
+            DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
+        return 0;
+    }
+    const uint32_t own_pid = (uint32_t)getpid();
+    const ds4_runtime_nvml_process_sample *baseline_process =
+        cuda_laguna_nvml_find_process(&nvml_baseline, own_pid);
+    if (own_pid == 0u || !baseline_process ||
+        !baseline_process->used_bytes_known) {
+        (void)close(owned_fd);
         g_laguna_compact_state.store(
             DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
         return 0;
@@ -2651,6 +3079,10 @@ extern "C" int ds4_gpu_laguna_compact_create(
     ctx->ledger = ledger;
     ctx->plan = plan;
     ctx->tracker = tracker;
+    ctx->nvml_baseline = nvml_baseline;
+    ctx->baseline_tracked_cuda_physical_bytes =
+        baseline_tracked_cuda_physical_bytes;
+    ctx->nvml_baseline_valid = 1;
     ctx->static_slab_bytes = ledger->static_aligned_device_bytes;
     ctx->static_offset_count = ledger->tensor_range_count;
     ctx->static_offset_bytes = static_offset_bytes;
@@ -2895,6 +3327,420 @@ extern "C" bool ds4_gpu_laguna_compact_ownership_pending(
     return g_laguna_compact_state.load(std::memory_order_relaxed) !=
                DS4_LAGUNA_COMPACT_IDLE &&
            g_laguna_compact_storage.tracker == tracker;
+}
+
+static int cuda_laguna_nvml_snapshot_valid(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot) {
+    static const char expected_api_identity[] =
+        "nvmlDeviceGetComputeRunningProcesses_v2";
+    if (!snapshot || snapshot->api_version != 2u) return 0;
+    const char *const api_identity_end = (const char *)memchr(
+        snapshot->api_identity, '\0', sizeof(snapshot->api_identity));
+    if (!api_identity_end ||
+        api_identity_end != snapshot->api_identity +
+            sizeof(expected_api_identity) - 1u ||
+        memcmp(snapshot->api_identity, expected_api_identity,
+               sizeof(expected_api_identity)) != 0 ||
+        snapshot->library_version[0] == '\0' ||
+        memchr(snapshot->library_version, '\0',
+               sizeof(snapshot->library_version)) == NULL ||
+        snapshot->device_uuid[0] == '\0' ||
+        memchr(snapshot->device_uuid, '\0',
+               sizeof(snapshot->device_uuid)) == NULL ||
+        snapshot->process_count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return 0;
+    }
+    for (size_t i = 0; i < snapshot->process_count; i++) {
+        if (snapshot->processes[i].pid == 0u) return 0;
+        for (size_t j = i + 1u; j < snapshot->process_count; j++) {
+            if (snapshot->processes[i].pid ==
+                snapshot->processes[j].pid) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+typedef struct {
+    int previous_device;
+    int target_device;
+    int armed;
+} cuda_laguna_checkpoint_device_scope;
+
+static int cuda_laguna_checkpoint_device_scope_enter(
+        cuda_laguna_checkpoint_device_scope *scope,
+        int target_device) {
+    if (!scope || target_device < 0) return 0;
+    memset(scope, 0, sizeof(*scope));
+    scope->previous_device = -1;
+    scope->target_device = target_device;
+    if (cudaGetDevice(&scope->previous_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (scope->previous_device != target_device &&
+        cudaSetDevice(target_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    scope->armed = 1;
+    return 1;
+}
+
+static int cuda_laguna_checkpoint_device_scope_leave(
+        cuda_laguna_checkpoint_device_scope *scope) {
+    if (!scope || !scope->armed || scope->previous_device < 0) return 0;
+    const int previous_device = scope->previous_device;
+    const int target_device = scope->target_device;
+    scope->armed = 0;
+    if (previous_device == target_device) return 1;
+    if (cudaSetDevice(scope->previous_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_laguna_read_smaps(char **text_out, size_t *bytes_out) {
+    if (!text_out || !bytes_out) return 0;
+    *text_out = NULL;
+    *bytes_out = 0;
+    const int fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    const size_t maximum = 32u * 1024u * 1024u;
+    size_t capacity = 1024u * 1024u;
+    char *text = (char *)malloc(capacity + 1u);
+    if (!text) {
+        (void)close(fd);
+        return 0;
+    }
+    size_t used = 0;
+    int ok = 1;
+    for (;;) {
+        if (used == capacity) {
+            if (capacity >= maximum) {
+                ok = 0;
+                break;
+            }
+            size_t next = capacity * 2u;
+            if (next > maximum) next = maximum;
+            char *grown = (char *)realloc(text, next + 1u);
+            if (!grown) {
+                ok = 0;
+                break;
+            }
+            text = grown;
+            capacity = next;
+        }
+        const ssize_t count = read(fd, text + used, capacity - used);
+        if (count > 0) {
+            used += (size_t)count;
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        ok = 0;
+        break;
+    }
+    if (close(fd) != 0) ok = 0;
+    if (!ok || used == 0 || memchr(text, '\0', used) != NULL) {
+        free(text);
+        return 0;
+    }
+    text[used] = '\0';
+    *text_out = text;
+    *bytes_out = used;
+    return 1;
+}
+
+static ds4_runtime_status cuda_laguna_external_checkpoint_fail(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    if (out) memset(&out->sample, 0, sizeof(out->sample));
+    if (!ctx || !ctx->tracker || !out) return DS4_RUNTIME_STATUS_UNSAFE;
+    ds4_runtime_external_checkpoint_input invalid;
+    memset(&invalid, 0, sizeof(invalid));
+    return ds4_runtime_tracker_checkpoint_attributed(
+        ctx->tracker, &invalid, &out->sample);
+}
+
+static int cuda_laguna_external_checkpoint_enter(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t *execution_epoch) {
+    if (execution_epoch) *execution_epoch = 0u;
+    if (!ctx || !execution_epoch) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const uint64_t epoch = g_laguna_compact_published_epoch.load(
+        std::memory_order_acquire);
+    if (ctx != &g_laguna_compact_storage || epoch == 0u ||
+        ctx->lifecycle_epoch != epoch ||
+        g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE ||
+        ctx->cache_unsafe || !ctx->tracker ||
+        !ctx->nvml_baseline_valid ||
+        ctx->baseline_tracked_cuda_physical_bytes != 0u ||
+        ctx->active_execution_count == UINT64_MAX) {
+        return 0;
+    }
+    ctx->active_execution_count++;
+    *execution_epoch = epoch;
+    return 1;
+}
+
+static ds4_runtime_status cuda_laguna_external_checkpoint_finish(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        const ds4_runtime_external_checkpoint_input *input,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!ctx || !out || ctx != &g_laguna_compact_storage ||
+        execution_epoch == 0u || ctx->lifecycle_epoch != execution_epoch ||
+        g_laguna_compact_published_epoch.load(
+            std::memory_order_relaxed) != execution_epoch ||
+        g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE ||
+        ctx->active_execution_count == 0u) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    const ds4_runtime_status result = input
+        ? ds4_runtime_tracker_checkpoint_attributed(
+              ctx->tracker, input, &out->sample)
+        : cuda_laguna_external_checkpoint_fail(ctx, out);
+    ctx->active_execution_count--;
+    return result;
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int
+ds4_test_engine_laguna_external_checkpoint_inject_nvml_once(
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_before,
+        const ds4_gpu_nvml_inventory_snapshot *inside_ds4,
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_after) {
+    if (!cuda_laguna_nvml_snapshot_valid(checkpoint_before) ||
+        !cuda_laguna_nvml_snapshot_valid(inside_ds4) ||
+        !cuda_laguna_nvml_snapshot_valid(checkpoint_after)) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> guard(g_laguna_external_injection_mutex);
+    if (g_laguna_external_injection_armed) return 0;
+    g_laguna_external_injected_before = *checkpoint_before;
+    g_laguna_external_injected_inside = *inside_ds4;
+    g_laguna_external_injected_after = *checkpoint_after;
+    g_laguna_external_injection_armed = true;
+    return 1;
+}
+
+static int cuda_laguna_external_injection_take(
+        ds4_gpu_nvml_inventory_snapshot *checkpoint_before,
+        ds4_gpu_nvml_inventory_snapshot *inside_ds4,
+        ds4_gpu_nvml_inventory_snapshot *checkpoint_after) {
+    std::lock_guard<std::mutex> guard(g_laguna_external_injection_mutex);
+    if (!g_laguna_external_injection_armed) return 0;
+    *checkpoint_before = g_laguna_external_injected_before;
+    *inside_ds4 = g_laguna_external_injected_inside;
+    *checkpoint_after = g_laguna_external_injected_after;
+    memset(&g_laguna_external_injected_before, 0,
+           sizeof(g_laguna_external_injected_before));
+    memset(&g_laguna_external_injected_inside, 0,
+           sizeof(g_laguna_external_injected_inside));
+    memset(&g_laguna_external_injected_after, 0,
+           sizeof(g_laguna_external_injected_after));
+    g_laguna_external_injection_armed = false;
+    return 1;
+}
+#endif
+
+static ds4_runtime_status
+cuda_laguna_compact_external_checkpoint_device_zero(
+        ds4_gpu_laguna_compact *ctx,
+        const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const uint8_t
+            observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !frozen_pre_child || !expected_build_identity ||
+        !observed_build_identity || !out) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+
+    std::lock_guard<std::mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    uint64_t execution_epoch = 0u;
+    if (!cuda_laguna_external_checkpoint_enter(ctx, &execution_epoch) ||
+        !cuda_laguna_nvml_snapshot_valid(frozen_pre_child) ||
+        !cuda_laguna_nvml_snapshot_valid(&ctx->nvml_baseline)) {
+        return execution_epoch != 0u
+            ? cuda_laguna_external_checkpoint_finish(
+                  ctx, execution_epoch, NULL, out)
+            : cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, out);
+    }
+
+    int injected = 0;
+#ifdef DS4_TEST_HOOKS
+    injected = cuda_laguna_external_injection_take(
+        &out->checkpoint_before,
+        &out->inside_ds4,
+        &out->checkpoint_after);
+#endif
+    if (!injected &&
+        !cuda_laguna_nvml_inventory_capture_bound(
+            ctx->nvml_baseline.device_uuid,
+            &out->checkpoint_before)) {
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, out);
+    }
+
+    const uint32_t own_pid = (uint32_t)getpid();
+    const ds4_runtime_nvml_process_sample *baseline_process =
+        cuda_laguna_nvml_find_process(&ctx->nvml_baseline, own_pid);
+    uint64_t page_size = 0;
+    uint64_t mapped_page_bytes = 0;
+    uint64_t resident_bytes = 0;
+    struct stat identity_before;
+    struct stat identity_after;
+    size_t cuda_free = 0;
+    size_t cuda_total = 0;
+    char *smaps_text = NULL;
+    size_t smaps_text_bytes = 0;
+    if (own_pid == 0u || !baseline_process ||
+        !baseline_process->used_bytes_known ||
+        !cuda_laguna_compact_identity_matches(
+            ctx->model_fd, ctx->model_size, &ctx->model_identity,
+            &identity_before) ||
+        !cuda_laguna_compact_system_page_size(&page_size) ||
+        ctx->model_size > UINT64_MAX - (page_size - 1u)) {
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, out);
+    }
+    mapped_page_bytes =
+        (ctx->model_size + page_size - 1u) & ~(page_size - 1u);
+    if (!cuda_laguna_compact_page_sample_exact_locked(
+            ctx, page_size, &resident_bytes) ||
+        !cuda_laguna_compact_identity_matches(
+            ctx->model_fd, ctx->model_size, &ctx->model_identity,
+            &identity_after) ||
+        (!injected &&
+         !cuda_laguna_nvml_inventory_capture_bound(
+             ctx->nvml_baseline.device_uuid,
+             &out->inside_ds4)) ||
+        cudaMemGetInfo(&cuda_free, &cuda_total) != cudaSuccess ||
+        !cuda_laguna_read_smaps(&smaps_text, &smaps_text_bytes) ||
+        (!injected &&
+         !cuda_laguna_nvml_inventory_capture_bound(
+             ctx->nvml_baseline.device_uuid,
+             &out->checkpoint_after))) {
+        (void)cudaGetLastError();
+        free(smaps_text);
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, out);
+    }
+
+    out->model_identity = ctx->model_identity;
+    out->model_map_base = (uint64_t)(uintptr_t)ctx->model_map;
+    out->model_map_bytes = ctx->model_size;
+    out->model_file_offset = 0u;
+    out->model_source_page_size = page_size;
+    out->model_source_resident_bytes = resident_bytes;
+    out->model_source_mapped_page_bytes = mapped_page_bytes;
+    memcpy(out->observed_build_identity, observed_build_identity,
+           DS4_RUNTIME_BUILD_IDENTITY_BYTES);
+
+    ds4_runtime_nvml_inventory pre_child_view;
+    ds4_runtime_nvml_inventory before_view;
+    ds4_runtime_nvml_inventory inside_view;
+    ds4_runtime_nvml_inventory after_view;
+    cuda_laguna_nvml_inventory_view(frozen_pre_child, &pre_child_view);
+    cuda_laguna_nvml_inventory_view(
+        &out->checkpoint_before, &before_view);
+    cuda_laguna_nvml_inventory_view(&out->inside_ds4, &inside_view);
+    cuda_laguna_nvml_inventory_view(
+        &out->checkpoint_after, &after_view);
+
+    ds4_runtime_external_checkpoint_input input;
+    memset(&input, 0, sizeof(input));
+    input.smaps_text = smaps_text;
+    input.smaps_text_bytes = smaps_text_bytes;
+    input.model_device_major =
+        (uint32_t)major((dev_t)ctx->model_identity.device);
+    input.model_device_minor =
+        (uint32_t)minor((dev_t)ctx->model_identity.device);
+    input.model_inode = ctx->model_identity.inode;
+    input.model_map_base = out->model_map_base;
+    input.model_map_bytes = out->model_map_bytes;
+    input.model_file_offset = out->model_file_offset;
+    input.attribution_records = ctx->tracker->records;
+    input.attribution_record_count = ctx->tracker->record_count;
+    input.expected_nvml_api_version = frozen_pre_child->api_version;
+    input.expected_nvml_library_version =
+        frozen_pre_child->library_version;
+    input.expected_device_uuid = frozen_pre_child->device_uuid;
+    input.own_pid = own_pid;
+    input.expected_build_identity = expected_build_identity;
+    input.observed_build_identity = observed_build_identity;
+    input.build_identity_bytes = DS4_RUNTIME_BUILD_IDENTITY_BYTES;
+    input.baseline_nvml_api_version = ctx->nvml_baseline.api_version;
+    input.baseline_nvml_library_version =
+        ctx->nvml_baseline.library_version;
+    input.baseline_device_uuid = ctx->nvml_baseline.device_uuid;
+    input.baseline_process_id = own_pid;
+    input.baseline_nvml_process_present = true;
+    input.baseline_nvml_process_bytes_known = true;
+    input.baseline_nvml_process_bytes = baseline_process->used_bytes;
+    input.baseline_tracked_cuda_physical_bytes =
+        ctx->baseline_tracked_cuda_physical_bytes;
+    input.pre_child_inventory = &pre_child_view;
+    input.checkpoint_before_inventory = &before_view;
+    input.inside_ds4_inventory = &inside_view;
+    input.checkpoint_after_inventory = &after_view;
+    input.cuda_mem_info_known = true;
+    input.cuda_mem_free_bytes = (uint64_t)cuda_free;
+    input.cuda_mem_total_bytes = (uint64_t)cuda_total;
+    input.model_source_page_size = page_size;
+    input.model_source_resident_bytes = resident_bytes;
+    input.model_source_mapped_page_bytes = mapped_page_bytes;
+
+    const ds4_runtime_status result =
+        cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, &input, out);
+    free(smaps_text);
+    return result;
+}
+
+extern "C" ds4_runtime_status
+ds4_gpu_laguna_compact_external_checkpoint(
+        ds4_gpu_laguna_compact *ctx,
+        const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const uint8_t
+            observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !frozen_pre_child || !expected_build_identity ||
+        !observed_build_identity || !out) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    cuda_laguna_checkpoint_device_scope device_scope;
+    if (!cuda_laguna_checkpoint_device_scope_enter(&device_scope, 0)) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    const ds4_runtime_status result =
+        cuda_laguna_compact_external_checkpoint_device_zero(
+            ctx, frozen_pre_child, expected_build_identity,
+            observed_build_identity, out);
+    if (!cuda_laguna_checkpoint_device_scope_leave(&device_scope)) {
+        memset(out, 0, sizeof(*out));
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    return result;
 }
 
 static void cuda_laguna_compact_counter_increment(uint64_t *counter) {

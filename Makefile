@@ -41,7 +41,7 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o ds4_cuda.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o ds4_layer_pack.o
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -ldl
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
@@ -51,7 +51,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-resident test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-resident test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) -I. -c -o $@ $<
@@ -118,6 +118,7 @@ help:
 	@echo "  make test                Build and run tests"
 	@echo "  make test-cuda-laguna-resident  Run the pinned Poolside resident-CUDA oracle"
 	@echo "  make test-cuda-laguna-model-page-advice DS4_TEST_MODEL=/abs/model.gguf  Run exact-inode page-disposal qualification"
+	@echo "  make test-cuda-laguna-external-attribution DS4_TEST_MODEL=/abs/model.gguf  Reconcile live smaps/mincore/NVML footprint"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
@@ -489,7 +490,7 @@ test-cuda-laguna-model: tests/test_cuda_laguna_model
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode streamed --case prefill-8192
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode resident --case all
 
-tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h
+tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_plan_io.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/ds4_cuda_laguna_stream_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
@@ -521,6 +522,17 @@ test-cuda-laguna-model-page-advice: tests/test_cuda_laguna_stream
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" timeout --kill-after=5s 900s \
 		./tests/test_cuda_laguna_stream --case model-page-advice
 
+# Capture the frozen peer inventory before the test process makes any CUDA
+# call.  Descriptor-bound safe-union cold preparation remains the Python
+# qualification harness's responsibility; this target measures live state.
+test-cuda-laguna-external-attribution: tests/test_cuda_laguna_stream
+	@if [ "$(DS4_TEST_MODEL)" = ds4flash.gguf ]; then \
+		echo "error: set DS4_TEST_MODEL to the explicit Laguna GGUF path" >&2; \
+		exit 2; \
+	fi
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" timeout --kill-after=5s 900s \
+		./tests/test_cuda_laguna_stream --case external-attribution
+
 export DS4_TEST_MODEL
 export LAGUNA_TOKENIZER_RUNTIME_COMMIT
 
@@ -541,6 +553,9 @@ test-cuda-laguna-c7:
 
 test-cuda-laguna-model-page-advice:
 	@echo "error: test-cuda-laguna-model-page-advice is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-laguna-external-attribution:
+	@echo "error: test-cuda-laguna-external-attribution is unsupported; requires CUDA on Linux" >&2; exit 2
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

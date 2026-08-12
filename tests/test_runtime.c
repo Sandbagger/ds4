@@ -651,6 +651,112 @@ static void test_legacy_checkpoint_invalidates_attribution(void) {
           "snapshot cannot present a legacy setter as qualified attribution");
 }
 
+static void check_mutation_invalidated_attribution(
+        external_fixture *fixture,
+        uint64_t generation,
+        const char *message) {
+    ds4_runtime_snapshot snapshot;
+    ds4_runtime_allocation_record active[12];
+    CHECK(!fixture->tracker.external_sample.attributed_valid &&
+              fixture->tracker.external_sample.attributed_generation ==
+                  generation &&
+              ds4_runtime_tracker_snapshot_copy(
+                  &fixture->tracker, &snapshot, active,
+                  sizeof(active) / sizeof(active[0])) &&
+              !snapshot.external_sample.attributed_valid &&
+              snapshot.external_sample.attributed_generation == generation,
+          message);
+}
+
+static void test_tracker_mutations_invalidate_attribution(void) {
+    external_fixture fixture;
+
+    CHECK(fixture_init(&fixture),
+          "allocation invalidation fixture initializes");
+    CHECK(ds4_runtime_tracker_release(&fixture.tracker, 1u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "allocation invalidation fixture frees host capacity");
+    ds4_runtime_external_sample sample = run_checkpoint(&fixture);
+    CHECK(ds4_runtime_tracker_allocate(
+              &fixture.tracker, 7u, 1u, UINT64_C(0x20000000),
+              8u * kib, 8u * kib) == DS4_RUNTIME_STATUS_OK,
+          "owned allocation succeeds after a qualified checkpoint");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "owned allocation invalidates attribution without advancing its generation");
+
+    CHECK(fixture_init(&fixture),
+          "release invalidation fixture initializes");
+    sample = run_checkpoint(&fixture);
+    CHECK(ds4_runtime_tracker_release(&fixture.tracker, 1u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "owned release succeeds after a qualified checkpoint");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "owned release invalidates attribution without advancing its generation");
+
+    CHECK(fixture_init(&fixture),
+          "mapping invalidation fixture initializes");
+    sample = run_checkpoint(&fixture);
+    CHECK(ds4_runtime_tracker_unmap_model(&fixture.tracker, 6u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "model unmap succeeds after a qualified checkpoint");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "model unmap invalidates attribution without advancing its generation");
+    CHECK(ds4_runtime_tracker_map_model(
+              &fixture.tracker, 7u, UINT64_C(0x10000000),
+              256u * mib) == DS4_RUNTIME_STATUS_OK,
+          "replacement model map succeeds while attribution is invalid");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "model map preserves the invalid attribution generation");
+    const ds4_runtime_external_sample rebound = run_checkpoint(&fixture);
+    CHECK(rebound.attributed_valid &&
+              rebound.attributed_generation ==
+                  sample.attributed_generation + 1u,
+          "next successful checkpoint alone advances attribution generation");
+
+    CHECK(fixture_init(&fixture),
+          "registration invalidation fixture initializes");
+    sample = run_checkpoint(&fixture);
+    CHECK(ds4_runtime_tracker_register(
+              &fixture.tracker, 7u, UINT64_C(0x20001000),
+              4u * kib, 1u) == DS4_RUNTIME_STATUS_OK,
+          "registration succeeds after a qualified checkpoint");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "registration invalidates attribution without advancing its generation");
+
+    CHECK(fixture_init(&fixture),
+          "unregistration invalidation fixture initializes");
+    CHECK(ds4_runtime_tracker_register(
+              &fixture.tracker, 7u, UINT64_C(0x20001000),
+              4u * kib, 1u) == DS4_RUNTIME_STATUS_OK,
+          "unregistration fixture creates a real registration");
+    sample = run_checkpoint(&fixture);
+    CHECK(ds4_runtime_tracker_unregister(&fixture.tracker, 7u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "unregistration succeeds after a qualified checkpoint");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "unregistration invalidates attribution without advancing its generation");
+
+    CHECK(fixture_init(&fixture),
+          "managed-relation invalidation fixture initializes");
+    CHECK(ds4_runtime_tracker_unregister(&fixture.tracker, 5u) ==
+              DS4_RUNTIME_STATUS_OK,
+          "managed-relation fixture removes the initial host alias");
+    sample = run_checkpoint(&fixture);
+    CHECK(ds4_runtime_tracker_managed_host_relation(
+              &fixture.tracker, 7u, UINT64_C(0x40000000),
+              4u * mib, 3u) == DS4_RUNTIME_STATUS_OK,
+          "managed host relation succeeds after a qualified checkpoint");
+    check_mutation_invalidated_attribution(
+        &fixture, sample.attributed_generation,
+        "managed relation invalidates attribution without advancing its generation");
+}
+
 static void test_smaps_fail_closed(void) {
     static const char malformed[] =
         "1000-2000 rw-p not-a-header\nPss: 4 kB\n";
@@ -792,10 +898,37 @@ static void test_nvml_fail_closed(void) {
     CHECK(bracket_peers_only.nvml_process_bytes == 116u * mib,
           "before/after inventories bracket peers while inside inventory owns the charge");
 
+    CHECK(fixture_init(&fixture),
+          "unknown ignored bracket-own usage fixture initializes");
+    fixture.before_processes[0].used_bytes_known = false;
+    fixture.after_processes[1].used_bytes_known = false;
+    const ds4_runtime_external_sample unknown_bracket_own =
+        run_checkpoint(&fixture);
+    CHECK(unknown_bracket_own.nvml_process_bytes == 116u * mib,
+          "unknown ignored own usage in peer brackets does not reject inside evidence");
+
     CHECK(fixture_init(&fixture), "unknown usage fixture initializes");
     fixture.inside_processes[0].used_bytes_known = false;
     check_failure(&fixture, DS4_RUNTIME_EXTERNAL_FAILURE_NVML_USAGE_UNKNOWN,
                   "unknown own-process NVML bytes invalidate attribution");
+
+    CHECK(fixture_init(&fixture),
+          "unknown pre-child peer fixture initializes");
+    fixture.pre_processes[0].used_bytes_known = false;
+    check_failure(&fixture, DS4_RUNTIME_EXTERNAL_FAILURE_NVML_USAGE_UNKNOWN,
+                  "unknown pre-child peer usage invalidates attribution");
+
+    CHECK(fixture_init(&fixture),
+          "unknown bracket peer fixture initializes");
+    fixture.before_processes[1].used_bytes_known = false;
+    check_failure(&fixture, DS4_RUNTIME_EXTERNAL_FAILURE_NVML_USAGE_UNKNOWN,
+                  "unknown bracket peer usage invalidates attribution");
+
+    CHECK(fixture_init(&fixture),
+          "unknown inside peer fixture initializes");
+    fixture.inside_processes[1].used_bytes_known = false;
+    check_failure(&fixture, DS4_RUNTIME_EXTERNAL_FAILURE_NVML_USAGE_UNKNOWN,
+                  "unknown inside peer usage invalidates attribution");
 
     CHECK(fixture_init(&fixture), "duplicate PID fixture initializes");
     fixture.inside_processes[1] = fixture.inside_processes[0];
@@ -913,6 +1046,7 @@ static int run_external_attribution(void) {
     test_exact_model_mapping_binding();
     test_failed_checkpoint_retains_last_good_sample();
     test_legacy_checkpoint_invalidates_attribution();
+    test_tracker_mutations_invalidate_attribution();
     test_smaps_fail_closed();
     test_nvml_fail_closed();
     test_peer_inventory_and_ceilings();

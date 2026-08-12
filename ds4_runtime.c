@@ -838,7 +838,9 @@ static ds4_runtime_external_failure external_validate_inventory(
         const ds4_runtime_nvml_inventory *inventory,
         uint32_t expected_api_version,
         const char *expected_library_version,
-        const char *expected_device_uuid) {
+        const char *expected_device_uuid,
+        uint32_t own_pid,
+        bool allow_unknown_own_usage) {
     if (!inventory) return DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT;
     if (inventory->api_version != expected_api_version) {
         return DS4_RUNTIME_EXTERNAL_FAILURE_NVML_API_MISMATCH;
@@ -861,7 +863,8 @@ static ds4_runtime_external_failure external_validate_inventory(
         if (process->pid == 0) {
             return DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT;
         }
-        if (!process->used_bytes_known) {
+        if (!process->used_bytes_known &&
+            !(allow_unknown_own_usage && process->pid == own_pid)) {
             return DS4_RUNTIME_EXTERNAL_FAILURE_NVML_USAGE_UNKNOWN;
         }
         for (size_t j = 0; j < i; j++) {
@@ -919,6 +922,15 @@ static ds4_runtime_status external_checkpoint_fail(
     }
     latch(tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
     return DS4_RUNTIME_STATUS_UNSAFE;
+}
+
+static void invalidate_attributed_sample(ds4_runtime_tracker *tracker) {
+    if (!tracker || !tracker->external_sample.attributed_valid) return;
+    const uint64_t generation =
+        tracker->external_sample.attributed_generation;
+    memset(&tracker->external_sample, 0,
+           sizeof(tracker->external_sample));
+    tracker->external_sample.attributed_generation = generation;
 }
 
 static ds4_runtime_allocation_record *append_record(
@@ -1241,6 +1253,7 @@ ds4_runtime_status ds4_runtime_tracker_allocate(
     record->domain = site->domain;
     record->callsite_id = site->id;
     record->relation = DS4_RUNTIME_RELATION_OWNED_ALLOCATION;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1347,6 +1360,7 @@ ds4_runtime_status ds4_runtime_tracker_release(
         return status(tracker);
     }
     record->live = false;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1377,6 +1391,7 @@ ds4_runtime_status ds4_runtime_tracker_map_model(
     record->requested_bytes = bytes;
     record->domain = DS4_RUNTIME_DOMAIN_HOST;
     record->relation = DS4_RUNTIME_RELATION_MODEL_MAPPING;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1395,6 +1410,7 @@ ds4_runtime_status ds4_runtime_tracker_unmap_model(
         return status(tracker);
     }
     record->live = false;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1457,6 +1473,7 @@ ds4_runtime_status ds4_runtime_tracker_register(
     record->domain = DS4_RUNTIME_DOMAIN_HOST;
     record->relation = DS4_RUNTIME_RELATION_REGISTRATION;
     record->owner_id = owner_id;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1488,6 +1505,7 @@ ds4_runtime_status ds4_runtime_tracker_managed_host_relation(
     record->domain = DS4_RUNTIME_DOMAIN_HOST;
     record->relation = DS4_RUNTIME_RELATION_MANAGED_HOST_VISIBLE;
     record->owner_id = owner_id;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1504,6 +1522,7 @@ ds4_runtime_status ds4_runtime_tracker_unregister(
         return status(tracker);
     }
     record->live = false;
+    invalidate_attributed_sample(tracker);
     recompute(tracker);
     return status(tracker);
 }
@@ -1678,12 +1697,19 @@ ds4_runtime_status ds4_runtime_tracker_checkpoint_attributed(
         input->inside_ds4_inventory,
         input->checkpoint_after_inventory,
     };
+    const bool allow_unknown_own_usage[] = {
+        false,
+        true,
+        false,
+        true,
+    };
     for (size_t i = 0; i < sizeof(inventories) / sizeof(inventories[0]); i++) {
         const ds4_runtime_external_failure failure =
             external_validate_inventory(
                 inventories[i], input->expected_nvml_api_version,
                 input->expected_nvml_library_version,
-                input->expected_device_uuid);
+                input->expected_device_uuid, input->own_pid,
+                allow_unknown_own_usage[i]);
         if (failure != DS4_RUNTIME_EXTERNAL_FAILURE_NONE) {
             return external_checkpoint_fail(tracker, sample_out, failure);
         }

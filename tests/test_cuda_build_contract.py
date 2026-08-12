@@ -2259,6 +2259,31 @@ class CudaBuildContractTest(unittest.TestCase):
                 self.assertIn("ds4_cuda.o", prerequisites)
                 self.assertIn("ds4_runtime.o", prerequisites)
 
+    def test_every_direct_cuda_link_includes_laguna_cache_policy(self) -> None:
+        direct_cuda_links: dict[str, list[str]] = {}
+        for rule in re.finditer(
+            r"(?m)^(?P<target>[^#\s][^:\n]*):\s*(?P<prerequisites>[^\n]*)$",
+            MAKEFILE,
+        ):
+            prerequisites = rule.group("prerequisites").split()
+            if "ds4_cuda.o" in prerequisites or any(
+                re.fullmatch(r"tests/ds4_cuda_.*_test_hooks\.o", item)
+                for item in prerequisites
+            ):
+                direct_cuda_links[rule.group("target")] = prerequisites
+
+        self.assertTrue(direct_cuda_links, "no direct CUDA link rules found")
+        missing = sorted(
+            target
+            for target, prerequisites in direct_cuda_links.items()
+            if "ds4_laguna_stream.o" not in prerequisites
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "direct ds4_cuda links need the Laguna cache-policy implementation",
+        )
+
     def test_poolside_mmvq_uses_the_active_configured_physical_device(
         self,
     ) -> None:

@@ -2062,6 +2062,62 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("current_device == physical_device", guarded)
         self.assertNotIn("cudaSetDevice", n1_prefix)
 
+    def test_external_nvml_identity_is_bounded_before_comparison(self) -> None:
+        body = function_body(
+            "static int cuda_laguna_nvml_snapshot_valid("
+        )
+        bounded_match = re.search(
+            r"memchr\(\s*snapshot->api_identity", body
+        )
+        compared_match = re.search(
+            r"memcmp\(\s*snapshot->api_identity", body
+        )
+        self.assertIsNotNone(bounded_match, "missing bounded NUL check")
+        self.assertIsNotNone(compared_match, "missing bounded comparison")
+        self.assertGreater(
+            compared_match.start(), bounded_match.start(),
+            "fixed NVML API identity must be bounded before comparison",
+        )
+        self.assertNotIn("strcmp(snapshot->api_identity", body)
+
+    def test_external_checkpoint_scopes_and_restores_cuda_device_zero(
+        self,
+    ) -> None:
+        scope = function_body(
+            "static int cuda_laguna_checkpoint_device_scope_enter("
+        )
+        self.assertIn("cudaGetDevice(&scope->previous_device)", scope)
+        self.assertIn("cudaSetDevice(target_device)", scope)
+
+        restore = function_body(
+            "static int cuda_laguna_checkpoint_device_scope_leave("
+        )
+        self.assertIn("cudaSetDevice(scope->previous_device)", restore)
+
+        wrapper = function_body(
+            'extern "C" ds4_runtime_status\n'
+            "ds4_gpu_laguna_compact_external_checkpoint("
+        )
+        entered = wrapper.find(
+            "cuda_laguna_checkpoint_device_scope_enter(&device_scope, 0)"
+        )
+        checkpoint = wrapper.find(
+            "cuda_laguna_compact_external_checkpoint_device_zero("
+        )
+        left = wrapper.find(
+            "cuda_laguna_checkpoint_device_scope_leave(&device_scope)"
+        )
+        self.assertGreaterEqual(entered, 0)
+        self.assertGreater(checkpoint, entered)
+        self.assertGreater(left, checkpoint)
+
+        device_zero = function_body(
+            "static ds4_runtime_status\n"
+            "cuda_laguna_compact_external_checkpoint_device_zero("
+        )
+        self.assertIn("cudaDeviceSynchronize()", device_zero)
+        self.assertIn("cudaMemGetInfo(&cuda_free, &cuda_total)", device_zero)
+
     def test_laguna_decode_routes_all_quantized_projections_through_matmul(
         self,
     ) -> None:

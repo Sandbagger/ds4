@@ -5872,8 +5872,31 @@ static int run_external_attribution(void) {
                   DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION,
           "failed checkpoint preserves the last sample/totals and latches attribution unsafe");
 
-cleanup_engine:
+cleanup_engine: {
+    const uint64_t cleanup_before =
+        ds4_gpu_test_generic_cleanup_attempts();
     ds4_engine_close(engine);
+    ds4_test_laguna_compact_close_observation close_observation;
+    ds4_gpu_laguna_compact_test_snapshot nonidle;
+    ds4_runtime_snapshot closed_runtime;
+    memset(&close_observation, 0, sizeof(close_observation));
+    memset(&nonidle, 0, sizeof(nonidle));
+    memset(&closed_runtime, 0, sizeof(closed_runtime));
+    CHECK(ds4_test_laguna_compact_close_observation_get(
+              &close_observation) &&
+              close_observation.first_destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_OK &&
+              close_observation.destroy_result ==
+                  DS4_GPU_LAGUNA_DESTROY_OK &&
+              close_observation.destroy_attempt_count == 1u &&
+              !close_observation.engine_retained &&
+              close_observation.gpu_cleanup_before == cleanup_before &&
+              close_observation.gpu_cleanup_after == cleanup_before + 1u &&
+              ds4_gpu_test_generic_cleanup_attempts() == cleanup_before + 1u &&
+              !ds4_gpu_test_laguna_compact_nonidle_snapshot(&nonidle) &&
+              !ds4_test_laguna_last_close_snapshot(&closed_runtime),
+          "sticky attribution failure still releases every compact owner without relabelling history clean");
+}
 cleanup:
     restore_forbidden_environment(&saved);
     if (close_model_fd) close(model_fd);

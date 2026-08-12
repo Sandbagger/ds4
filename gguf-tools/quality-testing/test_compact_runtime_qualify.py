@@ -121,6 +121,7 @@ def build_fixture() -> dict:
         model_identity=copy.deepcopy(MODEL_IDENTITY),
         runtime_identity=copy.deepcopy(RUNTIME_IDENTITY),
         seed_bytes=SEED,
+        qualification_preflight=_qualification_preflight_fixture(),
     )
 
 
@@ -144,6 +145,8 @@ def _delete(path: tuple[PathPart, ...], key: str) -> Callable[[dict], None]:
 
 
 NVML_COMPUTE_API = "nvmlDeviceGetComputeRunningProcesses_v2"
+NVML_LIBRARY_VERSION = "13.580.126.09"
+PRE_CHILD_CAPTURED_AT_UNIX_NS = "1785600200000000000"
 
 
 def _file_sha256(path: Path) -> str:
@@ -224,6 +227,73 @@ def _nvml_inventory(
     api: str = NVML_COMPUTE_API,
 ) -> dict[str, object]:
     return {"api": api, "gpu_uuid": gpu_uuid, "processes": processes}
+
+
+def _qualification_cold_preparation(
+    model_identity: dict[str, object] = MODEL_IDENTITY,
+) -> dict[str, object]:
+    page_size = 4096
+    model_size = int(model_identity["size_bytes"])
+    eligible_bytes = (model_size // page_size) * page_size
+    if eligible_bytes == 0:
+        raise AssertionError("qualification fixture model needs one complete page")
+    return {
+        "plan_sha256": "c" * 64,
+        "ledger_sha256": "d" * 64,
+        "model_identity": {
+            key: value for key, value in model_identity.items() if key != "path"
+        },
+        "page_size": str(page_size),
+        "eligible_ranges": [
+            {"offset": "0", "bytes": str(eligible_bytes)},
+        ],
+        "eligible_calls": 1,
+        "eligible_bytes": str(eligible_bytes),
+        "attempted_calls": 1,
+        "attempted_bytes": str(eligible_bytes),
+        "successful_calls": 1,
+        "successful_bytes": str(eligible_bytes),
+        "failed_calls": 0,
+        "failed_bytes": "0",
+        "errno_buckets": {},
+        "resident_bytes_after": "0",
+        "unavoidable_bytes": str(
+            ((model_size + page_size - 1) // page_size) * page_size
+            - eligible_bytes
+        ),
+    }
+
+
+def _qualification_preflight_fixture(
+    *,
+    model_identity: dict[str, object] = MODEL_IDENTITY,
+    runtime_identity: dict[str, object] = RUNTIME_IDENTITY,
+    host_identity: dict[str, object] = HOST_IDENTITY,
+) -> dict[str, object]:
+    return TOOL.freeze_qualification_preflight(
+        _qualification_cold_preparation(model_identity),
+        gpu_uuid=str(host_identity["gpu_uuid"]),
+        runtime_identity=copy.deepcopy(runtime_identity),
+        captured_at_unix_ns=PRE_CHILD_CAPTURED_AT_UNIX_NS,
+        nvml_query=lambda gpu_uuid: {
+            "library_version": NVML_LIBRARY_VERSION,
+            "inventory": _nvml_inventory([], gpu_uuid=gpu_uuid),
+        },
+    )
+
+
+def _qualification_binding_payload(
+    cold_preparation: dict[str, object],
+    nvml_pre_child: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "cold_preparation": cold_preparation,
+        "nvml_pre_child": nvml_pre_child,
+        "runtime": {
+            "source_revision": RUNTIME_IDENTITY["source_revision"],
+            "executable_sha256": RUNTIME_IDENTITY["executable_sha256"],
+        },
+    }
 
 
 def schema_expressible_mutations() -> list[Mutation]:
@@ -322,6 +392,10 @@ def schema_expressible_mutations() -> list[Mutation]:
         (("prompts", 0), "id"),
         (("sampling",), "max_generated_tokens"),
         (("execution",), "qualification_cold_preparations"),
+        ((), "qualification_preflight"),
+        (("qualification_preflight",), "binding_sha256"),
+        (("qualification_preflight", "cold_preparation"), "eligible_ranges"),
+        (("qualification_preflight", "nvml_pre_child"), "library_version"),
         (("profiles", 0), "profile_id"),
     ]
     for path, key in required_fields:
@@ -722,10 +796,47 @@ print("[" + ",".join(["0"] * count) + "]")
                 capture_output=True,
             )
 
-            model = Path(tmp) / "laguna-s-2.1-Q4_K_M.gguf"
-            model_bytes = b"fake pinned Laguna model\n"
-            model.write_bytes(model_bytes)
+            model, plan, _, plan_sha256 = _write_cold_preparation_fixture(Path(tmp))
+            model_bytes = model.read_bytes()
             output = Path(tmp) / "compact-runtime-benchmark-v1.json"
+            events: list[object] = []
+            real_cold_prepare = TOOL.cold_prepare_from_plan
+
+            def cold_prepare_for_cli(
+                model_path: Path,
+                plan_path: Path,
+                expected_sha256: str,
+            ) -> dict[str, object]:
+                events.append(("cold", model_path, plan_path, expected_sha256))
+                return real_cold_prepare(
+                    model_path,
+                    plan_path,
+                    expected_sha256,
+                    advise=lambda descriptor, offset, length: None,
+                    sample_residency=lambda descriptor, file_size, page_size: bytes(
+                        (file_size + page_size - 1) // page_size
+                    ),
+                )
+
+            def collect_nvml_for_cli(gpu_uuid: str) -> dict[str, object]:
+                events.append(("nvml", gpu_uuid))
+                return {
+                    "library_version": NVML_LIBRARY_VERSION,
+                    "inventory": _nvml_inventory(
+                        [
+                            {
+                                "pid": 9001,
+                                "used_gpu_memory_bytes": str(1 << 30),
+                            }
+                        ],
+                        gpu_uuid=gpu_uuid,
+                    ),
+                }
+
+            def capture_time_ns() -> int:
+                events.append("clock")
+                return int(PRE_CHILD_CAPTURED_AT_UNIX_NS)
+
             patches = [
                 mock.patch.object(TOOL, "ROOT", root),
                 mock.patch.object(TOOL, "ORACLE_MANIFEST_PATH", oracle),
@@ -735,6 +846,13 @@ print("[" + ",".join(["0"] * count) + "]")
                 mock.patch.object(
                     TOOL, "collect_host_identity", return_value=copy.deepcopy(HOST_IDENTITY)
                 ),
+                mock.patch.object(
+                    TOOL, "cold_prepare_from_plan", side_effect=cold_prepare_for_cli
+                ),
+                mock.patch.object(
+                    TOOL, "collect_nvml_pre_child", side_effect=collect_nvml_for_cli
+                ),
+                mock.patch.object(TOOL.time, "time_ns", side_effect=capture_time_ns),
                 mock.patch.dict(os.environ, {"FAKE_DS4_LOG": str(invocation_log)}),
             ]
             with contextlib.ExitStack() as stack:
@@ -743,18 +861,27 @@ print("[" + ",".join(["0"] * count) + "]")
                 yield {
                     "root": root,
                     "model": model,
+                    "plan": plan,
+                    "plan_sha256": plan_sha256,
                     "output": output,
                     "log": invocation_log,
                     "model_bytes": model_bytes,
+                    "events": events,
                 }
+
+    def fake_cli_build_argv(self, fixture: dict[str, object]) -> list[str]:
+        return [
+            "manifest", "build",
+            "--model", str(fixture["model"]),
+            "--output", str(fixture["output"]),
+            "--qualification-plan", str(fixture["plan"]),
+            "--qualification-plan-sha256", str(fixture["plan_sha256"]),
+        ]
 
     def build_with_fake_cli(self, fixture: dict[str, object]) -> None:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(
-                TOOL.main([
-                    "manifest", "build", "--model", str(fixture["model"]),
-                    "--output", str(fixture["output"]),
-                ]),
+                TOOL.main(self.fake_cli_build_argv(fixture)),
                 0,
             )
 
@@ -764,10 +891,7 @@ print("[" + ",".join(["0"] * count) + "]")
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 self.assertEqual(
-                    TOOL.main([
-                        "manifest", "build", "--model", str(fixture["model"]),
-                        "--output", str(fixture["output"]),
-                    ]),
+                    TOOL.main(self.fake_cli_build_argv(fixture)),
                     0,
                 )
                 self.assertEqual(
@@ -776,6 +900,27 @@ print("[" + ",".join(["0"] * count) + "]")
                 )
             self.assertEqual(stderr.getvalue(), "")
             self.assertIn("manifest_sha256=", stdout.getvalue())
+            events = fixture["events"]
+            self.assertIsInstance(events, list)
+            self.assertEqual(
+                events[:3],
+                [
+                    (
+                        "cold",
+                        fixture["model"],
+                        fixture["plan"],
+                        fixture["plan_sha256"],
+                    ),
+                    ("nvml", HOST_IDENTITY["gpu_uuid"]),
+                    "clock",
+                ],
+            )
+            manifest = TOOL.load_manifest(fixture["output"])
+            self.assertEqual(
+                manifest["qualification_preflight"]["nvml_pre_child"]
+                ["captured_at_unix_ns"],
+                PRE_CHILD_CAPTURED_AT_UNIX_NS,
+            )
             invocations = [
                 json.loads(line) for line in Path(fixture["log"]).read_text().splitlines()
             ]
@@ -887,10 +1032,26 @@ print("[" + ",".join(["0"] * count) + "]")
             TOOL.select_rendered_prompt(SEED[:1024], 513, impossible)
 
     def test_parser_exposes_only_the_two_manifest_commands(self) -> None:
-        build = TOOL.parse_args(["manifest", "build", "--model", "/m", "--output", "/o"])
+        build = TOOL.parse_args([
+            "manifest", "build", "--model", "/m", "--output", "/o",
+            "--qualification-plan", "/p",
+            "--qualification-plan-sha256", "c" * 64,
+        ])
         verify = TOOL.parse_args(["manifest", "verify", "--manifest", "/m"])
         self.assertEqual((build.command, build.action), ("manifest", "build"))
+        self.assertEqual(build.qualification_plan, Path("/p"))
+        self.assertEqual(build.qualification_plan_sha256, "c" * 64)
         self.assertEqual((verify.command, verify.action), ("manifest", "verify"))
+        for missing in ("--qualification-plan", "--qualification-plan-sha256"):
+            argv = [
+                "manifest", "build", "--model", "/m", "--output", "/o",
+                "--qualification-plan", "/p",
+                "--qualification-plan-sha256", "c" * 64,
+            ]
+            index = argv.index(missing)
+            del argv[index : index + 2]
+            with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                TOOL.parse_args(argv)
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
 
@@ -1432,6 +1593,7 @@ class NvmlCheckpointContractTest(unittest.TestCase):
                 "ledger_sha256",
                 "model_identity",
                 "page_size",
+                "eligible_ranges",
                 "eligible_calls",
                 "eligible_bytes",
                 "attempted_calls",
@@ -1518,6 +1680,315 @@ class NvmlCheckpointContractTest(unittest.TestCase):
         for process in candidates:
             with self.subTest(value=process["used_gpu_memory_bytes"]):
                 self.assertFalse(validator.is_valid(process))
+
+
+class NvmlPreChildCollectorContractTest(unittest.TestCase):
+    def test_collector_uses_only_nvml_v2_and_returns_every_process_sorted(self) -> None:
+        calls: list[object] = []
+
+        class FakeFunction:
+            def __init__(self, name: str, callback: Callable[..., int]) -> None:
+                self.name = name
+                self.callback = callback
+                self.argtypes: object = None
+                self.restype: object = None
+
+            def __call__(self, *args: object) -> int:
+                calls.append(self.name)
+                return self.callback(*args)
+
+        def success(*args: object) -> int:
+            return 0
+
+        def version(buffer: object, capacity: object) -> int:
+            self.assertGreaterEqual(capacity.value, len(NVML_LIBRARY_VERSION) + 1)
+            buffer.value = NVML_LIBRARY_VERSION.encode("ascii")
+            return 0
+
+        def device_by_uuid(uuid: object, output: object) -> int:
+            self.assertEqual(uuid, HOST_IDENTITY["gpu_uuid"].encode("ascii"))
+            output._obj.value = 0x1234
+            return 0
+
+        def processes(device: object, count: object, records: object) -> int:
+            self.assertEqual(device.value, 0x1234)
+            if records is None:
+                count._obj.value = 2
+                return 7
+            count._obj.value = 2
+            records[0].pid = 9001
+            records[0].usedGpuMemory = 1 << 30
+            records[1].pid = 123
+            records[1].usedGpuMemory = 256 << 20
+            return 0
+
+        class FakeNvml:
+            nvmlInit_v2 = FakeFunction("nvmlInit_v2", success)
+            nvmlShutdown = FakeFunction("nvmlShutdown", success)
+            nvmlSystemGetNVMLVersion = FakeFunction(
+                "nvmlSystemGetNVMLVersion", version
+            )
+            nvmlDeviceGetHandleByUUID = FakeFunction(
+                "nvmlDeviceGetHandleByUUID", device_by_uuid
+            )
+            nvmlDeviceGetComputeRunningProcesses_v2 = FakeFunction(
+                "nvmlDeviceGetComputeRunningProcesses_v2", processes
+            )
+
+        loaded: list[str] = []
+
+        def load_nvml(name: str, *, use_errno: bool = False) -> FakeNvml:
+            loaded.append(name)
+            self.assertFalse(use_errno)
+            return FakeNvml()
+
+        with mock.patch.object(TOOL.ctypes, "CDLL", side_effect=load_nvml):
+            result = TOOL.collect_nvml_pre_child(HOST_IDENTITY["gpu_uuid"])
+
+        self.assertEqual(loaded, ["libnvidia-ml.so.1"])
+        self.assertEqual(
+            result,
+            {
+                "library_version": NVML_LIBRARY_VERSION,
+                "inventory": _nvml_inventory(
+                    [
+                        {
+                            "pid": 123,
+                            "used_gpu_memory_bytes": str(256 << 20),
+                        },
+                        {
+                            "pid": 9001,
+                            "used_gpu_memory_bytes": str(1 << 30),
+                        },
+                    ]
+                ),
+            },
+        )
+        self.assertEqual(calls[0], "nvmlInit_v2")
+        self.assertEqual(calls[-1], "nvmlShutdown")
+        self.assertEqual(
+            calls.count("nvmlDeviceGetComputeRunningProcesses_v2"), 2
+        )
+
+
+class QualificationPreflightManifestContractTest(unittest.TestCase):
+    def freeze_preflight(
+        self,
+        *,
+        captured_at_unix_ns: str = PRE_CHILD_CAPTURED_AT_UNIX_NS,
+    ) -> tuple[dict[str, object], list[str]]:
+        query_calls: list[str] = []
+        inventory = _nvml_inventory(
+            [
+                {"pid": 9001, "used_gpu_memory_bytes": str(1 << 30)},
+                {"pid": 123, "used_gpu_memory_bytes": str(256 << 20)},
+            ]
+        )
+
+        def query_nvml_without_cuda(gpu_uuid: str) -> dict[str, object]:
+            query_calls.append(gpu_uuid)
+            return {
+                "library_version": NVML_LIBRARY_VERSION,
+                "inventory": copy.deepcopy(inventory),
+            }
+
+        preflight = TOOL.freeze_qualification_preflight(
+            _qualification_cold_preparation(),
+            gpu_uuid=HOST_IDENTITY["gpu_uuid"],
+            runtime_identity=copy.deepcopy(RUNTIME_IDENTITY),
+            captured_at_unix_ns=captured_at_unix_ns,
+            nvml_query=query_nvml_without_cuda,
+        )
+        return preflight, query_calls
+
+    def build_manifest_with_preflight(
+        self,
+        preflight: dict[str, object],
+    ) -> dict:
+        return TOOL.build_manifest(
+            Path(MODEL_IDENTITY["path"]),
+            token_counter=deterministic_token_count,
+            host_identity=copy.deepcopy(HOST_IDENTITY),
+            model_identity=copy.deepcopy(MODEL_IDENTITY),
+            runtime_identity=copy.deepcopy(RUNTIME_IDENTITY),
+            seed_bytes=SEED,
+            qualification_preflight=copy.deepcopy(preflight),
+        )
+
+    def test_builder_freezes_exact_cold_and_pre_child_nvml_evidence(self) -> None:
+        with mock.patch.object(
+            TOOL,
+            "_cuda_runtime_version",
+            side_effect=AssertionError("pre-child NVML capture must not touch CUDA"),
+        ) as cuda_probe:
+            preflight, query_calls = self.freeze_preflight()
+
+        self.assertEqual(query_calls, [HOST_IDENTITY["gpu_uuid"]])
+        cuda_probe.assert_not_called()
+        cold = _qualification_cold_preparation()
+        expected_inventory = _nvml_inventory(
+            [
+                {"pid": 123, "used_gpu_memory_bytes": str(256 << 20)},
+                {"pid": 9001, "used_gpu_memory_bytes": str(1 << 30)},
+            ]
+        )
+        nvml_pre_child = {
+            "capture_phase": "pre-child-before-cuda-initialization",
+            "captured_at_unix_ns": PRE_CHILD_CAPTURED_AT_UNIX_NS,
+            "library_version": NVML_LIBRARY_VERSION,
+            "inventory": expected_inventory,
+            "inventory_sha256": hashlib.sha256(
+                TOOL.canonical_json_bytes(expected_inventory)
+            ).hexdigest(),
+        }
+        expected = {
+            "cold_preparation": cold,
+            "cold_preparation_sha256": hashlib.sha256(
+                TOOL.canonical_json_bytes(cold)
+            ).hexdigest(),
+            "nvml_pre_child": nvml_pre_child,
+            "binding_sha256": hashlib.sha256(
+                TOOL.canonical_json_bytes(
+                    _qualification_binding_payload(cold, nvml_pre_child)
+                )
+            ).hexdigest(),
+        }
+        self.assertEqual(preflight, expected)
+        self.assertEqual(
+            preflight["cold_preparation"]["eligible_ranges"],
+            cold["eligible_ranges"],
+        )
+        self.assertEqual(
+            preflight["cold_preparation"]["model_identity"],
+            {key: value for key, value in MODEL_IDENTITY.items() if key != "path"},
+        )
+
+        manifest = self.build_manifest_with_preflight(preflight)
+        self.assertEqual(manifest["qualification_preflight"], expected)
+        TOOL.validate_manifest(manifest)
+        TOOL.verify_manifest_bindings(
+            manifest,
+            model_identity=copy.deepcopy(MODEL_IDENTITY),
+            runtime_identity=copy.deepcopy(RUNTIME_IDENTITY),
+            token_counter=deterministic_token_count,
+        )
+
+    def test_stale_inner_digests_and_runtime_binding_reject_substitution(self) -> None:
+        preflight, _ = self.freeze_preflight()
+        manifest = self.build_manifest_with_preflight(preflight)
+        mutations = {
+            "eligible range": lambda value: value["qualification_preflight"]
+            ["cold_preparation"]["eligible_ranges"][0].__setitem__("offset", "4096"),
+            "descriptor identity": lambda value: value["qualification_preflight"]
+            ["cold_preparation"]["model_identity"].__setitem__("inode", "9002"),
+            "inventory": lambda value: value["qualification_preflight"]
+            ["nvml_pre_child"]["inventory"]["processes"][0].__setitem__(
+                "used_gpu_memory_bytes", str(257 << 20)
+            ),
+            "library version": lambda value: value["qualification_preflight"]
+            ["nvml_pre_child"].__setitem__("library_version", "13.999.0"),
+            "capture time": lambda value: value["qualification_preflight"]
+            ["nvml_pre_child"].__setitem__(
+                "captured_at_unix_ns", str(int(PRE_CHILD_CAPTURED_AT_UNIX_NS) + 1)
+            ),
+            "runtime build": lambda value: value["prompt_source"]
+            ["tokenizer_runtime"].__setitem__("executable_sha256", "e" * 64),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = copy.deepcopy(manifest)
+                mutate(changed)
+                with self.assertRaisesRegex(
+                    ValueError, "digest|binding|identity|range|coverage"
+                ):
+                    TOOL.validate_manifest(changed)
+
+        original_sha256 = TOOL.manifest_sha256(manifest)
+        fresh_preflight, _ = self.freeze_preflight(
+            captured_at_unix_ns=str(int(PRE_CHILD_CAPTURED_AT_UNIX_NS) + 1)
+        )
+        stale_substitution = copy.deepcopy(manifest)
+        stale_substitution["qualification_preflight"]["nvml_pre_child"] = (
+            copy.deepcopy(fresh_preflight["nvml_pre_child"])
+        )
+        with self.assertRaisesRegex(ValueError, "digest|binding"):
+            TOOL.validate_manifest(stale_substitution)
+
+        intentionally_rebuilt = copy.deepcopy(manifest)
+        intentionally_rebuilt["qualification_preflight"] = fresh_preflight
+        TOOL.validate_manifest(intentionally_rebuilt)
+        self.assertNotEqual(
+            TOOL.manifest_sha256(intentionally_rebuilt),
+            original_sha256,
+            "a fresh baseline must change the immutable whole-manifest identity",
+        )
+
+    def test_schema_requires_closed_top_level_qualification_preflight(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertIn("qualification_preflight", schema["required"])
+        self.assertEqual(
+            schema["properties"]["qualification_preflight"],
+            {"$ref": "#/$defs/qualification_preflight"},
+        )
+
+        preflight = schema["$defs"]["qualification_preflight"]
+        self.assertIs(preflight["additionalProperties"], False)
+        self.assertEqual(
+            set(preflight["required"]),
+            {
+                "cold_preparation",
+                "cold_preparation_sha256",
+                "nvml_pre_child",
+                "binding_sha256",
+            },
+        )
+        self.assertEqual(
+            preflight["properties"]["cold_preparation"],
+            {"$ref": "#/$defs/cold_preparation"},
+        )
+        self.assertEqual(
+            preflight["properties"]["nvml_pre_child"],
+            {"$ref": "#/$defs/nvml_pre_child"},
+        )
+
+        cold = schema["$defs"]["cold_preparation"]
+        self.assertIn("eligible_ranges", cold["required"])
+        self.assertEqual(
+            cold["properties"]["eligible_ranges"]["items"],
+            {"$ref": "#/$defs/qualification_page_range"},
+        )
+        nvml_pre_child = schema["$defs"]["nvml_pre_child"]
+        self.assertIs(nvml_pre_child["additionalProperties"], False)
+        self.assertEqual(
+            set(nvml_pre_child["required"]),
+            {
+                "capture_phase",
+                "captured_at_unix_ns",
+                "library_version",
+                "inventory",
+                "inventory_sha256",
+            },
+        )
+        self.assertEqual(
+            nvml_pre_child["properties"]["capture_phase"]["const"],
+            "pre-child-before-cuda-initialization",
+        )
+        self.assertEqual(
+            nvml_pre_child["properties"]["inventory"],
+            {"$ref": "#/$defs/nvml_process_inventory"},
+        )
+        self.assertEqual(
+            nvml_pre_child["properties"]["library_version"],
+            {"$ref": "#/$defs/identity"},
+        )
+        self.assertEqual(
+            nvml_pre_child["properties"]["captured_at_unix_ns"],
+            {"$ref": "#/$defs/positive_uint64"},
+        )
+        self.assertEqual(
+            schema["$defs"]["nvml_process_inventory"]["properties"]["api"]["const"],
+            NVML_COMPUTE_API,
+        )
 
 
 if __name__ == "__main__":

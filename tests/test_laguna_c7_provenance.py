@@ -278,7 +278,8 @@ class SyntheticProducer:
         recipe = self.poolside_build / recipe_path
         recipe.parent.mkdir(parents=True, exist_ok=True)
         recipe_payload = (
-            f"source={self.poolside_src}\nbuild={self.poolside_build}\nlink\n"
+            f"source={self.poolside_src.resolve()}\n"
+            f"build={self.poolside_build.resolve()}\nlink\n"
         ).encode()
         recipe.write_bytes(recipe_payload)
         normalized_recipe = recipe_payload.replace(
@@ -502,6 +503,33 @@ class SyntheticProducer:
         if str(path) != self.toolchain_contract[name]["path"]:
             raise AssertionError(f"unexpected tool path for {name}: {path}")
         return self.toolchain_observed[name]
+
+    def relocate_build(self, destination: Path) -> None:
+        """Move and regenerate the synthetic build at its new absolute path."""
+        self.poolside_build.rename(destination)
+        self.poolside_build = destination
+
+        recipe_path = next(iter(self.recipe_contract))
+        recipe_payload = (
+            f"source={self.poolside_src.resolve()}\n"
+            f"build={self.poolside_build.resolve()}\nlink\n"
+        ).encode()
+        (self.poolside_build / recipe_path).write_bytes(recipe_payload)
+        normalized_recipe = recipe_payload.replace(
+            str(self.poolside_build.resolve()).encode(), b"$BUILD"
+        ).replace(str(self.poolside_src.resolve()).encode(), b"$SOURCE")
+        self.recipe_contract[recipe_path] = {
+            "normalized_bytes": len(normalized_recipe),
+            "normalized_sha256": sha256(normalized_recipe),
+        }
+
+        for manifest_path in (
+            self.q4_fixture / "manifest.json",
+            self.residual_fixture / "manifest.json",
+        ):
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["execution"]["generated_recipes"] = self.recipe_contract
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     def apply_patch(self) -> None:
         subprocess.run(
@@ -749,8 +777,22 @@ assert_build_outputs_absent
         with tempfile.TemporaryDirectory() as temporary_directory:
             fixture = SyntheticProducer(Path(temporary_directory))
             nested_build = fixture.poolside_src / "build-c7-diag"
-            fixture.poolside_build.rename(nested_build)
-            fixture.poolside_build = nested_build
+            fixture.relocate_build(nested_build)
+            recipe_path = next(iter(fixture.recipe_contract))
+            normalized_recipe = (
+                (fixture.poolside_build / recipe_path)
+                .read_bytes()
+                .replace(
+                    str(fixture.poolside_build.resolve()).encode(), b"$BUILD"
+                )
+                .replace(
+                    str(fixture.poolside_src.resolve()).encode(), b"$SOURCE"
+                )
+            )
+            self.assertEqual(
+                normalized_recipe,
+                b"source=$SOURCE\nbuild=$BUILD\nlink\n",
+            )
             exclude = fixture.poolside_src / ".git/info/exclude"
             exclude.write_text(
                 f"{exclude.read_text(encoding='utf-8')}build-c7-diag/\nignored.h\n",

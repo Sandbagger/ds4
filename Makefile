@@ -51,7 +51,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-resident test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) -I. -c -o $@ $<
@@ -117,6 +117,7 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make test-cuda-laguna-resident  Run the pinned Poolside resident-CUDA oracle"
+	@echo "  make test-cuda-laguna-streaming DS4_TEST_MODEL=/abs/model.gguf DS4_QUALIFICATION_PLAN=/abs/plan.json DS4_QUALIFICATION_PLAN_SHA256=<sha256>  Run the descriptor-bound streamed CUDA gate"
 	@echo "  make test-cuda-laguna-model-page-advice DS4_TEST_MODEL=/abs/model.gguf  Run exact-inode page-disposal qualification"
 	@echo "  make test-cuda-laguna-external-attribution DS4_TEST_MODEL=/abs/model.gguf  Reconcile live smaps/mincore/NVML footprint"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
@@ -535,11 +536,20 @@ test-cuda-laguna-external-attribution: tests/test_cuda_laguna_stream
 
 export DS4_TEST_MODEL
 export LAGUNA_TOKENIZER_RUNTIME_COMMIT
+export DS4_QUALIFICATION_PLAN
+export DS4_QUALIFICATION_PLAN_SHA256
 
 test-cuda-laguna-resident: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model
 	tests/run_cuda_laguna_gate.sh resident
 test-cuda-laguna-resident: override DS4_TEST_MODEL := $(value DS4_TEST_MODEL)
 test-cuda-laguna-resident: override LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(value LAGUNA_TOKENIZER_RUNTIME_COMMIT)
+
+test-cuda-laguna-streaming: test-laguna-stream tests/test_cuda_laguna_model tests/test_cuda_laguna_stream
+	tests/run_cuda_laguna_gate.sh streaming
+test-cuda-laguna-streaming: override DS4_TEST_MODEL := $(value DS4_TEST_MODEL)
+test-cuda-laguna-streaming: override LAGUNA_TOKENIZER_RUNTIME_COMMIT := $(value LAGUNA_TOKENIZER_RUNTIME_COMMIT)
+test-cuda-laguna-streaming: override DS4_QUALIFICATION_PLAN := $(value DS4_QUALIFICATION_PLAN)
+test-cuda-laguna-streaming: override DS4_QUALIFICATION_PLAN_SHA256 := $(value DS4_QUALIFICATION_PLAN_SHA256)
 
 test-cuda-laguna-c7: tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_stream
 	tests/run_cuda_laguna_gate.sh c7
@@ -550,6 +560,9 @@ endif
 ifeq ($(UNAME_S),Darwin)
 test-cuda-laguna-c7:
 	@echo "error: test-cuda-laguna-c7 is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-laguna-streaming:
+	@echo "error: test-cuda-laguna-streaming is unsupported; requires CUDA on Linux" >&2; exit 2
 
 test-cuda-laguna-model-page-advice:
 	@echo "error: test-cuda-laguna-model-page-advice is unsupported; requires CUDA on Linux" >&2; exit 2

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import fcntl
 import signal
 import shutil
 import stat
@@ -23,6 +24,10 @@ ISOLATED_FIXTURE_VARIABLES = (
     "DS4_LAGUNA_GATE_TEST_CHILD_DIR",
     "DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE",
     "DS4_LAGUNA_GATE_TEST_EXPECTED_SHA256",
+)
+STREAMING_PLAN_VARIABLES = (
+    "DS4_QUALIFICATION_PLAN",
+    "DS4_QUALIFICATION_PLAN_SHA256",
 )
 FAKE_ENVIRONMENT_VARIABLES = (
     "LAGUNA_FAKE_FAIL_ROLE",
@@ -105,16 +110,28 @@ def main():
             "--mode", "streamed", "--case", "prefill-8192"
         ]:
             case = "prefill-8192"
+        elif sys.argv[1:] == [
+            "--mode", "streamed", "--case", "warm-stability"
+        ]:
+            case = "warm-stability"
         elif sys.argv[1:]:
             raise SystemExit(f"model argv mismatch: {sys.argv[1:]!r}")
     else:
         allowed_cases = {
             "startup",
+            "cache-validation",
+            "cache-io",
+            "cache-faults",
+            "cache-unsafe",
+            "cache-unsafe-race",
             "teardown-unsafe",
+            "prefill-allocation",
+            "page-advice",
+            "create-unwind-unsafe",
+            "session-pressure",
             "model-startup",
             "model-page-advice",
             "model-teardown-unsafe",
-            "prefill-allocation",
         }
         if len(sys.argv) != 3 or sys.argv[1] != "--case":
             raise SystemExit(f"stream argv mismatch: {sys.argv[1:]!r}")
@@ -135,6 +152,7 @@ def main():
         "before_offset": before_offset,
         "after_offset": after_offset,
         "offset": after_offset,
+        "lock_file": os.environ.get("DS4_LOCK_FILE"),
     }
     log = Path(os.environ["LAGUNA_FAKE_LOG"])
     with log.open("a", encoding="utf-8") as handle:
@@ -239,6 +257,7 @@ record = {
     "sha256": hashlib.sha256(payload).hexdigest(),
     "before_offset": before_offset,
     "after_offset": after_offset,
+    "lock_file": os.environ.get("DS4_LOCK_FILE"),
 }
 with Path(os.environ["LAGUNA_FAKE_TIMEOUT_LOG"]).open(
     "a", encoding="utf-8"
@@ -248,6 +267,50 @@ with Path(os.environ["LAGUNA_FAKE_TIMEOUT_LOG"]).open(
 if os.environ.get("LAGUNA_FAKE_TIMEOUT_ROLE") == selector:
     raise SystemExit(124)
 os.execvp(command[0], command)
+'''
+
+FAKE_QUALIFIER = r'''#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path
+
+
+def cold_prepare_descriptor_from_plan(descriptor, plan_path, expected_sha256):
+    if descriptor != 9:
+        raise ValueError(f"cold preparation used fd {descriptor}, not fd 9")
+    before_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+    status = os.fstat(descriptor)
+    if not stat.S_ISREG(status.st_mode):
+        raise ValueError("cold-preparation descriptor is not regular")
+    payload = os.pread(descriptor, status.st_size, 0)
+    expected = bytes.fromhex(os.environ["LAGUNA_FAKE_ORIGINAL_HEX"])
+    if payload != expected:
+        raise ValueError("cold preparation did not retain the original inode")
+    plan_bytes = Path(plan_path).read_bytes()
+    if hashlib.sha256(plan_bytes).hexdigest() != expected_sha256:
+        raise ValueError("qualification plan digest mismatch")
+    after_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+    if before_offset != after_offset:
+        raise ValueError("cold preparation changed the retained offset")
+    record = {
+        "role": "coldprep",
+        "case": os.environ["DS4_LAGUNA_COLD_PREP_LABEL"],
+        "fd": descriptor,
+        "device": status.st_dev,
+        "inode": status.st_ino,
+        "size": status.st_size,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "before_offset": before_offset,
+        "after_offset": after_offset,
+        "lock_file": os.environ.get("DS4_LOCK_FILE"),
+    }
+    with Path(os.environ["LAGUNA_FAKE_LOG"]).open(
+        "a", encoding="utf-8"
+    ) as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    return {"resident_bytes_after": "0"}
 '''
 
 
@@ -271,13 +334,189 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 child_at = source.find(child_fragment, cold_at + len(needle))
                 self.assertGreater(child_at, cold_at)
 
+    def test_streaming_uses_descriptor_cold_preparation_without_proc_fd_path(
+        self,
+    ) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("cold_prepare_descriptor_from_plan", source)
+        self.assertNotIn("/proc/self/fd/9", source)
+        for label, child_fragment in (
+            ("model-streamed-short", "--mode streamed --case short"),
+            (
+                "model-streamed-prefill-8192",
+                "--mode streamed --case prefill-8192",
+            ),
+            (
+                "model-streamed-warm-stability",
+                "--mode streamed --case warm-stability",
+            ),
+        ):
+            with self.subTest(label=label):
+                cold_at = source.find(f"cold_prepare_exact_fd {label}")
+                self.assertGreaterEqual(cold_at, 0)
+                child_at = source.find(child_fragment, cold_at)
+                self.assertGreater(child_at, cold_at)
+
+    def test_streaming_runs_pressure_and_oracles_on_one_retained_descriptor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary_root = Path(tmp)
+            (
+                environment,
+                staged_runner,
+                model,
+                log,
+                original,
+                replacement,
+            ) = self.stage_streaming_fixture(temporary_root)
+            original_status = model.stat()
+
+            completed = self.run_runner(
+                "streaming",
+                environment,
+                runner=staged_runner,
+                cwd=temporary_root,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            records = [
+                json.loads(line)
+                for line in log.read_text(encoding="utf-8").splitlines()
+            ]
+            expected_stream_cases = [
+                "startup",
+                "cache-validation",
+                "cache-io",
+                "cache-faults",
+                "cache-unsafe",
+                "cache-unsafe-race",
+                "prefill-allocation",
+                "page-advice",
+                "create-unwind-unsafe",
+                "teardown-unsafe",
+                "session-pressure",
+            ]
+            self.assertEqual(
+                [(record["role"], record["case"]) for record in records],
+                [
+                    ("verifier", None),
+                    *[("stream", case) for case in expected_stream_cases],
+                    ("coldprep", "model-streamed-short"),
+                    ("model", "short"),
+                    ("coldprep", "model-streamed-prefill-8192"),
+                    ("model", "prefill-8192"),
+                    ("coldprep", "model-streamed-warm-stability"),
+                    ("model", "warm-stability"),
+                ],
+            )
+            for record in records:
+                with self.subTest(role=record["role"], case=record["case"]):
+                    self.assertEqual(record["fd"], 9)
+                    self.assertEqual(record["device"], original_status.st_dev)
+                    self.assertEqual(record["inode"], original_status.st_ino)
+                    self.assertEqual(record["size"], len(original))
+                    self.assertEqual(
+                        record["sha256"], hashlib.sha256(original).hexdigest()
+                    )
+                    self.assertEqual(record["before_offset"], 0)
+                    self.assertEqual(record["after_offset"], 0)
+            self.assertTrue(
+                all(record["lock_file"] is None for record in records),
+                "streaming qualification must use DS4's production instance lock",
+            )
+            self.assertEqual(model.read_bytes(), replacement)
+            self.assertNotEqual(model.stat().st_ino, original_status.st_ino)
+
+    def test_streaming_requires_absolute_plan_and_canonical_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "explicit-model.gguf"
+            model.write_bytes(b"model bytes\n")
+            plan = root / "plan.json"
+            plan.write_bytes(b"{}\n")
+            base = self.clean_gate_environment()
+            base.update(
+                {
+                    "DS4_TEST_MODEL": str(model),
+                    "LAGUNA_TOKENIZER_RUNTIME_COMMIT": (
+                        PINNED_TOKENIZER_COMMIT
+                    ),
+                }
+            )
+            cases = (
+                ({}, "DS4_QUALIFICATION_PLAN is required"),
+                (
+                    {
+                        "DS4_QUALIFICATION_PLAN": "plan.json",
+                        "DS4_QUALIFICATION_PLAN_SHA256": "0" * 64,
+                    },
+                    "DS4_QUALIFICATION_PLAN must be an absolute path",
+                ),
+                (
+                    {
+                        "DS4_QUALIFICATION_PLAN": str(plan),
+                        "DS4_QUALIFICATION_PLAN_SHA256": "A" * 64,
+                    },
+                    "DS4_QUALIFICATION_PLAN_SHA256 must be 64 lowercase",
+                ),
+            )
+            for additions, diagnostic in cases:
+                with self.subTest(diagnostic=diagnostic):
+                    environment = dict(base)
+                    environment.update(additions)
+                    completed = self.run_runner("streaming", environment)
+                    self.assertEqual(completed.returncode, 2, completed.stderr)
+                    self.assertIn(diagnostic, completed.stderr)
+
+    def test_streaming_rejects_a_custom_instance_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            environment, runner, _, _, _, _ = self.stage_streaming_fixture(root)
+            environment["DS4_LOCK_FILE"] = str(root / "bypass.lock")
+            completed = self.run_runner(
+                "streaming", environment, runner=runner, cwd=runner.parents[1]
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn(
+                "DS4_LOCK_FILE is forbidden in streaming mode",
+                completed.stderr,
+            )
+
+    def test_streaming_checks_production_lock_before_any_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            environment, runner, _, log, _, _ = self.stage_streaming_fixture(root)
+            lock_path = root / "production.lock"
+            source = runner.read_text(encoding="utf-8")
+            self.assertEqual(source.count("production_lock_path=/tmp/ds4.lock"), 1)
+            runner.write_text(
+                source.replace(
+                    "production_lock_path=/tmp/ds4.lock",
+                    f"production_lock_path={lock_path}",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with lock_path.open("a+") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                completed = self.run_runner(
+                    "streaming", environment, runner=runner,
+                    cwd=runner.parents[1]
+                )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("production instance lock is already held", completed.stderr)
+            self.assertFalse(log.exists(), "no verifier or test child may run first")
+
     def clean_gate_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         for name in (
             "DS4_TEST_MODEL",
             "DS4_TEST_MODEL_FD",
+            "DS4_LOCK_FILE",
             "LAGUNA_TOKENIZER_RUNTIME_COMMIT",
             *ISOLATED_FIXTURE_VARIABLES,
+            *STREAMING_PLAN_VARIABLES,
             *FAKE_ENVIRONMENT_VARIABLES,
         ):
             environment.pop(name, None)
@@ -376,6 +615,32 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+        return environment, staged_runner, model, log, original, replacement
+
+    def stage_streaming_fixture(
+        self, root: Path
+    ) -> tuple[dict[str, str], Path, Path, Path, bytes, bytes]:
+        environment, staged_runner, model, log, original, replacement = (
+            self.stage_c7_fixture(root)
+        )
+        qualifier = (
+            staged_runner.parents[1]
+            / "gguf-tools"
+            / "quality-testing"
+            / "compact_runtime_qualify.py"
+        )
+        self.stage_executable(qualifier, FAKE_QUALIFIER)
+        plan = root / "exact qualification plan.json"
+        plan_bytes = b'{"fixture":"descriptor-bound"}\n'
+        plan.write_bytes(plan_bytes)
+        environment.update(
+            {
+                "DS4_QUALIFICATION_PLAN": str(plan),
+                "DS4_QUALIFICATION_PLAN_SHA256": hashlib.sha256(
+                    plan_bytes
+                ).hexdigest(),
+            }
+        )
         return environment, staged_runner, model, log, original, replacement
 
     def stage_fake_timeout(

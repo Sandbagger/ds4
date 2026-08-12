@@ -1967,6 +1967,231 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertRegex(body, r"\bcompute_minor\s*==\s*1\b")
         self.assertNotRegex(body, r"\bcompute_major\s*>=\s*8\b")
 
+    def test_laguna_page_disposal_establishes_read_ptes_before_advice(
+        self,
+    ) -> None:
+        definition = re.search(
+            r"static\s+(?:int|bool)\s+"
+            r"cuda_laguna_compact_page_establish_read_ptes_locked\s*\(",
+            CUDA_SOURCE,
+        )
+        self.assertIsNotNone(
+            definition,
+            "missing read-only model-mapping PTE preparation helper",
+        )
+        prepare = source_function_body(
+            CUDA_SOURCE, definition.group(0), "CUDA"
+        )
+        model_bytes = re.search(
+            r"(?:const\s+volatile|volatile\s+const)\s+"
+            r"(?:unsigned\s+char|uint8_t)\s*\*\s*(?P<name>\w+)"
+            r"[^;]*ctx->model_map",
+            prepare,
+        )
+        self.assertIsNotNone(
+            model_bytes,
+            "PTE preparation must read through the retained model mapping",
+        )
+        page_loop = re.search(
+            r"for\s*\(\s*uint64_t\s+(?P<offset>\w+)\s*=\s*"
+            r"range->offset\s*;[^;]*;\s*(?P=offset)\s*\+=\s*"
+            r"page_size\s*\)",
+            prepare,
+        )
+        self.assertIsNotNone(
+            page_loop,
+            "PTE preparation must visit every page in the normalized range",
+        )
+        self.assertIn("range->bytes", prepare)
+        self.assertRegex(
+            prepare,
+            rf"\b{re.escape(model_bytes.group('name'))}\s*\[\s*"
+            rf"{re.escape(page_loop.group('offset'))}\s*\]",
+            "each page iteration must perform the volatile mapping read",
+        )
+
+        dispose = function_body(
+            "static int cuda_laguna_compact_page_dispose_locked("
+        )
+        precharge_at = dispose.find(
+            "ctx->page_advice_precharge_source_resident_bytes = charge"
+        )
+        prepare_at = dispose.find(
+            "cuda_laguna_compact_page_establish_read_ptes_locked("
+        )
+        touch_sequence_at = dispose.find(
+            "&ctx->page_advice_mapping_touch_sequence", prepare_at
+        )
+        attempt_sequence_at = dispose.find(
+            "&ctx->page_advice_attempt_sequence", prepare_at
+        )
+        madvise_at = dispose.find("madvise(", attempt_sequence_at)
+        fadvise_at = dispose.find("posix_fadvise(", madvise_at)
+        self.assertRegex(
+            dispose,
+            r"cuda_laguna_compact_page_establish_read_ptes_locked\(\s*"
+            r"ctx\s*,\s*page_size\s*,\s*range\s*\)",
+            "PTE preparation must apply to each normalized advice range",
+        )
+        self.assertGreaterEqual(
+            prepare_at,
+            0,
+            "each completed pread range needs mapping PTEs before disposal",
+        )
+        self.assertGreater(
+            prepare_at,
+            precharge_at,
+            "the exact conservative precharge must precede PTE preparation",
+        )
+        self.assertGreater(
+            touch_sequence_at,
+            prepare_at,
+            "mapping-touch completion needs its own sequence stage",
+        )
+        self.assertGreater(
+            attempt_sequence_at,
+            touch_sequence_at,
+            "mapping-touch completion must precede the advice-attempt stage",
+        )
+        self.assertGreater(
+            madvise_at,
+            attempt_sequence_at,
+            "mapping PTE preparation must precede MADV_DONTNEED",
+        )
+        self.assertGreater(
+            fadvise_at,
+            madvise_at,
+            "inode-cache disposal must remain after MADV_DONTNEED",
+        )
+        for field in (
+            "page_advice_mapping_touch_pages",
+            "page_advice_mapping_touch_bytes",
+        ):
+            with self.subTest(telemetry=field):
+                self.assertIn(field, prepare + dispose)
+
+        snapshot = function_body(
+            "static int cuda_laguna_compact_snapshot_locked("
+        )
+        for field in (
+            "page_advice_mapping_touch_pages",
+            "page_advice_mapping_touch_bytes",
+            "page_advice_mapping_touch_sequence",
+        ):
+            with self.subTest(snapshot=field):
+                self.assertRegex(
+                    snapshot,
+                    rf"out->{field}\s*=\s*ctx->{field}\s*;",
+                    "mapping-touch telemetry must be observable in the test snapshot",
+                )
+
+    def test_laguna_compact_source_access_disables_kernel_readahead(
+        self,
+    ) -> None:
+        definition = re.search(
+            r"static\s+(?:int|bool)\s+"
+            r"cuda_laguna_compact_source_set_random_access_locked\s*\(",
+            CUDA_SOURCE,
+        )
+        self.assertIsNotNone(
+            definition,
+            "missing compact source random-access preparation helper",
+        )
+        prepare = source_function_body(
+            CUDA_SOURCE, definition.group(0), "CUDA"
+        )
+        self.assertRegex(
+            prepare,
+            r"posix_fadvise\(\s*model_fd\s*,\s*0\s*,\s*0\s*,\s*"
+            r"POSIX_FADV_RANDOM\s*\)",
+            "routed pread must disable file-descriptor readahead",
+        )
+        self.assertRegex(
+            prepare,
+            r"madvise\(\s*(?:\([^)]*\)\s*)?model_map\s*,\s*"
+            r"\(size_t\)model_size\s*,\s*MADV_RANDOM\s*\)",
+            "static mapping faults must disable VMA readahead",
+        )
+        self.assertIn("model_size > SIZE_MAX", prepare)
+        self.assertEqual(
+            prepare.count("cuda_laguna_compact_identity_matches("),
+            2,
+            "random-access policy must be bracketed by exact inode identity",
+        )
+
+        create = function_body(
+            'extern "C" int ds4_gpu_laguna_compact_create('
+        )
+        validate_at = create.find("cuda_laguna_compact_validate(")
+        prepare_at = create.find(
+            "cuda_laguna_compact_source_set_random_access_locked("
+        )
+        publish_fd_at = create.find("ctx->model_fd = owned_fd")
+        cache_create_at = create.find(
+            "cuda_laguna_compact_cache_create_locked("
+        )
+        first_sample_at = create.find(
+            "cuda_laguna_compact_page_sample_exact_locked("
+        )
+        static_copy_at = create.find("error = cudaMemcpy(")
+        self.assertGreaterEqual(
+            prepare_at,
+            0,
+            "compact creation must prepare both retained source access paths",
+        )
+        self.assertGreater(
+            prepare_at,
+            validate_at,
+            "exact compact admission must precede source access policy",
+        )
+        self.assertGreater(
+            publish_fd_at,
+            prepare_at,
+            "policy failure must use pre-publication descriptor cleanup",
+        )
+        self.assertGreater(
+            cache_create_at,
+            prepare_at,
+            "random-access hints must precede cache allocation and source I/O",
+        )
+        self.assertGreater(
+            first_sample_at,
+            prepare_at,
+            "random-access hints must precede the attachment residency sample",
+        )
+        self.assertGreater(
+            static_copy_at,
+            prepare_at,
+            "random-access hints must precede all static source copies",
+        )
+
+        dispose = function_body(
+            "static int cuda_laguna_compact_cache_dispose_sources_locked("
+        )
+        last_promote_at = dispose.rfind(
+            "cuda_laguna_compact_page_promote_locked("
+        )
+        threshold_at = dispose.find("UINT64_C(512) << 20")
+        threshold_flush_at = dispose.find(
+            "cuda_laguna_compact_page_flush_locked(", threshold_at
+        )
+        self.assertGreater(
+            threshold_at,
+            last_promote_at,
+            "all completed expert ranges must be promoted before thresholding",
+        )
+        self.assertGreater(
+            threshold_flush_at,
+            threshold_at,
+            "completed cache transfers must flush at the 512 MiB bound",
+        )
+        self.assertRegex(
+            dispose[threshold_at:],
+            r"cuda_laguna_compact_page_flush_locked\(\s*"
+            r"ctx\s*,\s*default_page_size\s*,\s*0\s*\)",
+            "production threshold flush must use exact post-sampling",
+        )
+
     def test_laguna_stream_links_cuda_lifecycle_test_hooks(self) -> None:
         hook_object = "tests/ds4_cuda_laguna_stream_test_hooks.o"
         hook_prerequisites = rule_prerequisites(hook_object)
@@ -3136,6 +3361,27 @@ class CudaBuildContractTest(unittest.TestCase):
         phony_targets = rule_prerequisites(".PHONY").split()
         self.assertIn("test-cuda-laguna-c7", phony_targets)
 
+    def test_streaming_gate_is_phony(self) -> None:
+        phony_targets = rule_prerequisites(".PHONY").split()
+        self.assertIn("test-cuda-laguna-streaming", phony_targets)
+
+    def test_streaming_gate_runs_policy_then_one_descriptor_runner(self) -> None:
+        prerequisites = rule_prerequisites(
+            "test-cuda-laguna-streaming"
+        ).split()
+        self.assertEqual(
+            prerequisites,
+            [
+                "test-laguna-stream",
+                "tests/test_cuda_laguna_model",
+                "tests/test_cuda_laguna_stream",
+            ],
+        )
+        self.assertEqual(
+            rule_recipe_lines("test-cuda-laguna-streaming"),
+            ["\ttests/run_cuda_laguna_gate.sh streaming"],
+        )
+
     def test_c7_gate_has_exact_cuda_prerequisites_and_runner_recipe(
         self,
     ) -> None:
@@ -3182,6 +3428,49 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertEqual(rendered, "tests/run_cuda_laguna_gate.sh c7")
         self.assertNotIn(model_payload, rendered)
         self.assertNotIn(tokenizer_payload, rendered)
+        self.assertNotIn(";", rendered)
+
+    def test_streaming_gate_make_render_never_interpolates_hostile_values(
+        self,
+    ) -> None:
+        hostile = {
+            "DS4_TEST_MODEL": 'model"; printf MODEL_INJECTED >&2; #.gguf',
+            "LAGUNA_TOKENIZER_RUNTIME_COMMIT": (
+                "revision'; printf TOKENIZER_INJECTED >&2; #"
+            ),
+            "DS4_QUALIFICATION_PLAN": (
+                'plan"; printf PLAN_INJECTED >&2; #.json'
+            ),
+            "DS4_QUALIFICATION_PLAN_SHA256": (
+                "digest'; printf DIGEST_INJECTED >&2; #"
+            ),
+        }
+        completed = subprocess.run(
+            [
+                "make",
+                "-n",
+                "UNAME_S=Linux",
+                "-o",
+                "test-laguna-stream",
+                "-o",
+                "tests/test_cuda_laguna_model",
+                "-o",
+                "tests/test_cuda_laguna_stream",
+                *[f"{name}={value}" for name, value in hostile.items()],
+                "test-cuda-laguna-streaming",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        rendered = completed.stdout.strip()
+        self.assertEqual(
+            rendered, "tests/run_cuda_laguna_gate.sh streaming"
+        )
+        for value in hostile.values():
+            self.assertNotIn(value, rendered)
         self.assertNotIn(";", rendered)
 
     def test_gate_make_exports_do_not_expand_caller_make_syntax(self) -> None:
@@ -3250,6 +3539,26 @@ class CudaBuildContractTest(unittest.TestCase):
         diagnostic = (completed.stdout + completed.stderr).lower()
         for required in (
             "test-cuda-laguna-c7",
+            "unsupported",
+            "cuda",
+            "linux",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, diagnostic)
+
+    def test_streaming_gate_rejects_darwin_as_unsupported(self) -> None:
+        completed = subprocess.run(
+            ["make", "UNAME_S=Darwin", "test-cuda-laguna-streaming"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        diagnostic = (completed.stdout + completed.stderr).lower()
+        for required in (
+            "test-cuda-laguna-streaming",
             "unsupported",
             "cuda",
             "linux",

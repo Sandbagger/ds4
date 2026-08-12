@@ -532,7 +532,45 @@ static bool create_and_sync(
         return fail_message("session prefill cap", scenario);
     }
     if (ds4_session_sync(*out, tokens, err, sizeof(err)) != 0) {
+        ds4_gpu_laguna_compact_test_snapshot compact = {0};
+        ds4_runtime_snapshot runtime = {0};
+        ds4_runtime_allocation_record records[256];
+        size_t required = 0;
+        memset(records, 0, sizeof(records));
+        const bool compact_captured =
+            ds4_gpu_test_laguna_compact_active_snapshot(&compact);
+        const bool runtime_captured =
+            ds4_test_engine_laguna_runtime_snapshot(
+                engine, &runtime, records,
+                sizeof(records) / sizeof(records[0]), &required);
         fprintf(stderr, "FAIL: %s session sync: %s\n", scenario, err);
+        if (compact_captured || runtime_captured) {
+            fprintf(stderr,
+                    "  compact=%d runtime=%d unsafe=%d violation=%d "
+                    "source_current=%llu source_peak=%llu precharge=%llu "
+                    "post=%llu touches=%llu/%llu "
+                    "advice_failures=%llu\n",
+                    compact_captured ? 1 : 0,
+                    runtime_captured ? 1 : 0,
+                    compact_captured ? compact.cache_unsafe : -1,
+                    runtime_captured ? (int)runtime.violation : -1,
+                    (unsigned long long)(runtime_captured ?
+                        runtime.report_current[
+                            DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] : 0u),
+                    (unsigned long long)(runtime_captured ?
+                        runtime.report_peak[
+                            DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] : 0u),
+                    (unsigned long long)(compact_captured ?
+                        compact.page_advice_precharge_source_resident_bytes : 0u),
+                    (unsigned long long)(compact_captured ?
+                        compact.page_advice_post_source_resident_bytes : 0u),
+                    (unsigned long long)(compact_captured ?
+                        compact.page_advice_mapping_touch_pages : 0u),
+                    (unsigned long long)(compact_captured ?
+                        compact.page_advice_mapping_touch_bytes : 0u),
+                    (unsigned long long)(compact_captured ?
+                        compact.page_advice_failed_calls : 0u));
+        }
         ds4_session_free(*out);
         *out = NULL;
         return false;
@@ -622,6 +660,16 @@ static bool run_warm_stability(
         ok = create_and_sync(
             engine, &tokens, 1024, &session, "warm-stability-cold");
     }
+    if (!ok) {
+        fprintf(stderr,
+                "  startup precharge=%llu post=%llu touches=%llu/%llu\n",
+                (unsigned long long)
+                    initial.page_advice_precharge_source_resident_bytes,
+                (unsigned long long)
+                    initial.page_advice_post_source_resident_bytes,
+                (unsigned long long)initial.page_advice_mapping_touch_pages,
+                (unsigned long long)initial.page_advice_mapping_touch_bytes);
+    }
     if (ok) {
         ok = compare_session_oracle(
             session, fixture, "warm-stability-cold");
@@ -680,7 +728,6 @@ static bool run_warm_stability(
             ok = false;
         }
     }
-
     ds4_runtime_snapshot baseline = {0};
     ds4_runtime_snapshot cycles[WARM_STABILITY_CYCLES];
     memset(cycles, 0, sizeof(cycles));

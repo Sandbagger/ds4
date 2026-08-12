@@ -95,6 +95,7 @@ typedef struct {
 
 enum {
     DS4_RUNTIME_DEVICE_UUID_CAPACITY = 96,
+    DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY = 96,
     DS4_RUNTIME_BUILD_IDENTITY_BYTES = 32,
 };
 
@@ -103,10 +104,12 @@ typedef enum {
     DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT,
     DS4_RUNTIME_EXTERNAL_FAILURE_SMAPS_PARSE,
     DS4_RUNTIME_EXTERNAL_FAILURE_SMAPS_OVERFLOW,
+    DS4_RUNTIME_EXTERNAL_FAILURE_MODEL_MAPPING_MISMATCH,
     DS4_RUNTIME_EXTERNAL_FAILURE_TRACKED_RANGE_OVERLAP,
     DS4_RUNTIME_EXTERNAL_FAILURE_TRACKED_VMA_MISSING,
     DS4_RUNTIME_EXTERNAL_FAILURE_DUPLICATE_ATTRIBUTION,
     DS4_RUNTIME_EXTERNAL_FAILURE_NVML_API_MISMATCH,
+    DS4_RUNTIME_EXTERNAL_FAILURE_NVML_LIBRARY_VERSION_MISMATCH,
     DS4_RUNTIME_EXTERNAL_FAILURE_DEVICE_UUID_MISMATCH,
     DS4_RUNTIME_EXTERNAL_FAILURE_PROCESS_ID_MISMATCH,
     DS4_RUNTIME_EXTERNAL_FAILURE_BUILD_IDENTITY_MISMATCH,
@@ -127,6 +130,7 @@ typedef struct {
 
 typedef struct {
     uint32_t api_version;
+    const char *library_version;
     const char *device_uuid;
     const ds4_runtime_nvml_process_sample *processes;
     size_t process_count;
@@ -138,22 +142,30 @@ typedef struct {
     uint32_t model_device_major;
     uint32_t model_device_minor;
     uint64_t model_inode;
+    uint64_t model_map_base;
+    uint64_t model_map_bytes;
+    uint64_t model_file_offset;
     const ds4_runtime_allocation_record *attribution_records;
     size_t attribution_record_count;
 
     uint32_t expected_nvml_api_version;
+    const char *expected_nvml_library_version;
     const char *expected_device_uuid;
     uint32_t own_pid;
     const uint8_t *expected_build_identity;
     const uint8_t *observed_build_identity;
     size_t build_identity_bytes;
+    uint32_t baseline_nvml_api_version;
+    const char *baseline_nvml_library_version;
     const char *baseline_device_uuid;
     uint32_t baseline_process_id;
+    bool baseline_nvml_process_present;
     bool baseline_nvml_process_bytes_known;
     uint64_t baseline_nvml_process_bytes;
     uint64_t baseline_tracked_cuda_physical_bytes;
     const ds4_runtime_nvml_inventory *pre_child_inventory;
     const ds4_runtime_nvml_inventory *checkpoint_before_inventory;
+    const ds4_runtime_nvml_inventory *inside_ds4_inventory;
     const ds4_runtime_nvml_inventory *checkpoint_after_inventory;
 
     bool cuda_mem_info_known;
@@ -166,6 +178,8 @@ typedef struct {
 
 typedef struct {
     ds4_runtime_external_failure failure;
+    bool attributed_valid;
+    uint64_t attributed_generation;
     uint64_t checkpoint_sequence;
 
     uint32_t smaps_model_device_major;
@@ -180,8 +194,11 @@ typedef struct {
     uint64_t host_library_unattributed_bytes;
 
     uint32_t nvml_api_version;
+    char nvml_library_version[
+        DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY];
     char device_uuid[DS4_RUNTIME_DEVICE_UUID_CAPACITY];
     uint32_t process_id;
+    bool nvml_process_baseline_present;
     uint64_t nvml_process_baseline_bytes;
     uint64_t tracked_cuda_physical_baseline_bytes;
     uint64_t nvml_process_bytes;

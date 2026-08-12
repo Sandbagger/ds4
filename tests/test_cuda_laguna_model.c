@@ -34,6 +34,9 @@
 #define STREAMED_CACHE_BYTES (UINT64_C(8) * 1024u * 1024u * 1024u)
 #define LAGUNA_ROUTED_LAYERS 47u
 #define LAGUNA_ROUTED_EXPERTS 10u
+#define WARM_STABILITY_TOLERANCE_BYTES \
+    (UINT64_C(64) * 1024u * 1024u)
+#define WARM_STABILITY_CYCLES 3u
 
 typedef enum {
     MODEL_MODE_RESIDENT,
@@ -46,6 +49,7 @@ typedef enum {
     MODEL_CASE_SWA,
     MODEL_CASE_CONTINUATION,
     MODEL_CASE_PREFILL_8192,
+    MODEL_CASE_WARM_STABILITY,
 } model_case_selection;
 
 typedef struct {
@@ -87,6 +91,7 @@ static const char *model_case_name(model_case_selection selected) {
         case MODEL_CASE_SWA: return "swa-513";
         case MODEL_CASE_CONTINUATION: return "continuation";
         case MODEL_CASE_PREFILL_8192: return "prefill-8192";
+        case MODEL_CASE_WARM_STABILITY: return "warm-stability";
         case MODEL_CASE_ALL: return "all";
     }
     return "unknown";
@@ -95,8 +100,9 @@ static const char *model_case_name(model_case_selection selected) {
 static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s [--mode resident|streamed "
-            "--case short|swa-513|continuation|prefill-8192|all]\n"
-            "       --case prefill-8192 is streamed-only\n"
+            "--case short|swa-513|continuation|prefill-8192|"
+            "warm-stability|all]\n"
+            "       --case prefill-8192 and warm-stability are streamed-only\n"
             "       --case all is currently resident-only\n",
             program);
 }
@@ -134,6 +140,8 @@ static bool parse_selection(
                 *selected = MODEL_CASE_CONTINUATION;
             } else if (strcmp(argv[i + 1], "prefill-8192") == 0) {
                 *selected = MODEL_CASE_PREFILL_8192;
+            } else if (strcmp(argv[i + 1], "warm-stability") == 0) {
+                *selected = MODEL_CASE_WARM_STABILITY;
             } else if (strcmp(argv[i + 1], "all") == 0) {
                 *selected = MODEL_CASE_ALL;
             } else {
@@ -146,7 +154,8 @@ static bool parse_selection(
     return mode_seen && case_seen &&
         !(*mode == MODEL_MODE_STREAMED && *selected == MODEL_CASE_ALL) &&
         !(*mode == MODEL_MODE_RESIDENT &&
-          *selected == MODEL_CASE_PREFILL_8192);
+          (*selected == MODEL_CASE_PREFILL_8192 ||
+           *selected == MODEL_CASE_WARM_STABILITY));
 }
 
 static bool fail_message(const char *what, const char *detail) {
@@ -529,6 +538,237 @@ static bool create_and_sync(
         return false;
     }
     return true;
+}
+
+static bool capture_quiescent_runtime(
+        ds4_engine *engine,
+        ds4_runtime_snapshot *snapshot,
+        const char *scenario) {
+    ds4_runtime_allocation_record records[256];
+    size_t required = 0;
+    memset(snapshot, 0, sizeof(*snapshot));
+    memset(records, 0, sizeof(records));
+    if (!ds4_test_engine_laguna_runtime_snapshot(
+            engine, snapshot, records,
+            sizeof(records) / sizeof(records[0]), &required)) {
+        return fail_message("quiescent runtime snapshot", scenario);
+    }
+    if (snapshot->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        required != snapshot->active_record_count ||
+        required > sizeof(records) / sizeof(records[0]) ||
+        snapshot->category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] != 0 ||
+        snapshot->category_current[DS4_RUNTIME_CATEGORY_KV_STATE] != 0) {
+        fprintf(stderr,
+                "FAIL: %s is not quiescent violation=%d live=%zu/%zu "
+                "graph=%llu kv=%llu\n",
+                scenario,
+                (int)snapshot->violation,
+                snapshot->active_record_count,
+                required,
+                (unsigned long long)snapshot->category_current[
+                    DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH],
+                (unsigned long long)snapshot->category_current[
+                    DS4_RUNTIME_CATEGORY_KV_STATE]);
+        return false;
+    }
+    return true;
+}
+
+static uint64_t distance_u64(uint64_t left, uint64_t right) {
+    return left >= right ? left - right : right - left;
+}
+
+/* A cold/warm numerical and lifetime gate over the public session API.  The
+ * first pass establishes accepted output and cold routed-I/O cost.  The
+ * identical second pass must reuse cache state without changing output.  A
+ * further three full session lifecycles then prove that request-owned graph
+ * and KV state returns to the same engine-owned baseline after every free. */
+static bool run_warm_stability(
+        ds4_engine *engine,
+        const oracle_case *fixture,
+        uint64_t *routed_tokens) {
+    static const char expected[] =
+        "Explain why a ring buffer wraps, in two sentences.\n";
+    char *text = read_text("short.txt");
+    if (!text) return false;
+    if (strcmp(text, expected) != 0) {
+        free(text);
+        return fail_message("short.txt bytes changed", "warm-stability");
+    }
+
+    ds4_tokens tokens = {0};
+    ds4_encode_chat_prompt(engine, "", text, DS4_THINK_NONE, &tokens);
+    free(text);
+    if (tokens.len <= 0) {
+        ds4_tokens_free(&tokens);
+        return fail_message("empty warm-stability prompt", NULL);
+    }
+    if (routed_tokens) {
+        *routed_tokens =
+            (uint64_t)tokens.len * (2u + WARM_STABILITY_CYCLES) +
+            WARM_STABILITY_CYCLES;
+    }
+
+    bool ok = true;
+    ds4_gpu_laguna_compact_test_snapshot initial = {0};
+    ds4_gpu_laguna_compact_test_snapshot after_cold = {0};
+    ds4_gpu_laguna_compact_test_snapshot after_warm = {0};
+    if (!ds4_gpu_test_laguna_compact_active_snapshot(&initial)) {
+        ok = fail_message("initial compact snapshot", "warm-stability");
+    }
+
+    ds4_session *session = NULL;
+    if (ok) {
+        ok = create_and_sync(
+            engine, &tokens, 1024, &session, "warm-stability-cold");
+    }
+    if (ok) {
+        ok = compare_session_oracle(
+            session, fixture, "warm-stability-cold");
+    }
+    const int cold_argmax = ok ? ds4_session_argmax(session) : -1;
+    ds4_session_free(session);
+    session = NULL;
+    if (ok && !ds4_gpu_test_laguna_compact_active_snapshot(&after_cold)) {
+        ok = fail_message("post-cold compact snapshot", "warm-stability");
+    }
+
+    if (ok) {
+        ok = create_and_sync(
+            engine, &tokens, 1024, &session, "warm-stability-warm");
+    }
+    if (ok) {
+        ok = compare_session_oracle(
+            session, fixture, "warm-stability-warm");
+    }
+    if (ok && ds4_session_argmax(session) != cold_argmax) {
+        ok = fail_message(
+            "cold and warm accepted output differ", "warm-stability");
+    }
+    ds4_session_free(session);
+    session = NULL;
+    if (ok && !ds4_gpu_test_laguna_compact_active_snapshot(&after_warm)) {
+        ok = fail_message("post-warm compact snapshot", "warm-stability");
+    }
+
+    uint64_t cold_read_bytes = 0;
+    uint64_t warm_read_bytes = 0;
+    uint64_t warm_hits = 0;
+    if (ok && (after_cold.model_file_read_bytes <
+                   initial.model_file_read_bytes ||
+               after_warm.model_file_read_bytes <
+                   after_cold.model_file_read_bytes ||
+               after_warm.cache_acquire_hits <
+                   after_cold.cache_acquire_hits)) {
+        ok = fail_message("non-monotonic cache counters", "warm-stability");
+    }
+    if (ok) {
+        cold_read_bytes = after_cold.model_file_read_bytes -
+            initial.model_file_read_bytes;
+        warm_read_bytes = after_warm.model_file_read_bytes -
+            after_cold.model_file_read_bytes;
+        warm_hits = after_warm.cache_acquire_hits -
+            after_cold.cache_acquire_hits;
+        if (cold_read_bytes == 0 || warm_hits == 0 ||
+            warm_read_bytes > cold_read_bytes) {
+            fprintf(stderr,
+                    "FAIL: warm-stability cache reuse cold_read=%llu "
+                    "warm_read=%llu warm_hits=%llu\n",
+                    (unsigned long long)cold_read_bytes,
+                    (unsigned long long)warm_read_bytes,
+                    (unsigned long long)warm_hits);
+            ok = false;
+        }
+    }
+
+    ds4_runtime_snapshot baseline = {0};
+    ds4_runtime_snapshot cycles[WARM_STABILITY_CYCLES];
+    memset(cycles, 0, sizeof(cycles));
+    if (ok) {
+        ok = capture_quiescent_runtime(
+            engine, &baseline, "first post-warm result");
+    }
+    for (size_t cycle = 0; ok && cycle < WARM_STABILITY_CYCLES; cycle++) {
+        char scenario[64];
+        snprintf(scenario, sizeof(scenario),
+                 "warm-stability-cycle-%zu", cycle + 1u);
+        ok = create_and_sync(engine, &tokens, 1024, &session, scenario);
+        if (ok && ds4_session_argmax(session) != cold_argmax) {
+            ok = fail_message("warm cycle changed accepted output", scenario);
+        }
+        char error[256] = {0};
+        if (ok && ds4_session_eval(
+                      session, cold_argmax, error, sizeof(error)) != 0) {
+            ok = fail_message("warm cycle decode", error);
+        }
+        ds4_session_free(session);
+        session = NULL;
+        if (ok) {
+            ok = capture_quiescent_runtime(engine, &cycles[cycle], scenario);
+        }
+    }
+
+    for (size_t category = 0;
+         ok && category < DS4_RUNTIME_OWNED_CATEGORY_COUNT; category++) {
+        bool ever_increased = false;
+        bool ever_decreased = false;
+        uint64_t previous = baseline.category_current[category];
+        for (size_t cycle = 0; cycle < WARM_STABILITY_CYCLES; cycle++) {
+            const uint64_t current = cycles[cycle].category_current[category];
+            if (distance_u64(
+                    baseline.category_current[category], current) >
+                WARM_STABILITY_TOLERANCE_BYTES) {
+                fprintf(stderr,
+                        "FAIL: warm category=%zu cycle=%zu baseline=%llu "
+                        "current=%llu exceeds=%llu\n",
+                        category, cycle + 1u,
+                        (unsigned long long)baseline.category_current[category],
+                        (unsigned long long)current,
+                        (unsigned long long)WARM_STABILITY_TOLERANCE_BYTES);
+                ok = false;
+                break;
+            }
+            if (current > previous) ever_increased = true;
+            if (current < previous) ever_decreased = true;
+            previous = current;
+        }
+        if (ok && ever_increased && !ever_decreased) {
+            fprintf(stderr,
+                    "FAIL: owned category=%zu grows monotonically after warm-up\n",
+                    category);
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        for (size_t cycle = 0; cycle < WARM_STABILITY_CYCLES; cycle++) {
+            if (cycles[cycle].active_record_count !=
+                    baseline.active_record_count ||
+                distance_u64(cycles[cycle].owned_total_current,
+                             baseline.owned_total_current) >
+                    WARM_STABILITY_TOLERANCE_BYTES) {
+                ok = fail_message(
+                    "session lifecycle did not return to warm baseline",
+                    "warm-stability");
+                break;
+            }
+        }
+    }
+
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    if (ok) {
+        fprintf(stderr,
+                "warm-stability cycles=%u cold_read=%llu warm_read=%llu "
+                "warm_hits=%llu baseline=%llu live=%zu PASS\n",
+                WARM_STABILITY_CYCLES,
+                (unsigned long long)cold_read_bytes,
+                (unsigned long long)warm_read_bytes,
+                (unsigned long long)warm_hits,
+                (unsigned long long)baseline.owned_total_current,
+                baseline.active_record_count);
+    }
+    return ok;
 }
 
 static bool run_short(
@@ -1382,6 +1622,10 @@ int main(int argc, char **argv) {
     if (ok && selected == MODEL_CASE_PREFILL_8192) {
         ok = run_prefill_8192(engine, &streamed_routed_tokens);
     }
+    if (ok && selected == MODEL_CASE_WARM_STABILITY) {
+        ok = run_warm_stability(
+            engine, &fixtures.cases[0], &streamed_routed_tokens);
+    }
     if (ok && selected == MODEL_CASE_ALL && !diagnostic_mode) {
         if (ok) {
             ok = run_raw_frontier(
@@ -1411,10 +1655,13 @@ int main(int argc, char **argv) {
     if (!ok) return 1;
     if (diagnostic_mode) return 0;
     if (selected != MODEL_CASE_ALL) {
-        if (selected == MODEL_CASE_PREFILL_8192) {
+        if (selected == MODEL_CASE_PREFILL_8192 ||
+            selected == MODEL_CASE_WARM_STABILITY) {
             fprintf(stderr,
                     "test_cuda_laguna_model PASS "
-                    "contract=allocation-schedule mode=%s case=%s\n",
+                    "contract=%s mode=%s case=%s\n",
+                    selected == MODEL_CASE_PREFILL_8192 ?
+                        "allocation-schedule" : "warm-stability",
                     model_mode_name(mode), model_case_name(selected));
             return 0;
         }

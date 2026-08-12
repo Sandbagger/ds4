@@ -55,6 +55,16 @@ void ds4_gpu_test_laguna_compact_page_advice_inject(
     int fadvise_errno,
     int madvise_errno);
 
+/* Task 14 RED seam.  The policy layer can already form deterministic groups,
+ * but the live compact routed path still rejects a batch whose unique working
+ * set exceeds the fixed slots.  Keep this weak so the rest of the pressure
+ * lifecycle runs and reports its independent invariants before the one missing
+ * production integration is made explicit. */
+#if defined(__GNUC__)
+extern int ds4_gpu_test_laguna_compact_route_group_execution_supported(void)
+    __attribute__((weak));
+#endif
+
 /* Compile-only contract.  Runnable lifecycle behavior is driven separately
  * after this typed seam lands. */
 static void compile_typed_lifecycle_contract(
@@ -3976,6 +3986,7 @@ typedef enum {
     CACHE_LEDGER_OVERLAPPING_DEVICE_VIEWS = 3,
     CACHE_LEDGER_INCONSISTENT_LAYER_EXPERT_COUNT = 4,
     CACHE_PLAN_UNDERSLOTTED = 5,
+    CACHE_PLAN_TWO_SESSION_PRESSURE = 6,
 } cache_boundary_mutation;
 
 static void cache_ledger_make_layer_expert_counts_inconsistent(
@@ -4051,6 +4062,11 @@ static bool cache_cuda_fixture_open_mutated(
             fixture->plan.configured_cache_bytes;
         fixture->plan.cache_tail_uncharged_bytes =
             fixture->ledger.slot_stride_bytes;
+    } else if (mutation == CACHE_PLAN_TWO_SESSION_PRESSURE) {
+        fixture->plan.profile_id = "synthetic-4k-two-session-pressure";
+        fixture->plan.context_tokens = 4096u;
+        fixture->plan.prefill_rows = 4096u;
+        fixture->plan.session_count = 2u;
     }
     if (!tracker_fixture_init(
             &fixture->runtime, &fixture->plan, &fixture->ledger)) {
@@ -4071,6 +4087,12 @@ static bool cache_cuda_fixture_open_mutated(
 
 static bool cache_cuda_fixture_open(cache_cuda_fixture *fixture) {
     return cache_cuda_fixture_open_mutated(fixture, CACHE_LEDGER_VALID);
+}
+
+static bool cache_cuda_fixture_open_session_pressure(
+        cache_cuda_fixture *fixture) {
+    return cache_cuda_fixture_open_mutated(
+        fixture, CACHE_PLAN_TWO_SESSION_PRESSURE);
 }
 
 static void cache_cuda_fixture_close(cache_cuda_fixture *fixture) {
@@ -4753,6 +4775,263 @@ static int run_cache_io(void) {
     CHECK(fixture.context == NULL &&
               tracker_has_only_ledger(&fixture.runtime.tracker),
           "recreated lifecycle returns to the same ledger-only baseline");
+    const int result = g_failures == 0 ? 0 : 1;
+    cache_cuda_fixture_close(&fixture);
+    return result;
+}
+
+static bool cache_slots_are_quiescent_ready(
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot) {
+    if (!snapshot || !snapshot->cache_slots ||
+        snapshot->cache_slot_count == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < (size_t)snapshot->cache_slot_count; i++) {
+        const ds4_laguna_cache_slot *slot = &snapshot->cache_slots[i];
+        if (slot->state != DS4_LAGUNA_CACHE_SLOT_READY || slot->refs != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool session_pressure_grouping_contract(void) {
+    ds4_laguna_expert_entry entries[4];
+    ds4_laguna_cache_slot slots[2];
+    uint64_t hotness[4];
+    uint32_t entry_to_slot[4];
+    ds4_laguna_cache_policy policy;
+    memset(entries, 0, sizeof(entries));
+    memset(slots, 0, sizeof(slots));
+    memset(hotness, 0, sizeof(hotness));
+    memset(entry_to_slot, 0xff, sizeof(entry_to_slot));
+    memset(&policy, 0, sizeof(policy));
+    for (uint32_t expert = 0; expert < ARRAY_LEN(entries); expert++) {
+        entries[expert].layer = 1u;
+        entries[expert].expert = expert;
+    }
+    if (ds4_laguna_cache_policy_init(
+            &policy, entries, ARRAY_LEN(entries), slots, ARRAY_LEN(slots),
+            hotness, entry_to_slot, 2u) != DS4_LAGUNA_CACHE_OK) {
+        return false;
+    }
+
+    /* Two logical sessions contribute one two-expert token each.  Each token
+     * fits, while their combined layer working set exceeds the fixed slots. */
+    const ds4_laguna_expert_key selected[] = {
+        {1u, 0u}, {1u, 1u},
+        {1u, 2u}, {1u, 3u},
+    };
+    ds4_laguna_expert_key grouped[4];
+    ds4_laguna_expert_group groups[2];
+    size_t grouped_count = 0;
+    size_t group_count = 0;
+    memset(grouped, 0, sizeof(grouped));
+    memset(groups, 0, sizeof(groups));
+    return ds4_laguna_cache_policy_group(
+               &policy, selected, 2u, 2u,
+               grouped, ARRAY_LEN(grouped), groups, ARRAY_LEN(groups),
+               &grouped_count, &group_count) == DS4_LAGUNA_CACHE_OK &&
+        grouped_count == ARRAY_LEN(selected) && group_count == 2u &&
+        groups[0].first_key == 0u && groups[0].key_count == 2u &&
+        groups[1].first_key == 2u && groups[1].key_count == 2u &&
+        memcmp(grouped, selected, sizeof(selected)) == 0;
+}
+
+static int run_session_pressure(void) {
+    cache_cuda_fixture fixture;
+    CHECK(cache_cuda_fixture_open_session_pressure(&fixture),
+          "4K/two-logical-session pressure fixture creates one engine cache");
+    if (!fixture.context) {
+        cache_cuda_fixture_close(&fixture);
+        return 1;
+    }
+    CHECK(fixture.plan.context_tokens == 4096u &&
+              fixture.plan.prefill_rows == 4096u &&
+              fixture.plan.session_count == 2u &&
+              fixture.plan.slot_count == 2u,
+          "pressure fixture declares its separate 4K/two-session profile");
+
+    ds4_gpu_laguna_compact_test_snapshot initial;
+    ds4_runtime_snapshot runtime_initial;
+    ds4_runtime_allocation_record initial_records[TRACKER_RECORD_CAPACITY];
+    memset(&initial, 0, sizeof(initial));
+    memset(&runtime_initial, 0, sizeof(runtime_initial));
+    memset(initial_records, 0, sizeof(initial_records));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(fixture.context, &initial) &&
+              ds4_runtime_tracker_snapshot_copy(
+                  &fixture.runtime.tracker, &runtime_initial,
+                  initial_records, ARRAY_LEN(initial_records)) &&
+              runtime_initial.violation == DS4_RUNTIME_VIOLATION_NONE &&
+              initial.cache_payload_allocation_attempts == 1u &&
+              initial.pinned_staging_allocation_attempts == 4u &&
+              initial.cache_slot_count == 2u &&
+              cache_device_map_matches_slots(&fixture, &initial, 0u),
+          "pressure starts with one fixed engine-lifetime cache and no residents");
+
+    /* Actor A and actor B interleave cold misses and deliberately keep both
+     * handles pinned.  A third miss must report pressure, never grow capacity. */
+    ds4_laguna_cache_handle actor_a = {0};
+    ds4_laguna_cache_handle actor_b = {0};
+    ds4_laguna_cache_handle pressure = {0};
+    ds4_laguna_cache_acquire_outcome outcome =
+        DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(1u, 0u),
+              &actor_a, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "logical session A owns the first cold miss");
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(1u, 1u),
+              &actor_b, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "logical session B interleaves a second cold miss");
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(2u, 0u),
+              &pressure, &outcome) == DS4_LAGUNA_CACHE_RECOVERABLE &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_PRESSURE &&
+              pressure.slot_index == DS4_LAGUNA_CACHE_SLOT_NONE,
+          "held pins turn an interleaved third miss into typed pressure");
+
+    ds4_gpu_laguna_compact_test_snapshot pinned;
+    memset(&pinned, 0, sizeof(pinned));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(fixture.context, &pinned) &&
+              pinned.cache_slot_count == 2u &&
+              pinned.cache_slots[0].state == DS4_LAGUNA_CACHE_SLOT_IN_USE &&
+              pinned.cache_slots[0].refs == 1u &&
+              pinned.cache_slots[1].state == DS4_LAGUNA_CACHE_SLOT_IN_USE &&
+              pinned.cache_slots[1].refs == 1u &&
+              pinned.cache_payload == initial.cache_payload &&
+              pinned.cache_payload_allocation_attempts ==
+                  initial.cache_payload_allocation_attempts &&
+              pinned.pinned_staging_allocation_attempts ==
+                  initial.pinned_staging_allocation_attempts,
+          "pressure preserves both owners and cannot allocate an overflow slot");
+
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, actor_a) == DS4_LAGUNA_CACHE_OK,
+          "logical session A releases one current-group pin");
+    ds4_laguna_cache_handle actor_b_pressure = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(2u, 0u),
+              &actor_b_pressure, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "logical session B reuses the released slot by deterministic eviction");
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, actor_b_pressure) == DS4_LAGUNA_CACHE_OK,
+          "eviction owner releases its pin before the next actor runs");
+
+    /* Cancel a RESERVED miss before I/O.  Completion of the old capability is
+     * stale, and the emptied slot must be immediately reusable by actor A. */
+    ds4_laguna_cache_handle cancelled = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_begin(
+              fixture.context, cache_fixture_key(2u, 1u),
+              &cancelled, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
+          "logical session A reserves an eviction miss for cancellation");
+    const ds4_laguna_cache_handle stale_cancelled = cancelled;
+    CHECK(ds4_gpu_laguna_compact_cache_cancel(
+              fixture.context, cancelled) == DS4_LAGUNA_CACHE_RECOVERABLE &&
+              ds4_gpu_laguna_compact_cache_complete(
+                  fixture.context, &cancelled) ==
+                  DS4_LAGUNA_CACHE_RECOVERABLE &&
+              memcmp(&cancelled, &stale_cancelled,
+                     sizeof(cancelled)) == 0,
+          "reserved cancellation restores the slot and leaves no published key");
+
+    ds4_laguna_cache_handle actor_a_reuse = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(1u, 0u),
+              &actor_a_reuse, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+              ds4_gpu_laguna_compact_cache_unpin(
+                  fixture.context, actor_a_reuse) == DS4_LAGUNA_CACHE_OK,
+          "logical session A immediately reuses cancelled capacity");
+    CHECK(ds4_gpu_laguna_compact_cache_unpin(
+              fixture.context, actor_b) == DS4_LAGUNA_CACHE_OK,
+          "logical session B releases its original engine-cache entry");
+
+    ds4_laguna_cache_handle cross_session_hit = {0};
+    outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    CHECK(ds4_gpu_laguna_compact_cache_acquire(
+              fixture.context, cache_fixture_key(1u, 1u),
+              &cross_session_hit, &outcome) == DS4_LAGUNA_CACHE_OK &&
+              outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED &&
+              ds4_gpu_laguna_compact_cache_unpin(
+                  fixture.context, cross_session_hit) == DS4_LAGUNA_CACHE_OK,
+          "session A can hit session B's surviving engine-lifetime cache entry");
+
+    CHECK(session_pressure_grouping_contract(),
+          "two-session layer working set deterministically forms two slot groups");
+
+    ds4_gpu_laguna_compact_test_snapshot final;
+    ds4_runtime_snapshot runtime_final;
+    ds4_runtime_allocation_record final_records[TRACKER_RECORD_CAPACITY];
+    memset(&final, 0, sizeof(final));
+    memset(&runtime_final, 0, sizeof(runtime_final));
+    memset(final_records, 0, sizeof(final_records));
+    CHECK(ds4_gpu_test_laguna_compact_snapshot(fixture.context, &final) &&
+              !final.cache_unsafe && cache_slots_are_quiescent_ready(&final) &&
+              cache_device_map_matches_slots(&fixture, &final, 2u) &&
+              final.cache_acquire_hits == 1u &&
+              final.cache_acquire_misses == 5u &&
+              final.cache_load_successes == 4u &&
+              final.cache_load_failures == 1u &&
+              final.cache_acquire_misses ==
+                  final.cache_load_successes + final.cache_load_failures &&
+              final.cache_evictions == 2u &&
+              final.cache_cancellations == 1u,
+          "interleaved pressure leaves exact counters and zero live pins");
+    CHECK(final.cache_payload == initial.cache_payload &&
+              final.cache_slots == initial.cache_slots &&
+              final.device_entry_to_slot == initial.device_entry_to_slot &&
+              final.cache_payload_bytes == initial.cache_payload_bytes &&
+              final.pinned_staging_bytes == initial.pinned_staging_bytes &&
+              final.cache_payload_allocation_attempts == 1u &&
+              final.pinned_staging_allocation_attempts == 4u &&
+              final.routed_payload_bytes <= final.cache_payload_bytes &&
+              cache_snapshot_has_no_fallback(&final),
+          "pressure changes residents and counters without changing fixed owners");
+    CHECK(ds4_runtime_tracker_snapshot_copy(
+              &fixture.runtime.tracker, &runtime_final,
+              final_records, ARRAY_LEN(final_records)) &&
+              runtime_final.violation == DS4_RUNTIME_VIOLATION_NONE &&
+              runtime_final.active_record_count ==
+                  runtime_initial.active_record_count &&
+              runtime_final.owned_total_current ==
+                  runtime_initial.owned_total_current &&
+              memcmp(runtime_final.category_current,
+                     runtime_initial.category_current,
+                     sizeof(runtime_final.category_current)) == 0 &&
+              memcmp(final_records, initial_records,
+                     runtime_initial.active_record_count *
+                         sizeof(initial_records[0])) == 0,
+          "request pressure and cancellation restore exact tracker ownership");
+
+    const ds4_gpu_laguna_destroy_status destroyed =
+        ds4_gpu_laguna_compact_destroy(fixture.context);
+    CHECK(destroyed == DS4_GPU_LAGUNA_DESTROY_OK,
+          "quiescent two-actor pressure cache tears down cleanly");
+    if (destroyed == DS4_GPU_LAGUNA_DESTROY_OK) fixture.context = NULL;
+    CHECK(destroyed == DS4_GPU_LAGUNA_DESTROY_OK &&
+              tracker_has_only_ledger(&fixture.runtime.tracker),
+          "pressure teardown returns from engine owners to ledger baseline");
+
+    bool grouped_execution_supported = false;
+#if defined(__GNUC__)
+    if (ds4_gpu_test_laguna_compact_route_group_execution_supported) {
+        grouped_execution_supported =
+            ds4_gpu_test_laguna_compact_route_group_execution_supported() != 0;
+    }
+#endif
+    CHECK(grouped_execution_supported,
+          "RED: compact CUDA executes over-capacity routed batches group-by-group");
+
     const int result = g_failures == 0 ? 0 : 1;
     cache_cuda_fixture_close(&fixture);
     return result;
@@ -6649,9 +6928,12 @@ static void usage(const char *program) {
             "model-teardown-second-recoverable|cache-validation|cache-io|"
             "cache-faults|cache-unsafe|cache-unsafe-race|"
             "prefill-allocation|page-advice|model-page-advice|"
+            "session-pressure|"
             "external-attribution\n",
             program);
 }
+
+static int run_session_pressure(void);
 
 static int run_named_case(const char *name) {
     if (strcmp(name, "startup") == 0) {
@@ -6691,6 +6973,8 @@ static int run_named_case(const char *name) {
         return run_page_advice();
     } else if (strcmp(name, "model-page-advice") == 0) {
         return run_model_page_advice();
+    } else if (strcmp(name, "session-pressure") == 0) {
+        return run_session_pressure();
     } else if (strcmp(name, "external-attribution") == 0) {
         return run_external_attribution();
     }

@@ -103,6 +103,82 @@ HOST_IDENTITY = {
     },
 }
 
+WARM_OWNED_CATEGORY_NAMES = (
+    "static_weights",
+    "expert_cache_payload",
+    "cache_metadata_address_tables",
+    "kv_state",
+    "graph_scratch",
+    "pinned_staging",
+    "other_host",
+    "other_cuda",
+)
+
+
+def _warm_stability_sample(
+    categories: dict[str, int],
+    *,
+    hit_before: int,
+    hit_after: int,
+    read_before: int,
+    read_after: int,
+) -> dict[str, object]:
+    return {
+        "owned_category_current_bytes": {
+            name: str(categories[name]) for name in WARM_OWNED_CATEGORY_NAMES
+        },
+        "cache_acquire_hits_before": str(hit_before),
+        "cache_acquire_hits_after": str(hit_after),
+        "model_file_read_bytes_before": str(read_before),
+        "model_file_read_bytes_after": str(read_after),
+    }
+
+
+def _warm_stability_fixture() -> tuple[dict[str, object], list[dict[str, object]]]:
+    categories = {
+        "static_weights": 4 << 30,
+        "expert_cache_payload": 8 << 30,
+        "cache_metadata_address_tables": 1 << 20,
+        "kv_state": 0,
+        "graph_scratch": 0,
+        "pinned_staging": 24 << 20,
+        "other_host": 2 << 20,
+        "other_cuda": 0,
+    }
+    cold = _warm_stability_sample(
+        categories,
+        hit_before=100,
+        hit_after=105,
+        read_before=1_000,
+        read_after=5_000,
+    )
+    second_categories = dict(categories)
+    second_categories["other_host"] += 64 << 20
+    warm = [
+        _warm_stability_sample(
+            categories,
+            hit_before=105,
+            hit_after=110,
+            read_before=5_000,
+            read_after=7_000,
+        ),
+        _warm_stability_sample(
+            second_categories,
+            hit_before=110,
+            hit_after=114,
+            read_before=7_000,
+            read_after=7_500,
+        ),
+        _warm_stability_sample(
+            categories,
+            hit_before=114,
+            hit_after=115,
+            read_before=7_500,
+            read_after=7_500,
+        ),
+    ]
+    return cold, warm
+
 
 def deterministic_token_count(rendered: bytes) -> int:
     if not rendered.startswith(PREFIX) or not rendered.endswith(SUFFIX):
@@ -1112,6 +1188,132 @@ print("[" + ",".join(["0"] * count) + "]")
             ])
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
+
+
+class WarmStabilityContractTest(unittest.TestCase):
+    def test_freezes_warm_stability_constants_and_accepts_boundary_evidence(self) -> None:
+        self.assertEqual(TOOL.WARM_STABILITY_REPETITIONS, 3)
+        self.assertEqual(
+            TOOL.WARM_OWNED_CATEGORY_DRIFT_LIMIT_BYTES,
+            64 << 20,
+        )
+        self.assertEqual(
+            tuple(TOOL.RUNTIME_OWNED_CATEGORY_NAMES),
+            WARM_OWNED_CATEGORY_NAMES,
+        )
+        cold, warm = _warm_stability_fixture()
+        TOOL.validate_warm_stability_samples(cold, warm)
+
+    def test_requires_exactly_three_same_process_warm_samples(self) -> None:
+        cold, warm = _warm_stability_fixture()
+        for samples in (warm[:2], warm + [copy.deepcopy(warm[-1])]):
+            with self.subTest(count=len(samples)), self.assertRaises(ValueError):
+                TOOL.validate_warm_stability_samples(cold, samples)
+
+    def test_rejects_owned_category_drift_beyond_the_inclusive_limit(self) -> None:
+        cold, warm = _warm_stability_fixture()
+        changed = copy.deepcopy(warm)
+        first = int(
+            changed[0]["owned_category_current_bytes"]["other_host"]
+        )
+        changed[1]["owned_category_current_bytes"]["other_host"] = str(
+            first + (64 << 20) + 1
+        )
+        with self.assertRaises(ValueError):
+            TOOL.validate_warm_stability_samples(cold, changed)
+
+    def test_rejects_any_nonconstant_monotonically_growing_category(self) -> None:
+        cold, warm = _warm_stability_fixture()
+        for values in ((0, 1, 2), (0, 0, 1)):
+            with self.subTest(values=values):
+                changed = copy.deepcopy(warm)
+                for sample, value in zip(changed, values, strict=True):
+                    sample["owned_category_current_bytes"]["other_cuda"] = str(
+                        value
+                    )
+                with self.assertRaises(ValueError):
+                    TOOL.validate_warm_stability_samples(cold, changed)
+
+    def test_each_warm_sample_adds_hits_and_reads_no_more_than_cold(self) -> None:
+        cold, warm = _warm_stability_fixture()
+        zero_hits = copy.deepcopy(warm)
+        zero_hits[1]["cache_acquire_hits_after"] = zero_hits[1][
+            "cache_acquire_hits_before"
+        ]
+        excessive_reads = copy.deepcopy(warm)
+        cold_read_delta = (
+            int(cold["model_file_read_bytes_after"])
+            - int(cold["model_file_read_bytes_before"])
+        )
+        excessive_reads[1]["model_file_read_bytes_after"] = str(
+            int(excessive_reads[1]["model_file_read_bytes_before"])
+            + cold_read_delta
+            + 1
+        )
+        for label, changed in (
+            ("zero hit delta", zero_hits),
+            ("warm read delta", excessive_reads),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                TOOL.validate_warm_stability_samples(cold, changed)
+
+    def test_rejects_counter_regression_and_uint64_overflow(self) -> None:
+        cold, warm = _warm_stability_fixture()
+
+        hit_regression = copy.deepcopy(warm)
+        hit_regression[1]["cache_acquire_hits_after"] = str(
+            int(hit_regression[1]["cache_acquire_hits_before"]) - 1
+        )
+        read_regression = copy.deepcopy(warm)
+        read_regression[1]["model_file_read_bytes_after"] = str(
+            int(read_regression[1]["model_file_read_bytes_before"]) - 1
+        )
+        cross_sample_regression = copy.deepcopy(warm)
+        cross_sample_regression[0]["cache_acquire_hits_before"] = str(
+            int(cold["cache_acquire_hits_after"]) - 1
+        )
+        counter_overflow = copy.deepcopy(warm)
+        counter_overflow[1]["model_file_read_bytes_after"] = str(1 << 64)
+        category_overflow = copy.deepcopy(warm)
+        category_overflow[1]["owned_category_current_bytes"][
+            "static_weights"
+        ] = str(1 << 64)
+
+        for label, changed in (
+            ("hit regression", hit_regression),
+            ("read regression", read_regression),
+            ("cross-sample regression", cross_sample_regression),
+            ("counter overflow", counter_overflow),
+            ("category overflow", category_overflow),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                TOOL.validate_warm_stability_samples(cold, changed)
+
+    def test_rejects_malformed_sample_and_category_counts(self) -> None:
+        cold, warm = _warm_stability_fixture()
+        missing_category = copy.deepcopy(warm)
+        del missing_category[0]["owned_category_current_bytes"]["kv_state"]
+        extra_category = copy.deepcopy(warm)
+        extra_category[0]["owned_category_current_bytes"]["unknown"] = "0"
+        missing_counter = copy.deepcopy(warm)
+        del missing_counter[0]["model_file_read_bytes_after"]
+        noncanonical_counter = copy.deepcopy(warm)
+        noncanonical_counter[0]["cache_acquire_hits_after"] = "0110"
+        numeric_category = copy.deepcopy(warm)
+        numeric_category[0]["owned_category_current_bytes"]["kv_state"] = 0
+        boolean_counter = copy.deepcopy(warm)
+        boolean_counter[0]["cache_acquire_hits_after"] = True
+
+        for label, changed in (
+            ("missing category", missing_category),
+            ("extra category", extra_category),
+            ("missing counter", missing_counter),
+            ("noncanonical counter", noncanonical_counter),
+            ("numeric category", numeric_category),
+            ("boolean counter", boolean_counter),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                TOOL.validate_warm_stability_samples(cold, changed)
 
 
 class ColdPreparationContractTest(unittest.TestCase):

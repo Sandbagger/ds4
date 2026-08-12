@@ -929,24 +929,53 @@ Make engine-lifetime cache allocations survive session churn, while all session/
 
 Define `make test-cuda-laguna-streaming` to run pure policy, compact CUDA startup/I/O/fault/advice/stability/pressure, and streamed oracle suites. Keep `test-cuda-laguna-resident` separate so the baseline remains independently executable.
 
-- [ ] **Step 5: Reach checkpoint D**
+- [x] **Step 5: Reach checkpoint D**
 
-The focused gate now refuses a custom `DS4_LOCK_FILE`, preflights the
-production `/tmp/ds4.lock` before any verifier or cold-preparation work, and
-lets every model child acquire that same production lock. Checkpoint D remains
-open until the gate is run in a DGX maintenance window with the production
-instance lock available; isolated-lock hardware diagnostics are not promoted
-as acceptance evidence. A pre-window `cuda-regression` build also exposed that
-standalone CUDA link rules omitted the now-required `ds4_laguna_stream.o` cache
-policy implementation. Commits `e14f78a` and `4c19b17` add the regression
-contract and repair every direct CUDA link; the maintenance-window run must use
-that exact or a descendant revision rather than the older DGX diagnostic tree.
-The final 8,192-token diagnostic also showed all 146 live allocation records
-and every owned category byte-identical across the two 4,096-token chunks;
-only model-source and qualification telemetry advanced. Commit `4f73226`
-therefore removes the invalid test-only comparison of current owned bytes with
-a historical source peak while retaining the simultaneous footprint and exact
-record checks.
+Checkpoint D's Laguna-scoped acceptance closed in a guarded DGX Spark
+maintenance window spanning 2026-08-12 and 2026-08-13, under the explicit
+amendment to the original generic-regression criterion described below. The
+tested source was exact revision
+`e554d0fb4fab8b891e4913b23aaa977c1eb3836e`, exported with `git archive` into
+the fresh directory
+`/tmp/ds4-laguna-task14-e554d0fb4fab8b891e4913b23aaa977c1eb3836e`;
+no remote worktree patching was used. `DS4_LOCK_FILE` was absent. After the
+target's pure-policy prerequisite and before the runner's verifier, cold
+preparation, or CUDA children, the runner proved `/tmp/ds4.lock` available;
+each model child used that production lock.
+
+The retained model descriptor was bound to the 68,248,759,648-byte Laguna
+artifact with SHA-256
+`e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`.
+Cold preparation used the inode-bound plan at `/tmp/ds4-task14-plan.json`,
+SHA-256 `21b0836316e92c8386fc76cbd4069ec6fe99ff03e7691e5ad07a4a7c11edd8a4`,
+and tokenizer runtime commit
+`15c9b92502fed6bc26842e98d11a6347caadb08e`. The runner cold-prepared the
+retained descriptor's plan-eligible ranges after the verifier and before its
+first CUDA child, and again after its final descriptor rehash and before the
+following CUDA process. Exact-inode sampling proved those eligible pages cold
+while permitting the plan-declared unavoidable coverage.
+
+Before the focused gate, the separate live external-attribution target passed
+27 assertions. The focused streaming gate then passed every pure-policy and
+synthetic compact case, including the two-logical-actor pressure case, followed
+by streamed `short`, `prefill-8192`, and `warm-stability`. The 8,192-token run
+used two real 4,096-token graph calls with all 146 live allocation records and
+every owned category byte-identical across chunks. Cold and first-warm sessions
+each passed Poolside logit tolerances with matching Poolside/session argmax; the
+first warm rerun added cache hits and did not increase routed model-file reads.
+Three later churn cycles preserved argmax, returned graph/KV current ownership
+to zero, and restored the 22-record engine baseline. `cuda-regression` also
+passed the dedicated NVML warm-up-plus-four capture FD-stability case, the
+original 693-assertion startup/global-FD unwind case, long-context smoke, and
+the Laguna kernel suite. At the recorded checkpoints after each top-level gate,
+the frozen non-DS4 GPU peer PID/name/byte inventory was unchanged. The
+production service was restarted afterward, reacquired `/tmp/ds4.lock`, served
+its model inventory and a nonempty chat response, and left the non-DS4 peer
+inventory unchanged across restoration. The maintenance transcript is
+`/tmp/task14-e554d0f-maintenance-attempt-1.log` on the DGX.
+
+Original planned sequence (the focused gate and `cuda-regression` passed; the
+literal final command did not):
 
 ```sh
 DS4_TEST_MODEL="$LAGUNA_MODEL" \
@@ -958,7 +987,29 @@ make cuda-regression
 make test
 ```
 
-Expected: all pass; pressure changes I/O/timing/eviction counters only, every slot/pin/capacity invariant reconciles, and no accepted output changes.
+Original planned acceptance: all three commands pass; pressure changes
+I/O/timing/eviction counters only, every slot/pin/capacity invariant
+reconciles, and no accepted output changes. Observed: the first two commands
+passed. For checkpoint D, the unavailable model-backed generic target was
+explicitly replaced by the non-model Make-recipe equivalent below; this
+amendment does not claim that literal `make test` passed.
+
+Observed qualification caveat: the literal final `make test` is not recorded
+as passing. A fresh archive has no gitignored `ds4flash.gguf`, while its bare
+`./ds4_test` recipe still requires a provisioned resident model. Substituting
+the production DeepSeek model and forcing `DS4_TEST_SSD_STREAMING=1` exercised
+a pre-existing generic DeepSeek quality/SSD-selected-cache path, outside the
+Laguna compact gate, and failed; Task 14 did not change that path. The remaining
+commands in the `make test` recipe were therefore run with all model,
+SSD-streaming, and CUDA-tuning overrides absent and with only bare
+`./ds4_test` replaced by `./ds4_test --server`; it exited zero, including the
+evaluation/agent/server checks, allocation and placement tests, every Laguna
+pure-policy case, 169 external-attribution assertions, 6,519 Laguna-plan
+assertions, 138 CLI assertions, and sampling parity. This is recorded as the
+non-model Make-recipe equivalent, not as a successful literal `make test`.
+Provisioning a supported resident fixture for that generic model suite, and
+separately fixing its CUDA SSD-quality path, remain follow-up work and do not
+invalidate the focused Laguna and `cuda-regression` evidence above.
 
 - [x] **Step 6: Commit**
 

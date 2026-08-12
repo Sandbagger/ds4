@@ -34,6 +34,7 @@ if SPEC is None or SPEC.loader is None:
 TOOL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TOOL)
 
+TEST_PAGE_SIZE = TOOL.mmap.PAGESIZE
 
 PREFIX = b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
 SUFFIX = b"</user>\n<assistant></think>"
@@ -159,26 +160,31 @@ def _write_cold_preparation_fixture(
     ranges: list[dict[str, str]] | None = None,
 ) -> tuple[Path, Path, dict, str]:
     """Write a sparse model and the smallest Task-13 qualification plan."""
+    page_size = TEST_PAGE_SIZE
     model = directory / "laguna-s-2.1-Q4_K_M.gguf"
     with model.open("wb") as handle:
-        handle.truncate(8 * 4096)
-        handle.seek(4096)
+        handle.truncate(8 * page_size)
+        handle.seek(page_size)
         handle.write(b"original descriptor bytes")
     identity = model.stat()
     ledger = {
         "file_size": str(identity.st_size),
         "tensor_ranges": [
-            {"class": "STATIC", "source_bytes": "8192", "source_offset": "4096"},
+            {
+                "class": "STATIC",
+                "source_bytes": str(2 * page_size),
+                "source_offset": str(page_size),
+            },
             {
                 "class": "ROUTED_EXPERT",
-                "source_bytes": "4096",
-                "source_offset": "16384",
+                "source_bytes": str(page_size),
+                "source_offset": str(4 * page_size),
             },
         ],
     }
     safe_ranges = ranges or [
-        {"bytes": "8192", "offset": "4096"},
-        {"bytes": "4096", "offset": "16384"},
+        {"bytes": str(2 * page_size), "offset": str(page_size)},
+        {"bytes": str(page_size), "offset": str(4 * page_size)},
     ]
     plan = {
         "allocation": {"profile_id": "cache-8gib"},
@@ -197,11 +203,11 @@ def _write_cold_preparation_fixture(
             "size_bytes": str(identity.st_size),
         },
         "page_cache": {
-            "eligible_unique_bytes": "12288",
+            "eligible_unique_bytes": str(3 * page_size),
             "mapped_page_bytes": str(identity.st_size),
-            "page_size": "4096",
+            "page_size": str(page_size),
             "ranges": safe_ranges,
-            "unavoidable_bytes": str(identity.st_size - 12288),
+            "unavoidable_bytes": str(identity.st_size - 3 * page_size),
         },
         "schema": "ds4.laguna.qualification-plan/v1",
     }
@@ -902,7 +908,7 @@ class ColdPreparationContractTest(unittest.TestCase):
             sampled_descriptors: list[int] = []
 
             def advise(descriptor: int, offset: int, length: int) -> None:
-                self.assertEqual(os.pread(descriptor, 8, 4096), b"original")
+                self.assertEqual(os.pread(descriptor, 8, TEST_PAGE_SIZE), b"original")
                 advised.append((descriptor, offset, length))
                 if len(advised) == 1:
                     os.replace(replacement, model)
@@ -911,8 +917,10 @@ class ColdPreparationContractTest(unittest.TestCase):
                 descriptor: int, file_size: int, page_size: int
             ) -> int:
                 sampled_descriptors.append(descriptor)
-                self.assertEqual((file_size, page_size), (8 * 4096, 4096))
-                self.assertEqual(os.pread(descriptor, 8, 4096), b"original")
+                self.assertEqual(
+                    (file_size, page_size), (8 * TEST_PAGE_SIZE, TEST_PAGE_SIZE)
+                )
+                self.assertEqual(os.pread(descriptor, 8, TEST_PAGE_SIZE), b"original")
                 return 0
 
             result = TOOL.cold_prepare_from_plan(
@@ -925,14 +933,17 @@ class ColdPreparationContractTest(unittest.TestCase):
 
             self.assertEqual(
                 [(offset, length) for _, offset, length in advised],
-                [(4096, 8192), (16384, 4096)],
+                [
+                    (TEST_PAGE_SIZE, 2 * TEST_PAGE_SIZE),
+                    (4 * TEST_PAGE_SIZE, TEST_PAGE_SIZE),
+                ],
             )
             self.assertEqual(len({descriptor for descriptor, _, _ in advised}), 1)
             self.assertEqual(sampled_descriptors, [advised[0][0]])
             self.assertEqual(result["plan_sha256"], plan_sha256)
             self.assertEqual(result["ledger_sha256"], plan["ledger_sha256"])
             self.assertEqual(result["model_identity"], plan["model"])
-            self.assertEqual(result["page_size"], "4096")
+            self.assertEqual(result["page_size"], str(TEST_PAGE_SIZE))
             self.assertEqual(
                 {
                     key: result[key]
@@ -961,15 +972,17 @@ class ColdPreparationContractTest(unittest.TestCase):
                     )
                 },
                 {
-                    "eligible_bytes": "12288",
-                    "attempted_bytes": "12288",
-                    "successful_bytes": "12288",
+                    "eligible_bytes": str(3 * TEST_PAGE_SIZE),
+                    "attempted_bytes": str(3 * TEST_PAGE_SIZE),
+                    "successful_bytes": str(3 * TEST_PAGE_SIZE),
                     "failed_bytes": "0",
                 },
             )
             self.assertEqual(result["errno_buckets"], {})
             self.assertEqual(result["resident_bytes_after"], "0")
-            self.assertEqual(result["unavoidable_bytes"], str(5 * 4096))
+            self.assertEqual(
+                result["unavoidable_bytes"], str(5 * TEST_PAGE_SIZE)
+            )
 
     def test_plan_and_ledger_digests_and_opened_identity_are_independent_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1082,7 +1095,7 @@ class ColdPreparationContractTest(unittest.TestCase):
             )
             advice_calls: list[tuple[int, int]] = []
             observed_error: ValueError | None = None
-            with mock.patch.object(TOOL.mmap, "PAGESIZE", 8192):
+            with mock.patch.object(TOOL.mmap, "PAGESIZE", 2 * TEST_PAGE_SIZE):
                 try:
                     TOOL.cold_prepare_from_plan(
                         model,
@@ -1109,13 +1122,13 @@ class ColdPreparationContractTest(unittest.TestCase):
             model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
             cases = {
                 "missing coverage": lambda value: value["page_cache"].__setitem__(
-                    "eligible_unique_bytes", "16384"
+                    "eligible_unique_bytes", str(4 * TEST_PAGE_SIZE)
                 ),
                 "duplicate coverage": lambda value: value["page_cache"]["ranges"].append(
                     copy.deepcopy(value["page_cache"]["ranges"][0])
                 ),
                 "unaligned range": lambda value: value["page_cache"]["ranges"][0].__setitem__(
-                    "offset", "4097"
+                    "offset", str(TEST_PAGE_SIZE + 1)
                 ),
             }
             for label, mutate in cases.items():
@@ -1140,8 +1153,8 @@ class ColdPreparationContractTest(unittest.TestCase):
             model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
             changed = copy.deepcopy(plan)
             changed["page_cache"]["ranges"][1] = {
-                "bytes": "4096",
-                "offset": "24576",
+                "bytes": str(TEST_PAGE_SIZE),
+                "offset": str(6 * TEST_PAGE_SIZE),
             }
             raw = TOOL.canonical_json_bytes(changed)
             plan_path.write_bytes(raw)
@@ -1159,7 +1172,7 @@ class ColdPreparationContractTest(unittest.TestCase):
     def test_derived_unavoidable_residency_above_two_gib_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
-            model_size = (2 << 30) + (3 * 4096)
+            model_size = (2 << 30) + (3 * TEST_PAGE_SIZE)
             with model.open("r+b") as handle:
                 handle.truncate(model_size)
             identity = model.stat()
@@ -1178,10 +1191,15 @@ class ColdPreparationContractTest(unittest.TestCase):
             ).hexdigest()
             changed["page_cache"].update(
                 {
-                    "eligible_unique_bytes": "4096",
+                    "eligible_unique_bytes": str(TEST_PAGE_SIZE),
                     "mapped_page_bytes": str(identity.st_size),
-                    "ranges": [{"bytes": "4096", "offset": "4096"}],
-                    "unavoidable_bytes": str(identity.st_size - 4096),
+                    "ranges": [
+                        {
+                            "bytes": str(TEST_PAGE_SIZE),
+                            "offset": str(TEST_PAGE_SIZE),
+                        }
+                    ],
+                    "unavoidable_bytes": str(identity.st_size - TEST_PAGE_SIZE),
                 }
             )
             raw = TOOL.canonical_json_bytes(changed)
@@ -1199,8 +1217,8 @@ class ColdPreparationContractTest(unittest.TestCase):
 
     def test_advice_failure_counts_every_range_and_errno_without_short_circuiting(self) -> None:
         ranges = [
-            {"bytes": "8192", "offset": "4096"},
-            {"bytes": "4096", "offset": "16384"},
+            {"bytes": str(2 * TEST_PAGE_SIZE), "offset": str(TEST_PAGE_SIZE)},
+            {"bytes": str(TEST_PAGE_SIZE), "offset": str(4 * TEST_PAGE_SIZE)},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             model, _, _, _ = _write_cold_preparation_fixture(Path(tmp))
@@ -1209,32 +1227,38 @@ class ColdPreparationContractTest(unittest.TestCase):
 
             def advise(_descriptor: int, offset: int, length: int) -> None:
                 calls.append((offset, length))
-                if offset == 4096:
+                if offset == TEST_PAGE_SIZE:
                     raise OSError(errno.EIO, os.strerror(errno.EIO))
 
             try:
                 report = TOOL.advise_safe_page_ranges(
                     descriptor,
                     ranges,
-                    page_size=4096,
-                    model_size=8 * 4096,
+                    page_size=TEST_PAGE_SIZE,
+                    model_size=8 * TEST_PAGE_SIZE,
                     advise=advise,
                 )
             finally:
                 os.close(descriptor)
 
-            self.assertEqual(calls, [(4096, 8192), (16384, 4096)])
+            self.assertEqual(
+                calls,
+                [
+                    (TEST_PAGE_SIZE, 2 * TEST_PAGE_SIZE),
+                    (4 * TEST_PAGE_SIZE, TEST_PAGE_SIZE),
+                ],
+            )
             self.assertEqual(
                 report,
                 {
                     "eligible_calls": 2,
-                    "eligible_bytes": "12288",
+                    "eligible_bytes": str(3 * TEST_PAGE_SIZE),
                     "attempted_calls": 2,
-                    "attempted_bytes": "12288",
+                    "attempted_bytes": str(3 * TEST_PAGE_SIZE),
                     "successful_calls": 1,
-                    "successful_bytes": "4096",
+                    "successful_bytes": str(TEST_PAGE_SIZE),
                     "failed_calls": 1,
-                    "failed_bytes": "8192",
+                    "failed_bytes": str(2 * TEST_PAGE_SIZE),
                     "errno_buckets": {"EIO": 1},
                 },
             )
@@ -1244,7 +1268,7 @@ class ColdPreparationContractTest(unittest.TestCase):
             model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
                 Path(tmp)
             )
-            page_size = 4096
+            page_size = TEST_PAGE_SIZE
             page_count = 8
             safe_page = bytearray(page_count)
             safe_page[1] = 1
@@ -1290,7 +1314,7 @@ class ColdPreparationContractTest(unittest.TestCase):
 
             def mutate_open_inode(_descriptor: int, _offset: int, _length: int) -> None:
                 with model.open("r+b") as writable:
-                    writable.truncate(7 * 4096)
+                    writable.truncate(7 * TEST_PAGE_SIZE)
 
             with self.assertRaisesRegex(ValueError, "identity.*changed|size.*changed"):
                 TOOL.cold_prepare_from_plan(
@@ -1307,8 +1331,8 @@ class NvmlCheckpointContractTest(unittest.TestCase):
     OTHER_PID = 9001
 
     def test_stable_inventory_returns_only_the_ds4_process_usage(self) -> None:
-        other = {"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}
-        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30}
+        other = {"pid": self.OTHER_PID, "used_gpu_memory_bytes": str(1 << 30)}
+        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": str(6 << 30)}
         frozen = _nvml_inventory([other])
         before = _nvml_inventory([other, ds4])
         after = _nvml_inventory([copy.deepcopy(other), copy.deepcopy(ds4)])
@@ -1325,19 +1349,19 @@ class NvmlCheckpointContractTest(unittest.TestCase):
         self.assertEqual(result["ds4_process_bytes"], str(6 << 30))
 
     def test_unrelated_process_change_is_invalid_even_when_checkpoint_is_stable(self) -> None:
-        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30}
+        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": str(6 << 30)}
         cases = {
             "changed since frozen baseline": (
-                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}],
-                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": (1 << 30) + 4096}],
-                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": (1 << 30) + 4096}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": str(1 << 30)}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": str((1 << 30) + 4096)}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": str((1 << 30) + 4096)}],
             ),
-            "appeared": ([], [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1}], [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1}]),
-            "disappeared": ([{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1}], [], []),
+            "appeared": ([], [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": "1"}], [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": "1"}]),
+            "disappeared": ([{"pid": self.OTHER_PID, "used_gpu_memory_bytes": "1"}], [], []),
             "changed inside checkpoint": (
-                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}],
-                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}],
-                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": (1 << 30) + 4096}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": str(1 << 30)}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": str(1 << 30)}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": str((1 << 30) + 4096)}],
             ),
         }
         for label, (frozen_other, before_other, after_other) in cases.items():
@@ -1354,13 +1378,13 @@ class NvmlCheckpointContractTest(unittest.TestCase):
                     )
 
     def test_missing_or_unknown_process_usage_is_never_coerced_to_zero(self) -> None:
-        other = {"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}
+        other = {"pid": self.OTHER_PID, "used_gpu_memory_bytes": str(1 << 30)}
         cases = {
             "missing process": [],
             "missing usage": [{"pid": self.DS4_PID}],
             "null usage": [{"pid": self.DS4_PID, "used_gpu_memory_bytes": None}],
             "NVML unknown sentinel": [
-                {"pid": self.DS4_PID, "used_gpu_memory_bytes": (1 << 64) - 1}
+                {"pid": self.DS4_PID, "used_gpu_memory_bytes": str((1 << 64) - 1)}
             ],
         }
         for label, ds4_processes in cases.items():
@@ -1376,7 +1400,7 @@ class NvmlCheckpointContractTest(unittest.TestCase):
                     )
 
     def test_nvml_api_and_gpu_uuid_must_match_the_frozen_target(self) -> None:
-        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30}
+        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": str(6 << 30)}
         for label, changed in (
             ("API", _nvml_inventory([ds4], api="nvmlDeviceGetComputeRunningProcesses_v3")),
             (

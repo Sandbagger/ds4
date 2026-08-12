@@ -300,8 +300,14 @@
       "required": ["pid", "used_gpu_memory_bytes"],
       "properties": {
         "pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
-        "used_gpu_memory_bytes": { "$ref": "#/$defs/uint64" }
+        "used_gpu_memory_bytes": { "$ref": "#/$defs/nvml_known_bytes" }
       }
+    },
+    "nvml_known_bytes": {
+      "allOf": [
+        { "$ref": "#/$defs/uint64" },
+        { "not": { "const": "18446744073709551615" } }
+      ]
     },
     "nvml_process_inventory": {
       "type": "object",

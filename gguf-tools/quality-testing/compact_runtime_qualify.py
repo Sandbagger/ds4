@@ -678,15 +678,51 @@ def _uint64_int(value: Any, label: str, *, positive: bool = False) -> int:
 def _open_regular_nofollow(path: Path | str, label: str) -> tuple[int, os.stat_result]:
     source = Path(path)
     nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None:
         raise ValueError(f"{label} cannot be opened without following symlinks")
-    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    if not source.is_absolute() or ".." in source.parts:
+        raise ValueError(f"{label} requires an absolute path without traversal")
+
+    # Qualification runs on Linux, where each component is opened relative to
+    # its already-verified parent descriptor.  macOS test hosts conventionally
+    # spell /private/var as /var; normalize only that fixed system alias before
+    # applying the same component-wise walk.
+    if sys.platform == "darwin" and source.parts[:2] == ("/", "var"):
+        try:
+            var_target = os.readlink("/var")
+        except OSError:
+            var_target = ""
+        if var_target == "private/var":
+            source = Path("/private/var").joinpath(*source.parts[2:])
+
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    parent_flags = os.O_RDONLY | directory_flag | nofollow | cloexec
+    file_flags = os.O_RDONLY | nofollow | cloexec
+    parts = source.parts[1:]
+    if not parts:
+        raise ValueError(f"{label} must name a regular file")
+
+    parent_descriptor = -1
+    descriptor = -1
     try:
-        descriptor = os.open(source, flags)
+        parent_descriptor = os.open("/", os.O_RDONLY | directory_flag | cloexec)
+        for component in parts[:-1]:
+            previous_descriptor = parent_descriptor
+            parent_descriptor = os.open(
+                component,
+                parent_flags,
+                dir_fd=previous_descriptor,
+            )
+            os.close(previous_descriptor)
+        descriptor = os.open(parts[-1], file_flags, dir_fd=parent_descriptor)
     except OSError as exc:
         raise ValueError(
-            f"{label} cannot be opened without following symlinks: {exc}"
+            f"{label} cannot be opened without symlink traversal: {exc}"
         ) from exc
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
     try:
         identity = os.fstat(descriptor)
         if not stat.S_ISREG(identity.st_mode):
@@ -995,8 +1031,8 @@ def sample_exact_inode_residency(
     descriptor: int,
     file_size: int,
     page_size: int,
-) -> int:
-    """Count resident pages for one opened inode through mincore(2)."""
+) -> bytes:
+    """Return one location-preserving residency bit per mapped inode page."""
     if page_size != mmap.PAGESIZE:
         raise ValueError("qualification plan page size differs from the host page size")
     if file_size <= 0:
@@ -1024,7 +1060,7 @@ def sample_exact_inode_residency(
         if mincore(ctypes.addressof(anchor), file_size, vector) != 0:
             number = ctypes.get_errno()
             raise OSError(number, os.strerror(number))
-        return sum(1 for value in vector if value & 1) * page_size
+        return bytes(value & 1 for value in vector)
     finally:
         del anchor
         mapping.close()
@@ -1050,7 +1086,9 @@ def cold_prepare_from_plan(
     expected_plan_sha256: str,
     *,
     advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
-    sample_residency: Callable[[int, int, int], int] = sample_exact_inode_residency,
+    sample_residency: Callable[[int, int, int], int | bytes] = (
+        sample_exact_inode_residency
+    ),
 ) -> dict[str, Any]:
     """Cold-prepare only the plan's descriptor-bound, safe full-page union."""
     expected_digest = _sha256(
@@ -1072,6 +1110,8 @@ def cold_prepare_from_plan(
     model, ranges, page_size, model_size, unavoidable_bytes = (
         _validate_qualification_plan(plan)
     )
+    if page_size != mmap.PAGESIZE:
+        raise ValueError("qualification plan page size differs from the host page size")
 
     descriptor, before = _open_regular_nofollow(model_path, "model")
     try:
@@ -1088,14 +1128,34 @@ def cold_prepare_from_plan(
         after_advice = os.fstat(descriptor)
         if not _same_stat(before, after_advice):
             raise ValueError("model identity changed during cold preparation")
-        resident_bytes = sample_residency(descriptor, model_size, page_size)
-        if (
-            type(resident_bytes) is not int
-            or resident_bytes < 0
-            or resident_bytes > ((model_size + page_size - 1) // page_size) * page_size
-            or resident_bytes % page_size != 0
-        ):
+        sample = sample_residency(descriptor, model_size, page_size)
+        page_count = (model_size + page_size - 1) // page_size
+        if type(sample) is int:
+            # Legacy synthetic fixtures may state that every page is cold.
+            # Any nonzero scalar is location-ambiguous and cannot qualify.
+            if sample != 0:
+                raise ValueError(
+                    "nonzero exact-inode residency requires location-aware page bits"
+                )
+            resident_bits = bytes(page_count)
+        elif isinstance(sample, (bytes, bytearray, memoryview)):
+            resident_bits = bytes(sample)
+            if len(resident_bits) != page_count or any(
+                bit not in (0, 1) for bit in resident_bits
+            ):
+                raise ValueError("exact-inode residency page bits are invalid")
+        else:
             raise ValueError("exact-inode residency sample is invalid")
+
+        normalized_ranges, _ = _validated_advice_ranges(
+            ranges, page_size=page_size, model_size=model_size
+        )
+        for offset, length in normalized_ranges:
+            first_page = offset // page_size
+            final_page = (offset + length) // page_size
+            if any(resident_bits[first_page:final_page]):
+                raise ValueError("an eligible page remains resident after cold preparation")
+        resident_bytes = sum(resident_bits) * page_size
         after_sample = os.fstat(descriptor)
         if not _same_stat(before, after_sample):
             raise ValueError("model identity changed during residency measurement")
@@ -1145,13 +1205,17 @@ def _nvml_inventory_by_pid(
         pid = _integer(process["pid"], f"{label} NVML process {index} PID")
         if pid <= 0 or pid > 0xFFFFFFFF:
             raise ValueError(f"{label} NVML process {index} PID is invalid")
-        usage = process["used_gpu_memory_bytes"]
-        if type(usage) is not int or usage < 0:
-            raise ValueError(f"{label} NVML process {index} usage is missing")
+        try:
+            usage = _uint64_int(
+                process["used_gpu_memory_bytes"],
+                f"{label} NVML process {index} usage",
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{label} NVML process {index} usage representation is invalid"
+            ) from exc
         if usage == UINT64_MAX:
             raise ValueError(f"{label} NVML process {index} usage is unknown")
-        if usage > UINT64_MAX:
-            raise ValueError(f"{label} NVML process {index} usage is invalid")
         if pid in by_pid:
             raise ValueError(f"{label} contains duplicate NVML process PID {pid}")
         by_pid[pid] = usage

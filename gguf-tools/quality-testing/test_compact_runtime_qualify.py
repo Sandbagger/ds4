@@ -2144,6 +2144,15 @@ class ColdPreparationContractTest(unittest.TestCase):
                 "mapping_touch_bytes": str(3 * page_size),
             }
         )
+        model_size = int(cold["model_identity"]["size_bytes"])
+        residual["random_access_madvise"].update(
+            {
+                "attempted_calls": 2,
+                "attempted_bytes": str(2 * model_size),
+                "successful_calls": 2,
+                "successful_bytes": str(2 * model_size),
+            }
+        )
         for label in ("madvise", "fadvise"):
             residual[label].update(
                 {

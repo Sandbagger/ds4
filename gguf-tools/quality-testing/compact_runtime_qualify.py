@@ -95,6 +95,22 @@ NVML_ERROR_INSUFFICIENT_SIZE = 7
 NVML_VERSION_BUFFER_SIZE = 128
 NVML_DEVICE_UUID_BUFFER_SIZE = 96
 NVML_PROCESS_COUNT_LIMIT = 1 << 20
+# Linux UAPI include/uapi/linux/mman.h.  Python's mmap module does not expose
+# MADV_PAGEOUT on every supported interpreter, so keep the qualification-only
+# retry explicit and Linux-gated.
+LINUX_MADV_PAGEOUT = 21
+WARM_STABILITY_REPETITIONS = 3
+WARM_OWNED_CATEGORY_DRIFT_LIMIT_BYTES = 64 << 20
+RUNTIME_OWNED_CATEGORY_NAMES = (
+    "static_weights",
+    "expert_cache_payload",
+    "cache_metadata_address_tables",
+    "kv_state",
+    "graph_scratch",
+    "pinned_staging",
+    "other_host",
+    "other_cuda",
+)
 
 TokenCounter = Callable[[bytes], int]
 
@@ -443,7 +459,8 @@ def _validate_host(value: Any) -> None:
         raise ValueError("host.io.direct_io must be boolean")
     if io_mode != {
         "direct_io": False,
-        "cold_preparation_advice": "posix_fadvise_dontneed",
+        "cold_preparation_advice":
+            "madvise_random+posix_fadvise_dontneed+madvise_dontneed+linux_madv_pageout_residual",
         "runtime_disposal_advice": "madvise_dontneed",
     }:
         raise ValueError("host.io does not match the reference advice mode")
@@ -1048,6 +1065,126 @@ def advise_safe_page_ranges(
     return report
 
 
+def _dispose_resident_eligible_pages(
+    descriptor: int,
+    file_size: int,
+    page_size: int,
+    resident_bits: bytes,
+    eligible_ranges: Sequence[tuple[int, int]],
+    *,
+    advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
+    madvise_advice: int | None = None,
+) -> dict[str, Any]:
+    """Dispose only sampled-hot eligible runs through the retained mapping."""
+    def counters() -> dict[str, Any]:
+        return {
+            "attempted_calls": 0,
+            "attempted_bytes": "0",
+            "successful_calls": 0,
+            "successful_bytes": "0",
+            "failed_calls": 0,
+            "failed_bytes": "0",
+            "errno_buckets": {},
+        }
+
+    report: dict[str, Any] = {
+        "random_access_madvise": counters(),
+        "mapping_touch_pages": 0,
+        "mapping_touch_bytes": "0",
+        "madvise": counters(),
+        "fadvise": counters(),
+    }
+    if not hasattr(mmap, "MADV_RANDOM") or not hasattr(mmap, "MADV_DONTNEED"):
+        raise OSError(
+            errno.ENOSYS,
+            "mmap MADV_RANDOM/DONTNEED is unavailable",
+        )
+    if madvise_advice is None:
+        madvise_advice = mmap.MADV_DONTNEED
+    if type(madvise_advice) is not int or madvise_advice < 0:
+        raise ValueError("residual disposal mmap advice is invalid")
+    if len(resident_bits) != (file_size + page_size - 1) // page_size:
+        raise ValueError("residual disposal residency vector is invalid")
+    mapping = mmap.mmap(
+        descriptor,
+        file_size,
+        flags=mmap.MAP_PRIVATE,
+        prot=mmap.PROT_READ,
+    )
+    try:
+        random_access = report["random_access_madvise"]
+        random_access["attempted_calls"] = 1
+        random_access["attempted_bytes"] = str(file_size)
+        try:
+            mapping.madvise(mmap.MADV_RANDOM, 0, file_size)
+        except OSError as exc:
+            random_access["failed_calls"] = 1
+            random_access["failed_bytes"] = str(file_size)
+            bucket = errno.errorcode.get(exc.errno, "UNKNOWN")
+            random_access["errno_buckets"][bucket] = 1
+        else:
+            random_access["successful_calls"] = 1
+            random_access["successful_bytes"] = str(file_size)
+        for offset, length in eligible_ranges:
+            first_page = offset // page_size
+            final_page = (offset + length) // page_size
+            page = first_page
+            while page < final_page:
+                if resident_bits[page] == 0:
+                    page += 1
+                    continue
+                run_first = page
+                while page < final_page and resident_bits[page] != 0:
+                    _ = mapping[page * page_size]
+                    report["mapping_touch_pages"] += 1
+                    page += 1
+                run_bytes = (page - run_first) * page_size
+                for label, operation in (
+                    (
+                        "madvise",
+                        lambda: mapping.madvise(
+                            madvise_advice,
+                            run_first * page_size,
+                            run_bytes,
+                        ),
+                    ),
+                    (
+                        "fadvise",
+                        lambda: advise(
+                            descriptor,
+                            run_first * page_size,
+                            run_bytes,
+                        ),
+                    ),
+                ):
+                    specific = report[label]
+                    specific["attempted_calls"] += 1
+                    specific["attempted_bytes"] = str(
+                        int(specific["attempted_bytes"]) + run_bytes
+                    )
+                    try:
+                        operation()
+                    except OSError as exc:
+                        specific["failed_calls"] += 1
+                        specific["failed_bytes"] = str(
+                            int(specific["failed_bytes"]) + run_bytes
+                        )
+                        bucket = errno.errorcode.get(exc.errno, "UNKNOWN")
+                        buckets = specific["errno_buckets"]
+                        buckets[bucket] = buckets.get(bucket, 0) + 1
+                    else:
+                        specific["successful_calls"] += 1
+                        specific["successful_bytes"] = str(
+                            int(specific["successful_bytes"]) + run_bytes
+                        )
+    finally:
+        mapping.close()
+    report["mapping_touch_bytes"] = str(
+        report["mapping_touch_pages"] * page_size
+    )
+    return report
+
+
 def sample_exact_inode_residency(
     descriptor: int,
     file_size: int,
@@ -1101,17 +1238,12 @@ def _model_identity_matches(
             raise ValueError(f"model identity mismatch: {key}")
 
 
-def cold_prepare_from_plan(
-    model_path: Path | str,
+def _load_cold_preparation_plan(
     plan_path: Path | str,
     expected_plan_sha256: str,
-    *,
-    advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
-    sample_residency: Callable[[int, int, int], int | bytes] = (
-        sample_exact_inode_residency
-    ),
-) -> dict[str, Any]:
-    """Cold-prepare only the plan's descriptor-bound, safe full-page union."""
+) -> tuple[
+    Mapping[str, Any], Mapping[str, Any], list[Any], int, int, int, str
+]:
     expected_digest = _sha256(
         expected_plan_sha256, "expected qualification plan SHA-256"
     )
@@ -1133,11 +1265,34 @@ def cold_prepare_from_plan(
     )
     if page_size != mmap.PAGESIZE:
         raise ValueError("qualification plan page size differs from the host page size")
+    return (
+        plan, model, ranges, page_size, model_size, unavoidable_bytes,
+        observed_digest,
+    )
 
-    descriptor, before = _open_regular_nofollow(model_path, "model")
+
+def _cold_prepare_open_descriptor(
+    descriptor: int,
+    loaded_plan: tuple[
+        Mapping[str, Any], Mapping[str, Any], list[Any], int, int, int, str
+    ],
+    *,
+    advise: Callable[[int, int, int], None],
+    sample_residency: Callable[[int, int, int], int | bytes],
+) -> dict[str, Any]:
+    if type(descriptor) is not int or descriptor < 0:
+        raise ValueError("cold-preparation descriptor is invalid")
+    plan, model, ranges, page_size, model_size, unavoidable_bytes, \
+        observed_digest = loaded_plan
     try:
-        if Path(model_path).name != model["filename"]:
-            raise ValueError("opened model filename does not match the plan")
+        before = os.fstat(descriptor)
+    except OSError as exc:
+        raise ValueError("cold-preparation descriptor is not open") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("cold-preparation descriptor is not a regular file")
+    original_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+
+    try:
         _model_identity_matches(model, before)
         report = advise_safe_page_ranges(
             descriptor,
@@ -1149,33 +1304,161 @@ def cold_prepare_from_plan(
         after_advice = os.fstat(descriptor)
         if not _same_stat(before, after_advice):
             raise ValueError("model identity changed during cold preparation")
-        sample = sample_residency(descriptor, model_size, page_size)
+        if report["failed_calls"] != 0:
+            raise ValueError(
+                "cold-preparation advice failed; evidence is invalid: "
+                f"{report['errno_buckets']}"
+            )
         page_count = (model_size + page_size - 1) // page_size
-        if type(sample) is int:
-            # Legacy synthetic fixtures may state that every page is cold.
-            # Any nonzero scalar is location-ambiguous and cannot qualify.
-            if sample != 0:
-                raise ValueError(
-                    "nonzero exact-inode residency requires location-aware page bits"
-                )
-            resident_bits = bytes(page_count)
-        elif isinstance(sample, (bytes, bytearray, memoryview)):
-            resident_bits = bytes(sample)
-            if len(resident_bits) != page_count or any(
-                bit not in (0, 1) for bit in resident_bits
-            ):
-                raise ValueError("exact-inode residency page bits are invalid")
-        else:
-            raise ValueError("exact-inode residency sample is invalid")
-
         normalized_ranges, _ = _validated_advice_ranges(
             ranges, page_size=page_size, model_size=model_size
         )
-        for offset, length in normalized_ranges:
-            first_page = offset // page_size
-            final_page = (offset + length) // page_size
-            if any(resident_bits[first_page:final_page]):
-                raise ValueError("an eligible page remains resident after cold preparation")
+
+        def exact_residency_bits() -> bytes:
+            sample = sample_residency(descriptor, model_size, page_size)
+            if type(sample) is int:
+                # Legacy synthetic fixtures may state that every page is cold.
+                # Any nonzero scalar is location-ambiguous and cannot qualify.
+                if sample != 0:
+                    raise ValueError(
+                        "nonzero exact-inode residency requires location-aware page bits"
+                    )
+                return bytes(page_count)
+            if isinstance(sample, (bytes, bytearray, memoryview)):
+                bits = bytes(sample)
+                if len(bits) != page_count or any(bit not in (0, 1) for bit in bits):
+                    raise ValueError("exact-inode residency page bits are invalid")
+                return bits
+            raise ValueError("exact-inode residency sample is invalid")
+
+        def eligible_resident_pages(bits: bytes) -> int:
+            view = memoryview(bits)
+            return sum(
+                sum(view[offset // page_size:(offset + length) // page_size])
+                for offset, length in normalized_ranges
+            )
+
+        resident_bits = exact_residency_bits()
+        after_initial_sample = os.fstat(descriptor)
+        if not _same_stat(before, after_initial_sample):
+            raise ValueError("model identity changed during residency measurement")
+        initial_resident_eligible_pages = eligible_resident_pages(resident_bits)
+        empty_advice_report = {
+            "attempted_calls": 0,
+            "attempted_bytes": "0",
+            "successful_calls": 0,
+            "successful_bytes": "0",
+            "failed_calls": 0,
+            "failed_bytes": "0",
+            "errno_buckets": {},
+        }
+        residual_report: dict[str, Any] = {
+            "initial_resident_eligible_pages": initial_resident_eligible_pages,
+            "pageout_retry_pages": 0,
+            "residency_samples": 1,
+            "mapping_touch_pages": 0,
+            "mapping_touch_bytes": "0",
+            "random_access_madvise": {
+                **empty_advice_report, "errno_buckets": {}
+            },
+            "madvise": {**empty_advice_report, "errno_buckets": {}},
+            "fadvise": {**empty_advice_report, "errno_buckets": {}},
+        }
+
+        def merge_disposal_report(source: Mapping[str, Any]) -> None:
+            for key in ("mapping_touch_pages",):
+                total = int(residual_report[key]) + int(source[key])
+                if total > UINT64_MAX:
+                    raise ValueError("residual disposal accounting overflow")
+                residual_report[key] = total
+            total_touch_bytes = (
+                int(residual_report["mapping_touch_bytes"])
+                + int(source["mapping_touch_bytes"])
+            )
+            if total_touch_bytes > UINT64_MAX:
+                raise ValueError("residual disposal accounting overflow")
+            residual_report["mapping_touch_bytes"] = str(total_touch_bytes)
+            for label in ("random_access_madvise", "madvise", "fadvise"):
+                target = residual_report[label]
+                observed = source[label]
+                for key in (
+                    "attempted_calls", "successful_calls", "failed_calls"
+                ):
+                    total = int(target[key]) + int(observed[key])
+                    if total > UINT64_MAX:
+                        raise ValueError("residual disposal accounting overflow")
+                    target[key] = total
+                for key in (
+                    "attempted_bytes", "successful_bytes", "failed_bytes"
+                ):
+                    total = int(target[key]) + int(observed[key])
+                    if total > UINT64_MAX:
+                        raise ValueError("residual disposal accounting overflow")
+                    target[key] = str(total)
+                for bucket, count in observed["errno_buckets"].items():
+                    target["errno_buckets"][bucket] = (
+                        target["errno_buckets"].get(bucket, 0) + count
+                    )
+
+        if initial_resident_eligible_pages != 0:
+            try:
+                residual = _dispose_resident_eligible_pages(
+                    descriptor,
+                    model_size,
+                    page_size,
+                    resident_bits,
+                    normalized_ranges,
+                    advise=advise,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "an eligible page remains resident after cold preparation"
+                ) from exc
+            merge_disposal_report(residual)
+            residual_report["residency_samples"] = 2
+            if (residual_report["random_access_madvise"]["failed_calls"] != 0 or
+                    residual_report["madvise"]["failed_calls"] != 0 or
+                    residual_report["fadvise"]["failed_calls"] != 0):
+                raise ValueError(
+                    "residual eligible-page disposal failed; evidence is invalid"
+                )
+            resident_bits = exact_residency_bits()
+            after_dontneed_sample = os.fstat(descriptor)
+            if not _same_stat(before, after_dontneed_sample):
+                raise ValueError("model identity changed during residency measurement")
+            pageout_retry_pages = eligible_resident_pages(resident_bits)
+            if pageout_retry_pages != 0:
+                if sys.platform != "linux":
+                    raise ValueError(
+                        "an eligible page remains resident; "
+                        "Linux MADV_PAGEOUT disposal is unavailable"
+                    )
+                try:
+                    pageout = _dispose_resident_eligible_pages(
+                        descriptor,
+                        model_size,
+                        page_size,
+                        resident_bits,
+                        normalized_ranges,
+                        advise=advise,
+                        madvise_advice=LINUX_MADV_PAGEOUT,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        "an eligible page remains resident after cold preparation"
+                    ) from exc
+                merge_disposal_report(pageout)
+                residual_report["pageout_retry_pages"] = pageout_retry_pages
+                residual_report["residency_samples"] = 3
+                if (residual_report["random_access_madvise"]["failed_calls"] != 0 or
+                        residual_report["madvise"]["failed_calls"] != 0 or
+                        residual_report["fadvise"]["failed_calls"] != 0):
+                    raise ValueError(
+                        "residual eligible-page disposal failed; evidence is invalid"
+                    )
+                resident_bits = exact_residency_bits()
+        if eligible_resident_pages(resident_bits) != 0:
+            raise ValueError("an eligible page remains resident after cold preparation")
         resident_bytes = sum(resident_bits) * page_size
         after_sample = os.fstat(descriptor)
         if not _same_stat(before, after_sample):
@@ -1191,15 +1474,62 @@ def cold_prepare_from_plan(
                 for offset, length in normalized_ranges
             ],
             **report,
+            "residual_disposal": residual_report,
             "resident_bytes_after": str(resident_bytes),
             "unavoidable_bytes": str(unavoidable_bytes),
         }
-        if report["failed_calls"] != 0:
-            raise ValueError(
-                "cold-preparation advice failed; evidence is invalid: "
-                f"{report['errno_buckets']}"
-            )
         return result
+    finally:
+        os.lseek(descriptor, original_offset, os.SEEK_SET)
+
+
+def cold_prepare_descriptor_from_plan(
+    descriptor: int,
+    plan_path: Path | str,
+    expected_plan_sha256: str,
+    *,
+    advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
+    sample_residency: Callable[[int, int, int], int | bytes] = (
+        sample_exact_inode_residency
+    ),
+) -> dict[str, Any]:
+    """Cold-prepare a caller-owned exact model descriptor without closing it."""
+    loaded_plan = _load_cold_preparation_plan(
+        plan_path, expected_plan_sha256
+    )
+    return _cold_prepare_open_descriptor(
+        descriptor,
+        loaded_plan,
+        advise=advise,
+        sample_residency=sample_residency,
+    )
+
+
+def cold_prepare_from_plan(
+    model_path: Path | str,
+    plan_path: Path | str,
+    expected_plan_sha256: str,
+    *,
+    advise: Callable[[int, int, int], None] = _posix_fadvise_dontneed,
+    sample_residency: Callable[[int, int, int], int | bytes] = (
+        sample_exact_inode_residency
+    ),
+) -> dict[str, Any]:
+    """Open and cold-prepare only the plan's descriptor-bound safe union."""
+    loaded_plan = _load_cold_preparation_plan(
+        plan_path, expected_plan_sha256
+    )
+    model = loaded_plan[1]
+    descriptor, _ = _open_regular_nofollow(model_path, "model")
+    try:
+        if Path(model_path).name != model["filename"]:
+            raise ValueError("opened model filename does not match the plan")
+        return _cold_prepare_open_descriptor(
+            descriptor,
+            loaded_plan,
+            advise=advise,
+            sample_residency=sample_residency,
+        )
     finally:
         os.close(descriptor)
 
@@ -1287,6 +1617,83 @@ def validate_nvml_checkpoint(
     }
 
 
+def _warm_stability_sample(value: Any, label: str) -> tuple[dict[str, int], int, int, int, int]:
+    required = {
+        "owned_category_current_bytes",
+        "cache_acquire_hits_before",
+        "cache_acquire_hits_after",
+        "model_file_read_bytes_before",
+        "model_file_read_bytes_after",
+    }
+    sample = _mapping(value, label, required)
+    raw_categories = _mapping(
+        sample["owned_category_current_bytes"],
+        f"{label} owned categories",
+        set(RUNTIME_OWNED_CATEGORY_NAMES),
+    )
+    categories = {
+        name: _uint64_int(raw_categories[name], f"{label} {name}")
+        for name in RUNTIME_OWNED_CATEGORY_NAMES
+    }
+    hit_before = _uint64_int(
+        sample["cache_acquire_hits_before"], f"{label} hits before"
+    )
+    hit_after = _uint64_int(
+        sample["cache_acquire_hits_after"], f"{label} hits after"
+    )
+    read_before = _uint64_int(
+        sample["model_file_read_bytes_before"], f"{label} reads before"
+    )
+    read_after = _uint64_int(
+        sample["model_file_read_bytes_after"], f"{label} reads after"
+    )
+    if hit_after < hit_before or read_after < read_before:
+        raise ValueError(f"{label} cumulative cache counters regressed")
+    return categories, hit_before, hit_after, read_before, read_after
+
+
+def validate_warm_stability_samples(
+    cold_sample: Any,
+    warm_samples: Any,
+) -> None:
+    """Validate the bounded, same-process warm-repetition evidence."""
+    warm = _list(warm_samples, "warm stability samples")
+    if len(warm) != WARM_STABILITY_REPETITIONS:
+        raise ValueError("warm stability requires exactly three repetitions")
+    _, cold_hit_before, cold_hit_after, cold_read_before, cold_read_after = \
+        _warm_stability_sample(cold_sample, "cold sample")
+    cold_read_delta = cold_read_after - cold_read_before
+    if cold_read_delta == 0:
+        raise ValueError("cold sample must read routed model-file bytes")
+    previous_hits = cold_hit_after
+    previous_reads = cold_read_after
+    parsed: list[tuple[dict[str, int], int, int, int, int]] = []
+    for index, raw in enumerate(warm):
+        current = _warm_stability_sample(raw, f"warm sample {index}")
+        categories, hit_before, hit_after, read_before, read_after = current
+        if hit_before != previous_hits or read_before != previous_reads:
+            raise ValueError("warm cumulative counters are not contiguous")
+        if hit_after == hit_before:
+            raise ValueError("every warm repetition must increase cache hits")
+        if read_after - read_before > cold_read_delta:
+            raise ValueError("a warm repetition read more routed bytes than cold")
+        previous_hits = hit_after
+        previous_reads = read_after
+        parsed.append(current)
+
+    baseline = parsed[0][0]
+    for name in RUNTIME_OWNED_CATEGORY_NAMES:
+        values = [sample[0][name] for sample in parsed]
+        if any(
+            abs(value - baseline[name]) > WARM_OWNED_CATEGORY_DRIFT_LIMIT_BYTES
+            for value in values
+        ):
+            raise ValueError(f"warm owned category {name} exceeded its drift limit")
+        if any(values[index] > values[index - 1] for index in range(1, len(values))) \
+                and all(values[index] >= values[index - 1] for index in range(1, len(values))):
+            raise ValueError(f"warm owned category {name} grew monotonically")
+
+
 def _validate_cold_preparation(value: Any) -> Mapping[str, Any]:
     required = {
         "plan_sha256",
@@ -1303,6 +1710,7 @@ def _validate_cold_preparation(value: Any) -> Mapping[str, Any]:
         "failed_calls",
         "failed_bytes",
         "errno_buckets",
+        "residual_disposal",
         "resident_bytes_after",
         "unavoidable_bytes",
     }
@@ -1371,6 +1779,119 @@ def _validate_cold_preparation(value: Any) -> Mapping[str, Any]:
     buckets = _mapping(cold["errno_buckets"], "cold-preparation errno buckets", set())
     if buckets:
         raise ValueError("successful cold-preparation evidence has errno buckets")
+
+    residual = _mapping(
+        cold["residual_disposal"],
+        "cold-preparation residual disposal",
+        {
+            "initial_resident_eligible_pages",
+            "pageout_retry_pages",
+            "residency_samples",
+            "mapping_touch_pages",
+            "mapping_touch_bytes",
+            "random_access_madvise",
+            "madvise",
+            "fadvise",
+        },
+    )
+    initial_pages = _integer(
+        residual["initial_resident_eligible_pages"],
+        "cold-preparation initial resident eligible pages",
+    )
+    pageout_retry_pages = _integer(
+        residual["pageout_retry_pages"],
+        "cold-preparation PAGEOUT retry pages",
+    )
+    residency_samples = _integer(
+        residual["residency_samples"],
+        "cold-preparation residency sample count",
+    )
+    touch_pages = _integer(
+        residual["mapping_touch_pages"],
+        "cold-preparation mapping-touch pages",
+    )
+    touch_bytes = _uint64_int(
+        residual["mapping_touch_bytes"],
+        "cold-preparation mapping-touch bytes",
+    )
+    if (initial_pages < 0 or pageout_retry_pages < 0 or
+            residency_samples not in (1, 2, 3) or touch_pages < 0):
+        raise ValueError("cold-preparation residual disposal counts are invalid")
+    if (initial_pages > eligible_bytes // page_size or
+            pageout_retry_pages > initial_pages):
+        raise ValueError("cold-preparation residual disposal exceeds eligible pages")
+
+    def validate_residual_advice(label: str) -> tuple[int, int]:
+        advice = _mapping(
+            residual[label],
+            f"cold-preparation residual {label}",
+            {
+                "attempted_calls", "attempted_bytes", "successful_calls",
+                "successful_bytes", "failed_calls", "failed_bytes",
+                "errno_buckets",
+            },
+        )
+        advice_counts = {
+            key: _integer(advice[key], f"cold-preparation residual {label} {key}")
+            for key in ("attempted_calls", "successful_calls", "failed_calls")
+        }
+        advice_bytes = {
+            key: _uint64_int(
+                advice[key], f"cold-preparation residual {label} {key}"
+            )
+            for key in ("attempted_bytes", "successful_bytes", "failed_bytes")
+        }
+        if any(count < 0 for count in advice_counts.values()) or (
+            advice_counts["successful_calls"] + advice_counts["failed_calls"]
+            != advice_counts["attempted_calls"]
+        ) or (
+            advice_bytes["successful_bytes"] + advice_bytes["failed_bytes"]
+            != advice_bytes["attempted_bytes"]
+        ):
+            raise ValueError(
+                f"cold-preparation residual {label} accounting is inconsistent"
+            )
+        buckets = _mapping(
+            advice["errno_buckets"],
+            f"cold-preparation residual {label} errno buckets",
+            set(),
+        )
+        if advice_counts["failed_calls"] != 0 or advice_bytes["failed_bytes"] != 0:
+            raise ValueError(f"cold-preparation residual {label} failed")
+        if buckets:
+            raise ValueError(
+                f"successful cold-preparation residual {label} has errno buckets"
+            )
+        return advice_counts["attempted_calls"], advice_bytes["attempted_bytes"]
+
+    random_calls, random_bytes = validate_residual_advice(
+        "random_access_madvise"
+    )
+    madvise_calls, madvise_bytes = validate_residual_advice("madvise")
+    fadvise_calls, fadvise_bytes = validate_residual_advice("fadvise")
+    if initial_pages == 0:
+        if (pageout_retry_pages != 0 or residency_samples != 1 or
+                touch_pages != 0 or touch_bytes != 0 or
+                random_calls != 0 or random_bytes != 0 or
+                madvise_calls != 0 or madvise_bytes != 0 or
+                fadvise_calls != 0 or fadvise_bytes != 0):
+            raise ValueError(
+                "cold-preparation unnecessary residual disposal was attempted"
+            )
+    elif (
+        residency_samples != (3 if pageout_retry_pages != 0 else 2)
+        or touch_pages != initial_pages + pageout_retry_pages
+        or touch_bytes != touch_pages * page_size
+        or random_calls != 1 + int(pageout_retry_pages != 0)
+        or model_size > UINT64_MAX // random_calls
+        or random_bytes != model_size * random_calls
+        or madvise_calls < 1 + int(pageout_retry_pages != 0)
+        or madvise_calls > touch_pages
+        or fadvise_calls != madvise_calls
+        or madvise_bytes != touch_bytes
+        or fadvise_bytes != touch_bytes
+    ):
+        raise ValueError("cold-preparation residual disposal is incomplete")
 
     mapped_bytes = ((model_size + page_size - 1) // page_size) * page_size
     unavoidable_bytes = _uint64_int(
@@ -1995,7 +2516,8 @@ def collect_host_identity(model_path: Path) -> dict[str, Any]:
         "nvme": _nvme_identity(filesystem),
         "io": {
             "direct_io": False,
-            "cold_preparation_advice": "posix_fadvise_dontneed",
+                "cold_preparation_advice":
+                "madvise_random+posix_fadvise_dontneed+madvise_dontneed+linux_madv_pageout_residual",
             "runtime_disposal_advice": "madvise_dontneed",
         },
     }

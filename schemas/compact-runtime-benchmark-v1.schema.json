@@ -231,7 +231,7 @@
       "required": ["direct_io", "cold_preparation_advice", "runtime_disposal_advice"],
       "properties": {
         "direct_io": { "const": false },
-        "cold_preparation_advice": { "const": "posix_fadvise_dontneed" },
+        "cold_preparation_advice": { "const": "madvise_random+posix_fadvise_dontneed+madvise_dontneed+linux_madv_pageout_residual" },
         "runtime_disposal_advice": { "const": "madvise_dontneed" }
       }
     },
@@ -283,10 +283,39 @@
         "bytes": { "$ref": "#/$defs/positive_uint64" }
       }
     },
+    "cold_advice_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempted_calls", "attempted_bytes", "successful_calls", "successful_bytes", "failed_calls", "failed_bytes", "errno_buckets"],
+      "properties": {
+        "attempted_calls": { "type": "integer", "minimum": 0 },
+        "attempted_bytes": { "$ref": "#/$defs/uint64" },
+        "successful_calls": { "type": "integer", "minimum": 0 },
+        "successful_bytes": { "$ref": "#/$defs/uint64" },
+        "failed_calls": { "type": "integer", "minimum": 0 },
+        "failed_bytes": { "$ref": "#/$defs/uint64" },
+        "errno_buckets": { "$ref": "#/$defs/errno_buckets" }
+      }
+    },
+    "cold_residual_disposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial_resident_eligible_pages", "pageout_retry_pages", "residency_samples", "mapping_touch_pages", "mapping_touch_bytes", "random_access_madvise", "madvise", "fadvise"],
+      "properties": {
+        "initial_resident_eligible_pages": { "type": "integer", "minimum": 0 },
+        "pageout_retry_pages": { "type": "integer", "minimum": 0 },
+        "residency_samples": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "mapping_touch_pages": { "type": "integer", "minimum": 0 },
+        "mapping_touch_bytes": { "$ref": "#/$defs/uint64" },
+        "random_access_madvise": { "$ref": "#/$defs/cold_advice_result" },
+        "madvise": { "$ref": "#/$defs/cold_advice_result" },
+        "fadvise": { "$ref": "#/$defs/cold_advice_result" }
+      }
+    },
     "cold_preparation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["plan_sha256", "ledger_sha256", "model_identity", "page_size", "eligible_ranges", "eligible_calls", "eligible_bytes", "attempted_calls", "attempted_bytes", "successful_calls", "successful_bytes", "failed_calls", "failed_bytes", "errno_buckets", "resident_bytes_after", "unavoidable_bytes"],
+      "required": ["plan_sha256", "ledger_sha256", "model_identity", "page_size", "eligible_ranges", "eligible_calls", "eligible_bytes", "attempted_calls", "attempted_bytes", "successful_calls", "successful_bytes", "failed_calls", "failed_bytes", "errno_buckets", "residual_disposal", "resident_bytes_after", "unavoidable_bytes"],
       "properties": {
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "ledger_sha256": { "$ref": "#/$defs/sha256" },
@@ -306,6 +335,7 @@
         "failed_calls": { "type": "integer", "minimum": 0 },
         "failed_bytes": { "$ref": "#/$defs/uint64" },
         "errno_buckets": { "$ref": "#/$defs/errno_buckets" },
+        "residual_disposal": { "$ref": "#/$defs/cold_residual_disposal" },
         "resident_bytes_after": { "$ref": "#/$defs/uint64" },
         "unavoidable_bytes": { "$ref": "#/$defs/uint64" }
       }

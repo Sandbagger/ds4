@@ -98,7 +98,8 @@ HOST_IDENTITY = {
     },
     "io": {
         "direct_io": False,
-        "cold_preparation_advice": "posix_fadvise_dontneed",
+        "cold_preparation_advice":
+            "madvise_random+posix_fadvise_dontneed+madvise_dontneed+linux_madv_pageout_residual",
         "runtime_disposal_advice": "madvise_dontneed",
     },
 }
@@ -332,6 +333,40 @@ def _qualification_cold_preparation(
         "failed_calls": 0,
         "failed_bytes": "0",
         "errno_buckets": {},
+        "residual_disposal": {
+            "initial_resident_eligible_pages": 0,
+            "pageout_retry_pages": 0,
+            "residency_samples": 1,
+            "mapping_touch_pages": 0,
+            "mapping_touch_bytes": "0",
+            "random_access_madvise": {
+                "attempted_calls": 0,
+                "attempted_bytes": "0",
+                "successful_calls": 0,
+                "successful_bytes": "0",
+                "failed_calls": 0,
+                "failed_bytes": "0",
+                "errno_buckets": {},
+            },
+            "madvise": {
+                "attempted_calls": 0,
+                "attempted_bytes": "0",
+                "successful_calls": 0,
+                "successful_bytes": "0",
+                "failed_calls": 0,
+                "failed_bytes": "0",
+                "errno_buckets": {},
+            },
+            "fadvise": {
+                "attempted_calls": 0,
+                "attempted_bytes": "0",
+                "successful_calls": 0,
+                "successful_bytes": "0",
+                "failed_calls": 0,
+                "failed_bytes": "0",
+                "errno_buckets": {},
+            },
+        },
         "resident_bytes_after": "0",
         "unavoidable_bytes": str(
             ((model_size + page_size - 1) // page_size) * page_size
@@ -1257,6 +1292,35 @@ class WarmStabilityContractTest(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(ValueError):
                 TOOL.validate_warm_stability_samples(cold, changed)
 
+    def test_requires_real_cold_io_and_contiguous_same_process_counters(self) -> None:
+        cold, warm = _warm_stability_fixture()
+
+        zero_cold_io = copy.deepcopy(cold)
+        zero_cold_io["model_file_read_bytes_after"] = zero_cold_io[
+            "model_file_read_bytes_before"
+        ]
+        zero_cold_warm = copy.deepcopy(warm)
+        read_cursor = zero_cold_io["model_file_read_bytes_after"]
+        for sample in zero_cold_warm:
+            sample["model_file_read_bytes_before"] = read_cursor
+            sample["model_file_read_bytes_after"] = read_cursor
+
+        discontinuous = copy.deepcopy(warm)
+        discontinuous[1]["cache_acquire_hits_before"] = "112"
+        discontinuous[1]["cache_acquire_hits_after"] = "116"
+        discontinuous[2]["cache_acquire_hits_before"] = "116"
+        discontinuous[2]["cache_acquire_hits_after"] = "117"
+
+        for label, changed_cold, changed_warm in (
+            ("zero cold routed I/O", zero_cold_io, zero_cold_warm),
+            ("counter discontinuity", cold, discontinuous),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                TOOL.validate_warm_stability_samples(
+                    changed_cold,
+                    changed_warm,
+                )
+
     def test_rejects_counter_regression_and_uint64_overflow(self) -> None:
         cold, warm = _warm_stability_fixture()
 
@@ -1317,6 +1381,59 @@ class WarmStabilityContractTest(unittest.TestCase):
 
 
 class ColdPreparationContractTest(unittest.TestCase):
+    def test_caller_owned_descriptor_survives_path_swap_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp).resolve()
+            )
+            descriptor = os.open(model, os.O_RDONLY)
+            original = os.fstat(descriptor)
+            os.lseek(descriptor, 7, os.SEEK_SET)
+            moved = model.with_name("opened-original.gguf")
+            model.rename(moved)
+            model.write_bytes(b"replacement")
+            try:
+                seen: list[int] = []
+
+                def advise(fd: int, offset: int, length: int) -> None:
+                    seen.append(fd)
+
+                result = TOOL.cold_prepare_descriptor_from_plan(
+                    descriptor,
+                    plan_path,
+                    plan_sha256,
+                    advise=advise,
+                    sample_residency=lambda fd, size, page: bytes(
+                        (size + page - 1) // page
+                    ),
+                )
+                self.assertTrue(seen)
+                self.assertEqual(set(seen), {descriptor})
+                self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 7)
+                self.assertEqual(os.fstat(descriptor).st_ino, original.st_ino)
+                self.assertEqual(
+                    result["model_identity"]["inode"], str(original.st_ino)
+                )
+
+                def failing_advice(fd: int, offset: int, length: int) -> None:
+                    os.lseek(fd, 3, os.SEEK_SET)
+                    raise OSError(errno.EIO, "injected")
+
+                with self.assertRaisesRegex(ValueError, "advice failed"):
+                    TOOL.cold_prepare_descriptor_from_plan(
+                        descriptor,
+                        plan_path,
+                        plan_sha256,
+                        advise=failing_advice,
+                        sample_residency=lambda fd, size, page: bytes(
+                            (size + page - 1) // page
+                        ),
+                    )
+                self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 7)
+                self.assertEqual(os.fstat(descriptor).st_ino, original.st_ino)
+            finally:
+                os.close(descriptor)
+
     def test_cold_preparation_is_descriptor_bound_and_reports_exact_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -1684,6 +1801,361 @@ class ColdPreparationContractTest(unittest.TestCase):
                 },
             )
 
+    def test_residual_disposal_touches_only_hot_eligible_contiguous_runs(self) -> None:
+        page_size = TEST_PAGE_SIZE
+        descriptor = 41
+        resident = bytes((1, 1, 1, 1, 1, 0, 1, 0))
+        eligible = (
+            (page_size, 2 * page_size),
+            (4 * page_size, 2 * page_size),
+        )
+        events: list[tuple[object, ...]] = []
+
+        class FakeMapping:
+            def __getitem__(self, offset: int) -> int:
+                events.append(("touch", offset))
+                return 0
+
+            def madvise(self, advice: int, offset: int, length: int) -> None:
+                events.append(("madvise", advice, offset, length))
+
+            def close(self) -> None:
+                events.append(("close",))
+
+        def make_mapping(
+            fd: int,
+            length: int,
+            *,
+            flags: int,
+            prot: int,
+        ) -> FakeMapping:
+            events.append(("mmap", fd, length, flags, prot))
+            return FakeMapping()
+
+        def advise(fd: int, offset: int, length: int) -> None:
+            events.append(("fadvise", fd, offset, length))
+
+        random_advice = 4141
+        advice = 4242
+        with mock.patch.object(
+            TOOL.mmap, "MADV_DONTNEED", advice, create=True
+        ), mock.patch.object(
+            TOOL.mmap, "MADV_RANDOM", random_advice, create=True
+        ), mock.patch.object(TOOL.mmap, "mmap", side_effect=make_mapping):
+            report = TOOL._dispose_resident_eligible_pages(
+                descriptor,
+                8 * page_size,
+                page_size,
+                resident,
+                eligible,
+                advise=advise,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "mmap",
+                    descriptor,
+                    8 * page_size,
+                    TOOL.mmap.MAP_PRIVATE,
+                    TOOL.mmap.PROT_READ,
+                ),
+                ("madvise", random_advice, 0, 8 * page_size),
+                ("touch", page_size),
+                ("touch", 2 * page_size),
+                ("madvise", advice, page_size, 2 * page_size),
+                ("fadvise", descriptor, page_size, 2 * page_size),
+                ("touch", 4 * page_size),
+                ("madvise", advice, 4 * page_size, page_size),
+                ("fadvise", descriptor, 4 * page_size, page_size),
+                ("close",),
+            ],
+        )
+        self.assertEqual(
+            report,
+            {
+                "random_access_madvise": {
+                    "attempted_calls": 1,
+                    "attempted_bytes": str(8 * page_size),
+                    "successful_calls": 1,
+                    "successful_bytes": str(8 * page_size),
+                    "failed_calls": 0,
+                    "failed_bytes": "0",
+                    "errno_buckets": {},
+                },
+                "mapping_touch_pages": 3,
+                "mapping_touch_bytes": str(3 * page_size),
+                "madvise": {
+                    "attempted_calls": 2,
+                    "attempted_bytes": str(3 * page_size),
+                    "successful_calls": 2,
+                    "successful_bytes": str(3 * page_size),
+                    "failed_calls": 0,
+                    "failed_bytes": "0",
+                    "errno_buckets": {},
+                },
+                "fadvise": {
+                    "attempted_calls": 2,
+                    "attempted_bytes": str(3 * page_size),
+                    "successful_calls": 2,
+                    "successful_bytes": str(3 * page_size),
+                    "failed_calls": 0,
+                    "failed_bytes": "0",
+                    "errno_buckets": {},
+                },
+            },
+        )
+
+    def test_residual_disposal_attempts_and_accounts_both_calls_on_failures(self) -> None:
+        page_size = TEST_PAGE_SIZE
+        descriptor = 42
+        resident = bytes((0, 1, 1, 0, 1, 0, 0, 0))
+        eligible = (
+            (page_size, 2 * page_size),
+            (4 * page_size, page_size),
+        )
+        events: list[tuple[object, ...]] = []
+
+        class FakeMapping:
+            def __getitem__(self, offset: int) -> int:
+                events.append(("touch", offset))
+                return 0
+
+            def madvise(self, advice: int, offset: int, length: int) -> None:
+                events.append(("madvise", advice, offset, length))
+                if advice == 4242 and offset == page_size:
+                    raise OSError(errno.EIO, "injected madvise failure")
+
+            def close(self) -> None:
+                events.append(("close",))
+
+        def advise(fd: int, offset: int, length: int) -> None:
+            events.append(("fadvise", offset, length))
+            if offset == 4 * page_size:
+                raise OSError(errno.ENOSPC, "injected fadvise failure")
+
+        with mock.patch.object(
+            TOOL.mmap, "MADV_DONTNEED", 4242, create=True
+        ), mock.patch.object(
+            TOOL.mmap, "MADV_RANDOM", 4141, create=True
+        ), mock.patch.object(TOOL.mmap, "mmap", return_value=FakeMapping()):
+            report = TOOL._dispose_resident_eligible_pages(
+                descriptor,
+                8 * page_size,
+                page_size,
+                resident,
+                eligible,
+                advise=advise,
+            )
+
+        self.assertEqual(
+            [event for event in events if event[0] in ("madvise", "fadvise")],
+            [
+                ("madvise", 4141, 0, 8 * page_size),
+                ("madvise", 4242, page_size, 2 * page_size),
+                ("fadvise", page_size, 2 * page_size),
+                ("madvise", 4242, 4 * page_size, page_size),
+                ("fadvise", 4 * page_size, page_size),
+            ],
+        )
+        self.assertEqual(events[-1], ("close",))
+        self.assertEqual(
+            report["madvise"],
+            {
+                "attempted_calls": 2,
+                "attempted_bytes": str(3 * page_size),
+                "successful_calls": 1,
+                "successful_bytes": str(page_size),
+                "failed_calls": 1,
+                "failed_bytes": str(2 * page_size),
+                "errno_buckets": {"EIO": 1},
+            },
+        )
+        self.assertEqual(
+            report["fadvise"],
+            {
+                "attempted_calls": 2,
+                "attempted_bytes": str(3 * page_size),
+                "successful_calls": 1,
+                "successful_bytes": str(2 * page_size),
+                "failed_calls": 1,
+                "failed_bytes": str(page_size),
+                "errno_buckets": {"ENOSPC": 1},
+            },
+        )
+
+    def test_residual_disposal_is_a_noop_when_no_eligible_page_is_hot(self) -> None:
+        page_size = TEST_PAGE_SIZE
+        events: list[tuple[object, ...]] = []
+
+        class FakeMapping:
+            def __getitem__(self, offset: int) -> int:
+                events.append(("unexpected touch", offset))
+                return 0
+
+            def madvise(self, advice: int, offset: int, length: int) -> None:
+                events.append(("unexpected madvise", offset, length))
+
+            def close(self) -> None:
+                events.append(("close",))
+
+        def advise(fd: int, offset: int, length: int) -> None:
+            events.append(("unexpected fadvise", offset, length))
+
+        with mock.patch.object(
+            TOOL.mmap, "MADV_DONTNEED", 4242, create=True
+        ), mock.patch.object(
+            TOOL.mmap, "MADV_RANDOM", 4141, create=True
+        ), mock.patch.object(TOOL.mmap, "mmap", return_value=FakeMapping()):
+            report = TOOL._dispose_resident_eligible_pages(
+                43,
+                8 * page_size,
+                page_size,
+                bytes((1, 0, 0, 1, 0, 0, 1, 0)),
+                ((page_size, 2 * page_size), (4 * page_size, 2 * page_size)),
+                advise=advise,
+            )
+
+        self.assertEqual(events, [("unexpected madvise", 0, 8 * page_size),
+                                  ("close",)])
+        self.assertEqual(report["mapping_touch_pages"], 0)
+        self.assertEqual(report["mapping_touch_bytes"], "0")
+        for label in ("madvise", "fadvise"):
+            self.assertEqual(report[label]["attempted_calls"], 0)
+            self.assertEqual(report[label]["attempted_bytes"], "0")
+
+    def test_final_hot_resample_is_rejected_after_residual_disposal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp).resolve()
+            )
+            descriptor = os.open(model, os.O_RDONLY)
+            page_count = os.fstat(descriptor).st_size // TEST_PAGE_SIZE
+            hot = bytearray(page_count)
+            hot[1] = 1
+            samples = iter((bytes(hot), bytes(hot), bytes(hot)))
+
+            class FakeMapping:
+                def __getitem__(self, offset: int) -> int:
+                    return 0
+
+                def madvise(self, advice: int, offset: int, length: int) -> None:
+                    return None
+
+                def close(self) -> None:
+                    return None
+
+            try:
+                with mock.patch.object(
+                    TOOL.mmap, "MADV_DONTNEED", 4242, create=True
+                ), mock.patch.object(
+                    TOOL.mmap, "MADV_RANDOM", 4141, create=True
+                ), mock.patch.object(
+                    TOOL.mmap, "mmap", return_value=FakeMapping()
+                ), mock.patch.object(TOOL.sys, "platform", "linux"):
+                    with self.assertRaisesRegex(
+                        ValueError, "eligible.*resident|resident.*eligible"
+                    ):
+                        TOOL.cold_prepare_descriptor_from_plan(
+                            descriptor,
+                            plan_path,
+                            plan_sha256,
+                            advise=lambda fd, offset, length: None,
+                            sample_residency=lambda fd, size, page: next(samples),
+                        )
+                with self.assertRaises(StopIteration):
+                    next(samples)
+                os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def test_residual_disposal_uses_one_bounded_pageout_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp).resolve()
+            )
+            page_count = model.stat().st_size // TEST_PAGE_SIZE
+            initial = bytearray(page_count)
+            initial[1:4] = b"\1\1\1"
+            after_dontneed = bytearray(page_count)
+            after_dontneed[2] = 1
+            samples = iter(
+                (bytes(initial), bytes(after_dontneed), bytes(page_count))
+            )
+            advice_kinds: list[int] = []
+
+            class FakeMapping:
+                def __getitem__(self, offset: int) -> int:
+                    return 0
+
+                def madvise(self, advice: int, offset: int, length: int) -> None:
+                    if advice != 4141:
+                        advice_kinds.append(advice)
+
+                def close(self) -> None:
+                    return None
+
+            with mock.patch.object(
+                TOOL.mmap, "MADV_RANDOM", 4141, create=True
+            ), mock.patch.object(
+                TOOL.mmap, "MADV_DONTNEED", 4242, create=True
+            ), mock.patch.object(
+                TOOL.mmap, "mmap", return_value=FakeMapping()
+            ), mock.patch.object(TOOL.sys, "platform", "linux"):
+                result = TOOL.cold_prepare_from_plan(
+                    model,
+                    plan_path,
+                    plan_sha256,
+                    advise=lambda fd, offset, length: None,
+                    sample_residency=lambda fd, size, page: next(samples),
+                )
+
+            self.assertEqual(advice_kinds, [4242, TOOL.LINUX_MADV_PAGEOUT])
+            self.assertEqual(result["resident_bytes_after"], "0")
+            self.assertEqual(
+                result["residual_disposal"]["pageout_retry_pages"], 1
+            )
+            self.assertEqual(result["residual_disposal"]["residency_samples"], 3)
+            self.assertEqual(result["residual_disposal"]["mapping_touch_pages"], 3)
+            self.assertEqual(
+                result["residual_disposal"]["random_access_madvise"],
+                {
+                    "attempted_calls": 2,
+                    "attempted_bytes": str(2 * model.stat().st_size),
+                    "successful_calls": 2,
+                    "successful_bytes": str(2 * model.stat().st_size),
+                    "failed_calls": 0,
+                    "failed_bytes": "0",
+                    "errno_buckets": {},
+                },
+            )
+
+    def test_pageout_evidence_requires_two_disposal_runs(self) -> None:
+        cold = _qualification_cold_preparation()
+        page_size = int(cold["page_size"])
+        residual = cold["residual_disposal"]
+        residual.update(
+            {
+                "initial_resident_eligible_pages": 2,
+                "pageout_retry_pages": 1,
+                "residency_samples": 3,
+                "mapping_touch_pages": 3,
+                "mapping_touch_bytes": str(3 * page_size),
+            }
+        )
+        for label in ("madvise", "fadvise"):
+            residual[label].update(
+                {
+                    "attempted_calls": 1,
+                    "attempted_bytes": str(3 * page_size),
+                    "successful_calls": 1,
+                    "successful_bytes": str(3 * page_size),
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "residual disposal"):
+            TOOL._validate_cold_preparation(cold)
+
     def test_location_aware_residency_rejects_only_hot_eligible_pages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
@@ -1725,6 +2197,128 @@ class ColdPreparationContractTest(unittest.TestCase):
             self.assertLessEqual(
                 int(result["resident_bytes_after"]),
                 int(result["unavoidable_bytes"]),
+            )
+
+    def test_active_eligible_pages_are_disposed_and_resampled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp)
+            )
+            hot = bytearray(8)
+            hot[1] = 1
+            hot[2] = 1
+            hot[4] = 1
+            samples = iter((bytes(hot), bytes(8)))
+            disposal_calls: list[tuple[int, int, int, bytes, object]] = []
+
+            def dispose(
+                descriptor: int,
+                file_size: int,
+                page_size: int,
+                resident_bits: bytes,
+                eligible_ranges: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                disposal_calls.append(
+                    (
+                        descriptor,
+                        file_size,
+                        page_size,
+                        resident_bits,
+                        eligible_ranges,
+                    )
+                )
+                return {
+                    "random_access_madvise": {
+                        "attempted_calls": 1,
+                        "attempted_bytes": str(file_size),
+                        "successful_calls": 1,
+                        "successful_bytes": str(file_size),
+                        "failed_calls": 0,
+                        "failed_bytes": "0",
+                        "errno_buckets": {},
+                    },
+                    "mapping_touch_pages": 3,
+                    "mapping_touch_bytes": str(3 * TEST_PAGE_SIZE),
+                    "madvise": {
+                        "attempted_calls": 2,
+                        "attempted_bytes": str(3 * TEST_PAGE_SIZE),
+                        "successful_calls": 2,
+                        "successful_bytes": str(3 * TEST_PAGE_SIZE),
+                        "failed_calls": 0,
+                        "failed_bytes": "0",
+                        "errno_buckets": {},
+                    },
+                    "fadvise": {
+                        "attempted_calls": 2,
+                        "attempted_bytes": str(3 * TEST_PAGE_SIZE),
+                        "successful_calls": 2,
+                        "successful_bytes": str(3 * TEST_PAGE_SIZE),
+                        "failed_calls": 0,
+                        "failed_bytes": "0",
+                        "errno_buckets": {},
+                    },
+                }
+
+            with mock.patch.object(
+                TOOL,
+                "_dispose_resident_eligible_pages",
+                side_effect=dispose,
+                create=True,
+            ):
+                result = TOOL.cold_prepare_from_plan(
+                    model,
+                    plan_path,
+                    plan_sha256,
+                    advise=lambda descriptor, offset, length: None,
+                    sample_residency=lambda descriptor, file_size, page_size: next(
+                        samples
+                    ),
+                )
+
+            self.assertEqual(len(disposal_calls), 1)
+            self.assertEqual(disposal_calls[0][1:4], (
+                8 * TEST_PAGE_SIZE,
+                TEST_PAGE_SIZE,
+                bytes(hot),
+            ))
+            self.assertEqual(result["resident_bytes_after"], "0")
+            self.assertEqual(
+                result["residual_disposal"],
+                {
+                    "initial_resident_eligible_pages": 3,
+                    "pageout_retry_pages": 0,
+                    "residency_samples": 2,
+                    "mapping_touch_pages": 3,
+                    "mapping_touch_bytes": str(3 * TEST_PAGE_SIZE),
+                    "random_access_madvise": {
+                        "attempted_calls": 1,
+                        "attempted_bytes": str(8 * TEST_PAGE_SIZE),
+                        "successful_calls": 1,
+                        "successful_bytes": str(8 * TEST_PAGE_SIZE),
+                        "failed_calls": 0,
+                        "failed_bytes": "0",
+                        "errno_buckets": {},
+                    },
+                    "madvise": {
+                        "attempted_calls": 2,
+                        "attempted_bytes": str(3 * TEST_PAGE_SIZE),
+                        "successful_calls": 2,
+                        "successful_bytes": str(3 * TEST_PAGE_SIZE),
+                        "failed_calls": 0,
+                        "failed_bytes": "0",
+                        "errno_buckets": {},
+                    },
+                    "fadvise": {
+                        "attempted_calls": 2,
+                        "attempted_bytes": str(3 * TEST_PAGE_SIZE),
+                        "successful_calls": 2,
+                        "successful_bytes": str(3 * TEST_PAGE_SIZE),
+                        "failed_calls": 0,
+                        "failed_bytes": "0",
+                        "errno_buckets": {},
+                    },
+                },
             )
 
     def test_descriptor_identity_change_during_measurement_is_invalid(self) -> None:
@@ -1863,6 +2457,7 @@ class NvmlCheckpointContractTest(unittest.TestCase):
                 "failed_calls",
                 "failed_bytes",
                 "errno_buckets",
+                "residual_disposal",
                 "resident_bytes_after",
                 "unavoidable_bytes",
             },

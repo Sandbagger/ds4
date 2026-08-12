@@ -345,6 +345,18 @@ class LagunaGateRunnerTest(unittest.TestCase):
         stream_cases_at = source.find("stream_cases=(")
         self.assertGreater(startup_cold_at, verifier_identity_at)
         self.assertGreater(stream_cases_at, startup_cold_at)
+        warm_identity_at = source.find(
+            "assert_retained_identity model-streamed-warm-stability",
+            stream_cases_at,
+        )
+        final_hash_at = source.find("    hash_retained_fd", warm_identity_at)
+        final_cold_at = source.find(
+            "cold_prepare_exact_fd stream-final", final_hash_at
+        )
+        streaming_exit_at = source.find("    exit 0", final_hash_at)
+        self.assertGreater(final_hash_at, warm_identity_at)
+        self.assertGreater(final_cold_at, final_hash_at)
+        self.assertGreater(streaming_exit_at, final_cold_at)
         for label, child_fragment in (
             ("model-streamed-short", "--mode streamed --case short"),
             (
@@ -414,6 +426,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     ("model", "prefill-8192"),
                     ("coldprep", "model-streamed-warm-stability"),
                     ("model", "warm-stability"),
+                    ("coldprep", "stream-final"),
                 ],
             )
             self.assertEqual(
@@ -427,6 +440,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     "model-streamed-short",
                     "model-streamed-prefill-8192",
                     "model-streamed-warm-stability",
+                    "stream-final",
                 ],
             )
             for record in records:

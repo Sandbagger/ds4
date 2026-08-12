@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import copy
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
@@ -139,6 +140,84 @@ def _set(path: tuple[PathPart, ...], key: str, value: object) -> Callable[[dict]
 
 def _delete(path: tuple[PathPart, ...], key: str) -> Callable[[dict], None]:
     return lambda manifest: _node_at(manifest, path).__delitem__(key)
+
+
+NVML_COMPUTE_API = "nvmlDeviceGetComputeRunningProcesses_v2"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_cold_preparation_fixture(
+    directory: Path,
+    *,
+    ranges: list[dict[str, str]] | None = None,
+) -> tuple[Path, Path, dict, str]:
+    """Write a sparse model and the smallest Task-13 qualification plan."""
+    model = directory / "laguna-s-2.1-Q4_K_M.gguf"
+    with model.open("wb") as handle:
+        handle.truncate(8 * 4096)
+        handle.seek(4096)
+        handle.write(b"original descriptor bytes")
+    identity = model.stat()
+    ledger = {
+        "file_size": str(identity.st_size),
+        "tensor_ranges": [
+            {"class": "STATIC", "source_bytes": "8192", "source_offset": "4096"},
+            {
+                "class": "ROUTED_EXPERT",
+                "source_bytes": "4096",
+                "source_offset": "16384",
+            },
+        ],
+    }
+    safe_ranges = ranges or [
+        {"bytes": "8192", "offset": "4096"},
+        {"bytes": "4096", "offset": "16384"},
+    ]
+    plan = {
+        "allocation": {"profile_id": "cache-8gib"},
+        "ledger": ledger,
+        "ledger_sha256": hashlib.sha256(
+            TOOL.canonical_json_bytes(ledger)
+        ).hexdigest(),
+        "model": {
+            "device": str(identity.st_dev),
+            "filename": model.name,
+            "inode": str(identity.st_ino),
+            "mtime_ns": str(identity.st_mtime_ns),
+            "repository": "poolside/Laguna-S-2.1-GGUF",
+            "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
+            "sha256": _file_sha256(model),
+            "size_bytes": str(identity.st_size),
+        },
+        "page_cache": {
+            "eligible_unique_bytes": "12288",
+            "mapped_page_bytes": str(identity.st_size),
+            "page_size": "4096",
+            "ranges": safe_ranges,
+            "unavoidable_bytes": str(identity.st_size - 12288),
+        },
+        "schema": "ds4.laguna.qualification-plan/v1",
+    }
+    plan_path = directory / "qualification-plan.json"
+    plan_bytes = TOOL.canonical_json_bytes(plan)
+    plan_path.write_bytes(plan_bytes)
+    return model, plan_path, plan, hashlib.sha256(plan_bytes).hexdigest()
+
+
+def _nvml_inventory(
+    processes: list[dict[str, object]],
+    *,
+    gpu_uuid: str = HOST_IDENTITY["gpu_uuid"],
+    api: str = NVML_COMPUTE_API,
+) -> dict[str, object]:
+    return {"api": api, "gpu_uuid": gpu_uuid, "processes": processes}
 
 
 def schema_expressible_mutations() -> list[Mutation]:
@@ -808,6 +887,447 @@ print("[" + ",".join(["0"] * count) + "]")
         self.assertEqual((verify.command, verify.action), ("manifest", "verify"))
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
+
+
+class ColdPreparationContractTest(unittest.TestCase):
+    def test_cold_preparation_is_descriptor_bound_and_reports_exact_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            model, plan_path, plan, plan_sha256 = _write_cold_preparation_fixture(
+                directory
+            )
+            replacement = directory / "replacement.gguf"
+            replacement.write_bytes(b"replacement pathname")
+            advised: list[tuple[int, int, int]] = []
+            sampled_descriptors: list[int] = []
+
+            def advise(descriptor: int, offset: int, length: int) -> None:
+                self.assertEqual(os.pread(descriptor, 8, 4096), b"original")
+                advised.append((descriptor, offset, length))
+                if len(advised) == 1:
+                    os.replace(replacement, model)
+
+            def sample_residency(
+                descriptor: int, file_size: int, page_size: int
+            ) -> int:
+                sampled_descriptors.append(descriptor)
+                self.assertEqual((file_size, page_size), (8 * 4096, 4096))
+                self.assertEqual(os.pread(descriptor, 8, 4096), b"original")
+                return 0
+
+            result = TOOL.cold_prepare_from_plan(
+                model,
+                plan_path,
+                plan_sha256,
+                advise=advise,
+                sample_residency=sample_residency,
+            )
+
+            self.assertEqual(
+                [(offset, length) for _, offset, length in advised],
+                [(4096, 8192), (16384, 4096)],
+            )
+            self.assertEqual(len({descriptor for descriptor, _, _ in advised}), 1)
+            self.assertEqual(sampled_descriptors, [advised[0][0]])
+            self.assertEqual(result["plan_sha256"], plan_sha256)
+            self.assertEqual(result["ledger_sha256"], plan["ledger_sha256"])
+            self.assertEqual(result["model_identity"], plan["model"])
+            self.assertEqual(result["page_size"], "4096")
+            self.assertEqual(
+                {
+                    key: result[key]
+                    for key in (
+                        "eligible_calls",
+                        "attempted_calls",
+                        "successful_calls",
+                        "failed_calls",
+                    )
+                },
+                {
+                    "eligible_calls": 2,
+                    "attempted_calls": 2,
+                    "successful_calls": 2,
+                    "failed_calls": 0,
+                },
+            )
+            self.assertEqual(
+                {
+                    key: result[key]
+                    for key in (
+                        "eligible_bytes",
+                        "attempted_bytes",
+                        "successful_bytes",
+                        "failed_bytes",
+                    )
+                },
+                {
+                    "eligible_bytes": "12288",
+                    "attempted_bytes": "12288",
+                    "successful_bytes": "12288",
+                    "failed_bytes": "0",
+                },
+            )
+            self.assertEqual(result["errno_buckets"], {})
+            self.assertEqual(result["resident_bytes_after"], "0")
+            self.assertEqual(result["unavoidable_bytes"], str(5 * 4096))
+
+    def test_plan_and_ledger_digests_and_opened_identity_are_independent_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, plan, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp)
+            )
+            no_advice = lambda descriptor, offset, length: None
+            no_residency = lambda descriptor, file_size, page_size: 0
+
+            with self.subTest("outer plan digest"):
+                with self.assertRaisesRegex(ValueError, "plan.*digest|SHA-256"):
+                    TOOL.cold_prepare_from_plan(
+                        model,
+                        plan_path,
+                        "f" * 64,
+                        advise=no_advice,
+                        sample_residency=no_residency,
+                    )
+
+            with self.subTest("embedded ledger digest"):
+                changed = copy.deepcopy(plan)
+                changed["ledger_sha256"] = "e" * 64
+                changed_bytes = TOOL.canonical_json_bytes(changed)
+                plan_path.write_bytes(changed_bytes)
+                with self.assertRaisesRegex(ValueError, "ledger.*digest|ledger.*SHA-256"):
+                    TOOL.cold_prepare_from_plan(
+                        model,
+                        plan_path,
+                        hashlib.sha256(changed_bytes).hexdigest(),
+                        advise=no_advice,
+                        sample_residency=no_residency,
+                    )
+
+            with self.subTest("opened model identity"):
+                changed = copy.deepcopy(plan)
+                changed["model"]["inode"] = str(int(changed["model"]["inode"]) + 1)
+                changed_bytes = TOOL.canonical_json_bytes(changed)
+                plan_path.write_bytes(changed_bytes)
+                with self.assertRaisesRegex(ValueError, "model.*identity|inode"):
+                    TOOL.cold_prepare_from_plan(
+                        model,
+                        plan_path,
+                        hashlib.sha256(changed_bytes).hexdigest(),
+                        advise=no_advice,
+                        sample_residency=no_residency,
+                    )
+
+            self.assertRegex(plan_sha256, r"^[0-9a-f]{64}$")
+
+    def test_plan_and_model_paths_are_opened_without_following_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                directory
+            )
+            model_link = directory / "model-link.gguf"
+            plan_link = directory / "plan-link.json"
+            model_link.symlink_to(model)
+            plan_link.symlink_to(plan_path)
+            kwargs = {
+                "advise": lambda descriptor, offset, length: None,
+                "sample_residency": lambda descriptor, file_size, page_size: 0,
+            }
+            for label, model_arg, plan_arg in (
+                ("model", model_link, plan_path),
+                ("plan", model, plan_link),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(ValueError, "symlink|follow"):
+                        TOOL.cold_prepare_from_plan(
+                            model_arg, plan_arg, plan_sha256, **kwargs
+                        )
+
+    def test_plan_ranges_must_be_a_complete_normalized_safe_union(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
+            cases = {
+                "missing coverage": lambda value: value["page_cache"].__setitem__(
+                    "eligible_unique_bytes", "16384"
+                ),
+                "duplicate coverage": lambda value: value["page_cache"]["ranges"].append(
+                    copy.deepcopy(value["page_cache"]["ranges"][0])
+                ),
+                "unaligned range": lambda value: value["page_cache"]["ranges"][0].__setitem__(
+                    "offset", "4097"
+                ),
+            }
+            for label, mutate in cases.items():
+                with self.subTest(label=label):
+                    changed = copy.deepcopy(plan)
+                    mutate(changed)
+                    raw = TOOL.canonical_json_bytes(changed)
+                    plan_path.write_bytes(raw)
+                    with self.assertRaisesRegex(
+                        ValueError, "coverage|normalized|page|range|eligible"
+                    ):
+                        TOOL.cold_prepare_from_plan(
+                            model,
+                            plan_path,
+                            hashlib.sha256(raw).hexdigest(),
+                            advise=lambda descriptor, offset, length: None,
+                            sample_residency=lambda descriptor, file_size, page_size: 0,
+                        )
+
+    def test_digest_consistent_page_cache_cannot_claim_pages_outside_the_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
+            changed = copy.deepcopy(plan)
+            changed["page_cache"]["ranges"][1] = {
+                "bytes": "4096",
+                "offset": "24576",
+            }
+            raw = TOOL.canonical_json_bytes(changed)
+            plan_path.write_bytes(raw)
+            with self.assertRaisesRegex(
+                ValueError, "page.*ledger|ledger.*page|safe.*tensor"
+            ):
+                TOOL.cold_prepare_from_plan(
+                    model,
+                    plan_path,
+                    hashlib.sha256(raw).hexdigest(),
+                    advise=lambda descriptor, offset, length: None,
+                    sample_residency=lambda descriptor, file_size, page_size: 0,
+                )
+
+    def test_derived_unavoidable_residency_above_two_gib_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, plan, _ = _write_cold_preparation_fixture(Path(tmp))
+            model_size = (2 << 30) + (3 * 4096)
+            with model.open("r+b") as handle:
+                handle.truncate(model_size)
+            identity = model.stat()
+            changed = copy.deepcopy(plan)
+            changed["model"].update(
+                {
+                    "device": str(identity.st_dev),
+                    "inode": str(identity.st_ino),
+                    "mtime_ns": str(identity.st_mtime_ns),
+                    "size_bytes": str(identity.st_size),
+                }
+            )
+            changed["ledger"]["file_size"] = str(identity.st_size)
+            changed["ledger_sha256"] = hashlib.sha256(
+                TOOL.canonical_json_bytes(changed["ledger"])
+            ).hexdigest()
+            changed["page_cache"].update(
+                {
+                    "eligible_unique_bytes": "4096",
+                    "mapped_page_bytes": str(identity.st_size),
+                    "ranges": [{"bytes": "4096", "offset": "4096"}],
+                    "unavoidable_bytes": str(identity.st_size - 4096),
+                }
+            )
+            raw = TOOL.canonical_json_bytes(changed)
+            plan_path.write_bytes(raw)
+            with self.assertRaisesRegex(
+                ValueError, "unavoidable.*(?:2 GiB|bound|limit)"
+            ):
+                TOOL.cold_prepare_from_plan(
+                    model,
+                    plan_path,
+                    hashlib.sha256(raw).hexdigest(),
+                    advise=lambda descriptor, offset, length: None,
+                    sample_residency=lambda descriptor, file_size, page_size: 0,
+                )
+
+    def test_advice_failure_counts_every_range_and_errno_without_short_circuiting(self) -> None:
+        ranges = [
+            {"bytes": "8192", "offset": "4096"},
+            {"bytes": "4096", "offset": "16384"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            model, _, _, _ = _write_cold_preparation_fixture(Path(tmp))
+            descriptor = os.open(model, os.O_RDONLY)
+            calls: list[tuple[int, int]] = []
+
+            def advise(_descriptor: int, offset: int, length: int) -> None:
+                calls.append((offset, length))
+                if offset == 4096:
+                    raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+            try:
+                report = TOOL.advise_safe_page_ranges(
+                    descriptor,
+                    ranges,
+                    page_size=4096,
+                    model_size=8 * 4096,
+                    advise=advise,
+                )
+            finally:
+                os.close(descriptor)
+
+            self.assertEqual(calls, [(4096, 8192), (16384, 4096)])
+            self.assertEqual(
+                report,
+                {
+                    "eligible_calls": 2,
+                    "eligible_bytes": "12288",
+                    "attempted_calls": 2,
+                    "attempted_bytes": "12288",
+                    "successful_calls": 1,
+                    "successful_bytes": "4096",
+                    "failed_calls": 1,
+                    "failed_bytes": "8192",
+                    "errno_buckets": {"EIO": 1},
+                },
+            )
+
+    def test_descriptor_identity_change_during_measurement_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(
+                Path(tmp)
+            )
+
+            def mutate_open_inode(_descriptor: int, _offset: int, _length: int) -> None:
+                with model.open("r+b") as writable:
+                    writable.truncate(7 * 4096)
+
+            with self.assertRaisesRegex(ValueError, "identity.*changed|size.*changed"):
+                TOOL.cold_prepare_from_plan(
+                    model,
+                    plan_path,
+                    plan_sha256,
+                    advise=mutate_open_inode,
+                    sample_residency=lambda descriptor, file_size, page_size: 0,
+                )
+
+
+class NvmlCheckpointContractTest(unittest.TestCase):
+    DS4_PID = 4242
+    OTHER_PID = 9001
+
+    def test_stable_inventory_returns_only_the_ds4_process_usage(self) -> None:
+        other = {"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}
+        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30}
+        frozen = _nvml_inventory([other])
+        before = _nvml_inventory([other, ds4])
+        after = _nvml_inventory([copy.deepcopy(other), copy.deepcopy(ds4)])
+        result = TOOL.validate_nvml_checkpoint(
+            frozen,
+            before,
+            after,
+            ds4_pid=self.DS4_PID,
+            gpu_uuid=HOST_IDENTITY["gpu_uuid"],
+        )
+        self.assertEqual(result["api"], NVML_COMPUTE_API)
+        self.assertEqual(result["gpu_uuid"], HOST_IDENTITY["gpu_uuid"])
+        self.assertEqual(result["ds4_pid"], self.DS4_PID)
+        self.assertEqual(result["ds4_process_bytes"], str(6 << 30))
+
+    def test_unrelated_process_change_is_invalid_even_when_checkpoint_is_stable(self) -> None:
+        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30}
+        cases = {
+            "changed since frozen baseline": (
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": (1 << 30) + 4096}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": (1 << 30) + 4096}],
+            ),
+            "appeared": ([], [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1}], [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1}]),
+            "disappeared": ([{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1}], [], []),
+            "changed inside checkpoint": (
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}],
+                [{"pid": self.OTHER_PID, "used_gpu_memory_bytes": (1 << 30) + 4096}],
+            ),
+        }
+        for label, (frozen_other, before_other, after_other) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    ValueError, "unrelated.*process|inventory.*changed"
+                ):
+                    TOOL.validate_nvml_checkpoint(
+                        _nvml_inventory(frozen_other),
+                        _nvml_inventory(before_other + [copy.deepcopy(ds4)]),
+                        _nvml_inventory(after_other + [copy.deepcopy(ds4)]),
+                        ds4_pid=self.DS4_PID,
+                        gpu_uuid=HOST_IDENTITY["gpu_uuid"],
+                    )
+
+    def test_missing_or_unknown_process_usage_is_never_coerced_to_zero(self) -> None:
+        other = {"pid": self.OTHER_PID, "used_gpu_memory_bytes": 1 << 30}
+        cases = {
+            "missing process": [],
+            "missing usage": [{"pid": self.DS4_PID}],
+            "null usage": [{"pid": self.DS4_PID, "used_gpu_memory_bytes": None}],
+            "NVML unknown sentinel": [
+                {"pid": self.DS4_PID, "used_gpu_memory_bytes": (1 << 64) - 1}
+            ],
+        }
+        for label, ds4_processes in cases.items():
+            with self.subTest(label=label):
+                checkpoint = _nvml_inventory([copy.deepcopy(other)] + ds4_processes)
+                with self.assertRaisesRegex(ValueError, "missing|unknown|usage"):
+                    TOOL.validate_nvml_checkpoint(
+                        _nvml_inventory([copy.deepcopy(other)]),
+                        checkpoint,
+                        copy.deepcopy(checkpoint),
+                        ds4_pid=self.DS4_PID,
+                        gpu_uuid=HOST_IDENTITY["gpu_uuid"],
+                    )
+
+    def test_nvml_api_and_gpu_uuid_must_match_the_frozen_target(self) -> None:
+        ds4 = {"pid": self.DS4_PID, "used_gpu_memory_bytes": 6 << 30}
+        for label, changed in (
+            ("API", _nvml_inventory([ds4], api="nvmlDeviceGetComputeRunningProcesses_v3")),
+            (
+                "UUID",
+                _nvml_inventory(
+                    [ds4],
+                    gpu_uuid="GPU-ffffffff-ffff-ffff-ffff-ffffffffffff",
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "API|version|UUID|GPU"):
+                    TOOL.validate_nvml_checkpoint(
+                        _nvml_inventory([]),
+                        changed,
+                        copy.deepcopy(changed),
+                        ds4_pid=self.DS4_PID,
+                        gpu_uuid=HOST_IDENTITY["gpu_uuid"],
+                    )
+
+    def test_schema_defines_closed_cold_preparation_and_nvml_inventory_records(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        cold = schema["$defs"]["cold_preparation"]
+        self.assertIs(cold["additionalProperties"], False)
+        self.assertEqual(
+            set(cold["required"]),
+            {
+                "plan_sha256",
+                "ledger_sha256",
+                "model_identity",
+                "page_size",
+                "eligible_calls",
+                "eligible_bytes",
+                "attempted_calls",
+                "attempted_bytes",
+                "successful_calls",
+                "successful_bytes",
+                "failed_calls",
+                "failed_bytes",
+                "errno_buckets",
+                "resident_bytes_after",
+                "unavoidable_bytes",
+            },
+        )
+        inventory = schema["$defs"]["nvml_process_inventory"]
+        self.assertIs(inventory["additionalProperties"], False)
+        self.assertEqual(
+            set(inventory["required"]), {"api", "gpu_uuid", "processes"}
+        )
+        self.assertEqual(inventory["properties"]["api"]["const"], NVML_COMPUTE_API)
+        process = schema["$defs"]["nvml_process"]
+        self.assertIs(process["additionalProperties"], False)
+        self.assertEqual(
+            set(process["required"]), {"pid", "used_gpu_memory_bytes"}
+        )
 
 
 if __name__ == "__main__":

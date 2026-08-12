@@ -1712,24 +1712,32 @@ bool ds4_laguna_full_page_union(
     return true;
 }
 
-bool ds4_laguna_page_range_union_insert(
-        ds4_laguna_page_range *ranges,
-        size_t *range_count,
+typedef struct {
+    size_t first;
+    size_t after;
+    size_t resulting_count;
+    uint64_t merged_start;
+    uint64_t merged_bytes;
+    uint64_t newly_unique_bytes;
+    bool has_eligible_interval;
+} ds4_laguna_page_range_insert_plan;
+
+static bool page_range_union_insert_plan(
+        const ds4_laguna_page_range *ranges,
+        size_t range_count,
         size_t range_capacity,
         uint64_t page_size,
         uint64_t raw_offset,
         uint64_t raw_bytes,
-        uint64_t *newly_unique_bytes,
-        uint64_t *newly_unique_pages) {
-    if (!range_count || !newly_unique_bytes || !newly_unique_pages ||
-        !is_power_of_two(page_size) || *range_count > range_capacity ||
+        ds4_laguna_page_range_insert_plan *out) {
+    if (!out || !is_power_of_two(page_size) ||
+        range_count > range_capacity ||
         (range_capacity != 0 && !ranges)) {
         return false;
     }
 
-    const size_t count = *range_count;
     uint64_t previous_end = 0;
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < range_count; i++) {
         uint64_t current_end = 0;
         if (ranges[i].bytes == 0 || ranges[i].offset % page_size != 0 ||
             ranges[i].bytes % page_size != 0 ||
@@ -1740,9 +1748,11 @@ bool ds4_laguna_page_range_union_insert(
         previous_end = current_end;
     }
 
+    ds4_laguna_page_range_insert_plan plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.resulting_count = range_count;
     if (raw_bytes == 0) {
-        *newly_unique_bytes = 0;
-        *newly_unique_pages = 0;
+        *out = plan;
         return true;
     }
 
@@ -1757,13 +1767,12 @@ bool ds4_laguna_page_range_union_insert(
     }
     const uint64_t safe_end = raw_end - raw_end % page_size;
     if (safe_start >= safe_end) {
-        *newly_unique_bytes = 0;
-        *newly_unique_pages = 0;
+        *out = plan;
         return true;
     }
 
     size_t first = 0;
-    while (first < count) {
+    while (first < range_count) {
         uint64_t range_end = 0;
         if (!add_u64(ranges[first].offset, ranges[first].bytes,
                      &range_end)) {
@@ -1777,7 +1786,7 @@ bool ds4_laguna_page_range_union_insert(
     uint64_t merged_end = safe_end;
     uint64_t replaced_bytes = 0;
     size_t after = first;
-    while (after < count && ranges[after].offset <= merged_end) {
+    while (after < range_count && ranges[after].offset <= merged_end) {
         uint64_t range_end = 0;
         if (!add_u64(ranges[after].offset, ranges[after].bytes,
                      &range_end) ||
@@ -1793,30 +1802,88 @@ bool ds4_laguna_page_range_union_insert(
     }
 
     const size_t replaced_count = after - first;
-    size_t new_count = 0;
+    size_t resulting_count = 0;
     if (replaced_count == 0) {
-        if (count >= range_capacity) return false;
-        new_count = count + 1u;
+        if (range_count >= range_capacity) return false;
+        resulting_count = range_count + 1u;
     } else {
-        new_count = count - replaced_count + 1u;
+        resulting_count = range_count - replaced_count + 1u;
     }
-    if (new_count > range_capacity) return false;
+    if (resulting_count > range_capacity) return false;
 
     const uint64_t merged_bytes = merged_end - merged_start;
     if (replaced_bytes > merged_bytes) return false;
-    const uint64_t delta_bytes = merged_bytes - replaced_bytes;
-    const size_t suffix_count = count - after;
+    const size_t suffix_count = range_count - after;
     if (suffix_count > SIZE_MAX / sizeof(ranges[0])) return false;
 
-    if (suffix_count != 0) {
-        memmove(&ranges[first + 1u], &ranges[after],
+    plan.first = first;
+    plan.after = after;
+    plan.resulting_count = resulting_count;
+    plan.merged_start = merged_start;
+    plan.merged_bytes = merged_bytes;
+    plan.newly_unique_bytes = merged_bytes - replaced_bytes;
+    plan.has_eligible_interval = true;
+    *out = plan;
+    return true;
+}
+
+bool ds4_laguna_page_range_union_preview(
+        const ds4_laguna_page_range *ranges,
+        size_t range_count,
+        size_t range_capacity,
+        uint64_t page_size,
+        uint64_t raw_offset,
+        uint64_t raw_bytes,
+        size_t *resulting_range_count,
+        uint64_t *newly_unique_bytes,
+        uint64_t *newly_unique_pages) {
+    if (!resulting_range_count || !newly_unique_bytes ||
+        !newly_unique_pages) {
+        return false;
+    }
+    ds4_laguna_page_range_insert_plan plan;
+    if (!page_range_union_insert_plan(ranges, range_count, range_capacity,
+                                      page_size, raw_offset, raw_bytes,
+                                      &plan)) {
+        return false;
+    }
+    *resulting_range_count = plan.resulting_count;
+    *newly_unique_bytes = plan.newly_unique_bytes;
+    *newly_unique_pages = plan.newly_unique_bytes / page_size;
+    return true;
+}
+
+bool ds4_laguna_page_range_union_insert(
+        ds4_laguna_page_range *ranges,
+        size_t *range_count,
+        size_t range_capacity,
+        uint64_t page_size,
+        uint64_t raw_offset,
+        uint64_t raw_bytes,
+        uint64_t *newly_unique_bytes,
+        uint64_t *newly_unique_pages) {
+    if (!range_count || !newly_unique_bytes || !newly_unique_pages) {
+        return false;
+    }
+    ds4_laguna_page_range_insert_plan plan;
+    if (!page_range_union_insert_plan(ranges, *range_count, range_capacity,
+                                      page_size, raw_offset, raw_bytes,
+                                      &plan)) {
+        return false;
+    }
+
+    const size_t suffix_count = *range_count - plan.after;
+    if (plan.has_eligible_interval && suffix_count != 0) {
+        memmove(&ranges[plan.first + 1u], &ranges[plan.after],
                 suffix_count * sizeof(ranges[0]));
     }
-    ranges[first].offset = merged_start;
-    ranges[first].bytes = merged_bytes;
-    *range_count = new_count;
-    *newly_unique_bytes = delta_bytes;
-    *newly_unique_pages = delta_bytes / page_size;
+    if (plan.has_eligible_interval) {
+        ranges[plan.first].offset = plan.merged_start;
+        ranges[plan.first].bytes = plan.merged_bytes;
+    }
+    *range_count = plan.resulting_count;
+    *newly_unique_bytes = plan.newly_unique_bytes;
+    *newly_unique_pages = plan.newly_unique_bytes / page_size;
     return true;
 }
 

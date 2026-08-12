@@ -304,6 +304,23 @@ bool ds4_laguna_full_page_union(
     size_t *output_count,
     uint64_t *output_bytes);
 
+/* Preview one insertion into a canonical caller-owned union of full pages.
+ * The raw interval is rounded inward exactly as it is by the commit API.
+ * Success returns the resulting count and newly covered bytes/pages without
+ * mutating the range array. Failure leaves the array and all outputs
+ * unchanged. This allocation-free preflight lets callers establish capacity
+ * across multiple unions before committing any of them. */
+bool ds4_laguna_page_range_union_preview(
+    const ds4_laguna_page_range *ranges,
+    size_t range_count,
+    size_t range_capacity,
+    uint64_t page_size,
+    uint64_t raw_offset,
+    uint64_t raw_bytes,
+    size_t *resulting_range_count,
+    uint64_t *newly_unique_bytes,
+    uint64_t *newly_unique_pages);
+
 /* Insert one raw source interval into a canonical caller-owned union of full
  * pages. The raw interval is rounded inward before insertion. On success the
  * range array remains sorted, disjoint, and non-adjacent; the two delta

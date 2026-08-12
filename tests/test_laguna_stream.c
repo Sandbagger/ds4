@@ -3441,6 +3441,80 @@ static void test_incremental_page_union(void) {
           "missing fixed storage is rejected without output mutation");
 }
 
+static void test_incremental_page_union_preview(void) {
+    ds4_laguna_page_range ranges[3] = {
+        { 4096u, 4096u },
+        { 16384u, 4096u },
+        { UINT64_MAX, UINT64_MAX },
+    };
+    ds4_laguna_page_range before[3];
+    memcpy(before, ranges, sizeof(before));
+    size_t count = 2u;
+    size_t resulting_count = SIZE_MAX;
+    uint64_t new_bytes = UINT64_MAX;
+    uint64_t new_pages = UINT64_MAX;
+
+    CHECK(ds4_laguna_page_range_union_preview(
+              ranges, count, 3u, 4096u, 8192u, 8192u,
+              &resulting_count, &new_bytes, &new_pages) &&
+              count == 2u && memcmp(ranges, before, sizeof(ranges)) == 0 &&
+              resulting_count == 1u && new_bytes == 8192u &&
+              new_pages == 2u,
+          "preview reports an exact merge plan without mutating caller state");
+
+    ds4_laguna_page_range committed[3];
+    memcpy(committed, ranges, sizeof(committed));
+    size_t committed_count = count;
+    uint64_t committed_bytes = UINT64_MAX;
+    uint64_t committed_pages = UINT64_MAX;
+    CHECK(ds4_laguna_page_range_union_insert(
+              committed, &committed_count, 3u, 4096u, 8192u, 8192u,
+              &committed_bytes, &committed_pages) &&
+              committed_count == resulting_count &&
+              committed_bytes == new_bytes && committed_pages == new_pages &&
+              committed[0].offset == 4096u &&
+              committed[0].bytes == 16384u &&
+              memcmp(ranges, before, sizeof(ranges)) == 0,
+          "preview count and deltas exactly match the subsequent commit");
+
+    resulting_count = 31u;
+    new_bytes = 37u;
+    new_pages = 41u;
+    CHECK(!ds4_laguna_page_range_union_preview(
+               ranges, count, 2u, 4096u, 24576u, 4096u,
+               &resulting_count, &new_bytes, &new_pages) &&
+              count == 2u && memcmp(ranges, before, sizeof(ranges)) == 0 &&
+              resulting_count == 31u && new_bytes == 37u &&
+              new_pages == 41u,
+          "preview capacity failure leaves ranges, count, and outputs unchanged");
+
+    ds4_laguna_page_range invalid[2] = {
+        { 4096u, 4096u }, { 8192u, 4096u },
+    };
+    ds4_laguna_page_range invalid_before[2];
+    memcpy(invalid_before, invalid, sizeof(invalid));
+    resulting_count = 43u;
+    new_bytes = 47u;
+    new_pages = 53u;
+    CHECK(!ds4_laguna_page_range_union_preview(
+               invalid, 2u, 2u, 4096u, 0u, 0u,
+               &resulting_count, &new_bytes, &new_pages) &&
+              memcmp(invalid, invalid_before, sizeof(invalid)) == 0 &&
+              resulting_count == 43u && new_bytes == 47u &&
+              new_pages == 53u,
+          "preview rejects non-canonical input transactionally");
+
+    resulting_count = SIZE_MAX;
+    new_bytes = UINT64_MAX;
+    new_pages = UINT64_MAX;
+    CHECK(ds4_laguna_page_range_union_preview(
+              ranges, count, 3u, 4096u, 20481u, 1024u,
+              &resulting_count, &new_bytes, &new_pages) &&
+              resulting_count == count && new_bytes == 0 && new_pages == 0 &&
+              memcmp(ranges, before, sizeof(ranges)) == 0,
+          "preview reports an inward-rounded no-op without mutation");
+}
+
 static const ds4_laguna_page_advice_errno_bucket *find_errno_bucket(
         const ds4_laguna_page_advice_counters *counters,
         int error_number) {
@@ -3576,6 +3650,7 @@ static void test_page_source_charge(void) {
 static void test_page_ranges(void) {
     test_inward_page_union();
     test_incremental_page_union();
+    test_incremental_page_union_preview();
     test_page_advice_counters();
     test_page_source_charge();
 }

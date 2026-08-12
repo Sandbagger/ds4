@@ -1712,6 +1712,114 @@ bool ds4_laguna_full_page_union(
     return true;
 }
 
+bool ds4_laguna_page_range_union_insert(
+        ds4_laguna_page_range *ranges,
+        size_t *range_count,
+        size_t range_capacity,
+        uint64_t page_size,
+        uint64_t raw_offset,
+        uint64_t raw_bytes,
+        uint64_t *newly_unique_bytes,
+        uint64_t *newly_unique_pages) {
+    if (!range_count || !newly_unique_bytes || !newly_unique_pages ||
+        !is_power_of_two(page_size) || *range_count > range_capacity ||
+        (range_capacity != 0 && !ranges)) {
+        return false;
+    }
+
+    const size_t count = *range_count;
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t current_end = 0;
+        if (ranges[i].bytes == 0 || ranges[i].offset % page_size != 0 ||
+            ranges[i].bytes % page_size != 0 ||
+            !add_u64(ranges[i].offset, ranges[i].bytes, &current_end) ||
+            (i != 0 && previous_end >= ranges[i].offset)) {
+            return false;
+        }
+        previous_end = current_end;
+    }
+
+    if (raw_bytes == 0) {
+        *newly_unique_bytes = 0;
+        *newly_unique_pages = 0;
+        return true;
+    }
+
+    uint64_t raw_end = 0;
+    if (!add_u64(raw_offset, raw_bytes, &raw_end)) return false;
+
+    uint64_t safe_start = raw_offset;
+    const uint64_t start_remainder = safe_start % page_size;
+    if (start_remainder != 0 &&
+        !add_u64(safe_start, page_size - start_remainder, &safe_start)) {
+        return false;
+    }
+    const uint64_t safe_end = raw_end - raw_end % page_size;
+    if (safe_start >= safe_end) {
+        *newly_unique_bytes = 0;
+        *newly_unique_pages = 0;
+        return true;
+    }
+
+    size_t first = 0;
+    while (first < count) {
+        uint64_t range_end = 0;
+        if (!add_u64(ranges[first].offset, ranges[first].bytes,
+                     &range_end)) {
+            return false;
+        }
+        if (range_end >= safe_start) break;
+        first++;
+    }
+
+    uint64_t merged_start = safe_start;
+    uint64_t merged_end = safe_end;
+    uint64_t replaced_bytes = 0;
+    size_t after = first;
+    while (after < count && ranges[after].offset <= merged_end) {
+        uint64_t range_end = 0;
+        if (!add_u64(ranges[after].offset, ranges[after].bytes,
+                     &range_end) ||
+            !add_u64(replaced_bytes, ranges[after].bytes,
+                     &replaced_bytes)) {
+            return false;
+        }
+        if (ranges[after].offset < merged_start) {
+            merged_start = ranges[after].offset;
+        }
+        if (range_end > merged_end) merged_end = range_end;
+        after++;
+    }
+
+    const size_t replaced_count = after - first;
+    size_t new_count = 0;
+    if (replaced_count == 0) {
+        if (count >= range_capacity) return false;
+        new_count = count + 1u;
+    } else {
+        new_count = count - replaced_count + 1u;
+    }
+    if (new_count > range_capacity) return false;
+
+    const uint64_t merged_bytes = merged_end - merged_start;
+    if (replaced_bytes > merged_bytes) return false;
+    const uint64_t delta_bytes = merged_bytes - replaced_bytes;
+    const size_t suffix_count = count - after;
+    if (suffix_count > SIZE_MAX / sizeof(ranges[0])) return false;
+
+    if (suffix_count != 0) {
+        memmove(&ranges[first + 1u], &ranges[after],
+                suffix_count * sizeof(ranges[0]));
+    }
+    ranges[first].offset = merged_start;
+    ranges[first].bytes = merged_bytes;
+    *range_count = new_count;
+    *newly_unique_bytes = delta_bytes;
+    *newly_unique_pages = delta_bytes / page_size;
+    return true;
+}
+
 static uint64_t saturating_add_u64(uint64_t a, uint64_t b) {
     return b > UINT64_MAX - a ? UINT64_MAX : a + b;
 }

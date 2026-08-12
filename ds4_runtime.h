@@ -232,6 +232,12 @@ ds4_runtime_status ds4_runtime_tracker_checkpoint_external(
     uint64_t host_library_unattributed_bytes,
     uint64_t cuda_library_unattributed_bytes);
 
+/* Update only the model-source observation while retaining the most recent
+ * host- and CUDA-library unattributed observations in the same checkpoint. */
+ds4_runtime_status ds4_runtime_tracker_checkpoint_model_source(
+    ds4_runtime_tracker *tracker,
+    uint64_t model_source_resident_bytes);
+
 bool ds4_runtime_tracker_snapshot_copy(
     const ds4_runtime_tracker *tracker,
     ds4_runtime_snapshot *snapshot,

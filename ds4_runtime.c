@@ -695,6 +695,19 @@ ds4_runtime_status ds4_runtime_tracker_checkpoint_external(
     return status(tracker);
 }
 
+ds4_runtime_status ds4_runtime_tracker_checkpoint_model_source(
+        ds4_runtime_tracker *tracker,
+        uint64_t model_source_resident_bytes) {
+    if (!tracker || status(tracker) != DS4_RUNTIME_STATUS_OK) {
+        return DS4_RUNTIME_STATUS_UNSAFE;
+    }
+    return ds4_runtime_tracker_checkpoint_external(
+        tracker,
+        model_source_resident_bytes,
+        tracker->report_current[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED],
+        tracker->report_current[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED]);
+}
+
 bool ds4_runtime_tracker_snapshot_copy(
         const ds4_runtime_tracker *tracker,
         ds4_runtime_snapshot *snapshot,

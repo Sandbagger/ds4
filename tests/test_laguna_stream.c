@@ -3322,6 +3322,125 @@ static void test_inward_page_union(void) {
           "exact adjacent, overlapping, and duplicate page ranges canonicalize");
 }
 
+static void test_incremental_page_union(void) {
+    ds4_laguna_page_range ranges[3];
+    memset(ranges, 0, sizeof(ranges));
+    size_t count = 0;
+    uint64_t new_bytes = UINT64_MAX;
+    uint64_t new_pages = UINT64_MAX;
+
+    CHECK(ds4_laguna_page_range_union_insert(
+              ranges, &count, 3u, 4096u, 1u, 8192u,
+              &new_bytes, &new_pages) &&
+              count == 1u && ranges[0].offset == 4096u &&
+              ranges[0].bytes == 4096u && new_bytes == 4096u &&
+              new_pages == 1u,
+          "incremental union rounds each raw interval inward");
+    CHECK(ds4_laguna_page_range_union_insert(
+              ranges, &count, 3u, 4096u, 12288u, 4096u,
+              &new_bytes, &new_pages) &&
+              count == 2u && ranges[0].offset == 4096u &&
+              ranges[0].bytes == 4096u && ranges[1].offset == 12288u &&
+              ranges[1].bytes == 4096u && new_bytes == 4096u &&
+              new_pages == 1u,
+          "incremental union keeps disjoint ranges sorted");
+    CHECK(ds4_laguna_page_range_union_insert(
+              ranges, &count, 3u, 4096u, 8192u, 4096u,
+              &new_bytes, &new_pages) &&
+              count == 1u && ranges[0].offset == 4096u &&
+              ranges[0].bytes == 12288u && new_bytes == 4096u &&
+              new_pages == 1u,
+          "incremental union merges both adjacent neighbors");
+    CHECK(ds4_laguna_page_range_union_insert(
+              ranges, &count, 3u, 4096u, 4097u, 8190u,
+              &new_bytes, &new_pages) &&
+              count == 1u && ranges[0].offset == 4096u &&
+              ranges[0].bytes == 12288u && new_bytes == 0 &&
+              new_pages == 0,
+          "overlapping coverage reports only newly unique pages");
+    CHECK(ds4_laguna_page_range_union_insert(
+              ranges, &count, 3u, 4096u, 16384u, 2048u,
+              &new_bytes, &new_pages) &&
+              count == 1u && ranges[0].offset == 4096u &&
+              ranges[0].bytes == 12288u && new_bytes == 0 &&
+              new_pages == 0,
+          "a raw partial page contributes no eligible coverage");
+
+    ds4_laguna_page_range full[1] = {{ 4096u, 4096u }};
+    const ds4_laguna_page_range full_before[1] = {{ 4096u, 4096u }};
+    size_t full_count = 1u;
+    new_bytes = 17u;
+    new_pages = 19u;
+    CHECK(!ds4_laguna_page_range_union_insert(
+               full, &full_count, 1u, 4096u, 12288u, 4096u,
+               &new_bytes, &new_pages) &&
+              full_count == 1u &&
+              memcmp(full, full_before, sizeof(full)) == 0 &&
+              new_bytes == 17u && new_pages == 19u,
+          "capacity failure is transactional");
+    CHECK(ds4_laguna_page_range_union_insert(
+              full, &full_count, 1u, 4096u, 8192u, 4096u,
+              &new_bytes, &new_pages) &&
+              full_count == 1u && full[0].offset == 4096u &&
+              full[0].bytes == 8192u && new_bytes == 4096u &&
+              new_pages == 1u,
+          "a full union can still grow by merging in place");
+
+    const ds4_laguna_page_range canonical[2] = {
+        { 4096u, 4096u }, { 12288u, 4096u },
+    };
+    const struct {
+        ds4_laguna_page_range ranges[2];
+        size_t count;
+        size_t capacity;
+        uint64_t page_size;
+        uint64_t raw_offset;
+        uint64_t raw_bytes;
+    } invalid[] = {
+        {{{4096u, 4096u}, {8192u, 4096u}}, 2u, 2u,
+         4096u, 0u, 0u},
+        {{{4097u, 4096u}, {12288u, 4096u}}, 2u, 2u,
+         4096u, 0u, 0u},
+        {{{4096u, 4096u}, {12288u, 4096u}}, 3u, 2u,
+         4096u, 0u, 0u},
+        {{{4096u, 4096u}, {12288u, 4096u}}, 2u, 2u,
+         3000u, 0u, 0u},
+        {{{4096u, 4096u}, {12288u, 4096u}}, 2u, 2u,
+         4096u, UINT64_MAX - 1u, 4u},
+    };
+    bool invalid_transactional = true;
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        ds4_laguna_page_range candidate[2];
+        memcpy(candidate, invalid[i].ranges, sizeof(candidate));
+        ds4_laguna_page_range before[2];
+        memcpy(before, candidate, sizeof(before));
+        size_t candidate_count = invalid[i].count;
+        new_bytes = 23u;
+        new_pages = 29u;
+        if (ds4_laguna_page_range_union_insert(
+                candidate, &candidate_count, invalid[i].capacity,
+                invalid[i].page_size, invalid[i].raw_offset,
+                invalid[i].raw_bytes, &new_bytes, &new_pages) ||
+            candidate_count != invalid[i].count ||
+            memcmp(candidate, before, sizeof(candidate)) != 0 ||
+            new_bytes != 23u || new_pages != 29u) {
+            invalid_transactional = false;
+        }
+    }
+    CHECK(invalid_transactional,
+          "invalid canonical state, geometry, and overflow fail transactionally");
+
+    full_count = 1u;
+    memcpy(full, canonical, sizeof(full));
+    new_bytes = 31u;
+    new_pages = 37u;
+    CHECK(!ds4_laguna_page_range_union_insert(
+               NULL, &full_count, 1u, 4096u, 0u, 0u,
+               &new_bytes, &new_pages) &&
+              full_count == 1u && new_bytes == 31u && new_pages == 37u,
+          "missing fixed storage is rejected without output mutation");
+}
+
 static const ds4_laguna_page_advice_errno_bucket *find_errno_bucket(
         const ds4_laguna_page_advice_counters *counters,
         int error_number) {
@@ -3416,24 +3535,47 @@ static void test_page_source_charge(void) {
     tracker_fixture f;
     CHECK(tracker_fixture_init(&f),
           "page high-water tracker initializes with a source-residency bound");
+    CHECK(ds4_runtime_tracker_checkpoint_external(
+              &f.tracker, 0, 30u, 20u) == DS4_RUNTIME_STATUS_OK,
+          "page high-water tracker retains independent unattributed observations");
     CHECK(ds4_laguna_page_conservative_source_charge(
               100u, 70u, 40u, true, 80u, &charge) && charge == 100u &&
-              ds4_runtime_tracker_checkpoint_external(
-                  &f.tracker, charge, 0, 0) == DS4_RUNTIME_STATUS_OK &&
-              f.tracker.qualification_total_current == 100u &&
-              f.tracker.qualification_total_peak == 100u,
-          "the conservative pre-advice charge updates the simultaneous peak");
+              ds4_runtime_tracker_checkpoint_model_source(
+                  &f.tracker, charge) == DS4_RUNTIME_STATUS_OK &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] == 30u &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] == 20u &&
+              f.tracker.qualification_total_current == 150u &&
+              f.tracker.qualification_total_peak == 150u,
+          "the conservative pre-advice charge updates the simultaneous peak without erasing other observations");
     CHECK(ds4_laguna_page_conservative_source_charge(
               100u, 20u, 0, true, 10u, &charge) && charge == 20u &&
-              ds4_runtime_tracker_checkpoint_external(
-                  &f.tracker, charge, 0, 0) == DS4_RUNTIME_STATUS_OK &&
-              f.tracker.qualification_total_current == 20u &&
-              f.tracker.qualification_total_peak == 100u,
-          "a lower post-advice sample cannot erase the pre-advice high-water");
+              ds4_runtime_tracker_checkpoint_model_source(
+                  &f.tracker, charge) == DS4_RUNTIME_STATUS_OK &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] == 30u &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] == 20u &&
+              f.tracker.qualification_total_current == 70u &&
+              f.tracker.qualification_total_peak == 150u,
+          "a lower post-advice sample preserves the pre-advice high-water and other observations");
+    CHECK(ds4_runtime_tracker_checkpoint_model_source(
+              &f.tracker, 0) == DS4_RUNTIME_STATUS_OK &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] == 0 &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] == 30u &&
+              f.tracker.report_current[
+                  DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] == 20u &&
+              f.tracker.qualification_total_current == 50u &&
+              f.tracker.qualification_total_peak == 150u,
+          "source teardown clears only source residency and retains historical peak state");
 }
 
 static void test_page_ranges(void) {
     test_inward_page_union();
+    test_incremental_page_union();
     test_page_advice_counters();
     test_page_source_charge();
 }

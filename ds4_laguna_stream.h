@@ -304,6 +304,21 @@ bool ds4_laguna_full_page_union(
     size_t *output_count,
     uint64_t *output_bytes);
 
+/* Insert one raw source interval into a canonical caller-owned union of full
+ * pages. The raw interval is rounded inward before insertion. On success the
+ * range array remains sorted, disjoint, and non-adjacent; the two delta
+ * outputs report only coverage not already present. Failure leaves the range
+ * array, count, and delta outputs unchanged. No allocation is performed. */
+bool ds4_laguna_page_range_union_insert(
+    ds4_laguna_page_range *ranges,
+    size_t *range_count,
+    size_t range_capacity,
+    uint64_t page_size,
+    uint64_t raw_offset,
+    uint64_t raw_bytes,
+    uint64_t *newly_unique_bytes,
+    uint64_t *newly_unique_pages);
+
 /* `newly_touched_pages` and `newly_advised_pages` are deltas from the
  * caller-owned interval unions. Counters saturate rather than wrap. A
  * nonzero `error_number` records an attempted and failed call, coalesced by

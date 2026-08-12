@@ -1711,3 +1711,94 @@ bool ds4_laguna_full_page_union(
     *output_bytes = total;
     return true;
 }
+
+static uint64_t saturating_add_u64(uint64_t a, uint64_t b) {
+    return b > UINT64_MAX - a ? UINT64_MAX : a + b;
+}
+
+bool ds4_laguna_page_advice_note_touched(
+        ds4_laguna_page_advice_counters *counters,
+        uint64_t newly_touched_pages) {
+    if (!counters || counters->errno_bucket_count >
+                         DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY) {
+        return false;
+    }
+    counters->touched_eligible_unique_pages = saturating_add_u64(
+        counters->touched_eligible_unique_pages, newly_touched_pages);
+    return true;
+}
+
+bool ds4_laguna_page_advice_note_result(
+        ds4_laguna_page_advice_counters *counters,
+        uint64_t attempted_bytes,
+        uint64_t newly_advised_pages,
+        int error_number) {
+    if (!counters || error_number < 0 ||
+        (error_number != 0 && newly_advised_pages != 0) ||
+        counters->errno_bucket_count >
+            DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY) {
+        return false;
+    }
+
+    ds4_laguna_page_advice_counters next = *counters;
+    size_t bucket_index = next.errno_bucket_count;
+    if (error_number != 0) {
+        for (size_t i = 0; i < next.errno_bucket_count; i++) {
+            if (next.errno_buckets[i].error_number == error_number) {
+                bucket_index = i;
+                break;
+            }
+        }
+        if (bucket_index == next.errno_bucket_count) {
+            if (next.errno_bucket_count >=
+                DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY) {
+                return false;
+            }
+            next.errno_buckets[bucket_index].error_number = error_number;
+            next.errno_buckets[bucket_index].calls = 0;
+            next.errno_buckets[bucket_index].bytes = 0;
+            next.errno_bucket_count++;
+        }
+    }
+
+    next.attempted_calls = saturating_add_u64(next.attempted_calls, 1u);
+    next.attempted_bytes = saturating_add_u64(
+        next.attempted_bytes, attempted_bytes);
+    if (error_number == 0) {
+        next.successful_calls = saturating_add_u64(
+            next.successful_calls, 1u);
+        next.successful_bytes = saturating_add_u64(
+            next.successful_bytes, attempted_bytes);
+        next.advised_unique_pages = saturating_add_u64(
+            next.advised_unique_pages, newly_advised_pages);
+    } else {
+        next.failed_calls = saturating_add_u64(next.failed_calls, 1u);
+        next.failed_bytes = saturating_add_u64(
+            next.failed_bytes, attempted_bytes);
+        ds4_laguna_page_advice_errno_bucket *bucket =
+            &next.errno_buckets[bucket_index];
+        bucket->calls = saturating_add_u64(bucket->calls, 1u);
+        bucket->bytes = saturating_add_u64(bucket->bytes, attempted_bytes);
+    }
+    *counters = next;
+    return true;
+}
+
+bool ds4_laguna_page_conservative_source_charge(
+        uint64_t model_size_bytes,
+        uint64_t prior_post_advice_resident_bytes,
+        uint64_t touched_since_sample_unique_bytes,
+        bool exact_sample_available,
+        uint64_t exact_sample_bytes,
+        uint64_t *charge_out) {
+    if (!charge_out) return false;
+    uint64_t charge = saturating_add_u64(
+        prior_post_advice_resident_bytes,
+        touched_since_sample_unique_bytes);
+    if (exact_sample_available && exact_sample_bytes > charge) {
+        charge = exact_sample_bytes;
+    }
+    if (charge > model_size_bytes) charge = model_size_bytes;
+    *charge_out = charge;
+    return true;
+}

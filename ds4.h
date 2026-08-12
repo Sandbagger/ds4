@@ -642,6 +642,20 @@ uint64_t ds4_test_graph_context_memory_bytes(
         ds4_test_graph_family family,
         uint32_t context_tokens,
         uint32_t prefill_chunk);
+/* Exact Laguna graph sizing seam. Rows must be nonzero and within context;
+ * callers resolve any legacy/default policy before entering this boundary.
+ * Failure leaves `out` unchanged. */
+bool ds4_test_laguna_prefill_plan(
+        uint32_t context_tokens,
+        uint32_t configured_prefill_rows,
+        ds4_context_memory *out);
+/* Checked rows * bytes_per_row + fixed_bytes arithmetic used by the Laguna
+ * plan, estimator, and allocator. Failure leaves `out` unchanged. */
+bool ds4_test_checked_affine_bytes(
+        uint64_t rows,
+        uint64_t bytes_per_row,
+        uint64_t fixed_bytes,
+        uint64_t *out);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

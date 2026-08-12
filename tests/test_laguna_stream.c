@@ -2117,6 +2117,93 @@ static uint64_t sum_u64(const uint64_t *values, size_t count) {
     return sum;
 }
 
+static void test_prefill_plan(void) {
+    static const uint32_t context_rows = 32768u;
+    static const uint64_t expected_scratch_bytes = UINT64_C(1537052680);
+    static const uint64_t expected_kv_bytes = UINT64_C(1686110208);
+    static const uint64_t expected_total_bytes = UINT64_C(3223162888);
+
+    ds4_context_memory plan;
+    memset(&plan, 0, sizeof(plan));
+    CHECK(ds4_test_laguna_prefill_plan(context_rows, 1u, &plan) &&
+              plan.prefill_cap == 1u &&
+              plan.raw_cap == context_rows && plan.comp_cap == 512u &&
+              plan.raw_bytes == expected_kv_bytes &&
+              plan.scratch_bytes == UINT64_C(788860) &&
+              plan.total_bytes == UINT64_C(1686899068),
+          "one-row Laguna prefill plan prices exactly one scratch row");
+
+    memset(&plan, 0, sizeof(plan));
+    CHECK(ds4_test_laguna_prefill_plan(context_rows, 4096u, &plan),
+          "4K Laguna prefill plan is valid at 32K context");
+    CHECK(plan.prefill_cap == 4096u,
+          "4K Laguna prefill plan retains exactly 4096 allocated rows");
+    CHECK(plan.raw_cap == context_rows && plan.comp_cap == 512u,
+          "4K Laguna plan retains durable 32K full and 512-row SWA KV caps");
+    CHECK(plan.raw_bytes == expected_kv_bytes &&
+              plan.compressed_bytes == 0u,
+          "4K Laguna plan prices the exact durable KV allocation");
+    CHECK(plan.scratch_bytes == expected_scratch_bytes,
+          "4K Laguna plan prices the exact row-shaped scratch allocation");
+    CHECK(plan.total_bytes == expected_total_bytes &&
+              plan.total_bytes == plan.raw_bytes + plan.compressed_bytes +
+                                      plan.scratch_bytes,
+          "4K Laguna plan reconciles its exact KV and scratch total");
+
+    memset(&plan, 0, sizeof(plan));
+    CHECK(ds4_test_laguna_prefill_plan(
+              context_rows, context_rows, &plan) &&
+              plan.prefill_cap == context_rows &&
+              plan.scratch_bytes == UINT64_C(12293525512),
+          "context-sized Laguna prefill prices the explicit legacy boundary");
+
+    ds4_context_memory invalid_plan;
+    memset(&invalid_plan, 0xc3, sizeof(invalid_plan));
+    ds4_context_memory invalid_before;
+    memcpy(&invalid_before, &invalid_plan, sizeof(invalid_before));
+    CHECK(!ds4_test_laguna_prefill_plan(
+              context_rows, 0u, &invalid_plan) &&
+              memcmp(&invalid_plan, &invalid_before,
+                     sizeof(invalid_plan)) == 0,
+          "zero Laguna prefill rows are rejected without output mutation");
+
+    memset(&invalid_plan, 0xa5, sizeof(invalid_plan));
+    memcpy(&invalid_before, &invalid_plan, sizeof(invalid_before));
+    CHECK(!ds4_test_laguna_prefill_plan(0u, 1u, &invalid_plan) &&
+              memcmp(&invalid_plan, &invalid_before,
+                     sizeof(invalid_plan)) == 0,
+          "zero Laguna context is rejected without mutating the plan output");
+
+    memset(&invalid_plan, 0x5a, sizeof(invalid_plan));
+    memcpy(&invalid_before, &invalid_plan, sizeof(invalid_before));
+    CHECK(!ds4_test_laguna_prefill_plan(
+              context_rows, context_rows + 1u, &invalid_plan) &&
+              memcmp(&invalid_plan, &invalid_before,
+                     sizeof(invalid_plan)) == 0,
+          "Laguna prefill rows above context are rejected without output mutation");
+
+    uint64_t affine_bytes = UINT64_C(0x1122334455667788);
+    CHECK(ds4_test_checked_affine_bytes(
+              4096u, UINT64_C(375156), UINT64_C(413704),
+              &affine_bytes) &&
+              affine_bytes == expected_scratch_bytes,
+          "checked affine sizing reproduces the exact 4K Laguna scratch bytes");
+
+    affine_bytes = UINT64_C(0x8877665544332211);
+    const uint64_t multiply_before = affine_bytes;
+    CHECK(!ds4_test_checked_affine_bytes(
+              UINT64_MAX, 2u, 0u, &affine_bytes) &&
+              affine_bytes == multiply_before,
+          "checked affine sizing rejects multiplication overflow without output mutation");
+
+    affine_bytes = UINT64_C(0x1020304050607080);
+    const uint64_t addition_before = affine_bytes;
+    CHECK(!ds4_test_checked_affine_bytes(
+              1u, 1u, UINT64_MAX, &affine_bytes) &&
+              affine_bytes == addition_before,
+          "checked affine sizing rejects addition overflow without output mutation");
+}
+
 static void test_allocation_profiles(void) {
     const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
     const uint64_t tensor_range_count = UINT64_C(814);
@@ -3184,7 +3271,7 @@ static void test_allocation(void) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s --case "
-            "options|ledger|allocation|cache-policy|grouping "
+            "options|ledger|allocation|cache-policy|grouping|prefill-plan "
             "[--case ...]\n",
             argv0);
 }
@@ -3207,6 +3294,8 @@ int main(int argc, char **argv) {
             test_cache_policy();
         } else if (strcmp(argv[i + 1], "grouping") == 0) {
             test_grouping();
+        } else if (strcmp(argv[i + 1], "prefill-plan") == 0) {
+            test_prefill_plan();
         } else {
             usage(argv[0]);
             return 2;

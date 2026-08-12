@@ -39,6 +39,27 @@
 static int g_assertions;
 static int g_failures;
 
+/* Task 11 production seam.  This stays local until the implementation lands:
+ * the CUDA fixture must exercise the real Laguna graph allocator without a
+ * model, then return copy-only accounting from both sides of graph teardown. */
+#define DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT 48u
+typedef struct {
+    uint32_t context_tokens;
+    uint32_t graph_prefill_cap;
+    uint32_t session_prefill_cap;
+    uint32_t layer_count;
+    uint32_t cache_caps[DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT];
+    uint64_t scratch_tensor_bytes;
+    uint64_t kv_tensor_bytes;
+    ds4_runtime_snapshot allocated;
+    ds4_runtime_snapshot released;
+} ds4_test_laguna_prefill_allocation_snapshot;
+
+extern bool ds4_test_laguna_prefill_allocation(
+        uint32_t context_tokens,
+        uint32_t prefill_rows,
+        ds4_test_laguna_prefill_allocation_snapshot *out);
+
 /* Compile-only contract.  Runnable lifecycle behavior is driven separately
  * after this typed seam lands. */
 static void compile_typed_lifecycle_contract(
@@ -5212,6 +5233,102 @@ static int run_cache_unsafe_race(void) {
     return g_failures == 0 ? 0 : 1;
 }
 
+static int run_prefill_allocation(void) {
+    static const uint32_t context_tokens = 32768u;
+    static const uint32_t prefill_rows = 4096u;
+    static const uint32_t swa_rows = 512u;
+    static const uint64_t expected_scratch_bytes = UINT64_C(1537052680);
+    static const uint64_t expected_kv_bytes = UINT64_C(1686110208);
+    static const uint64_t expected_total_bytes = UINT64_C(3223162888);
+
+    ds4_test_laguna_prefill_allocation_snapshot invalid;
+    ds4_test_laguna_prefill_allocation_snapshot invalid_before;
+    memset(&invalid, 0xa5, sizeof(invalid));
+    memcpy(&invalid_before, &invalid, sizeof(invalid));
+    CHECK(!ds4_test_laguna_prefill_allocation(
+              context_tokens, 0u, &invalid) &&
+              memcmp(&invalid, &invalid_before, sizeof(invalid)) == 0,
+          "zero compact prefill rows are rejected before output mutation");
+
+    memset(&invalid, 0x5a, sizeof(invalid));
+    memcpy(&invalid_before, &invalid, sizeof(invalid));
+    CHECK(!ds4_test_laguna_prefill_allocation(
+              context_tokens, context_tokens + 1u, &invalid) &&
+              memcmp(&invalid, &invalid_before, sizeof(invalid)) == 0,
+          "prefill rows beyond context are rejected before output mutation");
+
+    ds4_test_laguna_prefill_allocation_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    CHECK(ds4_test_laguna_prefill_allocation(
+              context_tokens, prefill_rows, &snapshot),
+          "model-free compact Laguna graph allocation succeeds on CUDA");
+    CHECK(snapshot.context_tokens == context_tokens &&
+              snapshot.graph_prefill_cap == prefill_rows &&
+              snapshot.session_prefill_cap == prefill_rows,
+          "compact graph and synthetic session retain the planned 4K cap");
+    CHECK(snapshot.scratch_tensor_bytes == expected_scratch_bytes &&
+              snapshot.kv_tensor_bytes == expected_kv_bytes,
+          "actual CUDA tensor sizes match the exact 4K scratch and 32K KV plan");
+
+    uint32_t full_layer_count = 0;
+    uint32_t swa_layer_count = 0;
+    bool exact_layer_caps =
+        snapshot.layer_count ==
+            DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT;
+    for (uint32_t il = 0; il < snapshot.layer_count &&
+                              il < ARRAY_LEN(snapshot.cache_caps); il++) {
+        const uint32_t expected_cap =
+            (il % 4u) == 0 ? context_tokens : swa_rows;
+        exact_layer_caps = exact_layer_caps &&
+            snapshot.cache_caps[il] == expected_cap;
+        if (snapshot.cache_caps[il] == context_tokens) {
+            full_layer_count++;
+        } else if (snapshot.cache_caps[il] == swa_rows) {
+            swa_layer_count++;
+        }
+    }
+    CHECK(exact_layer_caps && full_layer_count == 12u &&
+              swa_layer_count == 36u,
+          "all 12 full-attention and 36 SWA layers retain exact KV caps");
+
+    bool allocated_categories_exact =
+        snapshot.allocated.violation == DS4_RUNTIME_VIOLATION_NONE &&
+        snapshot.allocated.active_record_count == 124u;
+    bool released_categories_exact =
+        snapshot.released.violation == DS4_RUNTIME_VIOLATION_NONE &&
+        snapshot.released.active_record_count == 0u;
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        const uint64_t expected =
+            i == DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH ?
+                expected_scratch_bytes :
+            i == DS4_RUNTIME_CATEGORY_KV_STATE ? expected_kv_bytes : 0u;
+        allocated_categories_exact = allocated_categories_exact &&
+            snapshot.allocated.category_current[i] == expected &&
+            snapshot.allocated.category_peak[i] == expected;
+        released_categories_exact = released_categories_exact &&
+            snapshot.released.category_current[i] == 0u &&
+            snapshot.released.category_peak[i] == expected;
+    }
+    CHECK(allocated_categories_exact &&
+              snapshot.allocated.owned_total_current ==
+                  expected_total_bytes &&
+              snapshot.allocated.owned_total_peak == expected_total_bytes &&
+              snapshot.allocated.qualification_total_current ==
+                  expected_total_bytes &&
+              snapshot.allocated.qualification_total_peak ==
+                  expected_total_bytes,
+          "live tracker charges every graph tensor to exact scratch and KV categories");
+    CHECK(released_categories_exact &&
+              snapshot.released.owned_total_current == 0u &&
+              snapshot.released.owned_total_peak == expected_total_bytes &&
+              snapshot.released.qualification_total_current == 0u &&
+              snapshot.released.qualification_total_peak ==
+                  expected_total_bytes,
+          "graph teardown clears current ownership while retaining exact peaks");
+
+    return g_failures == 0 ? 0 : 1;
+}
+
 static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --case "
@@ -5221,7 +5338,8 @@ static void usage(const char *program) {
             "model-teardown-reconcile-unsafe|"
             "model-cleanup-release-unsafe|"
             "model-teardown-second-recoverable|cache-validation|cache-io|"
-            "cache-faults|cache-unsafe|cache-unsafe-race\n",
+            "cache-faults|cache-unsafe|cache-unsafe-race|"
+            "prefill-allocation\n",
             program);
 }
 
@@ -5263,6 +5381,8 @@ int main(int argc, char **argv) {
         rc = run_cache_unsafe();
     } else if (strcmp(argv[2], "cache-unsafe-race") == 0) {
         rc = run_cache_unsafe_race();
+    } else if (strcmp(argv[2], "prefill-allocation") == 0) {
+        rc = run_prefill_allocation();
     } else {
         usage(argv[0]);
         return 2;

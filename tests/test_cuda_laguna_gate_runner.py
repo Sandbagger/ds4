@@ -340,6 +340,11 @@ class LagunaGateRunnerTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("cold_prepare_descriptor_from_plan", source)
         self.assertNotIn("/proc/self/fd/9", source)
+        verifier_identity_at = source.find("assert_retained_identity verifier")
+        startup_cold_at = source.find("cold_prepare_exact_fd stream-startup")
+        stream_cases_at = source.find("stream_cases=(")
+        self.assertGreater(startup_cold_at, verifier_identity_at)
+        self.assertGreater(stream_cases_at, startup_cold_at)
         for label, child_fragment in (
             ("model-streamed-short", "--mode streamed --case short"),
             (
@@ -401,6 +406,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 [(record["role"], record["case"]) for record in records],
                 [
                     ("verifier", None),
+                    ("coldprep", "stream-startup"),
                     *[("stream", case) for case in expected_stream_cases],
                     ("coldprep", "model-streamed-short"),
                     ("model", "short"),
@@ -408,6 +414,19 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     ("model", "prefill-8192"),
                     ("coldprep", "model-streamed-warm-stability"),
                     ("model", "warm-stability"),
+                ],
+            )
+            self.assertEqual(
+                [
+                    record["case"]
+                    for record in records
+                    if record["role"] == "coldprep"
+                ],
+                [
+                    "stream-startup",
+                    "model-streamed-short",
+                    "model-streamed-prefill-8192",
+                    "model-streamed-warm-stability",
                 ],
             )
             for record in records:

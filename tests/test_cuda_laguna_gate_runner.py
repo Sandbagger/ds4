@@ -112,6 +112,7 @@ def main():
             "startup",
             "teardown-unsafe",
             "model-startup",
+            "model-page-advice",
             "model-teardown-unsafe",
             "prefill-allocation",
         }
@@ -166,8 +167,8 @@ def main():
         )
     if (
         role == "stream"
-        and case == "startup"
-        and mutation == "seek-after-stream-startup"
+        and case == "model-page-advice"
+        and mutation == "seek-after-model-page-advice"
     ):
         os.lseek(9, 7, os.SEEK_SET)
 
@@ -701,6 +702,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     ("stream", "startup"),
                     ("stream", "teardown-unsafe"),
                     ("stream", "model-startup"),
+                    ("stream", "model-page-advice"),
                     ("stream", "model-teardown-unsafe"),
                     ("stream", "prefill-allocation"),
                 ],
@@ -774,7 +776,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 json.loads(line)
                 for line in timeout_log.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(records), 10)
+            self.assertEqual(len(records), 11)
             verifier = records[0]
             self.assertEqual(verifier["kill_after"], "5s")
             self.assertEqual(verifier["duration"], "180s")
@@ -815,7 +817,12 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     continue
                 with self.subTest(selector=record["selector"]):
                     self.assertEqual(record["kill_after"], "5s")
-                    self.assertEqual(record["duration"], "60s")
+                    expected_duration = (
+                        "900s"
+                        if record["selector"] == "stream:model-page-advice"
+                        else "60s"
+                    )
+                    self.assertEqual(record["duration"], expected_duration)
 
     def test_c7_bounds_a_hanging_child_and_stops_before_later_children(
         self,
@@ -832,7 +839,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
             ) = self.stage_c7_fixture(temporary_root)
             original_status = model.stat()
             timeout_log = Path(environment["LAGUNA_FAKE_TIMEOUT_LOG"])
-            hanging_role = "stream:teardown-unsafe"
+            hanging_role = "stream:model-page-advice"
             environment["LAGUNA_FAKE_HANG_ROLE"] = hanging_role
             environment["LAGUNA_FAKE_TIMEOUT_ROLE"] = hanging_role
 
@@ -858,6 +865,8 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     ("model", "prefill-8192"),
                     ("model", None),
                     ("stream", "startup"),
+                    ("stream", "teardown-unsafe"),
+                    ("stream", "model-startup"),
                 ],
                 "the timed-out child and every later child must not complete",
             )
@@ -877,14 +886,14 @@ class LagunaGateRunnerTest(unittest.TestCase):
             )
             timeout_record = selected[0]
             self.assertEqual(timeout_record["kill_after"], "5s")
-            self.assertEqual(timeout_record["duration"], "60s")
+            self.assertEqual(timeout_record["duration"], "900s")
             self.assertEqual(
                 Path(timeout_record["command"][0]).name,
                 "test_cuda_laguna_stream",
             )
             self.assertEqual(
                 timeout_record["command"][1:],
-                ["--case", "teardown-unsafe"],
+                ["--case", "model-page-advice"],
             )
             self.assertEqual(timeout_record["fd"], 9)
             self.assertEqual(timeout_record["device"], original_status.st_dev)
@@ -903,7 +912,7 @@ class LagunaGateRunnerTest(unittest.TestCase):
                 temporary_root
             )
             environment["LAGUNA_FAKE_MUTATION"] = (
-                "seek-after-stream-startup"
+                "seek-after-model-page-advice"
             )
 
             completed = self.run_runner(
@@ -915,7 +924,8 @@ class LagunaGateRunnerTest(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 2, completed.stderr)
             self.assertIn(
-                "retained descriptor identity changed after stream-startup",
+                "retained descriptor identity changed after "
+                "stream-model-page-advice",
                 completed.stderr,
             )
             records = [
@@ -931,8 +941,11 @@ class LagunaGateRunnerTest(unittest.TestCase):
                     ("model", "prefill-8192"),
                     ("model", None),
                     ("stream", "startup"),
+                    ("stream", "teardown-unsafe"),
+                    ("stream", "model-startup"),
+                    ("stream", "model-page-advice"),
                 ],
-                "offset drift must stop the gate before unsafe teardown",
+                "offset drift must stop the gate before the next stream child",
             )
 
     def test_resident_rejects_each_self_test_variable_before_opening_fd9(self) -> None:

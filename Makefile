@@ -51,7 +51,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-resident test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-resident test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) -I. -c -o $@ $<
@@ -117,6 +117,7 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make test-cuda-laguna-resident  Run the pinned Poolside resident-CUDA oracle"
+	@echo "  make test-cuda-laguna-model-page-advice DS4_TEST_MODEL=/abs/model.gguf  Run exact-inode page-disposal qualification"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
@@ -500,6 +501,17 @@ test-cuda-laguna-stream: tests/test_cuda_laguna_stream
 	timeout 60s ./tests/test_cuda_laguna_stream --case create-unwind-unsafe
 	timeout 60s ./tests/test_cuda_laguna_stream --case teardown-unsafe
 
+# Model-bearing qualification is intentionally separate from the synthetic
+# stream suite: it cold-prepares and scans the exact GGUF inode and can take
+# several minutes on a 68 GB Laguna model.
+test-cuda-laguna-model-page-advice: tests/test_cuda_laguna_stream
+	@if [ "$(DS4_TEST_MODEL)" = ds4flash.gguf ]; then \
+		echo "error: set DS4_TEST_MODEL to the explicit Laguna GGUF path" >&2; \
+		exit 2; \
+	fi
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" timeout --kill-after=5s 900s \
+		./tests/test_cuda_laguna_stream --case model-page-advice
+
 export DS4_TEST_MODEL
 export LAGUNA_TOKENIZER_RUNTIME_COMMIT
 
@@ -517,6 +529,9 @@ endif
 ifeq ($(UNAME_S),Darwin)
 test-cuda-laguna-c7:
 	@echo "error: test-cuda-laguna-c7 is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-laguna-model-page-advice:
+	@echo "error: test-cuda-laguna-model-page-advice is unsupported; requires CUDA on Linux" >&2; exit 2
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

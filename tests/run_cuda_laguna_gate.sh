@@ -210,6 +210,9 @@ if [ "$mode" = c7 ]; then
     timeout --kill-after=5s 60s "$stream_child" --case model-startup
     assert_retained_identity stream-model-startup
 
+    timeout --kill-after=5s 900s "$stream_child" --case model-page-advice
+    assert_retained_identity stream-model-page-advice
+
     timeout --kill-after=5s 60s "$stream_child" --case model-teardown-unsafe
     assert_retained_identity stream-model-teardown-unsafe
 

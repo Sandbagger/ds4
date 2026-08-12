@@ -5773,6 +5773,38 @@ static bool nvml_snapshot_binding_equal(
         strcmp(a->device_uuid, b->device_uuid) == 0;
 }
 
+static int run_nvml_fd_stability(void) {
+    ds4_gpu_nvml_inventory_snapshot warmup;
+    memset(&warmup, 0, sizeof(warmup));
+    const bool warmup_captured =
+        ds4_gpu_nvml_inventory_capture(&warmup) != 0;
+    CHECK(warmup_captured && nvml_snapshot_contract(&warmup),
+          "NVML descriptor stability warmup captures a valid inventory");
+    if (!warmup_captured || !nvml_snapshot_contract(&warmup)) return 1;
+
+    const int fd_baseline = open_fd_count();
+    CHECK(fd_baseline > 0,
+          "NVML descriptor stability records the post-warmup baseline");
+    if (fd_baseline <= 0) return 1;
+
+    bool captures_valid = true;
+    bool descriptors_stable = true;
+    for (unsigned iteration = 0; iteration < 4u; iteration++) {
+        ds4_gpu_nvml_inventory_snapshot repeated;
+        memset(&repeated, 0, sizeof(repeated));
+        if (!ds4_gpu_nvml_inventory_capture(&repeated) ||
+            !nvml_snapshot_binding_equal(&warmup, &repeated)) {
+            captures_valid = false;
+        }
+        if (open_fd_count() != fd_baseline) descriptors_stable = false;
+    }
+    CHECK(captures_valid,
+          "repeated NVML captures preserve the warmed inventory binding");
+    CHECK(descriptors_stable,
+          "repeated NVML captures preserve the post-warmup descriptor count");
+    return g_failures == 0 ? 0 : 1;
+}
+
 static int hexadecimal_nibble(char byte) {
     if (byte >= '0' && byte <= '9') return byte - '0';
     if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
@@ -6941,7 +6973,8 @@ static void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --case CASE [--case CASE ...]\n"
             "Cases: "
-            "startup|create-unwind-unsafe|teardown-unsafe|"
+            "startup|nvml-fd-stability|"
+            "create-unwind-unsafe|teardown-unsafe|"
             "model-startup|model-create-unwind-unsafe|"
             "model-teardown-unsafe|"
             "model-teardown-reconcile-unsafe|"
@@ -6959,6 +6992,8 @@ static int run_session_pressure(void);
 static int run_named_case(const char *name) {
     if (strcmp(name, "startup") == 0) {
         return run_startup();
+    } else if (strcmp(name, "nvml-fd-stability") == 0) {
+        return run_nvml_fd_stability();
     } else if (strcmp(name, "create-unwind-unsafe") == 0) {
         return run_create_unwind_unsafe();
     } else if (strcmp(name, "teardown-unsafe") == 0) {

@@ -501,6 +501,7 @@ tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hoo
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-stream: tests/test_cuda_laguna_stream
+	timeout 60s ./tests/test_cuda_laguna_stream --case nvml-fd-stability
 	timeout 60s ./tests/test_cuda_laguna_stream --case startup
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-validation
 	timeout 60s ./tests/test_cuda_laguna_stream --case cache-io

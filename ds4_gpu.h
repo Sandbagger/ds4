@@ -375,6 +375,8 @@ typedef struct {
     uint64_t page_advice_state_bytes;
     uint64_t page_advice_touched_eligible_unique_bytes;
     uint64_t page_advice_touched_eligible_unique_pages;
+    uint64_t page_advice_mapping_touch_pages;
+    uint64_t page_advice_mapping_touch_bytes;
     uint64_t page_advice_advised_unique_bytes;
     uint64_t page_advice_advised_unique_pages;
     uint64_t page_advice_attempted_calls;
@@ -407,6 +409,7 @@ typedef struct {
     uint64_t page_advice_post_source_resident_bytes;
     uint64_t page_advice_upload_completed_sequence;
     uint64_t page_advice_precharge_sequence;
+    uint64_t page_advice_mapping_touch_sequence;
     uint64_t page_advice_attempt_sequence;
     uint64_t page_advice_post_sample_sequence;
     uint64_t page_advice_complete_sequence;

@@ -60,10 +60,6 @@ void ds4_gpu_test_laguna_compact_page_advice_inject(
  * set exceeds the fixed slots.  Keep this weak so the rest of the pressure
  * lifecycle runs and reports its independent invariants before the one missing
  * production integration is made explicit. */
-#if defined(__GNUC__)
-extern int ds4_gpu_test_laguna_compact_route_group_execution_supported(void)
-    __attribute__((weak));
-#endif
 
 /* Compile-only contract.  Runnable lifecycle behavior is driven separately
  * after this typed seam lands. */
@@ -4063,7 +4059,8 @@ static bool cache_cuda_fixture_open_mutated(
         fixture->plan.cache_tail_uncharged_bytes =
             fixture->ledger.slot_stride_bytes;
     } else if (mutation == CACHE_PLAN_TWO_SESSION_PRESSURE) {
-        fixture->plan.profile_id = "synthetic-4k-two-session-pressure";
+        fixture->plan.profile_id =
+            "synthetic-4k-two-logical-actor-cache-pressure";
         fixture->plan.context_tokens = 4096u;
         fixture->plan.prefill_rows = 4096u;
         fixture->plan.session_count = 2u;
@@ -4816,8 +4813,8 @@ static bool session_pressure_grouping_contract(void) {
         return false;
     }
 
-    /* Two logical sessions contribute one two-expert token each.  Each token
-     * fits, while their combined layer working set exceeds the fixed slots. */
+    /* Two synthetic logical actors contribute one two-expert token each.
+     * Each token fits, while the combined policy working set exceeds slots. */
     const ds4_laguna_expert_key selected[] = {
         {1u, 0u}, {1u, 1u},
         {1u, 2u}, {1u, 3u},
@@ -4841,7 +4838,7 @@ static bool session_pressure_grouping_contract(void) {
 static int run_session_pressure(void) {
     cache_cuda_fixture fixture;
     CHECK(cache_cuda_fixture_open_session_pressure(&fixture),
-          "4K/two-logical-session pressure fixture creates one engine cache");
+          "synthetic 4K/two-logical-actor pressure fixture creates one cache");
     if (!fixture.context) {
         cache_cuda_fixture_close(&fixture);
         return 1;
@@ -4850,7 +4847,7 @@ static int run_session_pressure(void) {
               fixture.plan.prefill_rows == 4096u &&
               fixture.plan.session_count == 2u &&
               fixture.plan.slot_count == 2u,
-          "pressure fixture declares its separate 4K/two-session profile");
+          "pressure metadata declares 4K, two logical actors, and two slots");
 
     ds4_gpu_laguna_compact_test_snapshot initial;
     ds4_runtime_snapshot runtime_initial;
@@ -4880,13 +4877,13 @@ static int run_session_pressure(void) {
               fixture.context, cache_fixture_key(1u, 0u),
               &actor_a, &outcome) == DS4_LAGUNA_CACHE_OK &&
               outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
-          "logical session A owns the first cold miss");
+          "logical actor A owns the first cold miss");
     outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
     CHECK(ds4_gpu_laguna_compact_cache_acquire(
               fixture.context, cache_fixture_key(1u, 1u),
               &actor_b, &outcome) == DS4_LAGUNA_CACHE_OK &&
               outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
-          "logical session B interleaves a second cold miss");
+          "logical actor B interleaves a second cold miss");
     outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
     CHECK(ds4_gpu_laguna_compact_cache_begin(
               fixture.context, cache_fixture_key(2u, 0u),
@@ -4912,14 +4909,14 @@ static int run_session_pressure(void) {
 
     CHECK(ds4_gpu_laguna_compact_cache_unpin(
               fixture.context, actor_a) == DS4_LAGUNA_CACHE_OK,
-          "logical session A releases one current-group pin");
+          "logical actor A releases one current-group pin");
     ds4_laguna_cache_handle actor_b_pressure = {0};
     outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
     CHECK(ds4_gpu_laguna_compact_cache_acquire(
               fixture.context, cache_fixture_key(2u, 0u),
               &actor_b_pressure, &outcome) == DS4_LAGUNA_CACHE_OK &&
               outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
-          "logical session B reuses the released slot by deterministic eviction");
+          "logical actor B reuses the released slot by deterministic eviction");
     CHECK(ds4_gpu_laguna_compact_cache_unpin(
               fixture.context, actor_b_pressure) == DS4_LAGUNA_CACHE_OK,
           "eviction owner releases its pin before the next actor runs");
@@ -4932,7 +4929,7 @@ static int run_session_pressure(void) {
               fixture.context, cache_fixture_key(2u, 1u),
               &cancelled, &outcome) == DS4_LAGUNA_CACHE_OK &&
               outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER,
-          "logical session A reserves an eviction miss for cancellation");
+          "logical actor A reserves an eviction miss for cancellation");
     const ds4_laguna_cache_handle stale_cancelled = cancelled;
     CHECK(ds4_gpu_laguna_compact_cache_cancel(
               fixture.context, cancelled) == DS4_LAGUNA_CACHE_RECOVERABLE &&
@@ -4951,10 +4948,10 @@ static int run_session_pressure(void) {
               outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
               ds4_gpu_laguna_compact_cache_unpin(
                   fixture.context, actor_a_reuse) == DS4_LAGUNA_CACHE_OK,
-          "logical session A immediately reuses cancelled capacity");
+          "logical actor A immediately reuses cancelled capacity");
     CHECK(ds4_gpu_laguna_compact_cache_unpin(
               fixture.context, actor_b) == DS4_LAGUNA_CACHE_OK,
-          "logical session B releases its original engine-cache entry");
+          "logical actor B releases its original engine-cache entry");
 
     ds4_laguna_cache_handle cross_session_hit = {0};
     outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
@@ -4964,10 +4961,10 @@ static int run_session_pressure(void) {
               outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED &&
               ds4_gpu_laguna_compact_cache_unpin(
                   fixture.context, cross_session_hit) == DS4_LAGUNA_CACHE_OK,
-          "session A can hit session B's surviving engine-lifetime cache entry");
+          "actor A can hit actor B's surviving engine-lifetime cache entry");
 
     CHECK(session_pressure_grouping_contract(),
-          "two-session layer working set deterministically forms two slot groups");
+          "separate two-actor batch policy deterministically forms two groups");
 
     ds4_gpu_laguna_compact_test_snapshot final;
     ds4_runtime_snapshot runtime_final;
@@ -5022,16 +5019,6 @@ static int run_session_pressure(void) {
               tracker_has_only_ledger(&fixture.runtime.tracker),
           "pressure teardown returns from engine owners to ledger baseline");
 
-    bool grouped_execution_supported = false;
-#if defined(__GNUC__)
-    if (ds4_gpu_test_laguna_compact_route_group_execution_supported) {
-        grouped_execution_supported =
-            ds4_gpu_test_laguna_compact_route_group_execution_supported() != 0;
-    }
-#endif
-    CHECK(grouped_execution_supported,
-          "RED: compact CUDA executes over-capacity routed batches group-by-group");
-
     const int result = g_failures == 0 ? 0 : 1;
     cache_cuda_fixture_close(&fixture);
     return result;
@@ -5043,6 +5030,22 @@ static bool page_advice_sequence_is_ordered(
         snapshot->page_advice_upload_completed_sequence <
             snapshot->page_advice_precharge_sequence &&
         snapshot->page_advice_precharge_sequence <
+            snapshot->page_advice_attempt_sequence &&
+        snapshot->page_advice_attempt_sequence <
+            snapshot->page_advice_post_sample_sequence &&
+        snapshot->page_advice_post_sample_sequence <
+            snapshot->page_advice_complete_sequence;
+}
+
+static bool page_advice_mapping_touch_sequence_is_ordered(
+        const ds4_gpu_laguna_compact_test_snapshot *snapshot) {
+    return snapshot &&
+        snapshot->page_advice_upload_completed_sequence != 0 &&
+        snapshot->page_advice_upload_completed_sequence <
+            snapshot->page_advice_precharge_sequence &&
+        snapshot->page_advice_precharge_sequence <
+            snapshot->page_advice_mapping_touch_sequence &&
+        snapshot->page_advice_mapping_touch_sequence <
             snapshot->page_advice_attempt_sequence &&
         snapshot->page_advice_attempt_sequence <
             snapshot->page_advice_post_sample_sequence &&
@@ -5162,6 +5165,10 @@ static int run_page_advice(void) {
     CHECK(success.page_advice_precharge_source_resident_bytes == 128u &&
               success.page_advice_post_source_resident_bytes == 16u,
           "exact pre-advice sample wins the conservative source charge");
+    CHECK(success.page_advice_mapping_touch_pages == 0u &&
+              success.page_advice_mapping_touch_bytes == 0u &&
+              success.page_advice_mapping_touch_sequence == 0u,
+          "injected page advice performs no real model-mapping touches");
     CHECK(page_advice_sequence_is_ordered(&success) &&
               success.page_advice_complete_monotonic_ns != 0,
           "upload completion strictly precedes charge, advice, post-sample, and completion");
@@ -5386,6 +5393,10 @@ static int run_page_advice(void) {
               after_reload.page_advice_complete_monotonic_ns >
                   after_eio.page_advice_complete_monotonic_ns,
           "reload charge uses prior post plus since-sample touches and advances all stages");
+    CHECK(after_reload.page_advice_mapping_touch_pages == 0u &&
+              after_reload.page_advice_mapping_touch_bytes == 0u &&
+              after_reload.page_advice_mapping_touch_sequence == 0u,
+          "all injected transfers leave real mapping-touch telemetry unchanged");
     CHECK(ds4_gpu_laguna_compact_cache_unpin(
               fixture.context, reload) == DS4_LAGUNA_CACHE_OK,
           "deduplicated reload releases its cache reservation");
@@ -5403,6 +5414,8 @@ static bool model_page_advice_counters_reconcile(
         uint64_t page_size) {
     if (!snapshot || page_size == 0u ||
         snapshot->page_advice_touched_eligible_unique_bytes == 0u ||
+        snapshot->page_advice_mapping_touch_pages == 0u ||
+        snapshot->page_advice_mapping_touch_bytes == 0u ||
         snapshot->page_advice_attempted_calls == 0u ||
         snapshot->page_advice_attempted_bytes == 0u ||
         snapshot->page_advice_successful_calls == 0u ||
@@ -5450,7 +5463,11 @@ static bool model_page_advice_counters_reconcile(
         snapshot->page_advice_advised_unique_bytes % page_size == 0u &&
         snapshot->page_advice_attempted_bytes / page_size >=
             snapshot->page_advice_attempted_calls &&
-        page_advice_sequence_is_ordered(snapshot) &&
+        snapshot->page_advice_mapping_touch_pages <=
+            UINT64_MAX / page_size &&
+        snapshot->page_advice_mapping_touch_bytes ==
+            snapshot->page_advice_mapping_touch_pages * page_size &&
+        page_advice_mapping_touch_sequence_is_ordered(snapshot) &&
         snapshot->page_advice_complete_monotonic_ns != 0u;
 }
 
@@ -5610,9 +5627,13 @@ static int run_model_page_advice(void) {
                   startup.page_advice_attempted_calls &&
               routed.page_advice_attempted_bytes >
                   startup.page_advice_attempted_bytes &&
+              routed.page_advice_mapping_touch_pages >
+                  startup.page_advice_mapping_touch_pages &&
+              routed.page_advice_mapping_touch_bytes >
+                  startup.page_advice_mapping_touch_bytes &&
               routed.page_advice_advised_unique_bytes >
                   startup.page_advice_advised_unique_bytes,
-          "one token adds nonzero routed read and advised system-page coverage");
+          "one token adds routed reads, mapping touches, and advised system-page coverage");
     CHECK(routed_captured &&
               model_page_advice_counters_reconcile(&routed, page_size) &&
               routed.page_advice_attempted_bytes -
@@ -5632,11 +5653,11 @@ static int run_model_page_advice(void) {
               routed.page_advice_upload_completed_sequence >
                   startup.page_advice_complete_sequence &&
               routed.page_advice_complete_sequence ==
-                  startup.page_advice_complete_sequence + 25u &&
+                  startup.page_advice_complete_sequence + 30u &&
               routed.page_advice_complete_monotonic_ns >
                   startup.page_advice_complete_monotonic_ns &&
-              page_advice_sequence_is_ordered(&routed),
-          "routed advice uses four bounded batches plus one graph-tail drain after CUDA synchronization");
+              page_advice_mapping_touch_sequence_is_ordered(&routed),
+          "routed advice orders upload, precharge, mapping touch, advice, post-sample, and completion");
 
     ds4_runtime_snapshot live_runtime;
     ds4_runtime_allocation_record

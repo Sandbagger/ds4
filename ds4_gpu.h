@@ -169,6 +169,19 @@ ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
         ds4_gpu_laguna_compact *ctx);
 bool ds4_gpu_laguna_compact_ownership_pending(
         const ds4_runtime_tracker *tracker);
+
+/* Qualification barriers execute synchronously while the compact CUDA
+ * execution mutex is held.  READY runs after device synchronization and
+ * before the external inventory captures; RESULT/ACK completes after those
+ * captures but before the attributed sample commits or progress resumes. */
+typedef bool (*ds4_gpu_laguna_external_checkpoint_barrier_fn)(
+        void *userdata);
+typedef struct {
+    void *userdata;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_ready;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_result;
+} ds4_gpu_laguna_external_checkpoint_barrier;
+
 ds4_runtime_status ds4_gpu_laguna_compact_external_checkpoint(
         ds4_gpu_laguna_compact *ctx,
         const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
@@ -176,10 +189,15 @@ ds4_runtime_status ds4_gpu_laguna_compact_external_checkpoint(
             expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
         const uint8_t
             observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
         ds4_engine_laguna_external_checkpoint_observation *out);
-bool ds4_gpu_laguna_compact_runtime_counters(
+typedef bool (*ds4_gpu_laguna_runtime_snapshot_fn)(void *userdata);
+bool ds4_gpu_laguna_compact_runtime_snapshot(
         const ds4_gpu_laguna_compact *ctx,
-        ds4_runtime_wire_counters *out);
+        ds4_runtime_wire_counters *out,
+        bool *unsafe_out,
+        ds4_gpu_laguna_runtime_snapshot_fn capture,
+        void *userdata);
 
 /* Reserve one routed expert without performing SSD or CUDA work.  A cache hit
  * is returned already pinned.  LOAD_OWNER returns a lifecycle-bound LOADING

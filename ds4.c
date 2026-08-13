@@ -36466,6 +36466,13 @@ struct ds4_engine {
     ds4_runtime_tracker laguna_runtime_tracker;
     ds4_runtime_allocation_record
         laguna_runtime_records[DS4_LAGUNA_RUNTIME_RECORD_CAPACITY];
+    ds4_runtime_snapshot_context runtime_snapshot_context;
+    ds4_runtime_wire_snapshot_input runtime_snapshot_input;
+    pthread_mutex_t runtime_snapshot_mutex;
+    bool runtime_snapshot_mutex_initialized;
+    bool runtime_snapshot_ready;
+    ds4_qualification_control *qualification_control;
+    uint64_t qualification_checkpoint_sequence;
     uint64_t laguna_ledger_record_ids[3];
     bool laguna_ledger_records_live[3];
     uint64_t laguna_inventory_record_ids[
@@ -58974,6 +58981,56 @@ static int ds4_running_executable_identity(
     }
     return digest[2u * DS4_RUNTIME_BUILD_IDENTITY_BYTES] == '\0';
 }
+
+typedef struct {
+    ds4_engine *engine;
+    uint64_t sequence;
+    const char *failed_phase;
+    char error[256];
+} ds4_engine_qualification_barrier_state;
+
+static bool ds4_engine_qualification_sample_ready(void *userdata) {
+    ds4_engine_qualification_barrier_state *state =
+        (ds4_engine_qualification_barrier_state *)userdata;
+    if (!state || !state->engine ||
+        !state->engine->qualification_control) {
+        return false;
+    }
+    if (state->engine->qualification_checkpoint_sequence == UINT64_MAX) {
+        state->failed_phase = "sample-ready";
+        (void)snprintf(state->error, sizeof(state->error),
+                       "checkpoint sequence exhausted");
+        return false;
+    }
+    const uint64_t sequence =
+        state->engine->qualification_checkpoint_sequence + 1u;
+    if (ds4_qualification_control_begin_sample(
+            state->engine->qualification_control, sequence,
+            state->error, sizeof(state->error)) != 0) {
+        state->failed_phase = "sample-ready";
+        return false;
+    }
+    state->sequence = sequence;
+    return true;
+}
+
+static bool ds4_engine_qualification_sample_result(void *userdata) {
+    ds4_engine_qualification_barrier_state *state =
+        (ds4_engine_qualification_barrier_state *)userdata;
+    if (!state || !state->engine ||
+        !state->engine->qualification_control || state->sequence == 0u) {
+        return false;
+    }
+    if (ds4_qualification_control_finish_sample(
+            state->engine->qualification_control, state->sequence,
+            state->engine->model.fd,
+            state->error, sizeof(state->error)) != 0) {
+        state->failed_phase = "sample-result";
+        return false;
+    }
+    state->engine->qualification_checkpoint_sequence = state->sequence;
+    return true;
+}
 #endif
 
 ds4_runtime_status ds4_engine_laguna_external_checkpoint(
@@ -59011,9 +59068,29 @@ ds4_runtime_status ds4_engine_laguna_external_checkpoint(
         out->sample.failure = DS4_RUNTIME_EXTERNAL_FAILURE_INVALID_INPUT;
         return DS4_RUNTIME_STATUS_UNSAFE;
     }
-    return ds4_gpu_laguna_compact_external_checkpoint(
+    ds4_engine_qualification_barrier_state barrier_state = {
+        .engine = engine,
+    };
+    const ds4_gpu_laguna_external_checkpoint_barrier barrier = {
+        .userdata = &barrier_state,
+        .sample_ready = ds4_engine_qualification_sample_ready,
+        .sample_result = ds4_engine_qualification_sample_result,
+    };
+    const ds4_gpu_laguna_external_checkpoint_barrier *barrier_ptr =
+        engine->qualification_control ? &barrier : NULL;
+    const ds4_runtime_status status =
+        ds4_gpu_laguna_compact_external_checkpoint(
         engine->laguna_compact, pre_child,
-        expected_build_identity, observed_build_identity, out);
+        expected_build_identity, observed_build_identity,
+        barrier_ptr, out);
+    if (barrier_state.failed_phase) {
+        fprintf(stderr,
+                "ds4: qualification %s barrier failed: %s\n",
+                barrier_state.failed_phase,
+                barrier_state.error[0]
+                    ? barrier_state.error : "control protocol failure");
+    }
+    return status;
 #else
     (void)engine;
     (void)pre_child;
@@ -59021,6 +59098,73 @@ ds4_runtime_status ds4_engine_laguna_external_checkpoint(
     (void)out;
     return DS4_RUNTIME_STATUS_UNSAFE;
 #endif
+}
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+typedef struct {
+    ds4_engine *engine;
+    ds4_runtime_wire_snapshot_input *input;
+    ds4_runtime_wire_snapshot *out;
+    const bool *compact_unsafe;
+} ds4_engine_runtime_snapshot_capture;
+
+static bool ds4_engine_runtime_snapshot_capture_locked(void *userdata) {
+    ds4_engine_runtime_snapshot_capture *capture =
+        (ds4_engine_runtime_snapshot_capture *)userdata;
+    if (!capture || !capture->engine || !capture->input || !capture->out) {
+        return false;
+    }
+    if ((capture->compact_unsafe && *capture->compact_unsafe) ||
+        capture->engine->laguna_runtime_tracker.violation !=
+            DS4_RUNTIME_VIOLATION_NONE) {
+        capture->input->state = DS4_RUNTIME_WIRE_STATE_UNSAFE;
+    }
+    return ds4_runtime_wire_snapshot_capture(
+        &capture->engine->runtime_snapshot_context,
+        &capture->engine->laguna_runtime_tracker,
+        capture->input, capture->out);
+}
+#endif
+
+bool ds4_engine_runtime_snapshot(
+        ds4_engine *engine,
+        ds4_runtime_wire_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!engine || !out || !engine->runtime_snapshot_mutex_initialized ||
+        !engine->runtime_snapshot_ready ||
+        !engine->laguna_runtime_tracker_ready) {
+        return false;
+    }
+    if (pthread_mutex_lock(&engine->runtime_snapshot_mutex) != 0) {
+        return false;
+    }
+    bool ok = true;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_ROCM_BUILD)
+    ds4_runtime_wire_snapshot_input input = engine->runtime_snapshot_input;
+    bool compact_unsafe = false;
+    ds4_engine_runtime_snapshot_capture capture = {
+        .engine = engine,
+        .input = &input,
+        .out = out,
+        .compact_unsafe = &compact_unsafe,
+    };
+    if (!engine->laguna_compact ||
+        !ds4_gpu_laguna_compact_runtime_snapshot(
+            engine->laguna_compact, &input.counters, &compact_unsafe,
+            ds4_engine_runtime_snapshot_capture_locked, &capture)) {
+        ok = false;
+    }
+#else
+    ok = false;
+#endif
+    if (pthread_mutex_unlock(&engine->runtime_snapshot_mutex) != 0) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -60418,13 +60562,21 @@ static bool ds4_engine_prepare_laguna_compact_runtime(
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL);
+    const int rc = ds4_engine_open_internal(out, opt, NULL);
+    if (opt && opt->qualification_control_fd_set) {
+        close(opt->qualification_control_fd);
+    }
+    return rc;
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
-    return ds4_engine_open_internal(out, opt, gpu_cfg);
+    const int rc = ds4_engine_open_internal(out, opt, gpu_cfg);
+    if (opt && opt->qualification_control_fd_set) {
+        close(opt->qualification_control_fd);
+    }
+    return rc;
 }
 
 static int ds4_exact_graph_declaration_preflight(
@@ -61190,10 +61342,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    if (pthread_mutex_init(&e->runtime_snapshot_mutex, NULL) != 0) {
+        fprintf(stderr,
+                "ds4: failed to initialize runtime snapshot boundary\n");
+        free(e->directional_steering_file);
+        free(e);
+        return 1;
+    }
+    e->runtime_snapshot_mutex_initialized = true;
     if (e->exact_cache_session_limit != 0) {
         if (pthread_mutex_init(&e->exact_cache_session_mutex, NULL) != 0) {
             fprintf(stderr,
                     "ds4: failed to initialize exact-cache session safety gate\n");
+            pthread_mutex_destroy(&e->runtime_snapshot_mutex);
             free(e->directional_steering_file);
             free(e);
             return 1;
@@ -61201,6 +61362,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->exact_cache_session_mutex_initialized = true;
     }
     ds4_acquire_instance_lock();
+
+    if (opt->qualification_control_fd_set) {
+        char control_err[256] = {0};
+        const int control_rc = ds4_qualification_control_open(
+                &e->qualification_control,
+                opt->qualification_control_fd,
+                DS4_QUALIFICATION_CONTROL_DEFAULT_TIMEOUT_MS,
+                DS4_QUALIFICATION_CONTROL_MODEL_TIMEOUT_MS,
+                control_err, sizeof(control_err));
+        if (control_rc != 0) {
+            fprintf(stderr, "ds4: qualification control rejected: %s\n",
+                    control_err[0] ? control_err : "invalid control fd");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 2;
+        }
+    }
 
     if (opt->simulate_used_memory_bytes != 0 &&
         !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
@@ -61232,7 +61410,60 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only,
                opt->qualification_model_fd,
                opt->qualification_model_fd_set);
+    if (e->qualification_control) {
+        char control_err[256] = {0};
+        if (ds4_qualification_control_send_model_fd(
+                e->qualification_control, e->model.fd,
+                &(const ds4_runtime_file_identity){
+                    .device = e->model.identity.device,
+                    .inode = e->model.identity.inode,
+                    .size_bytes = e->model.identity.size_bytes,
+                    .mtime_ns = e->model.identity.mtime_ns,
+                },
+                control_err, sizeof(control_err)) != 0) {
+            fprintf(stderr,
+                    "ds4: qualification model descriptor rejected: %s\n",
+                    control_err[0] ? control_err : "control protocol failure");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 2;
+        }
+    }
     config_validate_model(&e->model);
+    if (opt->runtime_build_info) {
+        const char *runtime_model_id =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ?
+                "laguna-s-2.1" :
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
+                "glm-5.2" :
+            DS4_MODEL_VARIANT == DS4_VARIANT_PRO ?
+                "deepseek-v4-pro" : "deepseek-v4-flash";
+        const char *runtime_model_family =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ? "laguna" :
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ? "glm_dsa" :
+                "deepseek4";
+        if (!ds4_runtime_snapshot_context_init(
+                &e->runtime_snapshot_context, e->model.fd,
+                runtime_model_id, runtime_model_family)) {
+            fprintf(stderr,
+                    "ds4: cannot capture executable/model runtime identity\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 2;
+        }
+        e->runtime_snapshot_input.build = *opt->runtime_build_info;
+        e->runtime_snapshot_input.configured_context_tokens =
+            (uint32_t)opt->context_size;
+        e->runtime_snapshot_input.configured_prefill_chunk_tokens =
+            opt->prefill_chunk;
+        e->runtime_snapshot_input.configured_session_slots =
+            opt->session_slots != 0 ? opt->session_slots : 1u;
+        e->runtime_snapshot_input.configured_ssd_streaming =
+            opt->ssd_streaming;
+        e->runtime_snapshot_input.configured_ssd_streaming_cache_bytes =
+            opt->ssd_streaming_cache_bytes_set ?
+                opt->ssd_streaming_cache_bytes : 0u;
+    }
     e->laguna_compact_runtime =
         ds4_engine_laguna_compact_requested(e, opt);
     if (e->laguna_compact_runtime) {
@@ -62181,6 +62412,24 @@ graph_backend_ready:
     }
 #endif
 
+    if (e->laguna_compact_runtime && e->laguna_runtime_tracker_ready &&
+        e->runtime_snapshot_context.instance_id[0] != '\0') {
+        e->runtime_snapshot_input.state =
+            DS4_RUNTIME_WIRE_STATE_READY;
+        e->runtime_snapshot_input.effective_context_tokens =
+            e->laguna_allocation_plan.context_tokens;
+        e->runtime_snapshot_input.effective_prefill_chunk_tokens =
+            e->laguna_allocation_plan.prefill_rows;
+        e->runtime_snapshot_input.effective_session_slots =
+            e->laguna_allocation_plan.session_count;
+        e->runtime_snapshot_input.expert_cache_limit_bytes =
+            e->laguna_allocation_plan.effective_cache_limit_bytes;
+        e->runtime_snapshot_input.configured_prefill_rows =
+            opt->prefill_chunk;
+        e->runtime_snapshot_input.allocated_prefill_rows =
+            e->laguna_allocation_plan.prefill_rows;
+        e->runtime_snapshot_ready = true;
+    }
     if (!opt->inspect_only) {
         ds4_engine_print_startup_memory(e, opt->context_size);
     }
@@ -62780,6 +63029,14 @@ void ds4_engine_close(ds4_engine *e) {
         ds4_engine_laguna_retain_release_failure(
             "engine", "engine free");
         return;
+    }
+    if (e->qualification_control) {
+        ds4_qualification_control_close(e->qualification_control);
+        e->qualification_control = NULL;
+    }
+    if (e->runtime_snapshot_mutex_initialized) {
+        pthread_mutex_destroy(&e->runtime_snapshot_mutex);
+        e->runtime_snapshot_mutex_initialized = false;
     }
     ds4_release_instance_lock();
 #ifdef DS4_TEST_HOOKS

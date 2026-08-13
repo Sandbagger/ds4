@@ -469,6 +469,19 @@ typedef struct ds4_engine_laguna_external_checkpoint_observation {
     uint8_t observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
 } ds4_engine_laguna_external_checkpoint_observation;
 
+/* ds4_cuda.cu keeps a private copy of this backend ABI rather than including
+ * ds4_gpu.h, whose other declarations overlap the CUDA implementation's
+ * local types.  Keep these layouts byte-for-byte aligned with ds4_gpu.h. */
+typedef bool (*ds4_gpu_laguna_external_checkpoint_barrier_fn)(
+        void *userdata);
+typedef struct {
+    void *userdata;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_ready;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_result;
+} ds4_gpu_laguna_external_checkpoint_barrier;
+
+typedef bool (*ds4_gpu_laguna_runtime_snapshot_fn)(void *userdata);
+
 typedef enum {
     DS4_GPU_LAGUNA_DESTROY_OK = 0,
     DS4_GPU_LAGUNA_DESTROY_RECOVERABLE = 1,
@@ -3639,6 +3652,7 @@ static ds4_runtime_status cuda_laguna_external_checkpoint_finish(
         ds4_gpu_laguna_compact *ctx,
         uint64_t execution_epoch,
         const ds4_runtime_external_checkpoint_input *input,
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
         ds4_engine_laguna_external_checkpoint_observation *out) {
     std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
     if (!ctx || !out || ctx != &g_laguna_compact_storage ||
@@ -3650,12 +3664,40 @@ static ds4_runtime_status cuda_laguna_external_checkpoint_finish(
         ctx->active_execution_count == 0u) {
         return cuda_laguna_external_checkpoint_fail(ctx, out);
     }
+    if (barrier && !barrier->sample_result(barrier->userdata)) {
+        const ds4_runtime_status result =
+            cuda_laguna_external_checkpoint_fail(ctx, out);
+        ctx->active_execution_count--;
+        return result;
+    }
     const ds4_runtime_status result = input
         ? ds4_runtime_tracker_checkpoint_attributed(
               ctx->tracker, input, &out->sample)
         : cuda_laguna_external_checkpoint_fail(ctx, out);
     ctx->active_execution_count--;
     return result;
+}
+
+static bool cuda_laguna_external_barrier_valid(
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier) {
+    return !barrier ||
+        (barrier->sample_ready && barrier->sample_result);
+}
+
+static bool cuda_laguna_external_barrier_ready(
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier) {
+    return !barrier || barrier->sample_ready(barrier->userdata);
+}
+
+static ds4_runtime_status
+cuda_laguna_external_checkpoint_complete(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        const ds4_runtime_external_checkpoint_input *input,
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    return cuda_laguna_external_checkpoint_finish(
+        ctx, execution_epoch, input, barrier, out);
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -3706,6 +3748,7 @@ cuda_laguna_compact_external_checkpoint_device_zero(
             expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
         const uint8_t
             observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
         ds4_engine_laguna_external_checkpoint_observation *out) {
     if (out) memset(out, 0, sizeof(*out));
     if (!ctx || !frozen_pre_child || !expected_build_identity ||
@@ -3717,17 +3760,22 @@ cuda_laguna_compact_external_checkpoint_device_zero(
         g_laguna_compact_exec_mutex);
     uint64_t execution_epoch = 0u;
     if (!cuda_laguna_external_checkpoint_enter(ctx, &execution_epoch) ||
+        !cuda_laguna_external_barrier_valid(barrier) ||
         !cuda_laguna_nvml_snapshot_valid(frozen_pre_child) ||
         !cuda_laguna_nvml_snapshot_valid(&ctx->nvml_baseline)) {
         return execution_epoch != 0u
             ? cuda_laguna_external_checkpoint_finish(
-                  ctx, execution_epoch, NULL, out)
+                  ctx, execution_epoch, NULL, NULL, out)
             : cuda_laguna_external_checkpoint_fail(ctx, out);
     }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         (void)cudaGetLastError();
         return cuda_laguna_external_checkpoint_finish(
-            ctx, execution_epoch, NULL, out);
+            ctx, execution_epoch, NULL, NULL, out);
+    }
+    if (!cuda_laguna_external_barrier_ready(barrier)) {
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, NULL, out);
     }
 
     int injected = 0;
@@ -3741,8 +3789,8 @@ cuda_laguna_compact_external_checkpoint_device_zero(
         !cuda_laguna_nvml_inventory_capture_bound(
             ctx->nvml_baseline.device_uuid,
             &out->checkpoint_before)) {
-        return cuda_laguna_external_checkpoint_finish(
-            ctx, execution_epoch, NULL, out);
+        return cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, NULL, barrier, out);
     }
 
     const uint32_t own_pid = (uint32_t)getpid();
@@ -3764,8 +3812,8 @@ cuda_laguna_compact_external_checkpoint_device_zero(
             &identity_before) ||
         !cuda_laguna_compact_system_page_size(&page_size) ||
         ctx->model_size > UINT64_MAX - (page_size - 1u)) {
-        return cuda_laguna_external_checkpoint_finish(
-            ctx, execution_epoch, NULL, out);
+        return cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, NULL, barrier, out);
     }
     mapped_page_bytes =
         (ctx->model_size + page_size - 1u) & ~(page_size - 1u);
@@ -3786,8 +3834,8 @@ cuda_laguna_compact_external_checkpoint_device_zero(
              &out->checkpoint_after))) {
         (void)cudaGetLastError();
         free(smaps_text);
-        return cuda_laguna_external_checkpoint_finish(
-            ctx, execution_epoch, NULL, out);
+        return cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, NULL, barrier, out);
     }
 
     out->model_identity = ctx->model_identity;
@@ -3855,8 +3903,8 @@ cuda_laguna_compact_external_checkpoint_device_zero(
     input.model_source_mapped_page_bytes = mapped_page_bytes;
 
     const ds4_runtime_status result =
-        cuda_laguna_external_checkpoint_finish(
-            ctx, execution_epoch, &input, out);
+        cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, &input, barrier, out);
     free(smaps_text);
     return result;
 }
@@ -3869,6 +3917,7 @@ ds4_gpu_laguna_compact_external_checkpoint(
             expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
         const uint8_t
             observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
         ds4_engine_laguna_external_checkpoint_observation *out) {
     if (out) memset(out, 0, sizeof(*out));
     if (!ctx || !frozen_pre_child || !expected_build_identity ||
@@ -3882,7 +3931,7 @@ ds4_gpu_laguna_compact_external_checkpoint(
     const ds4_runtime_status result =
         cuda_laguna_compact_external_checkpoint_device_zero(
             ctx, frozen_pre_child, expected_build_identity,
-            observed_build_identity, out);
+            observed_build_identity, barrier, out);
     if (!cuda_laguna_checkpoint_device_scope_leave(&device_scope)) {
         memset(out, 0, sizeof(*out));
         return cuda_laguna_external_checkpoint_fail(ctx, out);
@@ -3915,15 +3964,20 @@ static void cuda_laguna_compact_cache_handle_clear(
     handle->lifecycle_epoch = 0;
 }
 
-static int cuda_laguna_compact_cache_active_locked(
+static int cuda_laguna_compact_cache_published_locked(
         const ds4_gpu_laguna_compact *ctx) {
     return ctx == &g_laguna_compact_storage && ctx->cache_policy_live &&
-        !ctx->cache_unsafe && ctx->cache_payload &&
-        ctx->lifecycle_epoch != 0 &&
+        ctx->cache_payload && ctx->lifecycle_epoch != 0 &&
         g_laguna_compact_published_epoch.load(
             std::memory_order_relaxed) == ctx->lifecycle_epoch &&
         g_laguna_compact_state.load(std::memory_order_relaxed) ==
             DS4_LAGUNA_COMPACT_ACTIVE;
+}
+
+static int cuda_laguna_compact_cache_active_locked(
+        const ds4_gpu_laguna_compact *ctx) {
+    return cuda_laguna_compact_cache_published_locked(ctx) &&
+        !ctx->cache_unsafe;
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -4920,16 +4974,21 @@ ds4_gpu_test_laguna_compact_cache_reserve_loading(
 #endif
 
 extern "C" bool
-ds4_gpu_laguna_compact_runtime_counters(
+ds4_gpu_laguna_compact_runtime_snapshot(
         const ds4_gpu_laguna_compact *ctx,
-        ds4_runtime_wire_counters *out) {
+        ds4_runtime_wire_counters *out,
+        bool *unsafe_out,
+        ds4_gpu_laguna_runtime_snapshot_fn capture,
+        void *userdata) {
     if (out) memset(out, 0, sizeof(*out));
-    if (!ctx || !out) return false;
+    if (unsafe_out) *unsafe_out = false;
+    if (!ctx || !out || !unsafe_out || !capture) return false;
     std::lock_guard<std::mutex> execution_guard(
         g_laguna_compact_exec_mutex);
     std::lock_guard<std::recursive_mutex> compact_guard(
         g_laguna_compact_mutex);
-    if (!cuda_laguna_compact_cache_active_locked(ctx)) return false;
+    if (!cuda_laguna_compact_cache_published_locked(ctx)) return false;
+    *unsafe_out = ctx->cache_unsafe;
     out->cache_acquire_hits = ctx->cache_acquire_hits;
     out->cache_acquire_misses = ctx->cache_acquire_misses;
     out->cache_evictions = ctx->cache_evictions;
@@ -4941,6 +5000,10 @@ ds4_gpu_laguna_compact_runtime_counters(
     out->page_advice_attempts = ctx->page_advice_counters.attempted_calls;
     out->page_advice_bytes = ctx->page_advice_counters.attempted_bytes;
     out->page_advice_failures = ctx->page_advice_counters.failed_calls;
+    if (!capture(userdata)) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
     return true;
 }
 

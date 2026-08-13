@@ -194,6 +194,8 @@ typedef struct {
     /* Qualification harness only: normal frontends never populate this. */
     int qualification_model_fd;
     bool qualification_model_fd_set;
+    /* When set, engine open consumes and closes this inherited endpoint after
+     * creating its private close-on-exec duplicate. */
     int qualification_control_fd;
     bool qualification_control_fd_set;
 } ds4_engine_options;
@@ -259,6 +261,11 @@ int ds4_engine_write_qualification_plan(
         char *err,
         size_t errcap);
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+/* Capture one coherent ds4.runtime/v1 value.  Callers that share an engine
+ * with request execution must hold their quiescence boundary while calling. */
+bool ds4_engine_runtime_snapshot(
+        ds4_engine *engine,
+        ds4_runtime_wire_snapshot *out);
 /* Explicit qualification checkpoint.  The caller must freeze `pre_child`
  * before launching or initializing CUDA.  Compact CUDA implementations
  * synchronize, measure exact model pages/smaps/process-scoped NVML, and

@@ -57,7 +57,16 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
+
+tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_session_request_attribution_api: tests/test_session_request_attribution_api.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-session-request-attribution-api: tests/test_session_request_attribution_api
+	./tests/test_session_request_attribution_api
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) -I. -c -o $@ $<

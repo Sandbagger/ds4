@@ -8,6 +8,7 @@ qualification server nor publishes a result bundle.
 from __future__ import annotations
 
 import argparse
+import array
 import ast
 import base64
 import ctypes
@@ -19,13 +20,16 @@ import mmap
 import os
 import platform
 import re
+import select
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,6 +117,583 @@ RUNTIME_OWNED_CATEGORY_NAMES = (
 )
 
 TokenCounter = Callable[[bytes], int]
+
+
+_QUALIFICATION_CONTROL_PROTOCOL_VERSION = 1
+_QUALIFICATION_CONTROL_MODEL_FD = 1
+_QUALIFICATION_CONTROL_SAMPLE_READY = 2
+_QUALIFICATION_CONTROL_SAMPLE_READY_ACK = 3
+_QUALIFICATION_CONTROL_SAMPLE_RESULT = 4
+_QUALIFICATION_CONTROL_SAMPLE_RESULT_ACK = 5
+_QUALIFICATION_CONTROL_MODEL_FD_ACK = 6
+_QUALIFICATION_CONTROL_MESSAGE = struct.Struct("@IIIIQQQQQ")
+_QUALIFICATION_CONTROL_RIGHTS_CAPACITY = 8
+
+
+class QualificationFileIdentity(NamedTuple):
+    """Path-independent identity for one retained regular-file descriptor."""
+
+    device: int
+    inode: int
+    size_bytes: int
+    mtime_ns: int
+
+    def as_decimal_mapping(self) -> dict[str, str]:
+        return {
+            "device": str(self.device),
+            "inode": str(self.inode),
+            "size_bytes": str(self.size_bytes),
+            "mtime_ns": str(self.mtime_ns),
+        }
+
+
+class QualificationModelEvidence(NamedTuple):
+    """Digest and identity obtained only through the opened model descriptor."""
+
+    identity: QualificationFileIdentity
+    sha256: str
+
+
+def _qualification_file_identity(
+    descriptor: int,
+) -> QualificationFileIdentity:
+    try:
+        observed = os.fstat(descriptor)
+    except OSError as exc:
+        raise ValueError(f"cannot stat qualification model descriptor: {exc}") from exc
+    if not stat.S_ISREG(observed.st_mode):
+        raise ValueError("qualification model descriptor is not a regular file")
+    values = (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+    )
+    if any(type(value) is not int or value < 0 or value > UINT64_MAX for value in values):
+        raise ValueError("qualification model descriptor identity is out of range")
+    return QualificationFileIdentity(*values)
+
+
+def _sha256_open_descriptor(descriptor: int) -> str:
+    """Hash an opened descriptor without changing its shared file offset."""
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        try:
+            chunk = os.pread(descriptor, 8 << 20, offset)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                f"cannot hash qualification model descriptor: {exc}"
+            ) from exc
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _qualification_wait_ready(
+    endpoint: socket.socket,
+    write: bool,
+    timeout: float,
+) -> bool:
+    readers = [] if write else [endpoint]
+    writers = [endpoint] if write else []
+    ready_readers, ready_writers, _ = select.select(
+        readers, writers, [], timeout
+    )
+    return bool(ready_writers if write else ready_readers)
+
+
+class QualificationControl:
+    """Parent-owned half of DS4's private same-host qualification channel.
+
+    The child endpoint is deliberately exposed only as an fd for a future
+    launcher to place in ``pass_fds`` and name with
+    ``--qualification-control-fd``.  The parent retains the descriptor sent
+    through SCM_RIGHTS, but callers receive only its identity and digest.
+    """
+
+    def __init__(
+        self,
+        parent: socket.socket,
+        child: socket.socket,
+        *,
+        timeout_seconds: float,
+        monotonic: Callable[[], float],
+        wait_ready: Callable[[socket.socket, bool, float], bool],
+    ) -> None:
+        self._parent: socket.socket | None = parent
+        self._child: socket.socket | None = child
+        self._timeout_seconds = timeout_seconds
+        self._monotonic = monotonic
+        self._wait_ready = wait_ready
+        self._model_fd = -1
+        self._model_evidence: QualificationModelEvidence | None = None
+        self._last_checkpoint_sequence = 0
+        self._unsafe = False
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        timeout_seconds: float = 30.0,
+        monotonic: Callable[[], float] = time.monotonic,
+        wait_ready: Callable[[socket.socket, bool, float], bool] = (
+            _qualification_wait_ready
+        ),
+    ) -> "QualificationControl":
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("qualification control timeout must be finite and positive")
+        if not callable(monotonic) or not callable(wait_ready):
+            raise ValueError("qualification control clock and waiter must be callable")
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            parent.set_inheritable(False)
+            child.set_inheritable(False)
+            parent.setblocking(False)
+            return cls(
+                parent,
+                child,
+                timeout_seconds=float(timeout_seconds),
+                monotonic=monotonic,
+                wait_ready=wait_ready,
+            )
+        except BaseException:
+            parent.close()
+            child.close()
+            raise
+
+    @property
+    def parent_fd(self) -> int:
+        if self._parent is None:
+            return -1
+        return self._parent.fileno()
+
+    @property
+    def child_fd(self) -> int:
+        if self._child is None:
+            raise ValueError("qualification control child endpoint is closed")
+        return self._child.fileno()
+
+    def close_child_endpoint(self) -> None:
+        if self._child is not None:
+            self._child.close()
+            self._child = None
+
+    def _close_parent_endpoint(self) -> None:
+        if self._parent is not None:
+            self._parent.close()
+            self._parent = None
+
+    def _close_model_descriptor(self) -> None:
+        descriptor = self._model_fd
+        self._model_fd = -1
+        self._model_evidence = None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def _mark_unsafe(self) -> None:
+        self._unsafe = True
+        self._close_model_descriptor()
+        self._close_parent_endpoint()
+        self.close_child_endpoint()
+
+    def _fail(self, message: str, error_type: type[Exception] = ValueError) -> None:
+        self._mark_unsafe()
+        raise error_type(message)
+
+    def _require_usable(self) -> socket.socket:
+        if self._unsafe:
+            raise ValueError("qualification control is already unsafe")
+        if self._parent is None:
+            raise ValueError("qualification control is closed")
+        return self._parent
+
+    def _deadline(self, timeout_seconds: float | None = None) -> float:
+        duration = (
+            self._timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or duration <= 0
+        ):
+            self._fail(
+                "qualification control deadline duration must be finite and positive"
+            )
+        try:
+            now = float(self._monotonic())
+        except BaseException as exc:
+            self._fail(f"cannot read qualification monotonic clock: {exc}")
+        if not math.isfinite(now):
+            self._fail("qualification monotonic clock is not finite")
+        deadline = now + float(duration)
+        if not math.isfinite(deadline):
+            self._fail("qualification control deadline is not finite")
+        return deadline
+
+    def _wait(self, *, write: bool, deadline: float, operation: str) -> None:
+        endpoint = self._require_usable()
+        while True:
+            try:
+                now = float(self._monotonic())
+            except BaseException as exc:
+                self._fail(f"cannot read qualification monotonic clock: {exc}")
+            if not math.isfinite(now) or now >= deadline:
+                self._fail(
+                    f"qualification control timed out while waiting to {operation}",
+                    TimeoutError,
+                )
+            remaining = deadline - now
+            try:
+                ready = self._wait_ready(endpoint, write, remaining)
+            except InterruptedError:
+                continue
+            except Exception as exc:
+                self._fail(
+                    f"qualification control failed while waiting to {operation}: {exc}"
+                )
+            if ready:
+                return
+            self._fail(
+                f"qualification control timed out while waiting to {operation}",
+                TimeoutError,
+            )
+
+    @staticmethod
+    def _close_descriptors(descriptors: Sequence[int]) -> None:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def _receive_message(
+        self,
+        *,
+        expected_type: int,
+        expected_sequence: int,
+        expect_model_fd: bool,
+        deadline: float,
+    ) -> tuple[QualificationFileIdentity, list[int]]:
+        endpoint = self._require_usable()
+        payload = bytearray()
+        descriptors: list[int] = []
+        integer_size = array.array("i").itemsize
+        ancillary_size = socket.CMSG_SPACE(
+            integer_size * _QUALIFICATION_CONTROL_RIGHTS_CAPACITY
+        )
+        receive_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+        try:
+            while len(payload) < _QUALIFICATION_CONTROL_MESSAGE.size:
+                self._wait(
+                    write=False,
+                    deadline=deadline,
+                    operation="receive protocol message",
+                )
+                try:
+                    part, ancillary, flags, _ = endpoint.recvmsg(
+                        _QUALIFICATION_CONTROL_MESSAGE.size - len(payload),
+                        ancillary_size,
+                        receive_flags,
+                    )
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError as exc:
+                    self._fail(
+                        f"qualification control failed to receive protocol message: {exc}"
+                    )
+                if not part:
+                    self._fail(
+                        "qualification control peer disconnected while receiving protocol message"
+                    )
+                ancillary_error = ""
+                for level, kind, data in ancillary:
+                    if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                        ancillary_error = (
+                            "qualification control message carried unexpected ancillary data"
+                        )
+                        continue
+                    if not data:
+                        ancillary_error = (
+                            "qualification control SCM_RIGHTS data is malformed"
+                        )
+                        continue
+                    aligned_size = len(data) - (len(data) % integer_size)
+                    rights = array.array("i")
+                    if aligned_size:
+                        rights.frombytes(data[:aligned_size])
+                    for descriptor in rights:
+                        try:
+                            os.set_inheritable(descriptor, False)
+                        except OSError as exc:
+                            ancillary_error = (
+                                "qualification control could not make a received "
+                                f"descriptor close-on-exec: {exc}"
+                            )
+                        descriptors.append(descriptor)
+                    if aligned_size != len(data):
+                        ancillary_error = (
+                            "qualification control SCM_RIGHTS data is malformed"
+                        )
+                if flags & (
+                    getattr(socket, "MSG_CTRUNC", 0)
+                    | getattr(socket, "MSG_TRUNC", 0)
+                ):
+                    self._fail(
+                        "qualification control message or ancillary data was truncated"
+                    )
+                if ancillary_error:
+                    self._fail(ancillary_error)
+                payload.extend(part)
+
+            values = _QUALIFICATION_CONTROL_MESSAGE.unpack(payload)
+            protocol, message_type, size, reserved, sequence = values[:5]
+            if (
+                protocol != _QUALIFICATION_CONTROL_PROTOCOL_VERSION
+                or message_type != expected_type
+                or size != _QUALIFICATION_CONTROL_MESSAGE.size
+                or reserved != 0
+                or sequence != expected_sequence
+            ):
+                self._fail(
+                    "qualification control received a mismatched protocol type, size, or sequence"
+                )
+            if expect_model_fd:
+                if len(descriptors) != 1:
+                    self._fail(
+                        "qualification control model message requires exactly one SCM_RIGHTS descriptor"
+                    )
+            elif descriptors:
+                self._fail(
+                    "qualification control barrier message carried forbidden SCM_RIGHTS descriptors"
+                )
+            identity = QualificationFileIdentity(*values[5:])
+            return identity, descriptors
+        except BaseException:
+            self._close_descriptors(descriptors)
+            raise
+
+    def _send_message(
+        self,
+        *,
+        message_type: int,
+        sequence: int,
+        deadline: float,
+        identity: QualificationFileIdentity | None = None,
+    ) -> None:
+        endpoint = self._require_usable()
+        identity_fields = (0, 0, 0, 0) if identity is None else tuple(identity)
+        payload = _QUALIFICATION_CONTROL_MESSAGE.pack(
+            _QUALIFICATION_CONTROL_PROTOCOL_VERSION,
+            message_type,
+            _QUALIFICATION_CONTROL_MESSAGE.size,
+            0,
+            sequence,
+            *identity_fields,
+        )
+        offset = 0
+        flags = getattr(socket, "MSG_NOSIGNAL", 0)
+        while offset != len(payload):
+            self._wait(
+                write=True,
+                deadline=deadline,
+                operation="send acknowledgement",
+            )
+            try:
+                written = endpoint.send(payload[offset:], flags)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError as exc:
+                self._fail(
+                    f"qualification control failed to send acknowledgement: {exc}"
+                )
+            if written <= 0:
+                self._fail(
+                    "qualification control peer disconnected while sending acknowledgement"
+                )
+            offset += written
+
+    def receive_model(
+        self,
+        *,
+        prepare_descriptor: (
+            Callable[[int, QualificationModelEvidence], Any] | None
+        ) = None,
+    ) -> QualificationModelEvidence:
+        """Verify the opened model and acknowledge it before child allocation.
+
+        ``prepare_descriptor`` is the qualification runner's narrow seam for
+        exact-fd cold preparation.  It runs after the descriptor hash and
+        identity checks but before MODEL_FD_ACK releases the child.
+        """
+        self._require_usable()
+        if self._model_evidence is not None:
+            self._fail("qualification model descriptor was already received")
+        if prepare_descriptor is not None and not callable(prepare_descriptor):
+            raise ValueError("qualification model descriptor preparer must be callable")
+        wire_identity, descriptors = self._receive_message(
+            expected_type=_QUALIFICATION_CONTROL_MODEL_FD,
+            expected_sequence=0,
+            expect_model_fd=True,
+            deadline=self._deadline(),
+        )
+        descriptor = descriptors.pop()
+        try:
+            os.set_inheritable(descriptor, False)
+            before = _qualification_file_identity(descriptor)
+            if wire_identity != before:
+                self._fail(
+                    "qualification model wire identity does not match the opened descriptor"
+                )
+            digest = _sha256_open_descriptor(descriptor)
+            after = _qualification_file_identity(descriptor)
+            if after != before:
+                self._fail(
+                    "qualification model descriptor identity changed while hashing"
+                )
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._mark_unsafe()
+            raise
+        self._model_fd = descriptor
+        self._model_evidence = QualificationModelEvidence(before, digest)
+        try:
+            if prepare_descriptor is not None:
+                prepare_descriptor(descriptor, self._model_evidence)
+            self.verify_model_unchanged()
+            self._send_message(
+                message_type=_QUALIFICATION_CONTROL_MODEL_FD_ACK,
+                sequence=0,
+                deadline=self._deadline(),
+                identity=before,
+            )
+        except BaseException:
+            self._mark_unsafe()
+            raise
+        return self._model_evidence
+
+    def verify_model_unchanged(self) -> QualificationFileIdentity:
+        """Re-stat the retained received descriptor without exposing its fd."""
+        self._require_usable()
+        if self._model_evidence is None or self._model_fd < 0:
+            raise ValueError("qualification model descriptor has not been received")
+        try:
+            observed = _qualification_file_identity(self._model_fd)
+        except BaseException:
+            self._mark_unsafe()
+            raise
+        if observed != self._model_evidence.identity:
+            self._fail("qualification model descriptor identity changed after hashing")
+        return observed
+
+    def bracket_sample(
+        self,
+        checkpoint_sequence: int,
+        *,
+        capture_before: Callable[[], Any],
+        capture_after: Callable[[], Any],
+        sample_timeout_seconds: float | None = None,
+    ) -> tuple[Any, Any]:
+        """Hold the child at READY and RESULT while the parent inventories it."""
+        self._require_usable()
+        if self._model_evidence is None:
+            raise ValueError("qualification model descriptor has not been received")
+        if (
+            isinstance(checkpoint_sequence, bool)
+            or type(checkpoint_sequence) is not int
+            or checkpoint_sequence <= self._last_checkpoint_sequence
+            or checkpoint_sequence > UINT64_MAX
+        ):
+            self._fail(
+                "qualification checkpoint sequence must be strictly increasing"
+            )
+        if not callable(capture_before) or not callable(capture_after):
+            raise ValueError("qualification checkpoint inventories must be callable")
+        if sample_timeout_seconds is not None and (
+            isinstance(sample_timeout_seconds, bool)
+            or not isinstance(sample_timeout_seconds, (int, float))
+            or not math.isfinite(float(sample_timeout_seconds))
+            or sample_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "qualification sample timeout must be finite and positive"
+            )
+
+        ready_arrival_deadline = self._deadline(sample_timeout_seconds)
+        ready_identity, _ = self._receive_message(
+            expected_type=_QUALIFICATION_CONTROL_SAMPLE_READY,
+            expected_sequence=checkpoint_sequence,
+            expect_model_fd=False,
+            deadline=ready_arrival_deadline,
+        )
+        if ready_identity != QualificationFileIdentity(0, 0, 0, 0):
+            self._fail("qualification READY message carried a model identity")
+        ready_ack_deadline = self._deadline()
+        self.verify_model_unchanged()
+        try:
+            before = capture_before()
+        except BaseException:
+            self._mark_unsafe()
+            raise
+        self._send_message(
+            message_type=_QUALIFICATION_CONTROL_SAMPLE_READY_ACK,
+            sequence=checkpoint_sequence,
+            deadline=ready_ack_deadline,
+        )
+
+        result_deadline = self._deadline(sample_timeout_seconds)
+        result_identity, _ = self._receive_message(
+            expected_type=_QUALIFICATION_CONTROL_SAMPLE_RESULT,
+            expected_sequence=checkpoint_sequence,
+            expect_model_fd=False,
+            deadline=result_deadline,
+        )
+        if result_identity != self._model_evidence.identity:
+            self._fail(
+                "qualification RESULT model identity does not match the opened descriptor"
+            )
+        result_ack_deadline = self._deadline()
+        try:
+            after = capture_after()
+            self.verify_model_unchanged()
+        except BaseException:
+            self._mark_unsafe()
+            raise
+        self._send_message(
+            message_type=_QUALIFICATION_CONTROL_SAMPLE_RESULT_ACK,
+            sequence=checkpoint_sequence,
+            deadline=result_ack_deadline,
+        )
+        self._last_checkpoint_sequence = checkpoint_sequence
+        return before, after
+
+    def close(self) -> None:
+        self._close_model_descriptor()
+        self._close_parent_endpoint()
+        self.close_child_endpoint()
+
+    def __enter__(self) -> "QualificationControl":
+        return self
+
+    def __exit__(self, _kind: object, _value: object, _traceback: object) -> None:
+        self.close()
 
 
 class _NvmlProcessInfoV2(ctypes.Structure):
@@ -321,6 +902,58 @@ def _revision(value: Any, label: str) -> str:
     if text == "0" * 40:
         raise ValueError(f"{label} must not use an all-zero sentinel")
     return text
+
+
+def validate_qualification_version(value: Any) -> dict[str, Any]:
+    """Admit one exact clean CUDA build identity for qualification.
+
+    This is deliberately a pure boundary: the future runner owns process I/O,
+    parses stdout with ``loads_strict``, then passes only the resulting value
+    here before it creates any qualification evidence or CUDA child.
+    """
+    required = {"schema", "revision", "dirty", "backend", "features"}
+    version = _mapping(value, "qualification version", required)
+    if version["schema"] != "ds4.version/v1":
+        raise ValueError("qualification version schema is not ds4.version/v1")
+    revision = _revision(
+        version["revision"], "qualification version revision"
+    )
+    if type(version["dirty"]) is not bool:
+        raise ValueError("qualification version dirty must be a boolean")
+    if version["dirty"]:
+        raise ValueError("qualification requires a clean build; dirty=true")
+    if type(version["backend"]) is not str or version["backend"] != "cuda":
+        raise ValueError("qualification version backend must be cuda")
+
+    raw_features = _list(
+        version["features"], "qualification version features"
+    )
+    features: list[str] = []
+    for index, feature in enumerate(raw_features):
+        if (
+            type(feature) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]*", feature) is None
+        ):
+            raise ValueError(
+                f"qualification version feature {index} is invalid"
+            )
+        features.append(feature)
+    if features != sorted(features):
+        raise ValueError("qualification version features must be sorted")
+    if len(features) != len(set(features)):
+        raise ValueError("qualification version features must be unique")
+    missing = sorted({"laguna", "ssd_streaming"} - set(features))
+    if missing:
+        raise ValueError(
+            "qualification version features must include " + ", ".join(missing)
+        )
+    return {
+        "schema": "ds4.version/v1",
+        "revision": revision,
+        "dirty": False,
+        "backend": "cuda",
+        "features": list(features),
+    }
 
 
 def _base64(value: Any, label: str) -> bytes:

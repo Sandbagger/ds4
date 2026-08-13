@@ -295,6 +295,33 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+/* Output-token counts are contract values, not sampling knobs.  Parse only a
+ * canonical nonnegative JSON integer and leave the cursor untouched for every
+ * other JSON shape so the request parser can consume it and return the stable
+ * invalid-output result instead of truncating or clamping it. */
+static bool json_exact_u64(const char **p, uint64_t *out) {
+    if (!p || !*p || !out) return false;
+    const char *cursor = *p;
+    json_ws(&cursor);
+    if (*cursor < '0' || *cursor > '9') return false;
+    if (*cursor == '0' && cursor[1] >= '0' && cursor[1] <= '9') return false;
+    uint64_t magnitude = 0u;
+    while (*cursor >= '0' && *cursor <= '9') {
+        const uint64_t digit = (uint64_t)(*cursor - '0');
+        if (magnitude > UINT64_MAX / 10u ||
+            (magnitude == UINT64_MAX / 10u &&
+             digit > UINT64_MAX % 10u)) {
+            return false;
+        }
+        magnitude = magnitude * 10u + digit;
+        cursor++;
+    }
+    if (*cursor == '.' || *cursor == 'e' || *cursor == 'E') return false;
+    *out = magnitude;
+    *p = cursor;
+    return true;
+}
+
 static bool json_bool(const char **p, bool *out) {
     json_ws(p);
     if (json_lit(p, "true")) {
@@ -620,6 +647,9 @@ typedef struct {
     char *prompt_text;
     tool_schema_orders tool_orders;
     int max_tokens;
+    uint64_t requested_output_tokens;
+    bool max_tokens_set;
+    bool max_tokens_valid;
     int top_k;
     float temperature;
     float top_p;
@@ -785,11 +815,30 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
+    r->max_tokens_valid = true;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
+}
+
+static bool request_parse_output_tokens(const char **p, request *r) {
+    if (!p || !*p || !r) return false;
+    const char *cursor = *p;
+    uint64_t requested = 0u;
+    bool exact = json_exact_u64(&cursor, &requested);
+    if (!exact) {
+        cursor = *p;
+        if (!json_skip_value(&cursor)) return false;
+    }
+    r->max_tokens_set = true;
+    r->max_tokens_valid = exact &&
+        requested <= DS4_RUNTIME_JSON_SAFE_INTEGER_MAX;
+    r->requested_output_tokens = r->max_tokens_valid ? requested : 0u;
+    r->max_tokens = 0;
+    *p = cursor;
+    return true;
 }
 
 static void request_apply_model_sampling_defaults(ds4_engine *engine, request *r) {
@@ -3196,7 +3245,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!request_parse_output_tokens(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -3413,7 +3462,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!request_parse_output_tokens(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -4320,7 +4369,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!request_parse_output_tokens(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -4542,7 +4591,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!request_parse_output_tokens(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -5552,12 +5601,79 @@ static const char *context_length_error_param(const request *r) {
     return r->kind == REQ_COMPLETION ? "prompt" : "messages";
 }
 
-static bool request_exceeds_context(const request *r, int ctx_size) {
-    /* ds4_session_sync() rejects prompt->len >= ctx_size because generation
-     * needs at least one free context slot.  Catch the same boundary here so
-     * clients get a normal protocol error instead of a later backend failure. */
-    return r && r->prompt.len >= ctx_size;
+typedef enum {
+    REQUEST_ADMISSION_FITS = 0,
+    REQUEST_ADMISSION_MODEL_MISMATCH,
+    REQUEST_ADMISSION_INVALID_REQUEST,
+    REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS,
+    REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE,
+    REQUEST_ADMISSION_CONTEXT_OVERFLOW,
+} request_admission_code;
+
+static request_admission_code request_token_counts_admit(
+        int templated_input_tokens,
+        uint64_t requested_output_tokens,
+        int context_tokens) {
+    if (templated_input_tokens < 0 || context_tokens <= 0) {
+        return REQUEST_ADMISSION_INVALID_REQUEST;
+    }
+    if (requested_output_tokens == 0u) {
+        return REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS;
+    }
+    if (requested_output_tokens > (uint64_t)context_tokens ||
+        (uint64_t)templated_input_tokens >
+            (uint64_t)context_tokens - requested_output_tokens) {
+        return REQUEST_ADMISSION_CONTEXT_OVERFLOW;
+    }
+    return REQUEST_ADMISSION_FITS;
 }
+
+static request_admission_code request_token_admission(
+        const request *r,
+        int ctx_size) {
+    if (!r) return REQUEST_ADMISSION_INVALID_REQUEST;
+    if (r->max_tokens_set && !r->max_tokens_valid) {
+        return REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS;
+    }
+    return request_token_counts_admit(
+        r->prompt.len,
+        r->max_tokens_set ? r->requested_output_tokens :
+            (r->max_tokens > 0 ? (uint64_t)r->max_tokens : 0u),
+        ctx_size);
+}
+
+/* An omitted output limit is server policy, not a client request to truncate.
+ * Resolve that policy once into an exact request-local count; explicitly
+ * supplied limits always remain byte-for-byte unchanged and either fit or
+ * fail. */
+static request_admission_code request_prepare_token_admission(
+        request *r,
+        int ctx_size) {
+    if (!r) return REQUEST_ADMISSION_INVALID_REQUEST;
+    if (r->max_tokens_set) {
+        const request_admission_code code =
+            request_token_admission(r, ctx_size);
+        if (code != REQUEST_ADMISSION_FITS) return code;
+        r->max_tokens = (int)r->requested_output_tokens;
+    } else {
+        if (r->prompt.len < 0 || ctx_size <= 0) {
+            return REQUEST_ADMISSION_INVALID_REQUEST;
+        }
+        if (r->prompt.len >= ctx_size) {
+            return REQUEST_ADMISSION_CONTEXT_OVERFLOW;
+        }
+        const int remaining = ctx_size - r->prompt.len;
+        if (r->max_tokens > remaining) r->max_tokens = remaining;
+    }
+    return request_token_admission(r, ctx_size);
+}
+
+#ifdef DS4_SERVER_TEST
+static bool request_exceeds_context(const request *r, int ctx_size) {
+    return request_token_admission(r, ctx_size) ==
+        REQUEST_ADMISSION_CONTEXT_OVERFLOW;
+}
+#endif
 
 static bool http_error_context_length_exceeded(int fd, bool enable_cors,
                                                const request *r,
@@ -5591,6 +5707,24 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
     bool ok = http_response(fd, enable_cors, 400, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+static bool http_reject_token_admission(
+        int fd,
+        bool enable_cors,
+        const request *r,
+        int ctx_size,
+        request_admission_code code) {
+    if (code == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS) {
+        return http_error(
+            fd, enable_cors, 400,
+            "Requested output tokens must be a positive integer");
+    }
+    if (code == REQUEST_ADMISSION_CONTEXT_OVERFLOW) {
+        return http_error_context_length_exceeded(
+            fd, enable_cors, r, r ? r->prompt.len : 0, ctx_size);
+    }
+    return http_error(fd, enable_cors, 400, "Invalid inference request");
 }
 
 /* Streaming is a translation state machine over the raw DS4 text.  The model
@@ -11195,6 +11329,13 @@ static uint64_t server_next_sequence(server *s) {
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 static void generate_job(server *s, server_slot *slot, job *j) {
+    const request_admission_code admission =
+        request_prepare_token_admission(&j->req, s->ctx_size);
+    if (admission != REQUEST_ADMISSION_FITS) {
+        (void)http_reject_token_admission(
+            j->fd, s->enable_cors, &j->req, s->ctx_size, admission);
+        return;
+    }
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
@@ -12757,8 +12898,11 @@ static void *client_main(void *arg) {
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
     request_apply_model_sampling_defaults(s->engine, &req);
-    if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
+    const request_admission_code admission =
+        request_prepare_token_admission(&req, ctx_size);
+    if (admission != REQUEST_ADMISSION_FITS) {
+        (void)http_reject_token_admission(
+            fd, s->enable_cors, &req, ctx_size, admission);
         request_free(&req);
         goto done;
     }
@@ -13948,20 +14092,111 @@ static void test_request_admission_exact_boundary_is_pure(void) {
     r.prompt.len = 12;
 
     request before = r;
+    TEST_ASSERT(request_token_admission(&r, 16) ==
+                REQUEST_ADMISSION_FITS);
     TEST_ASSERT(!request_exceeds_context(&r, 16));
     TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
 
     r.max_tokens = 5;
     before = r;
+    TEST_ASSERT(request_token_admission(&r, 16) ==
+                REQUEST_ADMISSION_CONTEXT_OVERFLOW);
     TEST_ASSERT(request_exceeds_context(&r, 16));
     TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
 
+    r.max_tokens = 0;
+    before = r;
+    TEST_ASSERT(request_token_admission(&r, 16) ==
+                REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS);
+    TEST_ASSERT(!request_exceeds_context(&r, 16));
+    TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
+
+    r.max_tokens = -1;
+    before = r;
+    TEST_ASSERT(request_token_admission(&r, 16) ==
+                REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS);
+    TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
+
+    r.prompt.len = -1;
+    r.max_tokens = 1;
+    before = r;
+    TEST_ASSERT(request_token_admission(&r, 16) ==
+                REQUEST_ADMISSION_INVALID_REQUEST);
+    TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
+
     request_free(&r);
+
+    request omitted;
+    request_init(&omitted, REQ_CHAT, 393216);
+    omitted.prompt.len = 12;
+    TEST_ASSERT(!omitted.max_tokens_set);
+    TEST_ASSERT(request_prepare_token_admission(&omitted, 16) ==
+                REQUEST_ADMISSION_FITS);
+    TEST_ASSERT(omitted.max_tokens == 4);
+
+    request explicit_request;
+    request_init(&explicit_request, REQ_CHAT, 393216);
+    explicit_request.prompt.len = 12;
+    explicit_request.max_tokens_set = true;
+    explicit_request.requested_output_tokens = 393216u;
+    TEST_ASSERT(request_prepare_token_admission(&explicit_request, 16) ==
+                REQUEST_ADMISSION_CONTEXT_OVERFLOW);
+    TEST_ASSERT(explicit_request.max_tokens == 393216);
+
+    request_free(&omitted);
+    request_free(&explicit_request);
+}
+
+static void test_request_output_count_requires_exact_json_integer(void) {
+    uint64_t value = 0u;
+    const char *positive = "17,";
+    TEST_ASSERT(json_exact_u64(&positive, &value) && value == 17u &&
+                *positive == ',');
+
+    const char *negative = "-1}";
+    const char *negative_before = negative;
+    TEST_ASSERT(!json_exact_u64(&negative, &value) &&
+                negative == negative_before);
+
+    const char *fractional = "1.5,";
+    const char *fractional_before = fractional;
+    TEST_ASSERT(!json_exact_u64(&fractional, &value) &&
+                fractional == fractional_before);
+
+    const char *exponent = "1e2,";
+    const char *exponent_before = exponent;
+    TEST_ASSERT(!json_exact_u64(&exponent, &value) &&
+                exponent == exponent_before);
+
+    const char *wide = "2147483648,";
+    TEST_ASSERT(json_exact_u64(&wide, &value) &&
+                value == UINT64_C(2147483648) && *wide == ',');
+
+    request parsed;
+    request_init(&parsed, REQ_CHAT, 128);
+    const char *invalid = "1.5,";
+    TEST_ASSERT(request_parse_output_tokens(&invalid, &parsed) &&
+                parsed.max_tokens_set && !parsed.max_tokens_valid &&
+                *invalid == ',');
+    request_free(&parsed);
+
+    request wide_request;
+    request_init(&wide_request, REQ_CHAT, 128);
+    wide_request.prompt.len = 1;
+    const char *wide_value = "2147483648,";
+    TEST_ASSERT(request_parse_output_tokens(&wide_value, &wide_request) &&
+                wide_request.max_tokens_valid &&
+                wide_request.requested_output_tokens ==
+                    UINT64_C(2147483648) &&
+                request_prepare_token_admission(&wide_request, 16) ==
+                    REQUEST_ADMISSION_CONTEXT_OVERFLOW &&
+                wide_request.max_tokens == 0);
+    request_free(&wide_request);
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    request_init(&r, REQ_CHAT, 1);
     r.api = API_OPENAI;
     r.prompt.len = 16;
     TEST_ASSERT(request_exceeds_context(&r, 16));
@@ -18013,6 +18248,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_request_admission_exact_boundary_is_pure();
+    test_request_output_count_requires_exact_json_integer();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();

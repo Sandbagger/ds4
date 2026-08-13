@@ -392,17 +392,23 @@ typedef struct {
     char request_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
     char instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
     uint64_t accepted_monotonic_ns;
+    uint64_t prefill_started_monotonic_ns;
     uint64_t prefill_complete_monotonic_ns;
-    uint64_t first_visible_token_monotonic_ns;
+    uint64_t first_visible_decode_monotonic_ns;
+    uint64_t last_visible_decode_monotonic_ns;
+    uint64_t first_visible_emitted_monotonic_ns;
     uint64_t page_advice_complete_monotonic_ns;
     uint64_t prompt_tokens;
     uint64_t generated_tokens;
     uint64_t visible_generated_tokens;
     ds4_runtime_wire_counters counters;
+    uint64_t owner_process_id;
     bool initialized;
     bool prompt_tokens_set;
+    bool prefill_started;
     bool prefill_complete;
-    bool first_visible_token;
+    bool visible_decode_started;
+    bool first_visible_emitted;
     bool page_advice_complete;
     bool terminal;
 } ds4_runtime_request_context;
@@ -436,6 +442,10 @@ bool ds4_runtime_request_set_prompt_tokens(
     ds4_runtime_request_context *context,
     uint64_t prompt_tokens);
 
+bool ds4_runtime_request_mark_prefill_started(
+    ds4_runtime_request_context *context,
+    uint64_t started_monotonic_ns);
+
 bool ds4_runtime_request_mark_prefill_complete(
     ds4_runtime_request_context *context,
     uint64_t complete_monotonic_ns);
@@ -453,9 +463,15 @@ bool ds4_runtime_request_add_generated_tokens(
     ds4_runtime_request_context *context,
     uint64_t generated_delta);
 
-bool ds4_runtime_request_add_visible_tokens(
+bool ds4_runtime_request_record_visible_decoded(
     ds4_runtime_request_context *context,
     uint64_t visible_delta,
+    uint64_t decoded_monotonic_ns);
+
+/* TTFT is acceptance to the first successfully emitted client-visible token,
+ * which is distinct from internal decode for buffered responses. */
+bool ds4_runtime_request_mark_first_visible_emitted(
+    ds4_runtime_request_context *context,
     uint64_t emitted_monotonic_ns);
 
 bool ds4_runtime_request_record_page_advice_complete(
@@ -470,7 +486,10 @@ bool ds4_runtime_request_finish(
     uint64_t finished_monotonic_ns,
     ds4_runtime_request_metrics *metrics);
 
-/* Deterministic compact JSON in ds4.runtime.request/v1 field order. */
+/* Rates are stage-local: prefill tokens over prefill-start to prefill-complete;
+ * visible decode excludes TTFT and is (visible tokens - 1) over first-to-last
+ * visible decode. One visible token therefore has rate zero. Deterministic
+ * compact JSON follows ds4.runtime.request/v1 field order. */
 bool ds4_runtime_request_metrics_json(
     const ds4_runtime_request_metrics *metrics,
     char *buffer,

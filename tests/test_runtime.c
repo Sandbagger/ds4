@@ -1585,32 +1585,49 @@ static void test_runtime_wire_snapshot(void) {
     CHECK(pipe(fork_pipe) == 0,
           "fork UUID fixture creates an identity pipe");
     if (fork_pipe[0] >= 0 && fork_pipe[1] >= 0) {
+        typedef struct {
+            bool fresh_initialized;
+            bool inherited_rejected;
+            char instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+        } runtime_fork_result;
         const pid_t child = fork();
         if (child == 0) {
             close(fork_pipe[0]);
+            runtime_fork_result result;
+            memset(&result, 0, sizeof(result));
             ds4_runtime_snapshot_context child_context;
-            const bool initialized = ds4_runtime_snapshot_context_init(
+            result.fresh_initialized = ds4_runtime_snapshot_context_init(
                 &child_context, model_fd, "laguna-s-2.1", "laguna");
-            const bool written = initialized &&
-                write(fork_pipe[1], child_context.instance_id,
-                      sizeof(child_context.instance_id)) ==
-                    (ssize_t)sizeof(child_context.instance_id);
+            if (result.fresh_initialized) {
+                memcpy(result.instance_id, child_context.instance_id,
+                       sizeof(result.instance_id));
+                ds4_runtime_wire_snapshot inherited_snapshot;
+                result.inherited_rejected =
+                    !ds4_runtime_wire_snapshot_capture(
+                        &context, &tracker, &input,
+                        &inherited_snapshot);
+            }
+            const bool written = write(
+                fork_pipe[1], &result, sizeof(result)) ==
+                (ssize_t)sizeof(result);
             close(fork_pipe[1]);
             _exit(written ? 0 : 1);
         }
         close(fork_pipe[1]);
         fork_pipe[1] = -1;
-        char child_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY] = {0};
+        runtime_fork_result result;
+        memset(&result, 0, sizeof(result));
         const bool child_identity_read = child > 0 && read_exact_bytes(
-            fork_pipe[0], child_instance_id, sizeof(child_instance_id));
+            fork_pipe[0], &result, sizeof(result));
         int child_status = 0;
         const bool child_reaped = child > 0 &&
             waitpid(child, &child_status, 0) == child &&
             WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
         CHECK(child_identity_read && child_reaped &&
-                  uuid_shape_valid(child_instance_id) &&
-                  strcmp(child_instance_id, context.instance_id) != 0,
-              "a forked process regenerates a distinct process-lifetime UUID");
+                  result.fresh_initialized && result.inherited_rejected &&
+                  uuid_shape_valid(result.instance_id) &&
+                  strcmp(result.instance_id, context.instance_id) != 0,
+              "a fork regenerates process identity and rejects inherited runtime contexts");
         close(fork_pipe[0]);
         fork_pipe[0] = -1;
     }
@@ -1663,6 +1680,8 @@ static void test_request_metrics_lifecycle(void) {
     }
 
     CHECK(ds4_runtime_request_set_prompt_tokens(&request_a, 22u) &&
+              ds4_runtime_request_mark_prefill_started(
+                  &request_a, UINT64_C(1100000000)) &&
               ds4_runtime_request_mark_prefill_complete(
                   &request_a, UINT64_C(1200000000)) &&
               ds4_runtime_request_set_prompt_tokens(&request_b, 1u),
@@ -1690,13 +1709,15 @@ static void test_request_metrics_lifecycle(void) {
 
     CHECK(ds4_runtime_request_add_generated_tokens(&request_a, 2u) &&
               ds4_runtime_request_add_generated_tokens(&request_a, 1u) &&
-              ds4_runtime_request_add_visible_tokens(
+              ds4_runtime_request_record_visible_decoded(
                   &request_a, 1u, UINT64_C(1500000000)) &&
               ds4_runtime_request_add_generated_tokens(&request_a, 5u) &&
-              ds4_runtime_request_add_visible_tokens(
+              ds4_runtime_request_record_visible_decoded(
                   &request_a, 5u, UINT64_C(2000000000)) &&
               ds4_runtime_request_record_page_advice_complete(
-                  &request_a, UINT64_C(2100000000)),
+                  &request_a, UINT64_C(2100000000)) &&
+              ds4_runtime_request_mark_first_visible_emitted(
+                  &request_a, UINT64_C(1500000000)),
           "hidden and visible generation plus final advice stay request-scoped");
 
     ds4_runtime_request_metrics completed;
@@ -1710,8 +1731,8 @@ static void test_request_metrics_lifecycle(void) {
               completed.generated_tokens == 8u &&
               completed.ttft_present &&
               completed.ttft_ns == UINT64_C(500000000) &&
-              completed.prefill_tokens_per_second == 110.0 &&
-              completed.visible_decode_tokens_per_second == 6.0 &&
+              completed.prefill_tokens_per_second == 220.0 &&
+              completed.visible_decode_tokens_per_second == 10.0 &&
               completed.wall_time_ns == UINT64_C(1200000000) &&
               completed.page_advice_complete_present &&
               completed.page_advice_complete_monotonic_ns ==
@@ -1720,11 +1741,39 @@ static void test_request_metrics_lifecycle(void) {
               memcmp(&completed.counters, &delta, sizeof(delta)) == 0,
           "completed metrics preserve exact counts, timing, rates, and counters");
 
+    ds4_runtime_request_context delayed_cleanup;
+    CHECK(ds4_runtime_request_begin(
+              &delayed_cleanup, UINT64_C(900000000)) &&
+              ds4_runtime_request_set_prompt_tokens(&delayed_cleanup, 22u) &&
+              ds4_runtime_request_mark_prefill_started(
+                  &delayed_cleanup, UINT64_C(1100000000)) &&
+              ds4_runtime_request_mark_prefill_complete(
+                  &delayed_cleanup, UINT64_C(1300000000)) &&
+              ds4_runtime_request_add_generated_tokens(&delayed_cleanup, 6u) &&
+              ds4_runtime_request_record_visible_decoded(
+                  &delayed_cleanup, 1u, UINT64_C(1500000000)) &&
+              ds4_runtime_request_record_visible_decoded(
+                  &delayed_cleanup, 5u, UINT64_C(2000000000)) &&
+              ds4_runtime_request_record_page_advice_complete(
+                  &delayed_cleanup, UINT64_C(2700000000)) &&
+              ds4_runtime_request_mark_first_visible_emitted(
+                  &delayed_cleanup, UINT64_C(2800000000)),
+          "rate fixture varies queue and final-advice time around fixed stages");
+    ds4_runtime_request_metrics delayed_metrics;
+    CHECK(ds4_runtime_request_finish(
+              &delayed_cleanup, DS4_RUNTIME_REQUEST_COMPLETED,
+              UINT64_C(3000000000), &delayed_metrics) &&
+              delayed_metrics.prefill_tokens_per_second == 110.0 &&
+              delayed_metrics.visible_decode_tokens_per_second == 10.0 &&
+              delayed_metrics.ttft_ns == UINT64_C(1900000000) &&
+              completed.ttft_ns == UINT64_C(500000000),
+          "decode rate excludes buffering while TTFT reflects actual emission");
+
     ds4_runtime_wire_snapshot runtime_after;
     CHECK(ds4_runtime_wire_snapshot_capture(
               &runtime_context, &runtime_tracker,
               &runtime_input, &runtime_after) &&
-              runtime_after.snapshot_seq == 3u &&
+              runtime_after.snapshot_seq == 4u &&
               strcmp(runtime_after.instance_id, completed.instance_id) == 0,
           "runtime publication continues immediately after request publication");
 
@@ -1738,12 +1787,21 @@ static void test_request_metrics_lifecycle(void) {
               memcmp(&rejected_repeat, &completed,
                      sizeof(completed)) == 0,
           "terminal state is immutable and a repeated finish is transactional");
+    CHECK(!ds4_runtime_request_add_generated_tokens(&request_a, 1u) &&
+              !ds4_runtime_request_record_visible_decoded(
+                  &request_a, 1u, UINT64_C(2300000000)) &&
+              !ds4_runtime_request_add_counters(&request_a, &delta) &&
+              !ds4_runtime_request_record_page_advice_complete(
+                  &request_a, UINT64_C(2300000000)) &&
+              memcmp(&request_a, &terminal_context,
+                     sizeof(request_a)) == 0,
+          "every request mutation rejects terminal state transactionally");
 
     ds4_runtime_request_metrics rejected;
     CHECK(ds4_runtime_request_finish(
               &request_b, DS4_RUNTIME_REQUEST_REJECTED,
               UINT64_C(1040000000), &rejected) &&
-              rejected.snapshot_seq == 4u &&
+              rejected.snapshot_seq == 5u &&
               rejected.prompt_tokens == 1u &&
               rejected.generated_tokens == 0u &&
               !rejected.ttft_present &&
@@ -1766,8 +1824,8 @@ static void test_request_metrics_lifecycle(void) {
         "\"request_id\":\"%s\",\"instance_id\":\"%s\","
         "\"snapshot_seq\":\"2\",\"prompt_tokens\":22,"
         "\"generated_tokens\":8,\"ttft_ns\":\"500000000\","
-        "\"prefill_tokens_per_second\":110,"
-        "\"visible_decode_tokens_per_second\":6,"
+        "\"prefill_tokens_per_second\":220,"
+        "\"visible_decode_tokens_per_second\":10,"
         "\"wall_time_ns\":\"1200000000\","
         "\"cache_hits\":\"1\",\"cache_misses\":\"2\","
         "\"cache_evictions\":\"3\","
@@ -1797,6 +1855,52 @@ static void test_request_metrics_lifecycle(void) {
                      "\"page_advice_complete_monotonic_ns\":null") !=
                   NULL,
           "terminal-before-first-token JSON emits both nullable fields as null");
+
+    static const char *const terminal_names[] = {
+        "completed", "cancelled", "rejected",
+        "recoverable_error", "unsafe_error",
+    };
+    for (size_t i = 0u;
+         i < sizeof(terminal_names) / sizeof(terminal_names[0]); i++) {
+        ds4_runtime_request_metrics terminal_shape = completed;
+        terminal_shape.terminal_status =
+            (ds4_runtime_request_terminal_status)i;
+        char terminal_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+        size_t terminal_length = 0u;
+        char needle[64];
+        const int needle_length = snprintf(
+            needle, sizeof(needle), "\"terminal_status\":\"%s\"",
+            terminal_names[i]);
+        CHECK(needle_length > 0 &&
+                  (size_t)needle_length < sizeof(needle) &&
+                  ds4_runtime_request_metrics_json(
+                      &terminal_shape, terminal_json,
+                      sizeof(terminal_json), &terminal_length) &&
+                  terminal_length == strlen(terminal_json) &&
+                  strstr(terminal_json, needle) != NULL,
+              "all five terminal statuses have stable wire names");
+    }
+
+    ds4_runtime_request_metrics invalid_metrics = completed;
+    const uint64_t quiet_nan_bits = UINT64_C(0x7ff8000000000000);
+    memcpy(&invalid_metrics.prefill_tokens_per_second,
+           &quiet_nan_bits, sizeof(quiet_nan_bits));
+    char invalid_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    memset(invalid_json, 0x5a, sizeof(invalid_json));
+    size_t invalid_length = 99u;
+    CHECK(!ds4_runtime_request_metrics_json(
+              &invalid_metrics, invalid_json, sizeof(invalid_json),
+              &invalid_length) &&
+              invalid_length == 0u && invalid_json[0] == '\0',
+          "request serializer rejects nonfinite rates under fast-math builds");
+    invalid_metrics = completed;
+    invalid_metrics.terminal_status =
+        DS4_RUNTIME_REQUEST_TERMINAL_STATUS_COUNT;
+    invalid_length = 99u;
+    CHECK(!ds4_runtime_request_metrics_json(
+              &invalid_metrics, invalid_json, sizeof(invalid_json),
+              &invalid_length) && invalid_length == 0u,
+          "request serializer rejects an invalid terminal status");
 
     char small[16];
     memset(small, 0x5a, sizeof(small));
@@ -1865,6 +1969,236 @@ static void test_request_metrics_saturation_and_validation(void) {
               !ds4_runtime_request_mark_prefill_complete(&request, 0u) &&
               memcmp(&request, &before, sizeof(request)) == 0,
           "invalid prompt counts and inverted timing fail transactionally");
+
+    CHECK(ds4_runtime_request_set_prompt_tokens(&request, 1u) &&
+              ds4_runtime_request_mark_prefill_started(&request, 1u) &&
+              ds4_runtime_request_mark_prefill_complete(&request, 2u) &&
+              ds4_runtime_request_add_generated_tokens(&request, 2u),
+          "visibility validation fixture records two generated tokens");
+    const ds4_runtime_request_context before_invalid_visible = request;
+    CHECK(!ds4_runtime_request_record_visible_decoded(&request, 3u, 3u) &&
+              !ds4_runtime_request_record_visible_decoded(&request, 0u, 3u) &&
+              memcmp(&before_invalid_visible, &request,
+                     sizeof(request)) == 0,
+          "visible emission cannot outrun generation or add zero tokens");
+    CHECK(ds4_runtime_request_record_visible_decoded(&request, 1u, 4u),
+          "one previously generated token becomes visible later");
+    const ds4_runtime_request_context before_impossible_emission = request;
+    CHECK(!ds4_runtime_request_mark_first_visible_emitted(&request, 3u) &&
+              memcmp(&before_impossible_emission, &request,
+                     sizeof(request)) == 0,
+          "client emission cannot precede the token's visible decode");
+    CHECK(ds4_runtime_request_mark_first_visible_emitted(&request, 4u),
+          "first client-visible emission records its own milestone");
+    const ds4_runtime_request_context after_valid_visible = request;
+    CHECK(!ds4_runtime_request_record_visible_decoded(&request, 1u, 3u) &&
+              request.generated_tokens == 2u &&
+              request.visible_generated_tokens == 1u &&
+              request.first_visible_decode_monotonic_ns == 4u &&
+              memcmp(&after_valid_visible, &request,
+                     sizeof(request)) == 0,
+          "later visible emission cannot move its timestamp backward");
+    CHECK(ds4_runtime_request_add_generated_tokens(&request, 1u) &&
+              ds4_runtime_request_record_visible_decoded(&request, 1u, 6u),
+          "visibility chronology fixture records a later emission");
+    const ds4_runtime_request_context after_later_visible = request;
+    CHECK(!ds4_runtime_request_record_visible_decoded(&request, 1u, 5u) &&
+              memcmp(&after_later_visible, &request, sizeof(request)) == 0,
+          "visible emission rejects a 4/6/5 timestamp regression");
+    ds4_runtime_request_metrics premature_metrics;
+    memset(&premature_metrics, 0xa5, sizeof(premature_metrics));
+    const ds4_runtime_request_metrics premature_metrics_before =
+        premature_metrics;
+    CHECK(!ds4_runtime_request_record_page_advice_complete(&request, 5u) &&
+              !ds4_runtime_request_finish(
+                  &request, DS4_RUNTIME_REQUEST_COMPLETED,
+                  5u, &premature_metrics) &&
+              memcmp(&after_later_visible, &request, sizeof(request)) == 0 &&
+              memcmp(&premature_metrics, &premature_metrics_before,
+                     sizeof(premature_metrics)) == 0,
+          "final advice and completion cannot precede the last visible output");
+    CHECK(ds4_runtime_request_record_page_advice_complete(&request, 7u),
+          "final advice completes after the last visible output");
+    const ds4_runtime_request_context after_advice = request;
+    CHECK(!ds4_runtime_request_record_page_advice_complete(&request, 7u) &&
+              !ds4_runtime_request_record_page_advice_complete(&request, 8u) &&
+              !ds4_runtime_request_add_generated_tokens(&request, 1u) &&
+              !ds4_runtime_request_record_visible_decoded(&request, 1u, 8u) &&
+              !ds4_runtime_request_add_counters(
+                  &request, &(ds4_runtime_wire_counters){
+                      .cache_acquire_hits = 1u,
+                  }) &&
+              memcmp(&after_advice, &request, sizeof(request)) == 0,
+          "final advice is one-shot and forbids later output or accounting mutation");
+
+    ds4_runtime_request_context late_emission;
+    ds4_runtime_request_metrics late_emission_metrics;
+    memset(&late_emission_metrics, 0xa5, sizeof(late_emission_metrics));
+    CHECK(ds4_runtime_request_begin(&late_emission, 1u) &&
+              ds4_runtime_request_set_prompt_tokens(&late_emission, 1u) &&
+              ds4_runtime_request_mark_prefill_started(&late_emission, 2u) &&
+              ds4_runtime_request_mark_prefill_complete(&late_emission, 3u) &&
+              ds4_runtime_request_add_generated_tokens(&late_emission, 1u) &&
+              ds4_runtime_request_record_visible_decoded(
+                  &late_emission, 1u, 4u) &&
+              ds4_runtime_request_mark_first_visible_emitted(
+                  &late_emission, 6u),
+          "late-emission fixture separates decode from client visibility");
+    const ds4_runtime_request_context late_emission_before = late_emission;
+    const ds4_runtime_request_metrics late_metrics_before =
+        late_emission_metrics;
+    CHECK(!ds4_runtime_request_finish(
+              &late_emission, DS4_RUNTIME_REQUEST_COMPLETED,
+              5u, &late_emission_metrics) &&
+              memcmp(&late_emission, &late_emission_before,
+                     sizeof(late_emission)) == 0 &&
+              memcmp(&late_emission_metrics, &late_metrics_before,
+                     sizeof(late_emission_metrics)) == 0,
+          "terminal publication cannot precede actual client emission");
+
+    ds4_runtime_request_context malformed;
+    CHECK(ds4_runtime_request_begin(&malformed, 10u) &&
+              ds4_runtime_request_set_prompt_tokens(&malformed, 1u),
+          "malformed-context fixture starts from a valid prepared request");
+    malformed.generated_tokens = DS4_RUNTIME_JSON_SAFE_INTEGER_MAX + 1u;
+    const ds4_runtime_request_context malformed_before = malformed;
+    ds4_runtime_request_metrics malformed_output;
+    memset(&malformed_output, 0xa5, sizeof(malformed_output));
+    const ds4_runtime_request_metrics malformed_output_before =
+        malformed_output;
+    CHECK(!ds4_runtime_request_add_generated_tokens(&malformed, 1u) &&
+              !ds4_runtime_request_finish(
+                  &malformed, DS4_RUNTIME_REQUEST_REJECTED,
+                  11u, &malformed_output) &&
+              memcmp(&malformed, &malformed_before,
+                     sizeof(malformed)) == 0 &&
+              memcmp(&malformed_output, &malformed_output_before,
+                     sizeof(malformed_output)) == 0,
+          "a corrupted public context cannot underflow or consume publication state");
+
+    ds4_runtime_request_context zero_milestones;
+    ds4_runtime_request_metrics zero_milestone_metrics;
+    memset(&zero_milestone_metrics, 0xa5,
+           sizeof(zero_milestone_metrics));
+    CHECK(ds4_runtime_request_begin(&zero_milestones, 0u) &&
+              ds4_runtime_request_set_prompt_tokens(&zero_milestones, 1u),
+          "zero-milestone corruption fixture begins validly");
+    zero_milestones.prefill_started = true;
+    zero_milestones.prefill_complete = true;
+    const ds4_runtime_request_context zero_milestones_before =
+        zero_milestones;
+    const ds4_runtime_request_metrics zero_metrics_before =
+        zero_milestone_metrics;
+    CHECK(!ds4_runtime_request_finish(
+              &zero_milestones, DS4_RUNTIME_REQUEST_COMPLETED,
+              0u, &zero_milestone_metrics) &&
+              memcmp(&zero_milestones, &zero_milestones_before,
+                     sizeof(zero_milestones)) == 0 &&
+              memcmp(&zero_milestone_metrics, &zero_metrics_before,
+                     sizeof(zero_milestone_metrics)) == 0,
+          "forged present milestones cannot use the absent zero sentinel");
+
+    ds4_runtime_request_context valid_after_malformed;
+    ds4_runtime_request_metrics valid_after_malformed_metrics;
+    CHECK(ds4_runtime_request_begin(&valid_after_malformed, 12u) &&
+              ds4_runtime_request_set_prompt_tokens(
+                  &valid_after_malformed, 1u) &&
+              ds4_runtime_request_finish(
+                  &valid_after_malformed,
+                  DS4_RUNTIME_REQUEST_REJECTED, 13u,
+                  &valid_after_malformed_metrics) &&
+              valid_after_malformed_metrics.snapshot_seq == 6u,
+          "failed malformed finalization does not consume the shared sequence");
+
+    ds4_runtime_request_context inherited;
+    CHECK(ds4_runtime_request_begin(&inherited, 20u) &&
+              ds4_runtime_request_set_prompt_tokens(&inherited, 1u),
+          "fork fixture prepares a parent-owned request context");
+    typedef struct {
+        bool inherited_rejected;
+        bool child_finished;
+        uint64_t child_sequence;
+        char child_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    } request_fork_result;
+    int request_pipe[2] = {-1, -1};
+    CHECK(pipe(request_pipe) == 0,
+          "fork fixture opens one result pipe");
+    if (request_pipe[0] >= 0 && request_pipe[1] >= 0) {
+        const pid_t child = fork();
+        if (child == 0) {
+            close(request_pipe[0]);
+            request_fork_result result;
+            memset(&result, 0, sizeof(result));
+            ds4_runtime_request_metrics inherited_metrics;
+            result.inherited_rejected = !ds4_runtime_request_finish(
+                &inherited, DS4_RUNTIME_REQUEST_REJECTED,
+                21u, &inherited_metrics);
+            ds4_runtime_request_context child_request;
+            ds4_runtime_request_metrics child_metrics;
+            result.child_finished =
+                ds4_runtime_request_begin(&child_request, 22u) &&
+                ds4_runtime_request_set_prompt_tokens(&child_request, 1u) &&
+                ds4_runtime_request_finish(
+                    &child_request, DS4_RUNTIME_REQUEST_REJECTED,
+                    23u, &child_metrics);
+            if (result.child_finished) {
+                result.child_sequence = child_metrics.snapshot_seq;
+                memcpy(result.child_instance_id,
+                       child_metrics.instance_id,
+                       sizeof(result.child_instance_id));
+            }
+            const bool written = write(
+                request_pipe[1], &result, sizeof(result)) ==
+                (ssize_t)sizeof(result);
+            close(request_pipe[1]);
+            _exit(written ? 0 : 1);
+        }
+        close(request_pipe[1]);
+        request_pipe[1] = -1;
+        request_fork_result result;
+        memset(&result, 0, sizeof(result));
+        const bool result_read = child > 0 && read_exact_bytes(
+            request_pipe[0], &result, sizeof(result));
+        int child_status = 0;
+        const bool child_reaped = child > 0 &&
+            waitpid(child, &child_status, 0) == child &&
+            WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
+        CHECK(result_read && child_reaped && result.inherited_rejected &&
+                  result.child_finished && result.child_sequence == 1u &&
+                  uuid_shape_valid(result.child_instance_id) &&
+                  strcmp(result.child_instance_id,
+                         inherited.instance_id) != 0,
+              "fork rejects inherited context and gives child work a new identity namespace");
+        close(request_pipe[0]);
+    }
+
+    ds4_runtime_request_context buffered_cancel;
+    ds4_runtime_request_metrics buffered_cancel_metrics;
+    char buffered_cancel_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t buffered_cancel_json_length = 0u;
+    CHECK(ds4_runtime_request_begin(&buffered_cancel, 100u) &&
+              ds4_runtime_request_set_prompt_tokens(&buffered_cancel, 2u) &&
+              ds4_runtime_request_mark_prefill_started(
+                  &buffered_cancel, 101u) &&
+              ds4_runtime_request_mark_prefill_complete(
+                  &buffered_cancel, 102u) &&
+              ds4_runtime_request_add_generated_tokens(
+                  &buffered_cancel, 2u) &&
+              ds4_runtime_request_record_visible_decoded(
+                  &buffered_cancel, 1u, 103u) &&
+              ds4_runtime_request_record_visible_decoded(
+                  &buffered_cancel, 1u, 104u) &&
+              ds4_runtime_request_finish(
+                  &buffered_cancel, DS4_RUNTIME_REQUEST_CANCELLED,
+                  105u, &buffered_cancel_metrics) &&
+              !buffered_cancel_metrics.ttft_present &&
+              buffered_cancel_metrics.visible_decode_tokens_per_second > 0.0 &&
+              ds4_runtime_request_metrics_json(
+                  &buffered_cancel_metrics, buffered_cancel_json,
+                  sizeof(buffered_cancel_json),
+                  &buffered_cancel_json_length) &&
+              strstr(buffered_cancel_json, "\"ttft_ns\":null") != NULL,
+          "decoded buffered output can be cancelled before any client emission");
 }
 
 static int run_external_attribution(void) {

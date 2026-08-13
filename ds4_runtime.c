@@ -80,11 +80,13 @@ static pid_t runtime_instance_pid;
 static uint64_t runtime_process_snapshot_seq = 1u;
 static pid_t runtime_snapshot_pid;
 
-static void runtime_instance_id_initialize(void) {
+static bool runtime_uuid_generate(
+        char output[DS4_RUNTIME_INSTANCE_ID_CAPACITY]) {
+    if (!output) return false;
     uint8_t bytes[16];
     size_t received = 0;
     const int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
+    if (fd < 0) return false;
     while (received < sizeof(bytes)) {
         const ssize_t result = read(
             fd, bytes + received, sizeof(bytes) - received);
@@ -97,21 +99,45 @@ static void runtime_instance_id_initialize(void) {
         }
     }
     close(fd);
-    if (received != sizeof(bytes)) return;
+    if (received != sizeof(bytes)) return false;
     bytes[6] = (uint8_t)((bytes[6] & 0x0fu) | 0x40u);
     bytes[8] = (uint8_t)((bytes[8] & 0x3fu) | 0x80u);
     static const char hex[] = "0123456789abcdef";
-    size_t output = 0;
+    size_t position = 0;
     for (size_t i = 0; i < sizeof(bytes); i++) {
         if (i == 4u || i == 6u || i == 8u || i == 10u) {
-            runtime_instance_id[output++] = '-';
+            output[position++] = '-';
         }
-        runtime_instance_id[output++] = hex[bytes[i] >> 4u];
-        runtime_instance_id[output++] = hex[bytes[i] & 0x0fu];
+        output[position++] = hex[bytes[i] >> 4u];
+        output[position++] = hex[bytes[i] & 0x0fu];
     }
-    runtime_instance_id[output] = '\0';
-    runtime_instance_id_valid = output == 36u;
-    runtime_instance_pid = getpid();
+    output[position] = '\0';
+    return position == 36u;
+}
+
+static void runtime_instance_id_initialize(void) {
+    memset(runtime_instance_id, 0, sizeof(runtime_instance_id));
+    runtime_instance_id_valid = runtime_uuid_generate(runtime_instance_id);
+    runtime_instance_pid = runtime_instance_id_valid ? getpid() : 0;
+}
+
+static bool runtime_instance_id_copy(
+        char output[DS4_RUNTIME_INSTANCE_ID_CAPACITY]) {
+    if (!output ||
+        pthread_once(
+            &runtime_instance_once, runtime_instance_id_initialize) != 0 ||
+        pthread_mutex_lock(&runtime_instance_mutex) != 0) {
+        return false;
+    }
+    if (!runtime_instance_id_valid || runtime_instance_pid != getpid()) {
+        runtime_instance_id_initialize();
+    }
+    const bool valid = runtime_instance_id_valid;
+    if (valid) {
+        memcpy(output, runtime_instance_id, sizeof(runtime_instance_id));
+    }
+    pthread_mutex_unlock(&runtime_instance_mutex);
+    return valid;
 }
 
 static bool add_u64(uint64_t a, uint64_t b, uint64_t *out) {
@@ -2171,6 +2197,344 @@ static bool runtime_wire_input_valid(
         input->allocated_prefill_rows != 0u;
 }
 
+static bool runtime_request_context_mutable(
+        const ds4_runtime_request_context *context) {
+    return context && context->initialized && !context->terminal &&
+        context->owner_process_id == (uint64_t)getpid() &&
+        runtime_wire_uuid_valid(context->request_id) &&
+        runtime_wire_uuid_valid(context->instance_id) &&
+        strcmp(context->request_id, context->instance_id) != 0 &&
+        ((!context->prompt_tokens_set && context->prompt_tokens == 0u) ||
+         (context->prompt_tokens_set && context->prompt_tokens != 0u &&
+          context->prompt_tokens <= DS4_RUNTIME_JSON_SAFE_INTEGER_MAX)) &&
+        context->generated_tokens <= DS4_RUNTIME_JSON_SAFE_INTEGER_MAX &&
+        context->visible_generated_tokens <= context->generated_tokens &&
+        (context->prefill_started ==
+         (context->prefill_started_monotonic_ns != 0u)) &&
+        (context->prefill_complete ==
+         (context->prefill_complete_monotonic_ns != 0u)) &&
+        (context->visible_decode_started ==
+         (context->visible_generated_tokens != 0u &&
+          context->first_visible_decode_monotonic_ns != 0u &&
+          context->last_visible_decode_monotonic_ns != 0u)) &&
+        (context->first_visible_emitted ==
+         (context->first_visible_emitted_monotonic_ns != 0u)) &&
+        (context->page_advice_complete ==
+         (context->page_advice_complete_monotonic_ns != 0u)) &&
+        (!context->prefill_started ||
+         context->prefill_started_monotonic_ns >=
+             context->accepted_monotonic_ns) &&
+        (!context->prefill_complete ||
+         (context->prefill_started &&
+          context->prefill_complete_monotonic_ns >=
+              context->prefill_started_monotonic_ns)) &&
+        (!context->visible_decode_started ||
+         (context->prefill_complete &&
+          context->first_visible_decode_monotonic_ns >=
+              context->prefill_complete_monotonic_ns &&
+          context->last_visible_decode_monotonic_ns >=
+              context->first_visible_decode_monotonic_ns)) &&
+        (!context->first_visible_emitted ||
+         (context->visible_decode_started &&
+          context->first_visible_emitted_monotonic_ns >=
+              context->first_visible_decode_monotonic_ns)) &&
+        (!context->page_advice_complete ||
+         (context->prefill_complete &&
+          context->page_advice_complete_monotonic_ns >=
+              context->prefill_complete_monotonic_ns &&
+          (!context->visible_decode_started ||
+           context->page_advice_complete_monotonic_ns >=
+               context->last_visible_decode_monotonic_ns)));
+}
+
+static bool runtime_request_instance_is_current(
+        const ds4_runtime_request_context *context) {
+    char current[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    return context && runtime_instance_id_copy(current) &&
+        strcmp(context->instance_id, current) == 0;
+}
+
+bool ds4_runtime_request_begin(
+        ds4_runtime_request_context *context,
+        uint64_t accepted_monotonic_ns) {
+    if (!context) return false;
+    ds4_runtime_request_context staged;
+    memset(&staged, 0, sizeof(staged));
+    if (!runtime_uuid_generate(staged.request_id) ||
+        !runtime_instance_id_copy(staged.instance_id) ||
+        !runtime_wire_uuid_valid(staged.request_id) ||
+        !runtime_wire_uuid_valid(staged.instance_id) ||
+        strcmp(staged.request_id, staged.instance_id) == 0) {
+        return false;
+    }
+    staged.accepted_monotonic_ns = accepted_monotonic_ns;
+    staged.owner_process_id = (uint64_t)getpid();
+    staged.initialized = true;
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_set_prompt_tokens(
+        ds4_runtime_request_context *context,
+        uint64_t prompt_tokens) {
+    if (!runtime_request_context_mutable(context) ||
+        context->prompt_tokens_set || prompt_tokens == 0u ||
+        prompt_tokens > DS4_RUNTIME_JSON_SAFE_INTEGER_MAX) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.prompt_tokens = prompt_tokens;
+    staged.prompt_tokens_set = true;
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_mark_prefill_complete(
+        ds4_runtime_request_context *context,
+        uint64_t complete_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || !context->prefill_started ||
+        context->prefill_complete ||
+        complete_monotonic_ns == 0u ||
+        complete_monotonic_ns < context->prefill_started_monotonic_ns) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.prefill_complete_monotonic_ns = complete_monotonic_ns;
+    staged.prefill_complete = true;
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_mark_prefill_started(
+        ds4_runtime_request_context *context,
+        uint64_t started_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || context->prefill_started ||
+        started_monotonic_ns == 0u ||
+        started_monotonic_ns < context->accepted_monotonic_ns) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.prefill_started_monotonic_ns = started_monotonic_ns;
+    staged.prefill_started = true;
+    *context = staged;
+    return true;
+}
+
+static uint64_t runtime_saturating_add_u64(uint64_t value, uint64_t delta) {
+    uint64_t result = 0u;
+    (void)add_u64(value, delta, &result);
+    return result;
+}
+
+bool ds4_runtime_request_add_counters(
+        ds4_runtime_request_context *context,
+        const ds4_runtime_wire_counters *delta) {
+    if (!runtime_request_context_mutable(context) || !delta ||
+        context->page_advice_complete) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+#define DS4_RUNTIME_REQUEST_SATURATE(field) do {                              \
+        staged.counters.field = runtime_saturating_add_u64(                  \
+            staged.counters.field, delta->field);                            \
+    } while (0)
+    DS4_RUNTIME_REQUEST_SATURATE(cache_acquire_hits);
+    DS4_RUNTIME_REQUEST_SATURATE(cache_acquire_misses);
+    DS4_RUNTIME_REQUEST_SATURATE(cache_evictions);
+    DS4_RUNTIME_REQUEST_SATURATE(model_file_read_operations);
+    DS4_RUNTIME_REQUEST_SATURATE(model_file_read_bytes);
+    DS4_RUNTIME_REQUEST_SATURATE(model_file_read_ns);
+    DS4_RUNTIME_REQUEST_SATURATE(host_to_device_bytes);
+    DS4_RUNTIME_REQUEST_SATURATE(host_to_device_ns);
+    DS4_RUNTIME_REQUEST_SATURATE(page_advice_attempts);
+    DS4_RUNTIME_REQUEST_SATURATE(page_advice_bytes);
+    DS4_RUNTIME_REQUEST_SATURATE(page_advice_failures);
+#undef DS4_RUNTIME_REQUEST_SATURATE
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_add_generated_tokens(
+        ds4_runtime_request_context *context,
+        uint64_t generated_delta) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || !context->prefill_complete ||
+        context->page_advice_complete ||
+        generated_delta >
+            DS4_RUNTIME_JSON_SAFE_INTEGER_MAX - context->generated_tokens) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.generated_tokens += generated_delta;
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_record_visible_decoded(
+        ds4_runtime_request_context *context,
+        uint64_t visible_delta,
+        uint64_t decoded_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || !context->prefill_complete ||
+        context->page_advice_complete ||
+        visible_delta == 0u ||
+        decoded_monotonic_ns == 0u ||
+        visible_delta >
+            context->generated_tokens - context->visible_generated_tokens ||
+        decoded_monotonic_ns < context->prefill_complete_monotonic_ns ||
+        (context->visible_decode_started &&
+         decoded_monotonic_ns <
+             context->last_visible_decode_monotonic_ns)) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.visible_generated_tokens += visible_delta;
+    if (!staged.visible_decode_started) {
+        staged.first_visible_decode_monotonic_ns =
+            decoded_monotonic_ns;
+        staged.visible_decode_started = true;
+    }
+    staged.last_visible_decode_monotonic_ns = decoded_monotonic_ns;
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_mark_first_visible_emitted(
+        ds4_runtime_request_context *context,
+        uint64_t emitted_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->visible_decode_started || context->first_visible_emitted ||
+        emitted_monotonic_ns == 0u ||
+        emitted_monotonic_ns <
+            context->first_visible_decode_monotonic_ns) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.first_visible_emitted_monotonic_ns = emitted_monotonic_ns;
+    staged.first_visible_emitted = true;
+    *context = staged;
+    return true;
+}
+
+bool ds4_runtime_request_record_page_advice_complete(
+        ds4_runtime_request_context *context,
+        uint64_t complete_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || !context->prefill_complete ||
+        context->page_advice_complete ||
+        complete_monotonic_ns == 0u ||
+        complete_monotonic_ns < context->prefill_complete_monotonic_ns ||
+        (context->visible_decode_started &&
+         complete_monotonic_ns <
+             context->last_visible_decode_monotonic_ns)) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.page_advice_complete_monotonic_ns = complete_monotonic_ns;
+    staged.page_advice_complete = true;
+    *context = staged;
+    return true;
+}
+
+static uint64_t runtime_process_sequence_allocate_locked(void) {
+    if (runtime_snapshot_pid != getpid()) {
+        runtime_process_snapshot_seq = 1u;
+        runtime_snapshot_pid = getpid();
+    }
+    const uint64_t sequence = runtime_process_snapshot_seq;
+    runtime_process_snapshot_seq = sequence == UINT64_MAX
+        ? UINT64_MAX : sequence + 1u;
+    return sequence;
+}
+
+bool ds4_runtime_request_finish(
+        ds4_runtime_request_context *context,
+        ds4_runtime_request_terminal_status status,
+        uint64_t finished_monotonic_ns,
+        ds4_runtime_request_metrics *metrics) {
+    if (!runtime_request_context_mutable(context) || !metrics ||
+        !context->prompt_tokens_set ||
+        !runtime_request_instance_is_current(context) ||
+        status < DS4_RUNTIME_REQUEST_COMPLETED ||
+        status >= DS4_RUNTIME_REQUEST_TERMINAL_STATUS_COUNT ||
+        (status == DS4_RUNTIME_REQUEST_COMPLETED &&
+         !context->prefill_complete) ||
+        finished_monotonic_ns < context->accepted_monotonic_ns ||
+        (context->prefill_complete &&
+         finished_monotonic_ns <
+             context->prefill_complete_monotonic_ns) ||
+        (context->visible_decode_started &&
+         finished_monotonic_ns <
+             context->last_visible_decode_monotonic_ns) ||
+        (context->first_visible_emitted &&
+         finished_monotonic_ns <
+             context->first_visible_emitted_monotonic_ns) ||
+        (context->page_advice_complete &&
+         finished_monotonic_ns <
+             context->page_advice_complete_monotonic_ns) ||
+        (context->visible_decode_started !=
+         (context->visible_generated_tokens != 0u)) ||
+        (context->first_visible_emitted &&
+         !context->visible_decode_started) ||
+        context->visible_generated_tokens > context->generated_tokens) {
+        return false;
+    }
+
+    ds4_runtime_request_metrics staged_metrics;
+    memset(&staged_metrics, 0, sizeof(staged_metrics));
+    memcpy(staged_metrics.request_id, context->request_id,
+           sizeof(staged_metrics.request_id));
+    memcpy(staged_metrics.instance_id, context->instance_id,
+           sizeof(staged_metrics.instance_id));
+    staged_metrics.prompt_tokens = context->prompt_tokens;
+    staged_metrics.generated_tokens = context->generated_tokens;
+    staged_metrics.wall_time_ns =
+        finished_monotonic_ns - context->accepted_monotonic_ns;
+    staged_metrics.counters = context->counters;
+    staged_metrics.terminal_status = status;
+    if (context->prefill_complete) {
+        const uint64_t elapsed =
+            context->prefill_complete_monotonic_ns -
+            context->prefill_started_monotonic_ns;
+        if (elapsed != 0u) {
+            staged_metrics.prefill_tokens_per_second =
+                (double)context->prompt_tokens * 1000000000.0 /
+                (double)elapsed;
+        }
+    }
+    if (context->first_visible_emitted) {
+        staged_metrics.ttft_present = true;
+        staged_metrics.ttft_ns =
+            context->first_visible_emitted_monotonic_ns -
+            context->accepted_monotonic_ns;
+    }
+    if (context->visible_generated_tokens > 1u &&
+        context->last_visible_decode_monotonic_ns >
+            context->first_visible_decode_monotonic_ns) {
+        staged_metrics.visible_decode_tokens_per_second =
+            (double)(context->visible_generated_tokens - 1u) *
+            1000000000.0 /
+            (double)(context->last_visible_decode_monotonic_ns -
+                context->first_visible_decode_monotonic_ns);
+    }
+    if (context->page_advice_complete) {
+        staged_metrics.page_advice_complete_present = true;
+        staged_metrics.page_advice_complete_monotonic_ns =
+            context->page_advice_complete_monotonic_ns;
+    }
+
+    if (pthread_mutex_lock(&runtime_snapshot_mutex) != 0) return false;
+    staged_metrics.snapshot_seq = runtime_process_sequence_allocate_locked();
+    ds4_runtime_request_context staged_context = *context;
+    staged_context.terminal = true;
+    *context = staged_context;
+    *metrics = staged_metrics;
+    pthread_mutex_unlock(&runtime_snapshot_mutex);
+    return true;
+}
+
 static void runtime_tracker_snapshot_scalars(
         const ds4_runtime_tracker *tracker,
         ds4_runtime_snapshot *snapshot) {
@@ -2275,8 +2639,10 @@ bool ds4_runtime_wire_snapshot_capture(
         const ds4_runtime_tracker *tracker,
         const ds4_runtime_wire_snapshot_input *input,
         ds4_runtime_wire_snapshot *snapshot) {
+    char current_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
     if (!context || !tracker || !snapshot ||
-        !runtime_wire_input_valid(input)) {
+        !runtime_wire_input_valid(input) ||
+        !runtime_instance_id_copy(current_instance_id)) {
         return false;
     }
     if (pthread_mutex_lock(&runtime_snapshot_mutex) != 0) return false;
@@ -2284,6 +2650,7 @@ bool ds4_runtime_wire_snapshot_capture(
         runtime_process_snapshot_seq == 0u ||
         context->next_snapshot_seq == 0u ||
         !runtime_wire_uuid_valid(context->instance_id) ||
+        strcmp(context->instance_id, current_instance_id) != 0 ||
         !runtime_wire_model_text(
             context->model_id, sizeof(context->model_id), NULL) ||
         !runtime_wire_model_text(
@@ -2488,6 +2855,28 @@ static const char *runtime_wire_state_name(ds4_runtime_wire_state state) {
     case DS4_RUNTIME_WIRE_STATE_UNSAFE: return "unsafe";
     }
     return NULL;
+}
+
+static const char *runtime_request_terminal_status_name(
+        ds4_runtime_request_terminal_status status) {
+    switch (status) {
+    case DS4_RUNTIME_REQUEST_COMPLETED: return "completed";
+    case DS4_RUNTIME_REQUEST_CANCELLED: return "cancelled";
+    case DS4_RUNTIME_REQUEST_REJECTED: return "rejected";
+    case DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR: return "recoverable_error";
+    case DS4_RUNTIME_REQUEST_UNSAFE_ERROR: return "unsafe_error";
+    case DS4_RUNTIME_REQUEST_TERMINAL_STATUS_COUNT: break;
+    }
+    return NULL;
+}
+
+static bool runtime_finite_nonnegative_double(double value) {
+    if (sizeof(value) != sizeof(uint64_t)) return false;
+    uint64_t bits = 0u;
+    memcpy(&bits, &value, sizeof(bits));
+    const uint64_t sign = UINT64_C(1) << 63u;
+    const uint64_t exponent = UINT64_C(0x7ff) << 52u;
+    return (bits & sign) == 0u && (bits & exponent) != exponent;
 }
 
 static const char *runtime_wire_violation_name(
@@ -2731,6 +3120,110 @@ bool ds4_runtime_wire_snapshot_json(
             snapshot->violations[i].latched_snapshot_seq);
     }
     runtime_json_append_literal(&writer, "]}");
+    if (!writer.ok) {
+        buffer[0] = '\0';
+        return false;
+    }
+    if (length_out) *length_out = writer.length;
+    return true;
+}
+
+bool ds4_runtime_request_metrics_json(
+        const ds4_runtime_request_metrics *metrics,
+        char *buffer,
+        size_t capacity,
+        size_t *length_out) {
+    if (length_out) *length_out = 0u;
+    if (!metrics || !buffer || capacity == 0u) return false;
+    buffer[0] = '\0';
+    const char *terminal = runtime_request_terminal_status_name(
+        metrics->terminal_status);
+    if (!terminal || metrics->snapshot_seq == 0u ||
+        !runtime_wire_uuid_valid(metrics->request_id) ||
+        !runtime_wire_uuid_valid(metrics->instance_id) ||
+        strcmp(metrics->request_id, metrics->instance_id) == 0 ||
+        metrics->prompt_tokens == 0u ||
+        metrics->prompt_tokens > DS4_RUNTIME_JSON_SAFE_INTEGER_MAX ||
+        metrics->generated_tokens > DS4_RUNTIME_JSON_SAFE_INTEGER_MAX ||
+        (metrics->ttft_present &&
+         (metrics->generated_tokens == 0u ||
+          metrics->ttft_ns > metrics->wall_time_ns)) ||
+        !runtime_finite_nonnegative_double(
+            metrics->prefill_tokens_per_second) ||
+        !runtime_finite_nonnegative_double(
+            metrics->visible_decode_tokens_per_second)) {
+        return false;
+    }
+
+    runtime_json_writer writer = {
+        .buffer = buffer,
+        .capacity = capacity,
+        .length = 0u,
+        .ok = true,
+    };
+    runtime_json_append_literal(
+        &writer, "{\"schema\":\"ds4.runtime.request/v1\",\"request_id\":");
+    runtime_json_append_string(
+        &writer, metrics->request_id, sizeof(metrics->request_id));
+    runtime_json_append_literal(&writer, ",\"instance_id\":");
+    runtime_json_append_string(
+        &writer, metrics->instance_id, sizeof(metrics->instance_id));
+    runtime_json_appendf(
+        &writer,
+        ",\"snapshot_seq\":\"%" PRIu64
+        "\",\"prompt_tokens\":%" PRIu64
+        ",\"generated_tokens\":%" PRIu64 ",\"ttft_ns\":",
+        metrics->snapshot_seq,
+        metrics->prompt_tokens,
+        metrics->generated_tokens);
+    if (metrics->ttft_present) {
+        runtime_json_appendf(
+            &writer, "\"%" PRIu64 "\"", metrics->ttft_ns);
+    } else {
+        runtime_json_append_literal(&writer, "null");
+    }
+    runtime_json_appendf(
+        &writer,
+        ",\"prefill_tokens_per_second\":%.17g"
+        ",\"visible_decode_tokens_per_second\":%.17g"
+        ",\"wall_time_ns\":\"%" PRIu64
+        "\",\"cache_hits\":\"%" PRIu64
+        "\",\"cache_misses\":\"%" PRIu64
+        "\",\"cache_evictions\":\"%" PRIu64
+        "\",\"model_file_read_operations\":\"%" PRIu64
+        "\",\"model_file_read_bytes\":\"%" PRIu64
+        "\",\"model_file_read_ns\":\"%" PRIu64
+        "\",\"host_to_device_bytes\":\"%" PRIu64
+        "\",\"host_to_device_ns\":\"%" PRIu64
+        "\",\"page_advice_attempts\":\"%" PRIu64
+        "\",\"page_advice_bytes\":\"%" PRIu64
+        "\",\"page_advice_failures\":\"%" PRIu64
+        "\",\"page_advice_complete_monotonic_ns\":",
+        metrics->prefill_tokens_per_second,
+        metrics->visible_decode_tokens_per_second,
+        metrics->wall_time_ns,
+        metrics->counters.cache_acquire_hits,
+        metrics->counters.cache_acquire_misses,
+        metrics->counters.cache_evictions,
+        metrics->counters.model_file_read_operations,
+        metrics->counters.model_file_read_bytes,
+        metrics->counters.model_file_read_ns,
+        metrics->counters.host_to_device_bytes,
+        metrics->counters.host_to_device_ns,
+        metrics->counters.page_advice_attempts,
+        metrics->counters.page_advice_bytes,
+        metrics->counters.page_advice_failures);
+    if (metrics->page_advice_complete_present) {
+        runtime_json_appendf(
+            &writer, "\"%" PRIu64 "\"",
+            metrics->page_advice_complete_monotonic_ns);
+    } else {
+        runtime_json_append_literal(&writer, "null");
+    }
+    runtime_json_append_literal(&writer, ",\"terminal_status\":");
+    runtime_json_append_string(
+        &writer, terminal, strlen(terminal) + 1u);
+    runtime_json_append_literal(&writer, "}");
     if (!writer.ok) {
         buffer[0] = '\0';
         return false;

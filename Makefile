@@ -359,6 +359,7 @@ tests/test_runtime: tests/test_runtime.o ds4_runtime.o
 
 test-runtime: tests/test_runtime
 	./tests/test_runtime --case external-attribution
+	./tests/test_runtime --case request-metrics
 
 test-runtime-request: tests/test_runtime
 	./tests/test_runtime --case request-metrics
@@ -727,6 +728,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract tes
 	./tests/test_laguna_stream --case prefill-plan
 	./tests/test_laguna_stream --case page-ranges
 	./tests/test_runtime --case external-attribution
+	./tests/test_runtime --case request-metrics
 	./tests/test_runtime_cpp_link
 	./tests/test_plan_io
 	./tests/test_laguna_plan

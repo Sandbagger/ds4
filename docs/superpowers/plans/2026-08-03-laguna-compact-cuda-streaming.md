@@ -1095,11 +1095,19 @@ git commit -m "test: freeze compact runtime wire schemas"
 - Modify: `Makefile`
 - Modify: `ds4_runtime.h`, `ds4_runtime.c`
 - Modify: `ds4.h`, `ds4.c:2470-2525`
+- Create: `ds4_build_info.h`, `ds4_build_info.c`
+- Create: `ds4_qualification_control.c`
+- Modify: `ds4_gpu.h`, `ds4_cuda.cu`
 - Modify: `ds4_cli.c`, `ds4_server.c`, `ds4_agent.c`, `ds4_bench.c`, `ds4_eval.c`
 - Modify: `ds4_help.c`
 - Modify: `tests/test_runtime.c`
-- Modify: `tests/test_runtime_contract.py`
-- Modify: `Makefile`
+- Create: `tests/test_version_json.py`
+- Create: `tests/test_runtime_endpoint_contract.py`
+- Create: `tests/test_qualification_control.c`
+- Create: `tests/test_qualification_control_contract.py`
+- Create: `tests/test_qualification_control_cli_contract.py`
+- Create: `tests/test_task16_gate_contract.py`
+- Modify: `tests/test_cuda_laguna_stream.c`, `tests/test_cuda_build_contract.py`
 
 - [ ] **Step 1: Add RED build/snapshot tests**
 
@@ -1109,8 +1117,10 @@ Require every inference binary's `--version-json` to exit `0` before opening a m
 
 ```sh
 make tests/test_runtime ds4 ds4-server ds4-agent ds4-bench ds4-eval
-./tests/test_runtime
-python3 tests/test_runtime_contract.py -v
+./tests/test_runtime --case external-attribution
+uv run --with-requirements \
+  gguf-tools/quality-testing/requirements-compact-runtime.txt \
+  python tests/test_runtime_contract.py -v
 ./ds4-server --version-json
 ```
 
@@ -1131,27 +1141,28 @@ Add `ds4_engine_runtime_snapshot()` and a serializer that takes the tracker/cach
 - [ ] **Step 6: Make identity and live endpoint tests green**
 
 ```sh
-./tests/test_runtime
-python3 tests/test_runtime_contract.py -v
-./ds4 --version-json
-./ds4-server --version-json
-./ds4-agent --version-json
-./ds4-bench --version-json
-./ds4-eval --version-json
-DS4_TEST_MODEL="$LAGUNA_MODEL" \
-  python3 tests/test_runtime_contract.py --live ./ds4-server
+make test-laguna-runtime-identity
+make test-cuda-build-contract
+env -u DS4_LOCK_FILE \
+  DS4_TEST_MODEL="$LAGUNA_MODEL" \
+  make test-cuda-laguna-qualification-control
+# Exact plan-bound cold preparation must run before and after the managed child.
+env -u DS4_LOCK_FILE \
+  DS4_TEST_MODEL="$LAGUNA_MODEL" \
+  DS4_RUNTIME_SERVER_START_TIMEOUT=900 \
+  uv run --with-requirements \
+    gguf-tools/quality-testing/requirements-compact-runtime.txt \
+    python tests/test_runtime_endpoint_contract.py -v --live ./ds4-server
 ```
 
 Expected: all JSON validates; model/executable stats match the opened descriptors; repeated runtime reads increase `snapshot_seq` without resetting counters.
 
 - [ ] **Step 7: Commit**
 
-```sh
-git add Makefile ds4_runtime.h ds4_runtime.c ds4.h ds4.c ds4_cli.c \
-  ds4_server.c ds4_agent.c ds4_bench.c ds4_eval.c ds4_help.c \
-  tests/test_runtime.c tests/test_runtime_contract.py
-git commit -m "feat: expose DS4 build identity and runtime snapshots"
-```
+Commit the RED contracts, runtime/build identity implementation, qualification
+transport, CUDA barrier integration, HTTP endpoint, and acceptance wiring as
+focused reviewable units. Record the exact clean revision used for the live
+CUDA and managed-server run; do not collapse the series into one mega-commit.
 
 ### Task 17: Expose request metrics and exact token admission
 

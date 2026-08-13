@@ -2451,6 +2451,26 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cudaDeviceSynchronize()", device_zero)
         self.assertIn("cudaMemGetInfo(&cuda_free, &cuda_total)", device_zero)
 
+    def test_successful_compact_teardown_clears_all_external_reports(
+        self,
+    ) -> None:
+        body = function_body("static int cuda_laguna_compact_release_locked(")
+        cleared = body.find(
+            "ds4_runtime_tracker_checkpoint_external(\n"
+            "            ctx->tracker, 0, 0, 0)"
+        )
+        unmapped = body.find("cuda_laguna_compact_tracker_unmap_record(")
+        self.assertGreaterEqual(
+            cleared,
+            0,
+            "clean teardown must retire model, host-library, and CUDA-library "
+            "external report charges together",
+        )
+        self.assertGreater(unmapped, cleared)
+        self.assertNotIn(
+            "ds4_runtime_tracker_checkpoint_model_source(", body
+        )
+
     def test_external_checkpoint_barriers_run_inside_quiescence_window(
         self,
     ) -> None:

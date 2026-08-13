@@ -4037,6 +4037,25 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertLess(declaration_at, first_use)
         self.assertGreater(definition_at, first_use)
 
+    def test_request_counter_gate_enables_runtime_snapshots(self) -> None:
+        body = source_function_body(
+            LAGUNA_STREAM_TEST,
+            "static int run_request_counters(void) {",
+            "tests/test_cuda_laguna_stream.c",
+        )
+        build_info = body.find(
+            "const ds4_runtime_build_info runtime_build_info = {"
+        )
+        option = body.find(".runtime_build_info = &runtime_build_info")
+        opened = body.find("ds4_engine_open(&engine, &options)")
+        snapshot = body.find(
+            "ds4_engine_runtime_snapshot(engine, &process_before)"
+        )
+        self.assertGreaterEqual(build_info, 0)
+        self.assertGreater(option, build_info)
+        self.assertGreater(opened, option)
+        self.assertGreater(snapshot, opened)
+
 
 if __name__ == "__main__":
     unittest.main()

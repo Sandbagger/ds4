@@ -6342,6 +6342,13 @@ static int run_request_counters(void) {
 
     saved_environment saved;
     save_and_clear_forbidden_environment(&saved);
+    const ds4_runtime_build_info runtime_build_info = {
+        .revision = "0123456789abcdef0123456789abcdef01234567",
+        .dirty = false,
+        .backend = "cuda",
+        .features = {"laguna", "ssd_streaming"},
+        .feature_count = 2u,
+    };
     const ds4_engine_options options = {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
@@ -6352,6 +6359,7 @@ static int run_request_counters(void) {
         .ssd_streaming_cache_bytes =
             UINT64_C(8) * 1024u * 1024u * 1024u,
         .ssd_streaming_cache_bytes_set = true,
+        .runtime_build_info = &runtime_build_info,
         .qualification_model_fd = model_fd,
         .qualification_model_fd_set = model_fd_set,
     };

@@ -346,6 +346,16 @@ class SchemaTests(unittest.TestCase):
                     self.assertIs(node.get("additionalProperties"), False, f"open object at {name}:{label(path)}")
                     self.assertEqual(set(node.get("required", [])), set(node.get("properties", {})), f"optional property at {name}:{label(path)}")
 
+    def test_schema_patterns_use_true_string_end_not_line_end(self) -> None:
+        for name, schema in self.schemas.items():
+            for path, key, pattern in walk({"root": schema}):
+                if key == "pattern":
+                    self.assertNotIn(
+                        "$",
+                        pattern,
+                        f"line-end anchor accepts a trailing newline at {name}:{label(path)}",
+                    )
+
     def test_valid_fixtures_schema_constants_and_recursive_closure(self) -> None:
         for name, fixture_list in variants().items():
             for index, value in enumerate(fixture_list):

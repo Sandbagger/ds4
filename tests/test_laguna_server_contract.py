@@ -1359,9 +1359,25 @@ class MetricsContract(unittest.TestCase):
                     terminal_status=terminal_status,
                 )
                 metric = self.assert_one_metric([json.loads(wire)], protocol_id)
-                self.assert_visible_fixture(
-                    metric, protocol_id, terminal_status=terminal_status
-                )
+                if terminal_status == "rejected":
+                    self.assert_metric_shape(metric, protocol_id)
+                    self.assertEqual(metric["prompt_tokens"], 22)
+                    self.assertEqual(metric["generated_tokens"], 0)
+                    self.assertIsNone(metric["ttft_ns"])
+                    self.assertEqual(metric["prefill_tokens_per_second"], 0)
+                    self.assertEqual(
+                        metric["visible_decode_tokens_per_second"], 0
+                    )
+                    self.assertIsNone(
+                        metric["page_advice_complete_monotonic_ns"]
+                    )
+                    for key in VISIBLE_COUNTERS:
+                        self.assertEqual(metric[key], "0", key)
+                    self.assertEqual(metric["terminal_status"], "rejected")
+                else:
+                    self.assert_visible_fixture(
+                        metric, protocol_id, terminal_status=terminal_status
+                    )
                 request_ids.add(metric["request_id"])
         self.assertEqual(len(request_ids), len(TERMINAL_STATUSES))
 

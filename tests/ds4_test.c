@@ -7432,6 +7432,14 @@ static bool test_metrics_build_lifecycle(
     memset(&context, 0, sizeof(context));
     memset(metrics, 0, sizeof(*metrics));
 
+    if (request->terminal_status == DS4_RUNTIME_REQUEST_REJECTED) {
+        return ds4_runtime_request_begin(&context, UINT64_C(900000000)) &&
+            ds4_runtime_request_set_prompt_tokens(&context, UINT64_C(22)) &&
+            ds4_runtime_request_finish(
+                &context, DS4_RUNTIME_REQUEST_REJECTED,
+                UINT64_C(1000000000), metrics);
+    }
+
     if (request->fixture == TEST_METRICS_BUFFERED_NO_EMIT) {
         return ds4_runtime_request_begin(&context, UINT64_C(100)) &&
             ds4_runtime_request_set_prompt_tokens(&context, UINT64_C(2)) &&

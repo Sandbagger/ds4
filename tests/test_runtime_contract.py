@@ -24,7 +24,11 @@ SCHEMA_FILES = {
     "admission": ("ds4-token-admission-v1.schema.json", "ds4.token-admission/v1"),
     "bundle": ("ds4-laguna-compact-runtime-v1.schema.json", "ds4.laguna.compact-runtime/v1"),
 }
-PINS = {"jsonschema": "4.25.1", "rfc8785": "0.1.4"}
+PINS = {
+    "jsonschema": "4.25.1",
+    "rfc3339-validator": "0.1.4",
+    "rfc8785": "0.1.4",
+}
 BACKENDS = ("cpu", "metal", "cuda", "rocm")
 STATES = ("starting", "ready", "draining", "unsafe")
 TERMINAL = ("completed", "cancelled", "rejected", "recoverable_error", "unsafe_error")
@@ -432,7 +436,12 @@ class SchemaTests(unittest.TestCase):
                 changed = copy.deepcopy(value); put(changed, path, candidate); self.invalid(name, changed)
         for candidate in ("2026-08-13T12:34:56Z", "2026-08-13T12:34:56.123456789Z"):
             changed = bundle(); changed["created_at"] = candidate; self.valid("bundle", changed)
-        for candidate in ("2026-08-13T12:34:56+00:00", "2026-08-13 12:34:56Z", "2026-13-13T12:34:56Z"):
+        for candidate in (
+            "2026-08-13T12:34:56+00:00",
+            "2026-08-13 12:34:56Z",
+            "2026-13-13T12:34:56Z",
+            "2026-02-31T12:34:56Z",
+        ):
             changed = bundle(); changed["created_at"] = candidate; self.invalid("bundle", changed)
         for name, value, path in (("version", version(), ("features",)), ("runtime", runtime(), ("build", "features"))):
             for candidate in ([], ["laguna"], ["laguna", "ssd_streaming"]):

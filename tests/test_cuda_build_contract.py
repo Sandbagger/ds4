@@ -444,7 +444,11 @@ class CudaBuildContractTest(unittest.TestCase):
         ]
         self.assertEqual(
             requirements,
-            ["jsonschema==4.25.1", "rfc8785==0.1.4"],
+            [
+                "jsonschema==4.25.1",
+                "rfc3339-validator==0.1.4",
+                "rfc8785==0.1.4",
+            ],
             "wire-schema validation and RFC 8785 canonicalization must use "
             "the qualification-only pinned runtime",
         )
@@ -471,7 +475,7 @@ class CudaBuildContractTest(unittest.TestCase):
                 "\t\texit 127; \\",
                 "\t}",
                 "\t@uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \\",
-                "\t\tpython -c 'from jsonschema import Draft202012Validator; import rfc8785' || { \\",
+                "\t\tpython -c 'from jsonschema import Draft202012Validator; import rfc3339_validator, rfc8785' || { \\",
                 "\t\techo \"error: unable to provision pinned compact-runtime requirements with uv\" >&2; \\",
                 "\t\texit 1; \\",
                 "\t}",

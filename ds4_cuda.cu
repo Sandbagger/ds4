@@ -688,6 +688,9 @@ struct ds4_gpu_laguna_compact {
     uint64_t cache_load_failures;
     uint64_t model_file_read_calls;
     uint64_t model_file_read_bytes;
+    uint64_t model_file_read_ns;
+    uint64_t host_to_device_bytes;
+    uint64_t host_to_device_ns;
     uint64_t pread_eintr_retries;
     uint64_t pread_eof_failures;
     uint64_t pread_short_failures;
@@ -3313,16 +3316,24 @@ extern "C" int ds4_gpu_laguna_compact_create(
             return 0;
         }
         ctx->static_offsets[i] = device_cursor;
+        const uint64_t copy_started =
+            cuda_laguna_compact_monotonic_ns_after(0u);
         error = cudaMemcpy(
             ctx->static_slab + device_cursor,
             (const char *)model_map + range->source_offset,
             (size_t)range->source_bytes,
             cudaMemcpyHostToDevice);
+        const uint64_t copy_finished =
+            cuda_laguna_compact_monotonic_ns_after(copy_started);
+        cuda_laguna_compact_counter_add(
+            &ctx->host_to_device_ns, copy_finished - copy_started);
         if (error != cudaSuccess) {
             (void)cudaGetLastError();
             cuda_laguna_compact_create_unwind_locked(ctx);
             return 0;
         }
+        cuda_laguna_compact_counter_add(
+            &ctx->host_to_device_bytes, range->source_bytes);
         device_cursor += aligned;
         ctx->static_source_copied_bytes += range->source_bytes;
         ctx->static_range_count++;
@@ -3929,6 +3940,9 @@ static int cuda_laguna_compact_take_cache_fault(int expected) {
 typedef struct {
     uint64_t model_file_read_calls;
     uint64_t model_file_read_bytes;
+    uint64_t model_file_read_ns;
+    uint64_t host_to_device_bytes;
+    uint64_t host_to_device_ns;
     uint64_t pread_eintr_retries;
     uint64_t pread_eof_failures;
     uint64_t pread_short_failures;
@@ -4015,6 +4029,12 @@ static void cuda_laguna_compact_cache_merge_stats_locked(
         &ctx->model_file_read_calls, stats->model_file_read_calls);
     cuda_laguna_compact_counter_add(
         &ctx->model_file_read_bytes, stats->model_file_read_bytes);
+    cuda_laguna_compact_counter_add(
+        &ctx->model_file_read_ns, stats->model_file_read_ns);
+    cuda_laguna_compact_counter_add(
+        &ctx->host_to_device_bytes, stats->host_to_device_bytes);
+    cuda_laguna_compact_counter_add(
+        &ctx->host_to_device_ns, stats->host_to_device_ns);
     cuda_laguna_compact_counter_add(
         &ctx->pread_eintr_retries, stats->pread_eintr_retries);
     cuda_laguna_compact_counter_add(
@@ -4141,8 +4161,14 @@ static int cuda_laguna_compact_cache_read_exact(
         }
         cuda_laguna_compact_counter_increment(
             &stats->model_file_read_calls);
+        const uint64_t read_started =
+            cuda_laguna_compact_monotonic_ns_after(0u);
         const ssize_t result = cuda_laguna_compact_cache_pread(
             ctx, (char *)buffer + done, requested, offset + done);
+        const uint64_t read_finished =
+            cuda_laguna_compact_monotonic_ns_after(read_started);
+        cuda_laguna_compact_counter_add(
+            &stats->model_file_read_ns, read_finished - read_started);
         if (result < 0) {
             if (errno == EINTR) {
                 cuda_laguna_compact_counter_increment(
@@ -4233,11 +4259,17 @@ cuda_laguna_compact_cache_transfer(
             break;
         }
 #endif
+        const uint64_t copy_started =
+            cuda_laguna_compact_monotonic_ns_after(0u);
         const cudaError_t copied = cudaMemcpyAsync(
             ctx->cache_payload + slot_offset + view->device_offset,
             ctx->pinned_staging[projection],
             (size_t)view->source_bytes,
             cudaMemcpyHostToDevice, ctx->upload_stream);
+        const uint64_t copy_finished =
+            cuda_laguna_compact_monotonic_ns_after(copy_started);
+        cuda_laguna_compact_counter_add(
+            &stats->host_to_device_ns, copy_finished - copy_started);
         if (copied != cudaSuccess) {
             (void)cudaGetLastError();
             cuda_laguna_compact_counter_increment(
@@ -4245,6 +4277,8 @@ cuda_laguna_compact_cache_transfer(
             result = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
             break;
         }
+        cuda_laguna_compact_counter_add(
+            &stats->host_to_device_bytes, view->source_bytes);
         submitted = 1;
 #ifdef DS4_TEST_HOOKS
         if (projection == 0) {
@@ -4884,6 +4918,31 @@ ds4_gpu_test_laguna_compact_cache_reserve_loading(
     return status;
 }
 #endif
+
+extern "C" bool
+ds4_gpu_laguna_compact_runtime_counters(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_wire_counters *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !out) return false;
+    std::lock_guard<std::mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    std::lock_guard<std::recursive_mutex> compact_guard(
+        g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx)) return false;
+    out->cache_acquire_hits = ctx->cache_acquire_hits;
+    out->cache_acquire_misses = ctx->cache_acquire_misses;
+    out->cache_evictions = ctx->cache_evictions;
+    out->model_file_read_operations = ctx->model_file_read_calls;
+    out->model_file_read_bytes = ctx->model_file_read_bytes;
+    out->model_file_read_ns = ctx->model_file_read_ns;
+    out->host_to_device_bytes = ctx->host_to_device_bytes;
+    out->host_to_device_ns = ctx->host_to_device_ns;
+    out->page_advice_attempts = ctx->page_advice_counters.attempted_calls;
+    out->page_advice_bytes = ctx->page_advice_counters.attempted_bytes;
+    out->page_advice_failures = ctx->page_advice_counters.failed_calls;
+    return true;
+}
 
 extern "C" void ds4_gpu_test_laguna_compact_fail_sync_once(void) {
 #ifdef DS4_TEST_HOOKS

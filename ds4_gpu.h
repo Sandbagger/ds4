@@ -177,6 +177,9 @@ ds4_runtime_status ds4_gpu_laguna_compact_external_checkpoint(
         const uint8_t
             observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
         ds4_engine_laguna_external_checkpoint_observation *out);
+bool ds4_gpu_laguna_compact_runtime_counters(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_wire_counters *out);
 
 /* Reserve one routed expert without performing SSD or CUDA work.  A cache hit
  * is returned already pinned.  LOAD_OWNER returns a lifecycle-bound LOADING

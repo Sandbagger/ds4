@@ -515,7 +515,16 @@ class RuntimeEndpointLiveTest(unittest.TestCase):
 
         self.assertEqual(first["instance_id"], second["instance_id"])
         self.assertGreater(int(second["snapshot_seq"]), int(first["snapshot_seq"]))
-        for stable in ("build", "executable", "model"):
+        for stable in (
+            "build",
+            "executable",
+            "model",
+            "config",
+            "limits",
+            "allocations",
+            "counters",
+            "violations",
+        ):
             with self.subTest(stable=stable):
                 self.assertEqual(first[stable], second[stable])
 

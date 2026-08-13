@@ -10024,11 +10024,68 @@ struct server {
 struct job {
     int fd;
     request req;
+    ds4_runtime_request_context runtime_request;
+    ds4_runtime_request_metrics runtime_terminal;
+    bool runtime_accepted;
+    bool runtime_finished;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+/* A queued job owns request accounting for exactly its stack lifetime.  The
+ * client thread prepares it before enqueue; the worker mutates the same
+ * context and publishes one immutable terminal value before signalling done. */
+static bool server_job_runtime_accept(
+        job *j,
+        uint64_t accepted_monotonic_ns) {
+    if (!j || j->runtime_accepted || j->runtime_finished ||
+        j->req.prompt.len <= 0) {
+        return false;
+    }
+    ds4_runtime_request_context staged;
+    memset(&staged, 0, sizeof(staged));
+    if (!ds4_runtime_request_begin(&staged, accepted_monotonic_ns) ||
+        !ds4_runtime_request_set_prompt_tokens(
+            &staged, (uint64_t)j->req.prompt.len)) {
+        return false;
+    }
+    j->runtime_request = staged;
+    memset(&j->runtime_terminal, 0, sizeof(j->runtime_terminal));
+    j->runtime_accepted = true;
+    return true;
+}
+
+static ds4_runtime_request_context *server_job_runtime_context(job *j) {
+    return j && j->runtime_accepted && !j->runtime_finished
+        ? &j->runtime_request : NULL;
+}
+
+static bool server_job_runtime_finish(
+        job *j,
+        ds4_runtime_request_terminal_status status,
+        uint64_t finished_monotonic_ns) {
+    if (!j || !j->runtime_accepted || j->runtime_finished) return false;
+    ds4_runtime_request_context staged_context = j->runtime_request;
+    ds4_runtime_request_metrics staged_metrics;
+    memset(&staged_metrics, 0, sizeof(staged_metrics));
+    if (!ds4_runtime_request_finish(
+            &staged_context, status, finished_monotonic_ns,
+            &staged_metrics)) {
+        return false;
+    }
+    j->runtime_request = staged_context;
+    j->runtime_terminal = staged_metrics;
+    j->runtime_finished = true;
+    return true;
+}
+
+static const ds4_runtime_request_metrics *
+server_job_runtime_terminal_metrics(const job *j) {
+    return j && j->runtime_accepted && j->runtime_finished
+        ? &j->runtime_terminal : NULL;
+}
 
 /* =========================================================================
  * Tool Call Text Memory.

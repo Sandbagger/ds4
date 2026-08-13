@@ -531,6 +531,33 @@ typedef enum {
     API_RESPONSES,
 } api_style;
 
+/* Protocol-native terminal response seam.  Request-metrics lifecycle wiring
+ * is intentionally separate: callers finish one runtime request snapshot,
+ * then hand that immutable value to the same terminal serializers used by the
+ * live server and host-only contract driver. */
+typedef enum {
+    SERVER_PROTOCOL_TERMINAL_OPENAI_CHAT,
+    SERVER_PROTOCOL_TERMINAL_RESPONSES,
+    SERVER_PROTOCOL_TERMINAL_ANTHROPIC,
+} server_protocol_terminal_kind;
+
+typedef enum {
+    SERVER_RESPONSES_TERMINAL_COMPLETED,
+    SERVER_RESPONSES_TERMINAL_INCOMPLETE,
+    SERVER_RESPONSES_TERMINAL_FAILED,
+} server_responses_terminal_kind;
+
+typedef struct {
+    server_protocol_terminal_kind protocol;
+    server_responses_terminal_kind responses_terminal;
+    bool stream;
+    bool include_usage;
+    bool enable_cors;
+    const char *model;
+    int prompt_tokens;
+    int completion_tokens;
+} server_protocol_terminal_options;
+
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
@@ -6979,6 +7006,25 @@ static int clamp_usage_tokens(int value, int max) {
     return value;
 }
 
+/* Serialize once through the runtime-owned schema implementation, then embed
+ * those bytes as a raw JSON object.  Protocol code must not reproduce the
+ * metrics schema field-by-field: that would create a second wire authority and
+ * eventually let process/runtime and request/response telemetry drift. */
+static bool append_runtime_request_metrics_member(
+        buf *b,
+        const ds4_runtime_request_metrics *metrics) {
+    if (!metrics) return true;
+    char json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t json_len = 0;
+    if (!ds4_runtime_request_metrics_json(
+            metrics, json, sizeof(json), &json_len)) {
+        return false;
+    }
+    buf_puts(b, ",\"request_metrics\":");
+    buf_append(b, json, json_len);
+    return true;
+}
+
 static void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
@@ -6997,21 +7043,29 @@ static void append_openai_usage_json(buf *b, const request *r,
 }
 
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
-                            int prompt_tokens, int completion_tokens) {
-    if (!r->stream_include_usage) return true;
+                            int prompt_tokens, int completion_tokens,
+                            const ds4_runtime_request_metrics *metrics) {
+    if (!r->stream_include_usage && !metrics) return true;
 
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[],\"usage\":");
+        buf_puts(&b, ",\"choices\":[]");
     } else {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[],\"usage\":");
+        buf_puts(&b, ",\"choices\":[]");
     }
-    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (r->stream_include_usage) {
+        buf_puts(&b, ",\"usage\":");
+        append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    }
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        return false;
+    }
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
@@ -7020,8 +7074,10 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
 }
 
 static bool sse_done(int fd, const request *r, const char *id,
-                     int prompt_tokens, int completion_tokens) {
-    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
+                     int prompt_tokens, int completion_tokens,
+                     const ds4_runtime_request_metrics *metrics) {
+    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens,
+                           metrics) &&
            send_all(fd, "data: [DONE]\n\n", 14);
 }
 
@@ -7060,7 +7116,7 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+              sse_done(fd, r, id, prompt_tokens, completion_tokens, NULL);
     buf_free(&b);
     return ok;
 }
@@ -7995,7 +8051,7 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+              sse_done(fd, r, id, prompt_tokens, completion_tokens, NULL);
     buf_free(&b);
     return ok;
 }
@@ -8499,7 +8555,8 @@ static bool responses_sse_completed(int fd, const request *r,
                                     const responses_tool_item *tool_items,
                                     const char *finish,
                                     int prompt_tokens, int completion_tokens,
-                                    long created_at) {
+                                    long created_at,
+                                    const ds4_runtime_request_metrics *metrics) {
     /* Codex routes terminal behaviour off the event type, not response.status.
      * Decide here so clients see response.failed / response.incomplete instead
      * of a "completed" wrapper marked failed in a sub-field. */
@@ -8563,6 +8620,10 @@ static bool responses_sse_completed(int fd, const request *r,
     buf_putc(&b, ']');
     buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        return false;
+    }
     buf_puts(&b, "}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -8744,7 +8805,8 @@ static bool responses_sse_finish_live(int fd, const request *r,
         }
     }
     if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
-                                         prompt_tokens, completion_tokens, created_at);
+                                         prompt_tokens, completion_tokens,
+                                         created_at, NULL);
     free(items);
     return ok;
 }
@@ -8753,10 +8815,14 @@ static bool responses_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
-                                     int prompt_tokens, int completion_tokens) {
-    (void)id;
+                                     int prompt_tokens, int completion_tokens,
+                                     const ds4_runtime_request_metrics *metrics) {
     char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
+    if (id && !strncmp(id, "resp_", 5)) {
+        snprintf(response_id, sizeof(response_id), "%s", id);
+    } else {
+        responses_random_id(response_id, sizeof(response_id), "resp_");
+    }
     responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
@@ -8816,6 +8882,11 @@ static bool responses_final_response(int fd, bool enable_cors,
     buf_putc(&b, ']');
     buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        free(items);
+        return false;
+    }
     buf_putc(&b, '}');
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -8826,7 +8897,8 @@ static bool responses_final_response(int fd, bool enable_cors,
 static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens) {
+                           int prompt_tokens, int completion_tokens,
+                           const ds4_runtime_request_metrics *metrics) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -8855,6 +8927,10 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        return false;
+    }
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -8939,7 +9015,8 @@ static void append_anthropic_usage_json(buf *b, const request *r,
 static bool anthropic_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
-                                     int prompt_tokens, int completion_tokens) {
+                                     int prompt_tokens, int completion_tokens,
+                                     const ds4_runtime_request_metrics *metrics) {
     buf b = {0};
     buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
     json_escape(&b, r->model);
@@ -8949,6 +9026,10 @@ static bool anthropic_final_response(int fd, bool enable_cors,
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        return false;
+    }
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -9607,12 +9688,18 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
 }
 
 static bool anthropic_sse_stop_live(int fd, const char *finish,
-                                    int completion_tokens) {
+                                    int completion_tokens,
+                                    const ds4_runtime_request_metrics *metrics) {
     buf b = {0};
     buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
-    buf_printf(&b, "%d}}", completion_tokens);
+    buf_printf(&b, "%d}", completion_tokens);
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        return false;
+    }
+    buf_putc(&b, '}');
     bool ok = sse_event(fd, "message_delta", b.ptr);
     buf_free(&b);
     if (ok) ok = sse_event(fd, "message_stop", "{\"type\":\"message_stop\"}");
@@ -9631,7 +9718,128 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
     }
 
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, completion_tokens);
+    return anthropic_sse_stop_live(fd, finish, completion_tokens, NULL);
+}
+
+/* Emit a complete protocol-native terminal fixture through the production
+ * serializers.  This seam is deliberately lifecycle-agnostic: the caller owns
+ * request accounting and supplies an already-terminal immutable snapshot.
+ * generate_job can therefore adopt the same native builders when request
+ * lifecycle threading lands, while host contract tests exercise placement
+ * without a model, session, or GPU. */
+static bool DS4_SERVER_MAYBE_UNUSED server_emit_protocol_terminal_metrics(
+        int fd,
+        const server_protocol_terminal_options *options,
+        const char *protocol_request_id,
+        const ds4_runtime_request_metrics *metrics) {
+    if (fd < 0 || !options || !protocol_request_id ||
+        !protocol_request_id[0] || !metrics ||
+        options->prompt_tokens < 0 || options->completion_tokens < 0) {
+        return false;
+    }
+    if (metrics->prompt_tokens > (uint64_t)INT_MAX ||
+        metrics->generated_tokens > (uint64_t)INT_MAX ||
+        (uint64_t)options->prompt_tokens != metrics->prompt_tokens ||
+        (uint64_t)options->completion_tokens != metrics->generated_tokens) {
+        return false;
+    }
+    if (options->protocol < SERVER_PROTOCOL_TERMINAL_OPENAI_CHAT ||
+        options->protocol > SERVER_PROTOCOL_TERMINAL_ANTHROPIC ||
+        options->responses_terminal < SERVER_RESPONSES_TERMINAL_COMPLETED ||
+        options->responses_terminal > SERVER_RESPONSES_TERMINAL_FAILED) {
+        return false;
+    }
+
+    /* Streaming protocols may emit a native created/message_start frame before
+     * their terminal frame.  Validate the runtime-owned JSON up front so an
+     * invalid snapshot cannot leave a syntactically valid but unterminated
+     * partial protocol response.  Terminal builders still serialize from the
+     * snapshot directly, keeping the runtime serializer as the only schema
+     * authority. */
+    char metrics_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t metrics_json_len = 0;
+    if (!ds4_runtime_request_metrics_json(
+            metrics, metrics_json, sizeof(metrics_json),
+            &metrics_json_len)) {
+        return false;
+    }
+
+    request r;
+    request_init(&r, REQ_CHAT, options->completion_tokens);
+    free(r.model);
+    r.model = xstrdup(options->model && options->model[0] ?
+                      options->model : "laguna-s-2.1-chat");
+    r.stream = options->stream;
+    r.stream_include_usage = options->include_usage;
+    r.think_mode = DS4_THINK_NONE;
+
+    const char *finish = "stop";
+    if (options->responses_terminal == SERVER_RESPONSES_TERMINAL_INCOMPLETE) {
+        finish = "length";
+    } else if (options->responses_terminal ==
+               SERVER_RESPONSES_TERMINAL_FAILED) {
+        finish = "error";
+    }
+
+    bool ok = false;
+    switch (options->protocol) {
+    case SERVER_PROTOCOL_TERMINAL_OPENAI_CHAT:
+        r.api = API_OPENAI;
+        if (options->stream) {
+            ok = sse_done(fd, &r, protocol_request_id,
+                          options->prompt_tokens,
+                          options->completion_tokens, metrics);
+        } else {
+            ok = final_response(fd, options->enable_cors, &r,
+                                protocol_request_id, "", NULL, NULL, finish,
+                                options->prompt_tokens,
+                                options->completion_tokens, metrics);
+        }
+        break;
+    case SERVER_PROTOCOL_TERMINAL_RESPONSES:
+        r.api = API_RESPONSES;
+        if (options->stream) {
+            responses_stream st;
+            responses_stream_init(&r, &st);
+            snprintf(st.response_id, sizeof(st.response_id), "%s",
+                     protocol_request_id);
+            st.active = true;
+            const long created_at = (long)time(NULL);
+            ok = responses_sse_created(fd, &r, &st, created_at) &&
+                 responses_sse_completed(fd, &r, &st, NULL, NULL, finish,
+                                         options->prompt_tokens,
+                                         options->completion_tokens,
+                                         created_at, metrics);
+            responses_stream_free(&st);
+        } else {
+            ok = responses_final_response(
+                fd, options->enable_cors, &r, protocol_request_id,
+                "", NULL, NULL, finish, options->prompt_tokens,
+                options->completion_tokens, metrics);
+        }
+        break;
+    case SERVER_PROTOCOL_TERMINAL_ANTHROPIC:
+        r.api = API_ANTHROPIC;
+        if (options->stream) {
+            anthropic_stream st;
+            ok = anthropic_sse_start_live(
+                fd, &r, protocol_request_id, options->prompt_tokens, &st);
+            if (ok) {
+                ok = anthropic_sse_stop_live(
+                    fd, finish, options->completion_tokens, metrics);
+            }
+            anthropic_stream_free(&st);
+        } else {
+            ok = anthropic_final_response(
+                fd, options->enable_cors, &r, protocol_request_id,
+                "", NULL, NULL, finish, options->prompt_tokens,
+                options->completion_tokens, metrics);
+        }
+        break;
+    }
+
+    request_free(&r);
+    return ok;
 }
 
 static double now_sec(void) {
@@ -13638,7 +13846,8 @@ decode_again:
                                           prompt_tokens, completion);
         } else {
             response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
+                          sse_done(j->fd, &j->req, id, prompt_tokens,
+                                   completion, NULL);
         }
         if (!response_ok) {
             server_log(DS4_LOG_DEFAULT,
@@ -13653,19 +13862,19 @@ decode_again:
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+                                 prompt_tokens, completion, NULL);
     } else if (j->req.api == API_RESPONSES) {
         responses_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+                                 prompt_tokens, completion, NULL);
     } else {
         final_response(j->fd, s->enable_cors, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+                       prompt_tokens, completion, NULL);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -16051,7 +16260,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16158,7 +16367,7 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
 
-    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2));
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16191,7 +16400,7 @@ static void test_responses_usage_reports_cache_details(void) {
     }
 
     TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_usage", "OK", NULL, NULL,
-                                         "stop", 10, 2));
+                                         "stop", 10, 2, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16215,7 +16424,7 @@ static void test_responses_usage_reports_cache_details(void) {
     responses_stream st;
     responses_stream_init(&r, &st);
     TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
-                                        "stop", 10, 2, 1234));
+                                        "stop", 10, 2, 1234, NULL));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
 

@@ -7032,10 +7032,37 @@ typedef struct {
     int tool_memory_entries;
     int disk_cache_entries;
     uint64_t disk_cache_bytes;
+    uint64_t protocol_sequence;
     buf tool_memory_records;
     buf disk_cache_records;
     FILE *disk_fixture;
 } test_server_driver;
+
+typedef enum {
+    TEST_METRICS_OPENAI_CHAT,
+    TEST_METRICS_RESPONSES,
+    TEST_METRICS_ANTHROPIC,
+} test_metrics_protocol;
+
+typedef enum {
+    TEST_METRICS_VISIBLE,
+    TEST_METRICS_BUFFERED_NO_EMIT,
+} test_metrics_fixture;
+
+typedef enum {
+    TEST_RESPONSES_COMPLETED,
+    TEST_RESPONSES_INCOMPLETE,
+    TEST_RESPONSES_FAILED,
+} test_responses_terminal;
+
+typedef struct {
+    test_metrics_protocol protocol;
+    test_metrics_fixture fixture;
+    test_responses_terminal responses_terminal;
+    ds4_runtime_request_terminal_status terminal_status;
+    bool stream;
+    bool include_usage;
+} test_metrics_request;
 
 static void test_server_rpc_free(test_server_rpc *rpc) {
     if (!rpc) return;
@@ -7113,6 +7140,161 @@ static bool test_server_rpc_parse(const char *line, test_server_rpc *rpc) {
 fail:
     test_server_rpc_free(rpc);
     return false;
+}
+
+static bool test_metrics_parse_protocol(const char *name,
+                                        test_metrics_protocol *protocol) {
+    if (!name || !protocol) return false;
+    if (!strcmp(name, "openai_chat")) {
+        *protocol = TEST_METRICS_OPENAI_CHAT;
+    } else if (!strcmp(name, "responses")) {
+        *protocol = TEST_METRICS_RESPONSES;
+    } else if (!strcmp(name, "anthropic")) {
+        *protocol = TEST_METRICS_ANTHROPIC;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool test_metrics_parse_fixture(const char *name,
+                                       test_metrics_fixture *fixture) {
+    if (!name || !fixture) return false;
+    if (!strcmp(name, "visible")) {
+        *fixture = TEST_METRICS_VISIBLE;
+    } else if (!strcmp(name, "buffered_no_emit")) {
+        *fixture = TEST_METRICS_BUFFERED_NO_EMIT;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool test_metrics_parse_terminal_status(
+        const char *name,
+        ds4_runtime_request_terminal_status *status) {
+    if (!name || !status) return false;
+    if (!strcmp(name, "completed")) {
+        *status = DS4_RUNTIME_REQUEST_COMPLETED;
+    } else if (!strcmp(name, "cancelled")) {
+        *status = DS4_RUNTIME_REQUEST_CANCELLED;
+    } else if (!strcmp(name, "rejected")) {
+        *status = DS4_RUNTIME_REQUEST_REJECTED;
+    } else if (!strcmp(name, "recoverable_error")) {
+        *status = DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR;
+    } else if (!strcmp(name, "unsafe_error")) {
+        *status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool test_metrics_parse_responses_terminal(
+        const char *name,
+        test_responses_terminal *terminal) {
+    if (!name || !terminal) return false;
+    if (!strcmp(name, "completed")) {
+        *terminal = TEST_RESPONSES_COMPLETED;
+    } else if (!strcmp(name, "incomplete")) {
+        *terminal = TEST_RESPONSES_INCOMPLETE;
+    } else if (!strcmp(name, "failed")) {
+        *terminal = TEST_RESPONSES_FAILED;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool test_metrics_request_parse(const char *json,
+                                       test_metrics_request *request) {
+    if (!json || !request) return false;
+    memset(request, 0, sizeof(*request));
+    request->responses_terminal = TEST_RESPONSES_COMPLETED;
+    const char *p = json;
+    bool got_protocol = false;
+    bool got_stream = false;
+    bool got_fixture = false;
+    bool got_terminal_status = false;
+    bool got_include_usage = false;
+    bool got_native_terminal = false;
+
+    json_ws(&p);
+    if (*p++ != '{') return false;
+    json_ws(&p);
+    if (*p == '}') return false;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p++ != ':') {
+            free(key);
+            return false;
+        }
+
+        bool valid = true;
+        if (!strcmp(key, "protocol") && !got_protocol) {
+            char *value = NULL;
+            valid = json_string(&p, &value) &&
+                test_metrics_parse_protocol(value, &request->protocol);
+            got_protocol = true;
+            free(value);
+        } else if (!strcmp(key, "stream") && !got_stream) {
+            valid = json_bool(&p, &request->stream);
+            got_stream = true;
+        } else if (!strcmp(key, "fixture") && !got_fixture) {
+            char *value = NULL;
+            valid = json_string(&p, &value) &&
+                test_metrics_parse_fixture(value, &request->fixture);
+            got_fixture = true;
+            free(value);
+        } else if (!strcmp(key, "terminal_status") &&
+                   !got_terminal_status) {
+            char *value = NULL;
+            valid = json_string(&p, &value) &&
+                test_metrics_parse_terminal_status(
+                    value, &request->terminal_status);
+            got_terminal_status = true;
+            free(value);
+        } else if (!strcmp(key, "include_usage") && !got_include_usage) {
+            valid = json_bool(&p, &request->include_usage);
+            got_include_usage = true;
+        } else if (!strcmp(key, "native_terminal") &&
+                   !got_native_terminal) {
+            char *value = NULL;
+            valid = json_string(&p, &value) &&
+                test_metrics_parse_responses_terminal(
+                    value, &request->responses_terminal);
+            got_native_terminal = true;
+            free(value);
+        } else {
+            valid = false;
+        }
+        free(key);
+        if (!valid) return false;
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p++ != ',') return false;
+        json_ws(&p);
+        if (*p == '}') return false;
+    }
+    json_ws(&p);
+    if (*p || !got_protocol || !got_stream || !got_fixture ||
+        !got_terminal_status) {
+        return false;
+    }
+    if (got_include_usage &&
+        request->protocol != TEST_METRICS_OPENAI_CHAT) {
+        return false;
+    }
+    if (got_native_terminal &&
+        request->protocol != TEST_METRICS_RESPONSES) {
+        return false;
+    }
+    return true;
 }
 
 static void test_server_fingerprint(const void *data, size_t len,
@@ -7242,6 +7424,186 @@ static bool test_server_tokenize_deterministic(void *ctx, const char *text,
     return true;
 }
 
+static bool test_metrics_build_lifecycle(
+        const test_metrics_request *request,
+        ds4_runtime_request_metrics *metrics) {
+    if (!request || !metrics) return false;
+    ds4_runtime_request_context context;
+    memset(&context, 0, sizeof(context));
+    memset(metrics, 0, sizeof(*metrics));
+
+    if (request->fixture == TEST_METRICS_BUFFERED_NO_EMIT) {
+        return ds4_runtime_request_begin(&context, UINT64_C(100)) &&
+            ds4_runtime_request_set_prompt_tokens(&context, UINT64_C(2)) &&
+            ds4_runtime_request_mark_prefill_started(
+                &context, UINT64_C(101)) &&
+            ds4_runtime_request_mark_prefill_complete(
+                &context, UINT64_C(102)) &&
+            ds4_runtime_request_add_generated_tokens(
+                &context, UINT64_C(2)) &&
+            ds4_runtime_request_record_visible_decoded(
+                &context, UINT64_C(1), UINT64_C(103)) &&
+            ds4_runtime_request_record_visible_decoded(
+                &context, UINT64_C(1), UINT64_C(104)) &&
+            ds4_runtime_request_finish(
+                &context, request->terminal_status, UINT64_C(105), metrics);
+    }
+
+    const ds4_runtime_wire_counters counters = {
+        .cache_acquire_hits = UINT64_C(1),
+        .cache_acquire_misses = UINT64_C(2),
+        .cache_evictions = UINT64_C(3),
+        .model_file_read_operations = UINT64_C(4),
+        .model_file_read_bytes = UINT64_C(5),
+        .model_file_read_ns = UINT64_C(6),
+        .host_to_device_bytes = UINT64_C(7),
+        .host_to_device_ns = UINT64_C(8),
+        .page_advice_attempts = UINT64_C(9),
+        .page_advice_bytes = UINT64_C(10),
+        .page_advice_failures = UINT64_C(11),
+    };
+    return request->fixture == TEST_METRICS_VISIBLE &&
+        ds4_runtime_request_begin(&context, UINT64_C(900000000)) &&
+        ds4_runtime_request_set_prompt_tokens(&context, UINT64_C(22)) &&
+        ds4_runtime_request_mark_prefill_started(
+            &context, UINT64_C(1100000000)) &&
+        ds4_runtime_request_mark_prefill_complete(
+            &context, UINT64_C(1300000000)) &&
+        ds4_runtime_request_add_counters(&context, &counters) &&
+        ds4_runtime_request_add_generated_tokens(&context, UINT64_C(2)) &&
+        ds4_runtime_request_add_generated_tokens(&context, UINT64_C(1)) &&
+        ds4_runtime_request_record_visible_decoded(
+            &context, UINT64_C(1), UINT64_C(1500000000)) &&
+        ds4_runtime_request_add_generated_tokens(&context, UINT64_C(5)) &&
+        ds4_runtime_request_record_visible_decoded(
+            &context, UINT64_C(5), UINT64_C(2000000000)) &&
+        ds4_runtime_request_record_page_advice_complete(
+            &context, UINT64_C(2700000000)) &&
+        ds4_runtime_request_mark_first_visible_emitted(
+            &context, UINT64_C(2800000000)) &&
+        ds4_runtime_request_finish(
+            &context, request->terminal_status, UINT64_C(3000000000),
+            metrics);
+}
+
+static bool test_server_read_socket(int fd, buf *wire) {
+    char chunk[4096];
+    for (;;) {
+        const ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+        if (n > 0) {
+            buf_append(wire, chunk, (size_t)n);
+            continue;
+        }
+        if (n == 0) return true;
+        if (errno == EINTR) continue;
+        return false;
+    }
+}
+
+static bool test_server_strip_http_headers(buf *wire) {
+    if (!wire || !wire->ptr) return false;
+    const char *separator = strstr(wire->ptr, "\r\n\r\n");
+    if (!separator) return false;
+    const size_t body_offset =
+        (size_t)(separator - wire->ptr) + strlen("\r\n\r\n");
+    if (body_offset > wire->len) return false;
+    const size_t body_len = wire->len - body_offset;
+    memmove(wire->ptr, wire->ptr + body_offset, body_len);
+    wire->len = body_len;
+    wire->ptr[wire->len] = '\0';
+    return true;
+}
+
+static bool test_server_emit_metrics_wire(
+        const test_metrics_request *request,
+        const char *protocol_request_id,
+        const ds4_runtime_request_metrics *metrics,
+        buf *wire) {
+    if (!request || !protocol_request_id || !metrics || !wire) return false;
+    if (metrics->prompt_tokens > (uint64_t)INT_MAX ||
+        metrics->generated_tokens > (uint64_t)INT_MAX) {
+        return false;
+    }
+    server_protocol_terminal_options options = {
+        .responses_terminal = SERVER_RESPONSES_TERMINAL_COMPLETED,
+        .stream = request->stream,
+        .include_usage = request->include_usage,
+        .enable_cors = false,
+        .model = "laguna-s-2.1-chat",
+        .prompt_tokens = (int)metrics->prompt_tokens,
+        .completion_tokens = (int)metrics->generated_tokens,
+    };
+    switch (request->protocol) {
+    case TEST_METRICS_OPENAI_CHAT:
+        options.protocol = SERVER_PROTOCOL_TERMINAL_OPENAI_CHAT;
+        break;
+    case TEST_METRICS_RESPONSES:
+        options.protocol = SERVER_PROTOCOL_TERMINAL_RESPONSES;
+        break;
+    case TEST_METRICS_ANTHROPIC:
+        options.protocol = SERVER_PROTOCOL_TERMINAL_ANTHROPIC;
+        break;
+    }
+    switch (request->responses_terminal) {
+    case TEST_RESPONSES_COMPLETED:
+        options.responses_terminal = SERVER_RESPONSES_TERMINAL_COMPLETED;
+        break;
+    case TEST_RESPONSES_INCOMPLETE:
+        options.responses_terminal = SERVER_RESPONSES_TERMINAL_INCOMPLETE;
+        break;
+    case TEST_RESPONSES_FAILED:
+        options.responses_terminal = SERVER_RESPONSES_TERMINAL_FAILED;
+        break;
+    }
+
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return false;
+    const bool emitted = server_emit_protocol_terminal_metrics(
+        sockets[0], &options, protocol_request_id, metrics);
+    (void)shutdown(sockets[0], SHUT_WR);
+    close(sockets[0]);
+    sockets[0] = -1;
+    const bool captured = test_server_read_socket(sockets[1], wire);
+    close(sockets[1]);
+    if (!emitted || !captured || wire->len == 0) return false;
+    return request->stream || test_server_strip_http_headers(wire);
+}
+
+static bool test_server_append_metrics_response(
+        test_server_driver *driver,
+        const test_server_rpc *rpc,
+        buf *response) {
+    if (!driver || !rpc || !rpc->body || !response) return false;
+    test_metrics_request request;
+    if (!test_metrics_request_parse(rpc->body, &request)) return false;
+
+    ds4_runtime_request_metrics metrics;
+    if (!test_metrics_build_lifecycle(&request, &metrics)) return false;
+
+    driver->protocol_sequence++;
+    char protocol_request_id[96];
+    const char *prefix = request.protocol == TEST_METRICS_OPENAI_CHAT ?
+        "chatcmpl_metrics_" :
+        request.protocol == TEST_METRICS_RESPONSES ?
+            "resp_metrics_" : "msg_metrics_";
+    snprintf(protocol_request_id, sizeof(protocol_request_id),
+             "%s%" PRIu64, prefix, driver->protocol_sequence);
+
+    buf wire = {0};
+    if (!test_server_emit_metrics_wire(
+            &request, protocol_request_id, &metrics, &wire) || !wire.len) {
+        buf_free(&wire);
+        return false;
+    }
+    buf_puts(response, "{\"protocol_request_id\":");
+    json_escape(response, protocol_request_id);
+    buf_puts(response, ",\"wire\":");
+    json_escape(response, wire.ptr ? wire.ptr : "");
+    buf_putc(response, '}');
+    buf_free(&wire);
+    return true;
+}
+
 static bool test_server_append_prepare_response(
         const test_server_driver *driver,
         const test_server_rpc *rpc,
@@ -7301,6 +7663,16 @@ static int test_server_token_admission_stdio(int context_tokens) {
             buf_puts(&response, "{\"ok\":true}");
         } else if (!strcmp(rpc.op, "snapshot")) {
             test_server_snapshot_json(&driver, &response);
+        } else if (!strcmp(rpc.op, "metrics")) {
+            if (!rpc.body || rpc.method || rpc.path || rpc.call_id ||
+                rpc.name || rpc.arguments || rpc.sampled_text) {
+                buf_puts(&response,
+                         "{\"error\":\"invalid metrics operation\"}");
+            } else if (!test_server_append_metrics_response(
+                           &driver, &rpc, &response)) {
+                buf_puts(&response,
+                         "{\"error\":\"metrics emission failed\"}");
+            }
         } else if (!strcmp(rpc.op, "seed_tool_replay") ||
                    !strcmp(rpc.op, "seed_disk_tool_replay")) {
             const bool disk = !strcmp(rpc.op, "seed_disk_tool_replay");

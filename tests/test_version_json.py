@@ -146,10 +146,28 @@ class VersionJsonSourceContractTest(unittest.TestCase):
                 frontend_source = (ROOT / source_name).read_text(encoding="utf-8")
                 self.assertIn('"--version-json"', frontend_source)
                 self.assertIn("ds4_build_info", frontend_source)
-                self.assertRegex(
+                self.assertIn(
+                    "$(DS4_BUILD_INFO_OBJ)",
                     _make_rule(self.makefile, frontend),
-                    r"\bds4_build_info(?:_cpu|_rocm)?\.o\b",
+                    f"{frontend} must link the backend-selected build-info object",
                 )
+
+        self.assertRegex(
+            self.makefile,
+            r"(?m)^DS4_BUILD_INFO_OBJ\s*\?=\s*ds4_build_info\.o\s*$",
+        )
+        cpu_rule = _make_rule(self.makefile, "cpu")
+        self.assertEqual(
+            cpu_rule.count("ds4_build_info_cpu.o"),
+            len(FRONTENDS),
+            "each CPU frontend link must use CPU-stamped build identity",
+        )
+        rocm_rule = _make_rule(self.makefile, "strix-halo")
+        self.assertIn(
+            'DS4_BUILD_INFO_OBJ="ds4_build_info_rocm.o"',
+            rocm_rule,
+            "the recursive ROCm build must select the ROCm-stamped object",
+        )
 
     def test_backend_specific_build_info_objects_have_exact_compile_facts(self) -> None:
         expected = {

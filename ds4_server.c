@@ -13942,6 +13942,23 @@ static char *read_socket_text(int fd) {
     return buf_take(&b);
 }
 
+static void test_request_admission_exact_boundary_is_pure(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    r.prompt.len = 12;
+
+    request before = r;
+    TEST_ASSERT(!request_exceeds_context(&r, 16));
+    TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
+
+    r.max_tokens = 5;
+    before = r;
+    TEST_ASSERT(request_exceeds_context(&r, 16));
+    TEST_ASSERT(memcmp(&r, &before, sizeof(r)) == 0);
+
+    request_free(&r);
+}
+
 static void test_context_length_error_uses_protocol_standard_shape(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -17995,6 +18012,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
+    test_request_admission_exact_boundary_is_pure();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();

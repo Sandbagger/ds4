@@ -2451,6 +2451,44 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cudaDeviceSynchronize()", device_zero)
         self.assertIn("cudaMemGetInfo(&cuda_free, &cuda_total)", device_zero)
 
+    def test_runtime_snapshot_copies_compact_counters_under_execution_lock(
+        self,
+    ) -> None:
+        self.assertRegex(
+            GPU_HEADER,
+            r"bool\s+ds4_gpu_laguna_compact_runtime_counters\(\s*"
+            r"const\s+ds4_gpu_laguna_compact\s*\*\s*ctx\s*,\s*"
+            r"ds4_runtime_wire_counters\s*\*\s*out\s*\)\s*;",
+        )
+        body = function_body(
+            'extern "C" bool\n'
+            "ds4_gpu_laguna_compact_runtime_counters("
+        )
+        ordered = (
+            body.find("g_laguna_compact_exec_mutex"),
+            body.find("g_laguna_compact_mutex"),
+            body.find("cuda_laguna_compact_cache_active_locked(ctx)"),
+            body.find("out->cache_acquire_hits"),
+            body.find("out->page_advice_failures"),
+        )
+        self.assertTrue(all(position >= 0 for position in ordered), ordered)
+        self.assertEqual(tuple(sorted(ordered)), ordered)
+        for assignment in (
+            "out->cache_acquire_hits = ctx->cache_acquire_hits",
+            "out->cache_acquire_misses = ctx->cache_acquire_misses",
+            "out->cache_evictions = ctx->cache_evictions",
+            "out->model_file_read_operations = ctx->model_file_read_calls",
+            "out->model_file_read_bytes = ctx->model_file_read_bytes",
+            "out->model_file_read_ns = ctx->model_file_read_ns",
+            "out->host_to_device_bytes = ctx->host_to_device_bytes",
+            "out->host_to_device_ns = ctx->host_to_device_ns",
+            "out->page_advice_attempts = ctx->page_advice_counters.attempted_calls",
+            "out->page_advice_bytes = ctx->page_advice_counters.attempted_bytes",
+            "out->page_advice_failures = ctx->page_advice_counters.failed_calls",
+        ):
+            with self.subTest(assignment=assignment):
+                self.assertIn(assignment, body)
+
     def test_laguna_decode_routes_all_quantized_projections_through_matmul(
         self,
     ) -> None:

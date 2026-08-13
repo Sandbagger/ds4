@@ -653,11 +653,18 @@ static bool validate_ledger(const ds4_laguna_ledger *ledger,
     return true;
 }
 
-static const char *profile_for_cache(uint64_t cache_bytes) {
+static const char *profile_for_cache(uint64_t cache_bytes,
+                                     uint32_t session_count) {
     const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
-    if (cache_bytes == 8u * gib) return "cache-8gib";
-    if (cache_bytes == 12u * gib) return "cache-12gib";
-    if (cache_bytes == 16u * gib) return "cache-16gib";
+    if (session_count == 1u) {
+        if (cache_bytes == 8u * gib) return "cache-8gib";
+        if (cache_bytes == 12u * gib) return "cache-12gib";
+        if (cache_bytes == 16u * gib) return "cache-16gib";
+    } else if (session_count == 2u) {
+        if (cache_bytes == 8u * gib) return "cache-8gib-sessions-2";
+        if (cache_bytes == 12u * gib) return "cache-12gib-sessions-2";
+        if (cache_bytes == 16u * gib) return "cache-16gib-sessions-2";
+    }
     return NULL;
 }
 
@@ -670,12 +677,13 @@ static bool validate_allocation(const ds4_laguna_allocation_plan *plan,
                          "qualification allocation plan is null");
     }
     const char *expected_profile =
-        profile_for_cache(plan->configured_cache_bytes);
+        profile_for_cache(plan->configured_cache_bytes,
+                          plan->session_count);
     if (expected_profile == NULL || plan->profile_id == NULL ||
         strcmp(plan->profile_id, expected_profile) != 0 ||
         plan->context_tokens != 32768u ||
         plan->prefill_rows != 4096u ||
-        plan->session_count != 1u) {
+        (plan->session_count != 1u && plan->session_count != 2u)) {
         return set_error(error, error_size,
                          "qualification allocation profile is invalid");
     }
@@ -766,13 +774,16 @@ static bool validate_allocation(const ds4_laguna_allocation_plan *plan,
                  &external) ||
         !add_u64(owned_non_cache, external, &qualification_non_cache) ||
         !add_u64(owned_total, external, &planned) ||
-        !add_u64(plan->configured_cache_bytes, 16u * gib, &total_bound) ||
+        !add_u64(plan->configured_cache_bytes,
+                 (plan->session_count == 1u ? 16u : 20u) * gib,
+                 &total_bound) ||
         plan->owned_non_cache_bound_bytes != owned_non_cache ||
         plan->owned_total_bound_bytes != owned_total ||
         plan->qualification_non_cache_bound_bytes != qualification_non_cache ||
         plan->planned_qualification_bytes != planned ||
         plan->qualification_total_bound_bytes != total_bound ||
-        qualification_non_cache > 16u * gib ||
+        qualification_non_cache >
+            (plan->session_count == 1u ? 16u : 20u) * gib ||
         planned > total_bound) {
         return set_error(error, error_size,
                          "qualification allocation totals do not reconcile");

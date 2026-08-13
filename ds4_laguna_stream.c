@@ -1359,9 +1359,9 @@ bool ds4_laguna_allocation_plan_make(
     const uint64_t expected_slot_stride = UINT64_C(5308416);
     const uint64_t expected_expert_entries = UINT64_C(12032);
     if (spec->context_tokens != 32768u || spec->prefill_rows != 4096u ||
-        spec->session_count != 1u) {
+        (spec->session_count != 1u && spec->session_count != 2u)) {
         return set_error(err, errlen,
-                         "allocation plan requires the 32K/4K/one-session profile");
+                         "allocation plan requires a 32K/4K one- or two-session profile");
     }
     if (spec->configured_cache_bytes != 8u * gib &&
         spec->configured_cache_bytes != 12u * gib &&
@@ -1432,16 +1432,21 @@ bool ds4_laguna_allocation_plan_make(
     }
 
     uint64_t kv_tokens = 0;
+    uint64_t kv_bytes_per_session = 0;
     uint64_t kv_bytes = 0;
     if (!mul_u64(UINT64_C(12), spec->context_tokens, &kv_tokens) ||
         !add_u64(kv_tokens, UINT64_C(36) * 512u, &kv_tokens) ||
-        !mul_u64(kv_tokens, UINT64_C(4096), &kv_bytes)) {
+        !mul_u64(kv_tokens, UINT64_C(4096), &kv_bytes_per_session) ||
+        !mul_u64(kv_bytes_per_session, spec->session_count, &kv_bytes)) {
         return set_error(err, errlen, "allocation plan KV arithmetic overflow");
     }
+    uint64_t graph_bytes_per_session = 0;
     uint64_t graph_bytes = 0;
     if (!ds4_runtime_checked_affine_bytes(
             spec->prefill_rows, UINT64_C(375156), UINT64_C(413704),
-            &graph_bytes)) {
+            &graph_bytes_per_session) ||
+        !mul_u64(graph_bytes_per_session, spec->session_count,
+                 &graph_bytes)) {
         return set_error(err, errlen,
                          "allocation plan graph arithmetic overflow");
     }
@@ -1451,9 +1456,16 @@ bool ds4_laguna_allocation_plan_make(
                          "allocation plan staging arithmetic overflow");
     }
 
-    out->profile_id = spec->configured_cache_bytes == 8u * gib ?
-        "cache-8gib" : spec->configured_cache_bytes == 12u * gib ?
-        "cache-12gib" : "cache-16gib";
+    if (spec->session_count == 1u) {
+        out->profile_id = spec->configured_cache_bytes == 8u * gib ?
+            "cache-8gib" : spec->configured_cache_bytes == 12u * gib ?
+            "cache-12gib" : "cache-16gib";
+    } else {
+        out->profile_id = spec->configured_cache_bytes == 8u * gib ?
+            "cache-8gib-sessions-2" :
+            spec->configured_cache_bytes == 12u * gib ?
+            "cache-12gib-sessions-2" : "cache-16gib-sessions-2";
+    }
     out->context_tokens = spec->context_tokens;
     out->prefill_rows = spec->prefill_rows;
     out->session_count = spec->session_count;
@@ -1477,7 +1489,15 @@ bool ds4_laguna_allocation_plan_make(
         graph_bytes;
     out->owned_category_bounds[DS4_RUNTIME_CATEGORY_PINNED_STAGING] =
         staging_bytes;
-    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = gib;
+    uint64_t session_host_bytes = 0;
+    uint64_t other_host_bytes = 0;
+    if (!mul_u64(128u * mib, spec->session_count, &session_host_bytes) ||
+        !add_u64(896u * mib, session_host_bytes, &other_host_bytes)) {
+        return set_error(err, errlen,
+                         "allocation plan session host arithmetic overflow");
+    }
+    out->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] =
+        other_host_bytes;
     out->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 2u * gib;
 
     out->report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] =
@@ -1519,14 +1539,16 @@ bool ds4_laguna_allocation_plan_make(
                  &out->qualification_non_cache_bound_bytes) ||
         !add_u64(owned_total, external,
                  &out->planned_qualification_bytes) ||
-        !add_u64(spec->configured_cache_bytes, 16u * gib,
+        !add_u64(spec->configured_cache_bytes,
+                 (spec->session_count == 1u ? 16u : 20u) * gib,
                  &out->qualification_total_bound_bytes)) {
         return set_error(err, errlen,
                          "allocation plan qualification arithmetic overflow");
     }
     out->owned_non_cache_bound_bytes = owned_non_cache;
     out->owned_total_bound_bytes = owned_total;
-    if (out->qualification_non_cache_bound_bytes > 16u * gib ||
+    if (out->qualification_non_cache_bound_bytes >
+            (spec->session_count == 1u ? 16u : 20u) * gib ||
         out->planned_qualification_bytes >
             out->qualification_total_bound_bytes) {
         return set_error(err, errlen,
@@ -1596,7 +1618,7 @@ bool ds4_laguna_allocation_plan_make(
         DS4_RUNTIME_DOMAIN_HOST, 256u * mib);
     allocation_callsite(out, 18, DS4_LAGUNA_CALLSITE_OTHER_HOST_SESSION,
         "laguna.other_host.session", DS4_RUNTIME_CATEGORY_OTHER_HOST,
-        DS4_RUNTIME_DOMAIN_HOST, 128u * mib);
+        DS4_RUNTIME_DOMAIN_HOST, session_host_bytes);
     allocation_callsite(out, 19, DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
         "laguna.other_host.tracker", DS4_RUNTIME_CATEGORY_OTHER_HOST,
         DS4_RUNTIME_DOMAIN_HOST, 128u * mib);

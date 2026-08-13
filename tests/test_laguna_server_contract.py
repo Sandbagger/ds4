@@ -14,7 +14,11 @@ Supported operations are:
   the production HTTP parse/render/admit path without opening a socket.  It
   returns ``{"http_status":N, "body":{...}}``.
 * ``{"op":"snapshot"}`` returns a read-only state fingerprint containing
-  session count and positions plus memory/disk KV-cache facts.
+  sessions, live/tool replay state, and memory/disk cache facts including LRU
+  order.
+* ``{"op":"seed_tool_replay", ...}`` seeds one in-memory sampled tool replay.
+* ``{"op":"seed_disk_tool_replay", ...}`` seeds one disk-backed sampled tool
+  replay without warming the in-memory replay table.
 * ``{"op":"quit"}`` returns ``{"ok":true}`` and exits.
 
 The test-only tokenizer may be deterministic and synthetic, but the endpoint
@@ -37,6 +41,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "ds4.token-admission/v1"
 MODEL = "laguna-s-2.1"
+INPUT_MODEL = "laguna-s-2.1-chat"
 TEMPLATE_REVISION = "poolside-laguna-s-2.1-native-nothink-v1"
 CONTEXT_TOKENS = 2048
 RESULT_KEYS = {
@@ -53,15 +58,23 @@ SNAPSHOT_KEYS = {
     "session_count",
     "session_positions",
     "session_token_hashes",
+    "tool_memory_entries",
+    "tool_memory_fingerprint",
+    "tool_memory_lru_fingerprint",
+    "live_tool_state_fingerprint",
     "memory_cache_entries",
+    "memory_cache_fingerprint",
+    "memory_cache_lru_fingerprint",
     "disk_cache_entries",
     "disk_cache_bytes",
+    "disk_cache_fingerprint",
+    "disk_cache_lru_fingerprint",
 }
 
 
 def _chat_body(**overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "model": MODEL,
+        "model": INPUT_MODEL,
         "messages": [
             {"role": "system", "content": "Answer using the supplied tool."},
             {"role": "user", "content": "What is the weather in Brussels?"},
@@ -192,9 +205,17 @@ class AdmissionContract(unittest.TestCase):
         self.assertIsInstance(snapshot["session_count"], int)
         self.assertIsInstance(snapshot["session_positions"], list)
         self.assertIsInstance(snapshot["session_token_hashes"], list)
+        self.assertIsInstance(snapshot["tool_memory_entries"], int)
+        self.assertIsInstance(snapshot["tool_memory_fingerprint"], str)
+        self.assertIsInstance(snapshot["tool_memory_lru_fingerprint"], str)
+        self.assertIsInstance(snapshot["live_tool_state_fingerprint"], str)
         self.assertIsInstance(snapshot["memory_cache_entries"], int)
+        self.assertIsInstance(snapshot["memory_cache_fingerprint"], str)
+        self.assertIsInstance(snapshot["memory_cache_lru_fingerprint"], str)
         self.assertIsInstance(snapshot["disk_cache_entries"], int)
         self.assertIsInstance(snapshot["disk_cache_bytes"], int)
+        self.assertIsInstance(snapshot["disk_cache_fingerprint"], str)
+        self.assertIsInstance(snapshot["disk_cache_lru_fingerprint"], str)
         return snapshot
 
     def request(
@@ -227,17 +248,61 @@ class AdmissionContract(unittest.TestCase):
         self.assert_result_shape(result)
         return status, result
 
+    @staticmethod
+    def inference_body(body: dict[str, Any]) -> dict[str, Any]:
+        inference = dict(body)
+        if "requested_output_tokens" in inference:
+            inference["max_tokens"] = inference.pop("requested_output_tokens")
+        return inference
+
+    def inference(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        status, result = self.request(
+            "/v1/chat/completions", self.inference_body(body)
+        )
+        self.assert_result_shape(result)
+        return status, result
+
     def assert_rejected(
         self, body: dict[str, Any], code: str
     ) -> dict[str, Any]:
         before = self.snapshot()
-        status, result = self.admission(body)
+        admission_status, admission = self.admission(body)
+        after_admission = self.snapshot()
+        inference_status, inference = self.inference(body)
+        after_inference = self.snapshot()
+        for status, result in (
+            (admission_status, admission),
+            (inference_status, inference),
+        ):
+            self.assertGreaterEqual(status, 400)
+            self.assertLess(status, 500)
+            self.assertFalse(result["fits"])
+            self.assertEqual(result["rejection_code"], code)
+        self.assertEqual(inference, admission)
+        self.assertEqual(
+            after_admission,
+            before,
+            "admission mutated session, replay, or cache state",
+        )
+        self.assertEqual(
+            after_inference,
+            before,
+            "dry-run inference mutated session, replay, or cache state",
+        )
+        return admission
+
+    def assert_one_endpoint_rejected(
+        self, path: str, body: dict[str, Any], code: str
+    ) -> dict[str, Any]:
+        before = self.snapshot()
+        status, result = self.request(path, body)
         after = self.snapshot()
         self.assertGreaterEqual(status, 400)
         self.assertLess(status, 500)
+        self.assert_result_shape(result)
         self.assertFalse(result["fits"])
         self.assertEqual(result["rejection_code"], code)
-        self.assertEqual(after, before, "admission mutated session or KV/cache state")
+        self.assertEqual(after, before)
         return result
 
     def test_exact_fit_and_one_token_overflow_are_not_clamped(self) -> None:
@@ -278,12 +343,24 @@ class AdmissionContract(unittest.TestCase):
         admission_status, admission = self.admission(
             _chat_body(requested_output_tokens=output_tokens)
         )
-        inference_status, inference = self.request(
-            "/v1/chat/completions", _chat_body(max_tokens=output_tokens)
+        inference_status, inference = self.inference(
+            _chat_body(requested_output_tokens=output_tokens)
         )
         self.assertEqual(admission_status, 200)
         self.assertEqual(inference_status, 200)
-        self.assert_result_shape(inference)
+        self.assertEqual(inference, admission)
+
+    def test_same_family_chat_alias_is_canonicalized(self) -> None:
+        status, admission = self.admission(
+            _chat_body(model=INPUT_MODEL, requested_output_tokens=8)
+        )
+        inference_status, inference = self.inference(
+            _chat_body(model=INPUT_MODEL, requested_output_tokens=8)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(inference_status, 200)
+        self.assertEqual(admission["model"], MODEL)
+        self.assertEqual(admission["template_revision"], TEMPLATE_REVISION)
         self.assertEqual(inference, admission)
 
     def test_invalid_output_token_numbers_have_stable_rejection(self) -> None:
@@ -325,6 +402,110 @@ class AdmissionContract(unittest.TestCase):
             _chat_body(requested_output_tokens=8, unexpected_extension=True),
             "invalid_request",
         )
+
+    def test_output_field_mapping_is_endpoint_specific(self) -> None:
+        admission_wrong = _chat_body(max_tokens=8)
+        admission_wrong_result = self.assert_one_endpoint_rejected(
+            "/v1/token-admission", admission_wrong, "invalid_request"
+        )
+        admission_both = _chat_body(requested_output_tokens=8, max_tokens=8)
+        admission_both_result = self.assert_one_endpoint_rejected(
+            "/v1/token-admission", admission_both, "invalid_request"
+        )
+
+        inference_wrong = _chat_body(requested_output_tokens=8)
+        inference_wrong_result = self.assert_one_endpoint_rejected(
+            "/v1/chat/completions", inference_wrong, "invalid_request"
+        )
+        inference_both = _chat_body(requested_output_tokens=8, max_tokens=8)
+        inference_both_result = self.assert_one_endpoint_rejected(
+            "/v1/chat/completions", inference_both, "invalid_request"
+        )
+        self.assertEqual(inference_wrong_result, admission_wrong_result)
+        self.assertEqual(inference_both_result, admission_both_result)
+
+    def test_seeded_tool_replay_state_is_read_only_for_prepare(self) -> None:
+        fixtures = (
+            ("seed_tool_replay", "call_memory_seed"),
+            ("seed_disk_tool_replay", "call_disk_seed"),
+        )
+        for operation, call_id in fixtures:
+            with self.subTest(operation=operation):
+                before_seed = self.snapshot()
+                seeded_response = self.driver.rpc(
+                    {
+                        "op": operation,
+                        "call_id": call_id,
+                        "name": "get_weather",
+                        "arguments": {"city": "Brussels"},
+                        "sampled_text": (
+                            "<｜DSML｜tool_calls>\n"
+                            "<｜DSML｜invoke name=\"get_weather\">\n"
+                            "<｜DSML｜parameter name=\"city\" string=\"true\">"
+                            "Brussels</｜DSML｜parameter>\n"
+                            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+                        ),
+                    }
+                )
+                self.assertEqual(seeded_response, {"ok": True})
+                seeded = self.snapshot()
+                self.assertNotEqual(seeded, before_seed)
+                if operation == "seed_tool_replay":
+                    self.assertGreater(
+                        seeded["tool_memory_entries"],
+                        before_seed["tool_memory_entries"],
+                    )
+                    self.assertNotEqual(
+                        seeded["tool_memory_fingerprint"],
+                        before_seed["tool_memory_fingerprint"],
+                    )
+                else:
+                    self.assertGreater(
+                        seeded["disk_cache_entries"],
+                        before_seed["disk_cache_entries"],
+                    )
+                    self.assertNotEqual(
+                        seeded["disk_cache_fingerprint"],
+                        before_seed["disk_cache_fingerprint"],
+                    )
+                    self.assertEqual(
+                        seeded["tool_memory_fingerprint"],
+                        before_seed["tool_memory_fingerprint"],
+                        "disk seed unexpectedly warmed in-memory replay state",
+                    )
+
+                replay = _chat_body(
+                    requested_output_tokens=8,
+                    messages=[
+                        {"role": "user", "content": "Check Brussels weather."},
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city":"Brussels"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": "12 C and cloudy",
+                        },
+                    ],
+                )
+                admission_status, admission = self.admission(replay)
+                self.assertEqual(self.snapshot(), seeded)
+                inference_status, inference = self.inference(replay)
+                self.assertEqual(self.snapshot(), seeded)
+                self.assertEqual(admission_status, 200)
+                self.assertEqual(inference_status, 200)
+                self.assertEqual(inference, admission)
 
 
 def _parse_args() -> argparse.Namespace:

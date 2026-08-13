@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -8455,6 +8456,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
+    bool runtime_snapshot_required;
     /* Alias of slots[0].session. Kept for the legacy, non-batched path and
      * parser-only context queries while slot-aware code is explicit. */
     ds4_session *session;
@@ -12522,8 +12524,35 @@ typedef struct {
     int fd;
 } client_arg;
 
+static bool server_runtime_snapshot(
+        server *s,
+        ds4_runtime_wire_snapshot *snapshot) {
+    if (!s || !snapshot) return false;
+    if (pthread_mutex_lock(&s->inference_mu) != 0) return false;
+    const bool ok = ds4_engine_runtime_snapshot(s->engine, snapshot);
+    if (pthread_mutex_unlock(&s->inference_mu) != 0) return false;
+    return ok;
+}
+
+static bool send_runtime(server *s, int fd) {
+    ds4_runtime_wire_snapshot snapshot;
+    char json[DS4_RUNTIME_JSON_CAPACITY];
+    size_t json_length = 0;
+    memset(&snapshot, 0, sizeof(snapshot));
+    memset(json, 0, sizeof(json));
+    if (!server_runtime_snapshot(s, &snapshot) ||
+        !ds4_runtime_wire_snapshot_json(&snapshot, json, sizeof(json),
+                                        &json_length) ||
+        json_length == 0) {
+        return http_error(fd, s->enable_cors, 500,
+                          "runtime snapshot is unavailable");
+    }
+    return http_response(fd, s->enable_cors, 200, "application/json", json);
+}
+
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens,
+                                     const ds4_runtime_wire_snapshot *snapshot) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -12552,23 +12581,49 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
-            "\"reasoning_effort\"]}",
+            "\"reasoning_effort\"]",
         ctx,
         ctx,
         max_completion);
+    if (snapshot) {
+        buf_puts(b, ",\"family\":");
+        json_escape(b, snapshot->model_family);
+        buf_printf(b,
+                   ",\"device\":\"%" PRIu64 "\""
+                   ",\"inode\":\"%" PRIu64 "\""
+                   ",\"size_bytes\":\"%" PRIu64 "\""
+                   ",\"mtime_ns\":\"%" PRIu64 "\"",
+                   snapshot->model.device,
+                   snapshot->model.inode,
+                   snapshot->model.size_bytes,
+                   snapshot->model.mtime_ns);
+    }
+    buf_putc(b, '}');
 }
 
-static void append_model_json(buf *b, const server *s, const char *id) {
+static void append_model_json(
+        buf *b,
+        const server *s,
+        const char *id,
+        const ds4_runtime_wire_snapshot *snapshot) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             snapshot);
 }
 
 static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
-    append_model_json(&b, s, id);
+    ds4_runtime_wire_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    const bool have_snapshot = server_runtime_snapshot(s, &snapshot);
+    if (s->runtime_snapshot_required && !have_snapshot) {
+        return http_error(fd, s->enable_cors, 500,
+                          "runtime model identity is unavailable");
+    }
+    append_model_json(&b, s, id, have_snapshot ? &snapshot : NULL);
     buf_putc(&b, '\n');
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -12577,23 +12632,43 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
+    ds4_runtime_wire_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    const bool have_snapshot = server_runtime_snapshot(s, &snapshot);
+    if (s->runtime_snapshot_required && !have_snapshot) {
+        return http_error(fd, s->enable_cors, 500,
+                          "runtime model identity is unavailable");
+    }
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     if (ds4_engine_is_laguna(s->engine)) {
-        append_model_json(&b, s, "laguna-s-2.1");
+        if (have_snapshot && strcmp(snapshot.model_id, "laguna-s-2.1")) {
+            buf_free(&b);
+            return http_error(fd, s->enable_cors, 500,
+                              "runtime model identity is unavailable");
+        }
+        append_model_json(&b, s, "laguna-s-2.1",
+                          have_snapshot ? &snapshot : NULL);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "laguna-s-2.1-chat");
+        append_model_json(&b, s, "laguna-s-2.1-chat",
+                          have_snapshot ? &snapshot : NULL);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "laguna-s-2.1-reasoner");
+        append_model_json(&b, s, "laguna-s-2.1-reasoner",
+                          have_snapshot ? &snapshot : NULL);
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
+        append_model_json(&b, s, "glm-5.2",
+                          have_snapshot ? &snapshot : NULL);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
+        append_model_json(&b, s, "glm-5.2-chat",
+                          have_snapshot ? &snapshot : NULL);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
+        append_model_json(&b, s, "glm-5.2-reasoner",
+                          have_snapshot ? &snapshot : NULL);
     } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
+        append_model_json(&b, s, "deepseek-v4-flash",
+                          have_snapshot ? &snapshot : NULL);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
+        append_model_json(&b, s, "deepseek-v4-pro",
+                          have_snapshot ? &snapshot : NULL);
     }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
@@ -12624,6 +12699,12 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/runtime")) {
+        send_runtime(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13303,6 +13384,10 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    s.runtime_snapshot_required =
+        ds4_engine_is_laguna(engine) &&
+        cfg.engine.ssd_streaming &&
+        cfg.engine.ssd_streaming_cache_bytes_set;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
@@ -16733,7 +16818,7 @@ static void test_json_string_handles_surrogates(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, NULL);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -16741,7 +16826,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, NULL);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);

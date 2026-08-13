@@ -446,14 +446,17 @@ bool ds4_runtime_request_add_counters(
     ds4_runtime_request_context *context,
     const ds4_runtime_wire_counters *delta);
 
-/* Add total generated tokens and the visible subset completed at this
- * timestamp. Hidden reasoning may therefore increment generated_delta while
- * visible_delta is zero. */
-bool ds4_runtime_request_record_generated(
+/* Sampling and client-visible emission are separate events: hidden reasoning
+ * increments generated tokens without visibility, while buffered output may
+ * become visible after its token was generated. */
+bool ds4_runtime_request_add_generated_tokens(
     ds4_runtime_request_context *context,
-    uint64_t generated_delta,
+    uint64_t generated_delta);
+
+bool ds4_runtime_request_add_visible_tokens(
+    ds4_runtime_request_context *context,
     uint64_t visible_delta,
-    uint64_t visible_complete_monotonic_ns);
+    uint64_t emitted_monotonic_ns);
 
 bool ds4_runtime_request_record_page_advice_complete(
     ds4_runtime_request_context *context,

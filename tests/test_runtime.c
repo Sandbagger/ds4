@@ -1688,12 +1688,13 @@ static void test_request_metrics_lifecycle(void) {
                      sizeof(request_b.counters)) == 0,
           "request-local accounting never leaks across interleaved contexts");
 
-    CHECK(ds4_runtime_request_record_generated(
-              &request_a, 2u, 0u, 0u) &&
-              ds4_runtime_request_record_generated(
-                  &request_a, 1u, 1u, UINT64_C(1500000000)) &&
-              ds4_runtime_request_record_generated(
-                  &request_a, 5u, 5u, UINT64_C(2000000000)) &&
+    CHECK(ds4_runtime_request_add_generated_tokens(&request_a, 2u) &&
+              ds4_runtime_request_add_generated_tokens(&request_a, 1u) &&
+              ds4_runtime_request_add_visible_tokens(
+                  &request_a, 1u, UINT64_C(1500000000)) &&
+              ds4_runtime_request_add_generated_tokens(&request_a, 5u) &&
+              ds4_runtime_request_add_visible_tokens(
+                  &request_a, 5u, UINT64_C(2000000000)) &&
               ds4_runtime_request_record_page_advice_complete(
                   &request_a, UINT64_C(2100000000)),
           "hidden and visible generation plus final advice stay request-scoped");

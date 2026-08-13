@@ -1,7 +1,112 @@
 #include "ds4_runtime.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+static bool runtime_file_identity_capture(
+        int fd, ds4_runtime_file_identity *identity) {
+    if (fd < 0 || !identity) return false;
+    struct stat status;
+    if (fstat(fd, &status) != 0 || status.st_size < 0) return false;
+#if defined(__APPLE__)
+    const time_t seconds = status.st_mtimespec.tv_sec;
+    const long nanoseconds = status.st_mtimespec.tv_nsec;
+#else
+    const time_t seconds = status.st_mtim.tv_sec;
+    const long nanoseconds = status.st_mtim.tv_nsec;
+#endif
+    const uintmax_t device = (uintmax_t)status.st_dev;
+    const uintmax_t inode = (uintmax_t)status.st_ino;
+    const uintmax_t size_bytes = (uintmax_t)status.st_size;
+    if (device > UINT64_MAX || inode > UINT64_MAX ||
+        size_bytes > UINT64_MAX || seconds < 0 || nanoseconds < 0 ||
+        nanoseconds >= 1000000000L) {
+        return false;
+    }
+    const uintmax_t unsigned_seconds = (uintmax_t)seconds;
+    if (unsigned_seconds >
+        (UINT64_MAX - (uint64_t)nanoseconds) / UINT64_C(1000000000)) {
+        return false;
+    }
+    identity->device = (uint64_t)device;
+    identity->inode = (uint64_t)inode;
+    identity->size_bytes = (uint64_t)size_bytes;
+    identity->mtime_ns =
+        (uint64_t)unsigned_seconds * UINT64_C(1000000000) +
+        (uint64_t)nanoseconds;
+    return true;
+}
+
+static bool runtime_executable_identity_capture(
+        ds4_runtime_file_identity *identity) {
+    if (!identity) return false;
+    int fd = -1;
+#if defined(__APPLE__)
+    char path[PATH_MAX];
+    uint32_t path_bytes = (uint32_t)sizeof(path);
+    if (_NSGetExecutablePath(path, &path_bytes) != 0) return false;
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+#elif defined(__linux__)
+    fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+#else
+    return false;
+#endif
+    if (fd < 0) return false;
+    const bool ok = runtime_file_identity_capture(fd, identity);
+    const int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return ok;
+}
+
+static pthread_once_t runtime_instance_once = PTHREAD_ONCE_INIT;
+static char runtime_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+static bool runtime_instance_id_valid;
+
+static void runtime_instance_id_initialize(void) {
+    uint8_t bytes[16];
+    size_t received = 0;
+    const int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    while (received < sizeof(bytes)) {
+        const ssize_t result = read(
+            fd, bytes + received, sizeof(bytes) - received);
+        if (result > 0) {
+            received += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    close(fd);
+    if (received != sizeof(bytes)) return;
+    bytes[6] = (uint8_t)((bytes[6] & 0x0fu) | 0x40u);
+    bytes[8] = (uint8_t)((bytes[8] & 0x3fu) | 0x80u);
+    static const char hex[] = "0123456789abcdef";
+    size_t output = 0;
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        if (i == 4u || i == 6u || i == 8u || i == 10u) {
+            runtime_instance_id[output++] = '-';
+        }
+        runtime_instance_id[output++] = hex[bytes[i] >> 4u];
+        runtime_instance_id[output++] = hex[bytes[i] & 0x0fu];
+    }
+    runtime_instance_id[output] = '\0';
+    runtime_instance_id_valid = output == 36u;
+}
 
 static bool add_u64(uint64_t a, uint64_t b, uint64_t *out) {
     if (UINT64_MAX - a < b) {
@@ -1902,6 +2007,613 @@ bool ds4_runtime_tracker_snapshot_copy(
             active_records[copied++] = tracker->records[i];
         }
     }
+    return true;
+}
+
+static bool runtime_wire_text_length(
+        const char *text, size_t capacity, size_t *length_out) {
+    if (!text || capacity == 0u) return false;
+    for (size_t i = 0; i < capacity; i++) {
+        if (text[i] == '\0') {
+            if (length_out) *length_out = i;
+            return i != 0u;
+        }
+    }
+    return false;
+}
+
+static bool runtime_wire_model_text(
+        const char *text, size_t capacity, size_t *length_out) {
+    size_t length = 0;
+    if (!runtime_wire_text_length(text, capacity, &length)) return false;
+    for (size_t i = 0; i < length; i++) {
+        const unsigned char byte = (unsigned char)text[i];
+        if (byte <= 0x20u || byte == 0x7fu) return false;
+    }
+    if (length_out) *length_out = length;
+    return true;
+}
+
+static bool runtime_wire_revision_valid(
+        const char revision[DS4_RUNTIME_REVISION_CAPACITY]) {
+    bool nonzero = false;
+    for (size_t i = 0; i < 40u; i++) {
+        const char byte = revision[i];
+        if (!((byte >= '0' && byte <= '9') ||
+              (byte >= 'a' && byte <= 'f'))) {
+            return false;
+        }
+        if (byte != '0') nonzero = true;
+    }
+    return revision[40] == '\0' && nonzero;
+}
+
+static bool runtime_wire_feature_valid(
+        const char feature[DS4_RUNTIME_FEATURE_CAPACITY]) {
+    size_t length = 0;
+    if (!runtime_wire_text_length(
+            feature, DS4_RUNTIME_FEATURE_CAPACITY, &length) ||
+        feature[0] < 'a' || feature[0] > 'z') {
+        return false;
+    }
+    for (size_t i = 1u; i < length; i++) {
+        const char byte = feature[i];
+        if (!((byte >= 'a' && byte <= 'z') ||
+              (byte >= '0' && byte <= '9') || byte == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool runtime_wire_build_valid(const ds4_runtime_build_info *build) {
+    if (!build || !runtime_wire_revision_valid(build->revision) ||
+        !runtime_wire_text_length(
+            build->backend, sizeof(build->backend), NULL) ||
+        build->feature_count > DS4_RUNTIME_FEATURE_COUNT) {
+        return false;
+    }
+    if (strcmp(build->backend, "cpu") != 0 &&
+        strcmp(build->backend, "metal") != 0 &&
+        strcmp(build->backend, "cuda") != 0 &&
+        strcmp(build->backend, "rocm") != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < build->feature_count; i++) {
+        if (!runtime_wire_feature_valid(build->features[i]) ||
+            (i != 0u &&
+             strcmp(build->features[i - 1u], build->features[i]) >= 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool runtime_wire_input_valid(
+        const ds4_runtime_wire_snapshot_input *input) {
+    return input && input->state >= DS4_RUNTIME_WIRE_STATE_STARTING &&
+        input->state <= DS4_RUNTIME_WIRE_STATE_UNSAFE &&
+        runtime_wire_build_valid(&input->build) &&
+        input->configured_context_tokens != 0u &&
+        input->configured_prefill_chunk_tokens != 0u &&
+        input->configured_session_slots != 0u &&
+        input->effective_context_tokens != 0u &&
+        input->effective_prefill_chunk_tokens != 0u &&
+        input->effective_session_slots != 0u &&
+        input->configured_prefill_rows != 0u &&
+        input->allocated_prefill_rows != 0u;
+}
+
+static void runtime_tracker_snapshot_scalars(
+        const ds4_runtime_tracker *tracker,
+        ds4_runtime_snapshot *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    memcpy(snapshot->category_bounds, tracker->category_bounds,
+           sizeof(snapshot->category_bounds));
+    memcpy(snapshot->category_current, tracker->category_current,
+           sizeof(snapshot->category_current));
+    memcpy(snapshot->category_peak, tracker->category_peak,
+           sizeof(snapshot->category_peak));
+    memcpy(snapshot->report_bounds, tracker->report_bounds,
+           sizeof(snapshot->report_bounds));
+    memcpy(snapshot->report_current, tracker->report_current,
+           sizeof(snapshot->report_current));
+    memcpy(snapshot->report_peak, tracker->report_peak,
+           sizeof(snapshot->report_peak));
+    snapshot->owned_total_bound_bytes = tracker->owned_total_bound_bytes;
+    snapshot->owned_total_current = tracker->owned_total_current;
+    snapshot->owned_total_peak = tracker->owned_total_peak;
+    snapshot->qualification_total_bound_bytes =
+        tracker->qualification_total_bound_bytes;
+    snapshot->qualification_total_current =
+        tracker->qualification_total_current;
+    snapshot->qualification_total_peak = tracker->qualification_total_peak;
+    snapshot->event_sequence = tracker->event_sequence;
+    snapshot->external_sample = tracker->external_sample;
+    snapshot->violation = tracker->violation;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (tracker->records[i].live) snapshot->active_record_count++;
+    }
+}
+
+bool ds4_runtime_snapshot_context_init(
+        ds4_runtime_snapshot_context *context,
+        int opened_model_fd,
+        const char *model_id,
+        const char *model_family) {
+    size_t id_length = 0;
+    size_t family_length = 0;
+    if (!context || opened_model_fd < 0 ||
+        !runtime_wire_model_text(
+            model_id, DS4_RUNTIME_MODEL_ID_CAPACITY, &id_length) ||
+        !runtime_wire_model_text(
+            model_family, DS4_RUNTIME_MODEL_FAMILY_CAPACITY,
+            &family_length)) {
+        return false;
+    }
+    ds4_runtime_snapshot_context staged;
+    memset(&staged, 0, sizeof(staged));
+    if (pthread_once(
+            &runtime_instance_once, runtime_instance_id_initialize) != 0 ||
+        !runtime_instance_id_valid ||
+        !runtime_executable_identity_capture(&staged.executable) ||
+        !runtime_file_identity_capture(opened_model_fd, &staged.model)) {
+        return false;
+    }
+    memcpy(staged.instance_id, runtime_instance_id,
+           sizeof(staged.instance_id));
+    memcpy(staged.model_id, model_id, id_length + 1u);
+    memcpy(staged.model_family, model_family, family_length + 1u);
+    staged.next_snapshot_seq = 1u;
+    *context = staged;
+    return true;
+}
+
+static bool runtime_wire_violation_present(
+        const ds4_runtime_snapshot_context *context,
+        ds4_runtime_violation violation) {
+    for (size_t i = 0; i < context->violation_count; i++) {
+        if (context->violations[i].code == violation) return true;
+    }
+    return false;
+}
+
+bool ds4_runtime_wire_snapshot_capture(
+        ds4_runtime_snapshot_context *context,
+        const ds4_runtime_tracker *tracker,
+        const ds4_runtime_wire_snapshot_input *input,
+        ds4_runtime_wire_snapshot *snapshot) {
+    if (!context || !tracker || !snapshot ||
+        context->next_snapshot_seq == 0u ||
+        context->violation_count > DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY ||
+        !runtime_wire_input_valid(input)) {
+        return false;
+    }
+    ds4_runtime_snapshot_context staged_context = *context;
+    const uint64_t sequence = staged_context.next_snapshot_seq;
+    if (tracker->violation != DS4_RUNTIME_VIOLATION_NONE &&
+        !runtime_wire_violation_present(
+            &staged_context, tracker->violation)) {
+        if (staged_context.violation_count >=
+            DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY) {
+            return false;
+        }
+        staged_context.violations[staged_context.violation_count++] =
+            (ds4_runtime_wire_violation){
+                .code = tracker->violation,
+                .latched_snapshot_seq = sequence,
+            };
+    }
+
+    ds4_runtime_wire_snapshot staged_snapshot;
+    memset(&staged_snapshot, 0, sizeof(staged_snapshot));
+    memcpy(staged_snapshot.instance_id, staged_context.instance_id,
+           sizeof(staged_snapshot.instance_id));
+    staged_snapshot.snapshot_seq = sequence;
+    staged_snapshot.state = input->state;
+    staged_snapshot.build = input->build;
+    staged_snapshot.executable = staged_context.executable;
+    staged_snapshot.model = staged_context.model;
+    memcpy(staged_snapshot.model_id, staged_context.model_id,
+           sizeof(staged_snapshot.model_id));
+    memcpy(staged_snapshot.model_family, staged_context.model_family,
+           sizeof(staged_snapshot.model_family));
+    staged_snapshot.configured_context_tokens =
+        input->configured_context_tokens;
+    staged_snapshot.configured_prefill_chunk_tokens =
+        input->configured_prefill_chunk_tokens;
+    staged_snapshot.configured_session_slots =
+        input->configured_session_slots;
+    staged_snapshot.configured_ssd_streaming =
+        input->configured_ssd_streaming;
+    staged_snapshot.configured_ssd_streaming_cache_bytes =
+        input->configured_ssd_streaming_cache_bytes;
+    staged_snapshot.effective_context_tokens =
+        input->effective_context_tokens;
+    staged_snapshot.effective_prefill_chunk_tokens =
+        input->effective_prefill_chunk_tokens;
+    staged_snapshot.effective_session_slots =
+        input->effective_session_slots;
+    staged_snapshot.expert_cache_limit_bytes =
+        input->expert_cache_limit_bytes;
+    runtime_tracker_snapshot_scalars(
+        tracker, &staged_snapshot.allocations);
+    staged_snapshot.configured_prefill_rows =
+        input->configured_prefill_rows;
+    staged_snapshot.allocated_prefill_rows = input->allocated_prefill_rows;
+    staged_snapshot.counters = input->counters;
+    memcpy(staged_snapshot.violations, staged_context.violations,
+           staged_context.violation_count *
+               sizeof(staged_context.violations[0]));
+    staged_snapshot.violation_count = staged_context.violation_count;
+
+    if (staged_context.next_snapshot_seq != UINT64_MAX) {
+        staged_context.next_snapshot_seq++;
+    }
+    *context = staged_context;
+    *snapshot = staged_snapshot;
+    return true;
+}
+
+typedef struct {
+    char *buffer;
+    size_t capacity;
+    size_t length;
+    bool ok;
+} runtime_json_writer;
+
+static bool runtime_json_append_bytes(
+        runtime_json_writer *writer, const char *bytes, size_t length) {
+    if (!writer || !writer->ok || !bytes ||
+        length >= writer->capacity - writer->length) {
+        if (writer) writer->ok = false;
+        return false;
+    }
+    memcpy(writer->buffer + writer->length, bytes, length);
+    writer->length += length;
+    writer->buffer[writer->length] = '\0';
+    return true;
+}
+
+static bool runtime_json_append_literal(
+        runtime_json_writer *writer, const char *literal) {
+    return literal && runtime_json_append_bytes(
+        writer, literal, strlen(literal));
+}
+
+static bool runtime_json_appendf(
+        runtime_json_writer *writer, const char *format, ...) {
+    if (!writer || !writer->ok || !format ||
+        writer->length >= writer->capacity) {
+        if (writer) writer->ok = false;
+        return false;
+    }
+    va_list args;
+    va_start(args, format);
+    const int result = vsnprintf(
+        writer->buffer + writer->length,
+        writer->capacity - writer->length,
+        format,
+        args);
+    va_end(args);
+    if (result < 0 ||
+        (size_t)result >= writer->capacity - writer->length) {
+        writer->ok = false;
+        return false;
+    }
+    writer->length += (size_t)result;
+    return true;
+}
+
+static bool runtime_json_append_string(
+        runtime_json_writer *writer,
+        const char *text,
+        size_t capacity) {
+    size_t length = 0;
+    if (!runtime_wire_text_length(text, capacity, &length) ||
+        !runtime_json_append_literal(writer, "\"")) {
+        if (writer) writer->ok = false;
+        return false;
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < length && writer->ok; i++) {
+        const unsigned char byte = (unsigned char)text[i];
+        switch (byte) {
+        case '"':
+            runtime_json_append_literal(writer, "\\\"");
+            break;
+        case '\\':
+            runtime_json_append_literal(writer, "\\\\");
+            break;
+        case '\b':
+            runtime_json_append_literal(writer, "\\b");
+            break;
+        case '\f':
+            runtime_json_append_literal(writer, "\\f");
+            break;
+        case '\n':
+            runtime_json_append_literal(writer, "\\n");
+            break;
+        case '\r':
+            runtime_json_append_literal(writer, "\\r");
+            break;
+        case '\t':
+            runtime_json_append_literal(writer, "\\t");
+            break;
+        default:
+            if (byte < 0x20u) {
+                char escaped[6] = {
+                    '\\', 'u', '0', '0', hex[byte >> 4u],
+                    hex[byte & 0x0fu],
+                };
+                runtime_json_append_bytes(writer, escaped, sizeof(escaped));
+            } else {
+                const char output = (char)byte;
+                runtime_json_append_bytes(writer, &output, 1u);
+            }
+            break;
+        }
+    }
+    return runtime_json_append_literal(writer, "\"");
+}
+
+static const char *runtime_wire_state_name(ds4_runtime_wire_state state) {
+    switch (state) {
+    case DS4_RUNTIME_WIRE_STATE_STARTING: return "starting";
+    case DS4_RUNTIME_WIRE_STATE_READY: return "ready";
+    case DS4_RUNTIME_WIRE_STATE_DRAINING: return "draining";
+    case DS4_RUNTIME_WIRE_STATE_UNSAFE: return "unsafe";
+    }
+    return NULL;
+}
+
+static const char *runtime_wire_violation_name(
+        ds4_runtime_violation violation) {
+    switch (violation) {
+    case DS4_RUNTIME_VIOLATION_INVALID_CONFIG: return "invalid_config";
+    case DS4_RUNTIME_VIOLATION_OVERFLOW: return "overflow";
+    case DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE: return "unknown_callsite";
+    case DS4_RUNTIME_VIOLATION_DUPLICATE_CALLSITE: return "duplicate_callsite";
+    case DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE:
+        return "unclassified_callsite";
+    case DS4_RUNTIME_VIOLATION_CAPACITY: return "capacity";
+    case DS4_RUNTIME_VIOLATION_DUPLICATE_ID: return "duplicate_id";
+    case DS4_RUNTIME_VIOLATION_ADDRESS_OVERFLOW: return "address_overflow";
+    case DS4_RUNTIME_VIOLATION_UNDERCHARGE: return "undercharge";
+    case DS4_RUNTIME_VIOLATION_OVERLAP: return "overlap";
+    case DS4_RUNTIME_VIOLATION_CALLSITE_BOUND: return "callsite_bound";
+    case DS4_RUNTIME_VIOLATION_CATEGORY_BOUND: return "category_bound";
+    case DS4_RUNTIME_VIOLATION_OWNED_TOTAL_BOUND: return "owned_total_bound";
+    case DS4_RUNTIME_VIOLATION_REPORT_BOUND: return "report_bound";
+    case DS4_RUNTIME_VIOLATION_QUALIFICATION_TOTAL_BOUND:
+        return "qualification_total_bound";
+    case DS4_RUNTIME_VIOLATION_RELATION: return "relation";
+    case DS4_RUNTIME_VIOLATION_NOT_LIVE: return "not_live";
+    case DS4_RUNTIME_VIOLATION_LIVE_RELATION: return "live_relation";
+    case DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION:
+        return "external_attribution";
+    case DS4_RUNTIME_VIOLATION_NONE: break;
+    }
+    return NULL;
+}
+
+static bool runtime_json_append_identity(
+        runtime_json_writer *writer,
+        const ds4_runtime_file_identity *identity) {
+    return runtime_json_appendf(
+        writer,
+        "{\"device\":\"%" PRIu64 "\",\"inode\":\"%" PRIu64
+        "\",\"size_bytes\":\"%" PRIu64 "\",\"mtime_ns\":\"%" PRIu64
+        "\"}",
+        identity->device, identity->inode, identity->size_bytes,
+        identity->mtime_ns);
+}
+
+static bool runtime_json_append_measurement(
+        runtime_json_writer *writer,
+        uint64_t current,
+        uint64_t bound,
+        uint64_t peak) {
+    return runtime_json_appendf(
+        writer,
+        "{\"current_bytes\":\"%" PRIu64 "\",\"bound_bytes\":\"%" PRIu64
+        "\",\"peak_bytes\":\"%" PRIu64 "\"}",
+        current, bound, peak);
+}
+
+bool ds4_runtime_wire_snapshot_json(
+        const ds4_runtime_wire_snapshot *snapshot,
+        char *buffer,
+        size_t capacity,
+        size_t *length_out) {
+    if (length_out) *length_out = 0u;
+    if (!snapshot || !buffer || capacity == 0u) return false;
+    buffer[0] = '\0';
+    const char *state = runtime_wire_state_name(snapshot->state);
+    size_t ignored = 0;
+    if (!state || snapshot->snapshot_seq == 0u ||
+        !runtime_wire_build_valid(&snapshot->build) ||
+        !runtime_wire_model_text(
+            snapshot->model_id, sizeof(snapshot->model_id), &ignored) ||
+        !runtime_wire_model_text(
+            snapshot->model_family, sizeof(snapshot->model_family), &ignored) ||
+        !runtime_wire_text_length(
+            snapshot->instance_id, sizeof(snapshot->instance_id), &ignored) ||
+        snapshot->configured_context_tokens == 0u ||
+        snapshot->configured_prefill_chunk_tokens == 0u ||
+        snapshot->configured_session_slots == 0u ||
+        snapshot->effective_context_tokens == 0u ||
+        snapshot->effective_prefill_chunk_tokens == 0u ||
+        snapshot->effective_session_slots == 0u ||
+        snapshot->configured_prefill_rows == 0u ||
+        snapshot->allocated_prefill_rows == 0u ||
+        snapshot->violation_count > DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY) {
+        return false;
+    }
+    for (size_t i = 0; i < snapshot->violation_count; i++) {
+        if (!runtime_wire_violation_name(snapshot->violations[i].code) ||
+            snapshot->violations[i].latched_snapshot_seq == 0u ||
+            snapshot->violations[i].latched_snapshot_seq >
+                snapshot->snapshot_seq) {
+            return false;
+        }
+    }
+
+    runtime_json_writer writer = {
+        .buffer = buffer,
+        .capacity = capacity,
+        .length = 0u,
+        .ok = true,
+    };
+    runtime_json_append_literal(
+        &writer, "{\"schema\":\"ds4.runtime/v1\",\"instance_id\":");
+    runtime_json_append_string(
+        &writer, snapshot->instance_id, sizeof(snapshot->instance_id));
+    runtime_json_appendf(
+        &writer, ",\"snapshot_seq\":\"%" PRIu64 "\",\"state\":\"%s\","
+        "\"build\":{\"revision\":",
+        snapshot->snapshot_seq, state);
+    runtime_json_append_string(
+        &writer, snapshot->build.revision,
+        sizeof(snapshot->build.revision));
+    runtime_json_appendf(
+        &writer, ",\"dirty\":%s,\"backend\":",
+        snapshot->build.dirty ? "true" : "false");
+    runtime_json_append_string(
+        &writer, snapshot->build.backend, sizeof(snapshot->build.backend));
+    runtime_json_append_literal(&writer, ",\"features\":[");
+    for (size_t i = 0; i < snapshot->build.feature_count; i++) {
+        if (i != 0u) runtime_json_append_literal(&writer, ",");
+        runtime_json_append_string(
+            &writer, snapshot->build.features[i],
+            sizeof(snapshot->build.features[i]));
+    }
+    runtime_json_append_literal(&writer, "]},\"executable\":");
+    runtime_json_append_identity(&writer, &snapshot->executable);
+    runtime_json_append_literal(
+        &writer, ",\"model\":{\"id\":");
+    runtime_json_append_string(
+        &writer, snapshot->model_id, sizeof(snapshot->model_id));
+    runtime_json_append_literal(&writer, ",\"family\":");
+    runtime_json_append_string(
+        &writer, snapshot->model_family, sizeof(snapshot->model_family));
+    runtime_json_appendf(
+        &writer,
+        ",\"device\":\"%" PRIu64 "\",\"inode\":\"%" PRIu64
+        "\",\"size_bytes\":\"%" PRIu64 "\",\"mtime_ns\":\"%" PRIu64
+        "\"},\"config\":{\"context_tokens\":%" PRIu32
+        ",\"prefill_chunk_tokens\":%" PRIu32
+        ",\"session_slots\":%" PRIu32 ",\"ssd_streaming\":%s,"
+        "\"ssd_streaming_cache_bytes\":\"%" PRIu64
+        "\"},\"limits\":{\"effective_context_tokens\":%" PRIu32
+        ",\"effective_prefill_chunk_tokens\":%" PRIu32
+        ",\"effective_session_slots\":%" PRIu32
+        ",\"expert_cache_limit_bytes\":\"%" PRIu64
+        "\"},\"allocations\":{\"categories\":{",
+        snapshot->model.device, snapshot->model.inode,
+        snapshot->model.size_bytes, snapshot->model.mtime_ns,
+        snapshot->configured_context_tokens,
+        snapshot->configured_prefill_chunk_tokens,
+        snapshot->configured_session_slots,
+        snapshot->configured_ssd_streaming ? "true" : "false",
+        snapshot->configured_ssd_streaming_cache_bytes,
+        snapshot->effective_context_tokens,
+        snapshot->effective_prefill_chunk_tokens,
+        snapshot->effective_session_slots,
+        snapshot->expert_cache_limit_bytes);
+
+    static const char *const category_names[DS4_RUNTIME_OWNED_CATEGORY_COUNT] = {
+        "static_weights",
+        "expert_cache_payload",
+        "cache_metadata_address_tables",
+        "kv_state",
+        "graph_scratch",
+        "pinned_staging",
+        "other_host",
+        "other_cuda",
+    };
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        if (i != 0u) runtime_json_append_literal(&writer, ",");
+        runtime_json_appendf(&writer, "\"%s\":", category_names[i]);
+        runtime_json_append_measurement(
+            &writer,
+            snapshot->allocations.category_current[i],
+            snapshot->allocations.category_bounds[i],
+            snapshot->allocations.category_peak[i]);
+    }
+    runtime_json_append_literal(&writer, "},\"reports\":{");
+    static const char *const report_names[DS4_RUNTIME_REPORT_COUNT] = {
+        "model_mapped_virtual",
+        "model_mapping_registered",
+        "model_source_resident",
+        "host_library_unattributed",
+        "cuda_library_unattributed",
+    };
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (i != 0u) runtime_json_append_literal(&writer, ",");
+        runtime_json_appendf(&writer, "\"%s\":", report_names[i]);
+        runtime_json_append_measurement(
+            &writer,
+            snapshot->allocations.report_current[i],
+            snapshot->allocations.report_bounds[i],
+            snapshot->allocations.report_peak[i]);
+    }
+    runtime_json_append_literal(&writer, "},\"owned_total\":");
+    runtime_json_append_measurement(
+        &writer,
+        snapshot->allocations.owned_total_current,
+        snapshot->allocations.owned_total_bound_bytes,
+        snapshot->allocations.owned_total_peak);
+    runtime_json_append_literal(&writer, ",\"qualification_total\":");
+    runtime_json_append_measurement(
+        &writer,
+        snapshot->allocations.qualification_total_current,
+        snapshot->allocations.qualification_total_bound_bytes,
+        snapshot->allocations.qualification_total_peak);
+    runtime_json_appendf(
+        &writer,
+        ",\"configured_prefill_rows\":%" PRIu32
+        ",\"allocated_prefill_rows\":%" PRIu32
+        "},\"counters\":{\"cache_acquire_hits\":\"%" PRIu64
+        "\",\"cache_acquire_misses\":\"%" PRIu64
+        "\",\"cache_evictions\":\"%" PRIu64
+        "\",\"model_file_read_operations\":\"%" PRIu64
+        "\",\"model_file_read_bytes\":\"%" PRIu64
+        "\",\"model_file_read_ns\":\"%" PRIu64
+        "\",\"host_to_device_bytes\":\"%" PRIu64
+        "\",\"host_to_device_ns\":\"%" PRIu64
+        "\",\"page_advice_attempts\":\"%" PRIu64
+        "\",\"page_advice_bytes\":\"%" PRIu64
+        "\",\"page_advice_failures\":\"%" PRIu64
+        "\"},\"violations\":[",
+        snapshot->configured_prefill_rows,
+        snapshot->allocated_prefill_rows,
+        snapshot->counters.cache_acquire_hits,
+        snapshot->counters.cache_acquire_misses,
+        snapshot->counters.cache_evictions,
+        snapshot->counters.model_file_read_operations,
+        snapshot->counters.model_file_read_bytes,
+        snapshot->counters.model_file_read_ns,
+        snapshot->counters.host_to_device_bytes,
+        snapshot->counters.host_to_device_ns,
+        snapshot->counters.page_advice_attempts,
+        snapshot->counters.page_advice_bytes,
+        snapshot->counters.page_advice_failures);
+    for (size_t i = 0; i < snapshot->violation_count; i++) {
+        if (i != 0u) runtime_json_append_literal(&writer, ",");
+        runtime_json_appendf(
+            &writer,
+            "{\"code\":\"%s\",\"latched_snapshot_seq\":\"%" PRIu64
+            "\"}",
+            runtime_wire_violation_name(snapshot->violations[i].code),
+            snapshot->violations[i].latched_snapshot_seq);
+    }
+    runtime_json_append_literal(&writer, "]}");
+    if (!writer.ok) {
+        buffer[0] = '\0';
+        return false;
+    }
+    if (length_out) *length_out = writer.length;
     return true;
 }
 

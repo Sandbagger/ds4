@@ -187,6 +187,11 @@ class RuntimeEndpointSourceContractTest(unittest.TestCase):
         )
         self.assertIn("&snapshot", body)
         self.assertIn('"laguna-s-2.1"', body)
+        self.assertIn("s->runtime_snapshot_required", body)
+        self.assertIn("!have_snapshot", body)
+        detail = _c_function_body(SERVER_SOURCE, "static bool send_model(")
+        self.assertIn("s->runtime_snapshot_required", detail)
+        self.assertIn("!have_snapshot", detail)
 
         rendering = "\n".join(
             (

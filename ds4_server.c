@@ -15382,6 +15382,158 @@ static bool server_job_runtime_finish(
 static const ds4_runtime_request_metrics *server_job_runtime_terminal_metrics(
     const job *j);
 
+static char *test_server_source_text(void) {
+    const char *paths[] = {__FILE__, "ds4_server.c"};
+    FILE *fp = NULL;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        fp = fopen(paths[i], "rb");
+        if (fp) break;
+    }
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    const long size = ftell(fp);
+    if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    char *text = xmalloc((size_t)size + 1);
+    const size_t got = fread(text, 1, (size_t)size, fp);
+    fclose(fp);
+    if (got != (size_t)size) {
+        free(text);
+        return NULL;
+    }
+    text[got] = '\0';
+    return text;
+}
+
+/* Extract a C function without being confused by JSON/string braces in the
+ * server serializers.  The source contract intentionally examines only
+ * function-level control flow; it is not a second C parser. */
+static char *test_source_function(const char *source, const char *signature) {
+    if (!source || !signature) return NULL;
+    const char *start = source;
+    for (;;) {
+        start = strstr(start, signature);
+        if (!start) return NULL;
+        const char *brace = strchr(start, '{');
+        const char *semi = strchr(start, ';');
+        if (brace && (!semi || brace < semi)) {
+            enum {
+                TEST_C_NORMAL,
+                TEST_C_STRING,
+                TEST_C_CHAR,
+                TEST_C_LINE_COMMENT,
+                TEST_C_BLOCK_COMMENT,
+            } state = TEST_C_NORMAL;
+            bool escaped = false;
+            int depth = 0;
+            for (const char *p = brace; *p; p++) {
+                const char c = *p;
+                const char next = p[1];
+                if (state == TEST_C_LINE_COMMENT) {
+                    if (c == '\n') state = TEST_C_NORMAL;
+                    continue;
+                }
+                if (state == TEST_C_BLOCK_COMMENT) {
+                    if (c == '*' && next == '/') {
+                        state = TEST_C_NORMAL;
+                        p++;
+                    }
+                    continue;
+                }
+                if (state == TEST_C_STRING || state == TEST_C_CHAR) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (c == '\\') {
+                        escaped = true;
+                    } else if ((state == TEST_C_STRING && c == '"') ||
+                               (state == TEST_C_CHAR && c == '\'')) {
+                        state = TEST_C_NORMAL;
+                    }
+                    continue;
+                }
+                if (c == '/' && next == '/') {
+                    state = TEST_C_LINE_COMMENT;
+                    p++;
+                } else if (c == '/' && next == '*') {
+                    state = TEST_C_BLOCK_COMMENT;
+                    p++;
+                } else if (c == '"') {
+                    state = TEST_C_STRING;
+                } else if (c == '\'') {
+                    state = TEST_C_CHAR;
+                } else if (c == '{') {
+                    depth++;
+                } else if (c == '}' && --depth == 0) {
+                    return xstrndup(start, (size_t)(p - start + 1));
+                }
+            }
+            return NULL;
+        }
+        start += strlen(signature);
+    }
+}
+
+static size_t test_source_count(const char *text, const char *needle) {
+    if (!text || !needle || !needle[0]) return 0;
+    size_t count = 0;
+    const size_t len = strlen(needle);
+    for (const char *p = text; (p = strstr(p, needle)) != NULL; p += len) {
+        count++;
+    }
+    return count;
+}
+
+static bool test_source_before(const char *text,
+                               const char *first,
+                               const char *second) {
+    if (!text) return false;
+    const char *a = strstr(text, first);
+    const char *b = strstr(text, second);
+    return a && b && a < b;
+}
+
+static bool test_source_last_before(const char *text,
+                                    const char *first,
+                                    const char *second) {
+    if (!text) return false;
+    const char *last = NULL;
+    const char *p = text;
+    while ((p = strstr(p, first)) != NULL) {
+        last = p;
+        p += strlen(first);
+    }
+    const char *b = strstr(text, second);
+    return last && b && last < b;
+}
+
+static bool test_source_call_contains(const char *text,
+                                      const char *callee,
+                                      const char *argument) {
+    if (!text) return false;
+    const char *call = strstr(text, callee);
+    if (!call) return false;
+    const char *end = strstr(call, ");");
+    if (!end) return false;
+    const char *found = strstr(call, argument);
+    return found && found < end;
+}
+
+static char *test_source_between(const char *text,
+                                 const char *begin,
+                                 const char *end) {
+    if (!text) return NULL;
+    const char *a = strstr(text, begin);
+    if (!a) return NULL;
+    const char *b = strstr(a + strlen(begin), end);
+    if (!b) return NULL;
+    return xstrndup(a, (size_t)(b - a));
+}
+
 static void test_server_bind_slot(server *s, server_slot *slot) {
     memset(slot, 0, sizeof(*slot));
     slot->srv = s;
@@ -15956,6 +16108,211 @@ static void test_server_job_runtime_pre_token_terminals(void) {
                             sizeof(metrics_snapshot)));
         request_free(&prepared.req);
     }
+}
+
+static void test_live_server_request_lifecycle_call_sites(void) {
+    char *source = test_server_source_text();
+    TEST_ASSERT(source != NULL);
+    if (!source) return;
+
+    char *client = test_source_function(
+        source, "static void *client_main(void *arg)");
+    char *generate = test_source_function(
+        source, "static void generate_job(server *s, server_slot *slot, job *j)");
+    char *adopt = test_source_function(
+        source, "static bool server_job_runtime_adopt(");
+    char *flush_visible = test_source_function(
+        source, "static bool server_flush_final_visible(");
+    char *emit_terminal = test_source_function(
+        source, "static bool server_emit_native_terminal(");
+    char *malformed = NULL;
+    char *admission_reject = NULL;
+    char *enqueue_cancel = NULL;
+    TEST_ASSERT(client != NULL);
+    TEST_ASSERT(generate != NULL);
+    if (!client || !generate) goto done;
+
+    /* The UUID is born as soon as one of the four inference POST routes is
+     * recognized.  Token-admission/GET/OPTIONS never enter this region. */
+    TEST_ASSERT(test_source_count(
+                    client, "ds4_runtime_request_context accepted_context") == 1 &&
+                test_source_count(
+                    client, "ds4_runtime_request_begin(&accepted_context") == 1 &&
+                test_source_before(client, "\"/v1/token-admission\"",
+                                    "ds4_runtime_request_begin(&accepted_context") &&
+                test_source_before(client, "\"/v1/chat/completions\"",
+                                    "ds4_runtime_request_begin(&accepted_context") &&
+                test_source_before(client, "\"/v1/messages\"",
+                                    "ds4_runtime_request_begin(&accepted_context") &&
+                test_source_before(client, "\"/v1/responses\"",
+                                    "ds4_runtime_request_begin(&accepted_context") &&
+                test_source_before(client, "\"/v1/completions\"",
+                                    "ds4_runtime_request_begin(&accepted_context") &&
+                test_source_before(client,
+                                    "ds4_runtime_request_begin(&accepted_context",
+                                    "LAGUNA_PREPARE_INFERENCE") &&
+                test_source_before(client,
+                                    "ds4_runtime_request_begin(&accepted_context",
+                                    "parse_anthropic_request("));
+
+    /* Malformed input can die before a positive canonical prompt exists.  The
+     * v1 schema deliberately emits no fabricated zero-prompt record there. */
+    malformed = test_source_between(
+        client, "if (!ok) {", "if (!req.model_from_request)");
+    TEST_ASSERT(malformed != NULL &&
+                strstr(malformed, "server_job_runtime_adopt(") == NULL &&
+                strstr(malformed, "server_job_runtime_finish(") == NULL &&
+                strstr(malformed,
+                       "server_job_runtime_terminal_metrics(") == NULL);
+
+    /* Adoption moves the early identity into the stack-owned job and sets the
+     * exact prepared prompt exactly once; it must never generate a new UUID. */
+    TEST_ASSERT(adopt != NULL &&
+                strstr(adopt, "j->req.prompt.len") != NULL &&
+                strstr(adopt, "ds4_runtime_request_set_prompt_tokens(") != NULL &&
+                strstr(adopt, "ds4_runtime_request_begin(") == NULL);
+    TEST_ASSERT(test_source_count(client,
+                                  "server_job_runtime_adopt(") == 1 &&
+                test_source_before(client, "j.req = req;",
+                                    "server_job_runtime_adopt(") &&
+                test_source_before(client, "server_job_runtime_adopt(",
+                                    "request_prepare_token_admission(&j.req") &&
+                test_source_before(client,
+                                    "request_prepare_token_admission(&j.req",
+                                    "enqueue(s, &j)"));
+
+    /* Once a positive prompt has been adopted, scalar rejection and shutdown
+     * cancellation each finalize that job once. */
+    admission_reject = test_source_between(
+        client, "if (admission != REQUEST_ADMISSION_FITS)",
+        "set_client_socket_nonblocking");
+    enqueue_cancel = test_source_between(
+        client, "if (!enqueue(s, &j))", "while (!j.done)");
+    TEST_ASSERT(admission_reject != NULL &&
+                test_source_count(admission_reject,
+                                  "server_job_runtime_finish(") == 1 &&
+                strstr(admission_reject,
+                       "DS4_RUNTIME_REQUEST_REJECTED") != NULL);
+    TEST_ASSERT(enqueue_cancel != NULL &&
+                test_source_count(enqueue_cancel,
+                                  "server_job_runtime_finish(") == 1 &&
+                strstr(enqueue_cancel,
+                       "DS4_RUNTIME_REQUEST_CANCELLED") != NULL);
+
+    /* Every worker exit shares one terminal funnel.  Admission rejects before
+     * prefill, sync failures, server cancellation, barrier failure, and normal
+     * completion select status; only the funnel calls finish. */
+    TEST_ASSERT(test_source_count(generate, "return;") == 0 &&
+                test_source_count(generate,
+                                  "server_job_runtime_finish(") == 1 &&
+                strstr(generate, "DS4_RUNTIME_REQUEST_REJECTED") != NULL &&
+                strstr(generate,
+                       "DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR") != NULL &&
+                strstr(generate, "DS4_RUNTIME_REQUEST_CANCELLED") != NULL &&
+                (strstr(generate, "DS4_RUNTIME_REQUEST_UNSAFE_ERROR") != NULL ||
+                 strstr(generate,
+                        "DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR") != NULL) &&
+                strstr(generate, "DS4_RUNTIME_REQUEST_COMPLETED") != NULL);
+
+    /* Prefill milestones bracket both the optional cold-prefix sync and the
+     * canonical sync, while remaining single-shot on the job context. */
+    TEST_ASSERT(test_source_count(
+                    generate,
+                    "ds4_runtime_request_mark_prefill_started(") == 1 &&
+                test_source_count(
+                    generate,
+                    "ds4_runtime_request_mark_prefill_complete(") == 1 &&
+                test_source_before(
+                    generate,
+                    "ds4_runtime_request_mark_prefill_started(",
+                    "server_session_sync(") &&
+                test_source_last_before(
+                    generate, "server_session_sync(",
+                    "ds4_runtime_request_mark_prefill_complete("));
+
+    /* Streaming flushes its final visible tail first.  Both streaming and
+     * buffered responses then cross the attributed request barrier; buffered
+     * responses mark imminent first emission at that point.  Only afterward
+     * may the immutable snapshot enter the native terminal builder. */
+    TEST_ASSERT(flush_visible != NULL &&
+                strstr(flush_visible, "server_job_runtime_finish(") == NULL &&
+                strstr(flush_visible,
+                       "server_job_runtime_terminal_metrics(") == NULL &&
+                strstr(flush_visible, "server_emit_native_terminal(") == NULL &&
+                (strstr(flush_visible,
+                        "ds4_runtime_request_mark_first_visible_emitted(") != NULL ||
+                 strstr(flush_visible, "first_visible") != NULL));
+    TEST_ASSERT(test_source_count(generate,
+                                  "server_flush_final_visible(") == 1 &&
+                test_source_count(generate,
+                                  "ds4_session_request_barrier(") == 1 &&
+                test_source_call_contains(generate,
+                                          "ds4_session_request_barrier(",
+                                          "runtime") &&
+                test_source_count(generate,
+                                  "server_job_runtime_terminal_metrics(") == 1 &&
+                test_source_count(generate,
+                                  "server_emit_native_terminal(") == 1 &&
+                test_source_before(generate,
+                                   "server_flush_final_visible(",
+                                   "ds4_session_request_barrier(") &&
+                test_source_before(generate,
+                                   "ds4_session_request_barrier(",
+                                   "server_job_runtime_finish(") &&
+                test_source_before(generate,
+                                   "server_job_runtime_finish(",
+                                   "server_job_runtime_terminal_metrics(") &&
+                test_source_before(generate,
+                                   "server_job_runtime_terminal_metrics(",
+                                   "server_emit_native_terminal("));
+
+    /* generate_job has one protocol-independent terminal call.  The helper
+     * rejects NULL/invalid snapshots before sending and threads the same
+     * metrics value into every native stream/nonstream terminal builder. */
+    TEST_ASSERT(strstr(generate, "anthropic_sse_finish_live(") == NULL &&
+                strstr(generate, "openai_sse_finish_live(") == NULL &&
+                strstr(generate, "responses_sse_finish_live(") == NULL &&
+                strstr(generate, "sse_chat_finish(") == NULL &&
+                strstr(generate, "sse_done(") == NULL &&
+                strstr(generate, "anthropic_final_response(") == NULL &&
+                strstr(generate, "responses_final_response(") == NULL &&
+                strstr(generate, "final_response(") == NULL);
+    TEST_ASSERT(emit_terminal != NULL &&
+                strstr(emit_terminal, "if (!metrics") != NULL &&
+                strstr(emit_terminal,
+                       "ds4_runtime_request_metrics_json(") != NULL &&
+                test_source_call_contains(emit_terminal,
+                                          "anthropic_sse_finish_live(",
+                                          "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "openai_sse_finish_live(",
+                                          "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "responses_sse_finish_live(",
+                                          "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "sse_chat_finish(", "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "sse_done(", "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "anthropic_final_response(",
+                                          "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "responses_final_response(",
+                                          "metrics") &&
+                test_source_call_contains(emit_terminal,
+                                          "final_response(", "metrics"));
+
+done:
+    free(enqueue_cancel);
+    free(admission_reject);
+    free(malformed);
+    free(emit_terminal);
+    free(flush_visible);
+    free(adopt);
+    free(generate);
+    free(client);
+    free(source);
 }
 
 static void test_laguna_prepare_omitted_output_resolves_after_tokenize(void) {
@@ -20375,6 +20732,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_server_job_runtime_completed_lifecycle();
     test_server_job_runtime_pre_token_terminals();
+    test_live_server_request_lifecycle_call_sites();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();

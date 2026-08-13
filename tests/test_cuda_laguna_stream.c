@@ -6755,6 +6755,31 @@ static int run_qualification_control_disconnect(void) {
         return 1;
     }
 
+    ds4_runtime_wire_snapshot wire_before;
+    ds4_runtime_snapshot tracker_before;
+    ds4_runtime_allocation_record
+        records_before[MODEL_PAGE_ADVICE_RECORD_CAPACITY];
+    size_t records_before_required = 0;
+    memset(&wire_before, 0, sizeof(wire_before));
+    memset(&tracker_before, 0, sizeof(tracker_before));
+    memset(records_before, 0, sizeof(records_before));
+    const bool wire_before_captured =
+        ds4_engine_runtime_snapshot(fixture.engine, &wire_before);
+    const bool tracker_before_captured =
+        ds4_test_engine_laguna_runtime_snapshot(
+            fixture.engine, &tracker_before, records_before,
+            ARRAY_LEN(records_before), &records_before_required);
+    CHECK(wire_before_captured && tracker_before_captured &&
+              wire_before.state == DS4_RUNTIME_WIRE_STATE_READY &&
+              wire_before.allocations.violation ==
+                  DS4_RUNTIME_VIOLATION_NONE &&
+              tracker_before.violation == DS4_RUNTIME_VIOLATION_NONE &&
+              !tracker_before.external_sample.attributed_valid &&
+              tracker_before.active_record_count != 0u &&
+              records_before_required ==
+                  tracker_before.active_record_count,
+          "disconnect baseline captures ready unattributed provenance and live ownership");
+
     CHECK(close(fixture.control_pair[1]) == 0,
           "qualification parent disconnects before checkpoint READY");
     fixture.control_pair[1] = -1;
@@ -6773,15 +6798,39 @@ static int run_qualification_control_disconnect(void) {
     memset(&active, 0, sizeof(active));
     CHECK(ds4_gpu_test_laguna_compact_active_snapshot(&active),
           "disconnect releases the checkpoint lease while engine remains inspectable");
-    ds4_runtime_wire_snapshot runtime;
-    memset(&runtime, 0, sizeof(runtime));
-    CHECK(ds4_engine_runtime_snapshot(fixture.engine, &runtime) &&
-              runtime.state == DS4_RUNTIME_WIRE_STATE_UNSAFE &&
-              runtime.allocations.violation ==
+    ds4_runtime_wire_snapshot wire_after;
+    ds4_runtime_snapshot tracker_after;
+    ds4_runtime_allocation_record
+        records_after[MODEL_PAGE_ADVICE_RECORD_CAPACITY];
+    size_t records_after_required = 0;
+    memset(&wire_after, 0, sizeof(wire_after));
+    memset(&tracker_after, 0, sizeof(tracker_after));
+    memset(records_after, 0, sizeof(records_after));
+    const bool wire_after_captured =
+        ds4_engine_runtime_snapshot(fixture.engine, &wire_after);
+    const bool tracker_after_captured =
+        ds4_test_engine_laguna_runtime_snapshot(
+            fixture.engine, &tracker_after, records_after,
+            ARRAY_LEN(records_after), &records_after_required);
+    ds4_runtime_snapshot tracker_before_normalized = tracker_before;
+    ds4_runtime_snapshot tracker_after_normalized = tracker_after;
+    tracker_before_normalized.violation = DS4_RUNTIME_VIOLATION_NONE;
+    tracker_after_normalized.violation = DS4_RUNTIME_VIOLATION_NONE;
+    CHECK(wire_before_captured && tracker_before_captured &&
+              wire_after_captured && tracker_after_captured &&
+              wire_after.state == DS4_RUNTIME_WIRE_STATE_UNSAFE &&
+              wire_after.allocations.violation ==
                   DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION &&
-              runtime.allocations.external_sample.attributed_generation ==
-                  0u &&
-              runtime.allocations.active_record_count != 0u,
+              tracker_after.violation ==
+                  DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION &&
+              records_after_required == records_before_required &&
+              records_after_required == tracker_after.active_record_count &&
+              memcmp(&tracker_before_normalized,
+                     &tracker_after_normalized,
+                     sizeof(tracker_before_normalized)) == 0 &&
+              memcmp(records_before, records_after,
+                     records_before_required * sizeof(records_before[0])) ==
+                  0,
           "disconnect latches unsafe without fabricating or releasing live ownership");
 
     qualification_live_fixture_close(&fixture, false);

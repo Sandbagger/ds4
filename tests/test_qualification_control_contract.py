@@ -11,6 +11,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DS4_C = (ROOT / "ds4.c").read_text(encoding="utf-8")
 DS4_H = (ROOT / "ds4.h").read_text(encoding="utf-8")
+GPU_H = (ROOT / "ds4_gpu.h").read_text(encoding="utf-8")
 
 
 def braced_body(source: str, signature: str) -> str:
@@ -104,43 +105,112 @@ class QualificationControlIntegrationContract(unittest.TestCase):
         self.assertIn("e->model.identity", window)
         self.assertIn("ds4_engine_close(e)", body[send : send + 900])
 
-    def test_external_checkpoint_is_fully_bracketed(self) -> None:
+    def test_engine_consumes_the_inherited_control_endpoint_after_duplication(
+        self,
+    ) -> None:
+        internal = braced_body(
+            DS4_C,
+            r"static\s+int\s+ds4_engine_open_internal\s*\([^;]*?\)\s*\{",
+        )
+        self.assertNotIn(
+            "close(opt->qualification_control_fd)",
+            internal,
+            "the shared wrapper owns the endpoint on every internal exit",
+        )
+        for signature in (
+            r"int\s+ds4_engine_open\s*\([^;]*?\)\s*\{",
+            r"int\s+ds4_engine_create_with_gpu_config\s*\([^;]*?\)\s*\{",
+        ):
+            with self.subTest(signature=signature):
+                body = braced_body(DS4_C, signature)
+                ordered(
+                    body,
+                    "ds4_engine_open_internal(",
+                    "close(opt->qualification_control_fd)",
+                    "return rc",
+                )
+                self.assertIn("opt && opt->qualification_control_fd_set", body)
+
+        body = internal
+        ordered(
+            body,
+            "ds4_qualification_control_open(",
+            "model_open(&e->model",
+        )
+
+    def test_external_checkpoint_delegates_barrier_to_gpu_quiescence(self) -> None:
         body = braced_body(
             DS4_C,
             r"ds4_runtime_status\s+"
             r"ds4_engine_laguna_external_checkpoint\s*\([^;]*?\)\s*\{",
         )
-        ordered(
-            body,
+        self.assertIn("ds4_gpu_laguna_external_checkpoint_barrier", body)
+        self.assertIn("ds4_gpu_laguna_compact_external_checkpoint(", body)
+        self.assertIn("barrier_ptr", body)
+        self.assertNotIn(
             "ds4_qualification_control_begin_sample(",
-            "ds4_gpu_laguna_compact_external_checkpoint(",
-            "ds4_qualification_control_finish_sample(",
+            body,
+            "READY cannot precede the CUDA execution/quiescence lock",
         )
         self.assertNotIn(
-            "return ds4_gpu_laguna_compact_external_checkpoint(",
+            "ds4_qualification_control_finish_sample(",
             body,
-            "the GPU sample must not return past the RESULT/ACK barrier",
+            "RESULT cannot follow release of the CUDA execution lock",
         )
-        finish = body.index("ds4_qualification_control_finish_sample(")
-        self.assertIn("engine->model.fd", body[finish : finish + 500])
         self.assertGreaterEqual(
             body.count("DS4_RUNTIME_STATUS_UNSAFE"),
-            3,
-            "input, begin-barrier, and finish-barrier failures must fail safe",
+            2,
+            "invalid inputs and a failed delegated barrier must fail safe",
         )
 
-    def test_successful_engine_teardown_closes_the_owned_control(self) -> None:
+    def test_gpu_checkpoint_api_accepts_synchronous_barrier_callbacks(
+        self,
+    ) -> None:
+        barrier = braced_body(
+            GPU_H,
+            r"typedef\s+struct\s*\{[^}]*?\}\s*"
+            r"ds4_gpu_laguna_external_checkpoint_barrier\s*;",
+        )
+        self.assertIn("sample_ready", barrier)
+        self.assertIn("sample_result", barrier)
+        self.assertIn("userdata", barrier)
+        self.assertRegex(
+            GPU_H,
+            r"ds4_gpu_laguna_compact_external_checkpoint\s*\([^;]*"
+            r"const\s+ds4_gpu_laguna_external_checkpoint_barrier\s*\*"
+            r"\s*barrier[^;]*\)\s*;",
+        )
+
+    def test_engine_teardown_preserves_control_until_final_disposal(
+        self,
+    ) -> None:
         body = braced_body(
             DS4_C,
             r"void\s+ds4_engine_close\s*\([^;]*?\)\s*\{",
         )
-        ordered(
-            body,
-            "ds4_qualification_control_close(",
-            "free(e)",
-        )
+        last_destroy = body.rfind("ds4_gpu_laguna_compact_destroy(")
+        last_retained_return = body.rfind("return;")
         close = body.index("ds4_qualification_control_close(")
+        final_free = body.rfind("free(e)")
+        self.assertGreaterEqual(last_destroy, 0)
+        self.assertGreater(
+            close,
+            last_destroy,
+            "the control must outlive compact CUDA quiescence",
+        )
+        self.assertGreater(
+            close,
+            last_retained_return,
+            "every retained-engine return must preserve the live control",
+        )
+        self.assertGreater(final_free, close)
+        self.assertNotIn(
+            "return;",
+            body[close:final_free],
+            "control close must be committed only on the final free path",
+        )
         self.assertIn("e->qualification_control", body[close : close + 300])
+        self.assertIn("e->qualification_control = NULL", body[close : close + 300])
 
 
 if __name__ == "__main__":

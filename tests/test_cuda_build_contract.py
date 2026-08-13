@@ -2451,25 +2451,84 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cudaDeviceSynchronize()", device_zero)
         self.assertIn("cudaMemGetInfo(&cuda_free, &cuda_total)", device_zero)
 
+    def test_external_checkpoint_barriers_run_inside_quiescence_window(
+        self,
+    ) -> None:
+        barrier_type = CUDA_SOURCE.find(
+            "typedef bool (*ds4_gpu_laguna_external_checkpoint_barrier_fn)("
+        )
+        barrier_struct = CUDA_SOURCE.find(
+            "} ds4_gpu_laguna_external_checkpoint_barrier;"
+        )
+        snapshot_type = CUDA_SOURCE.find(
+            "typedef bool (*ds4_gpu_laguna_runtime_snapshot_fn)(void *userdata);"
+        )
+        first_barrier_use = CUDA_SOURCE.find(
+            "static ds4_runtime_status cuda_laguna_external_checkpoint_finish("
+        )
+        self.assertTrue(
+            0 <= barrier_type < barrier_struct < snapshot_type < first_barrier_use,
+            "ds4_cuda.cu must define its private callback ABI before use",
+        )
+        device_zero = function_body(
+            "static ds4_runtime_status\n"
+            "cuda_laguna_compact_external_checkpoint_device_zero("
+        )
+        ordered = (
+            device_zero.find("g_laguna_compact_exec_mutex"),
+            device_zero.find("cudaDeviceSynchronize()"),
+            device_zero.find("cuda_laguna_external_barrier_ready("),
+            device_zero.find("&out->checkpoint_before"),
+            device_zero.find("&out->inside_ds4"),
+            device_zero.find("&out->checkpoint_after"),
+            device_zero.rfind("cuda_laguna_external_checkpoint_complete("),
+        )
+        self.assertTrue(all(position >= 0 for position in ordered), ordered)
+        self.assertEqual(tuple(sorted(ordered)), ordered)
+
+        complete = function_body(
+            "static ds4_runtime_status\n"
+            "cuda_laguna_external_checkpoint_complete("
+        )
+        self.assertIn("cuda_laguna_external_checkpoint_finish(", complete)
+        self.assertIn("barrier", complete)
+
+        finish = function_body(
+            "static ds4_runtime_status "
+            "cuda_laguna_external_checkpoint_finish("
+        )
+        sample = finish.find("ds4_runtime_tracker_checkpoint_attributed(")
+        result = finish.find("barrier->sample_result(")
+        release = finish.rfind("ctx->active_execution_count--")
+        self.assertGreaterEqual(result, 0)
+        self.assertGreater(sample, result)
+        self.assertGreater(release, sample)
+        self.assertIn("cuda_laguna_external_checkpoint_fail(ctx, out)", finish)
+
     def test_runtime_snapshot_copies_compact_counters_under_execution_lock(
         self,
     ) -> None:
         self.assertRegex(
             GPU_HEADER,
-            r"bool\s+ds4_gpu_laguna_compact_runtime_counters\(\s*"
+            r"bool\s+ds4_gpu_laguna_compact_runtime_snapshot\(\s*"
             r"const\s+ds4_gpu_laguna_compact\s*\*\s*ctx\s*,\s*"
-            r"ds4_runtime_wire_counters\s*\*\s*out\s*\)\s*;",
+            r"ds4_runtime_wire_counters\s*\*\s*out\s*,\s*"
+            r"bool\s*\*\s*unsafe_out\s*,\s*"
+            r"ds4_gpu_laguna_runtime_snapshot_fn\s+capture\s*,\s*"
+            r"void\s*\*\s*userdata\s*\)\s*;",
         )
         body = function_body(
             'extern "C" bool\n'
-            "ds4_gpu_laguna_compact_runtime_counters("
+            "ds4_gpu_laguna_compact_runtime_snapshot("
         )
         ordered = (
             body.find("g_laguna_compact_exec_mutex"),
             body.find("g_laguna_compact_mutex"),
-            body.find("cuda_laguna_compact_cache_active_locked(ctx)"),
+            body.find("cuda_laguna_compact_cache_published_locked(ctx)"),
+            body.find("*unsafe_out = ctx->cache_unsafe"),
             body.find("out->cache_acquire_hits"),
             body.find("out->page_advice_failures"),
+            body.find("capture(userdata)"),
         )
         self.assertTrue(all(position >= 0 for position in ordered), ordered)
         self.assertEqual(tuple(sorted(ordered)), ordered)

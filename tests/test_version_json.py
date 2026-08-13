@@ -277,12 +277,26 @@ class VersionJsonSourceContractTest(unittest.TestCase):
                 text=True,
             ).stdout.strip()
 
+            nested_make_env = os.environ.copy()
+            for inherited_name in (
+                "MAKEFLAGS",
+                "MAKEOVERRIDES",
+                "GNUMAKEFLAGS",
+                "MFLAGS",
+                "MAKELEVEL",
+                "MAKEFILES",
+                "DS4_BUILD_REVISION",
+                "DS4_BUILD_DIRTY",
+            ):
+                nested_make_env.pop(inherited_name, None)
+
             clean = subprocess.run(
                 ["make", "-n", "ds4_build_info_cpu.o"],
                 cwd=repo,
                 check=False,
                 capture_output=True,
                 text=True,
+                env=nested_make_env,
             )
             self.assertEqual(clean.returncode, 0, clean.stderr)
             self.assertIn(revision, clean.stdout)
@@ -293,6 +307,7 @@ class VersionJsonSourceContractTest(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
+                env=nested_make_env,
             )
             self.assertEqual(clean_repeat.stdout, clean.stdout)
 
@@ -306,6 +321,7 @@ class VersionJsonSourceContractTest(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
+                env=nested_make_env,
             )
             self.assertEqual(dirty.returncode, 0, dirty.stderr)
             self.assertIn(revision, dirty.stdout)

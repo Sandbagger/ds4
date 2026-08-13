@@ -2474,6 +2474,52 @@ static void test_allocation_profiles(void) {
         }
     }
 
+    ds4_laguna_allocation_plan_spec two_session_spec = {
+        .configured_cache_bytes = 8u * gib,
+        .context_tokens = 32768u,
+        .prefill_rows = 4096u,
+        .session_count = 2u,
+    };
+    ds4_laguna_allocation_plan two_session_plan;
+    char two_session_error[256] = {0};
+    memset(&two_session_plan, 0, sizeof(two_session_plan));
+    CHECK(ds4_laguna_allocation_plan_make(
+              &two_session_plan, &ledger, &two_session_spec,
+              two_session_error, sizeof(two_session_error)),
+          "two-session exact allocation profile builds");
+    CHECK(two_session_error[0] == '\0' &&
+              two_session_plan.profile_id != NULL &&
+              strcmp(two_session_plan.profile_id,
+                     "cache-8gib-sessions-2") == 0,
+          "two-session profile has an unambiguous frozen identity");
+    CHECK(two_session_plan.owned_category_bounds[
+                  DS4_RUNTIME_CATEGORY_KV_STATE] ==
+              UINT64_C(3372220416) &&
+              two_session_plan.callsites[
+                  DS4_LAGUNA_CALLSITE_KV_STATE - 1u].bound_bytes ==
+              UINT64_C(3372220416),
+          "two-session KV category and callsite multiply exactly");
+    CHECK(two_session_plan.owned_category_bounds[
+                  DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] ==
+              UINT64_C(3074105360) &&
+              two_session_plan.callsites[
+                  DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH - 1u].bound_bytes ==
+              UINT64_C(3074105360),
+          "two-session graph category and callsite multiply exactly");
+    CHECK(two_session_plan.callsites[
+                  DS4_LAGUNA_CALLSITE_OTHER_HOST_SESSION - 1u].bound_bytes ==
+              UINT64_C(268435456) &&
+              two_session_plan.owned_category_bounds[
+                  DS4_RUNTIME_CATEGORY_OTHER_HOST] == UINT64_C(1207959552),
+          "two-session host session envelope multiplies without changing shared host bounds");
+    CHECK(two_session_plan.qualification_non_cache_bound_bytes ==
+              UINT64_C(17420062728) &&
+              two_session_plan.qualification_total_bound_bytes ==
+              UINT64_C(30064771072) &&
+              two_session_plan.planned_qualification_bytes <=
+                  two_session_plan.qualification_total_bound_bytes,
+          "two-session profile uses a truthful cache-plus-20GiB qualification envelope");
+
     ds4_laguna_allocation_plan_spec invalid = {
         8u * gib, 32768u, 4096u, 1u,
     };
@@ -2496,7 +2542,7 @@ static void test_allocation_profiles(void) {
               &plan, &ledger, &invalid, err, sizeof(err)),
           "non-reference prefill shape is rejected");
     invalid.prefill_rows = 4096u;
-    invalid.session_count = 2u;
+    invalid.session_count = 3u;
     CHECK(!ds4_laguna_allocation_plan_make(
               &plan, &ledger, &invalid, err, sizeof(err)),
           "non-reference session count is rejected");

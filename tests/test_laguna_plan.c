@@ -558,6 +558,50 @@ static void test_serialize(void) {
     ds4_laguna_page_plan_free(&fixture.pages);
 }
 
+static void test_two_session_serialize(void) {
+    plan_fixture fixture;
+    char error[512] = {0};
+    CHECK(prepare_fixture(&fixture, error, sizeof(error)),
+          "two-session serializer fixture prepares");
+    ds4_laguna_allocation_plan *plan = &fixture.allocation;
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    plan->profile_id = "cache-8gib-sessions-2";
+    plan->session_count = 2u;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] += 200u;
+    plan->callsites[DS4_LAGUNA_CALLSITE_KV_STATE - 1u].bound_bytes += 200u;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] += 300u;
+    plan->callsites[
+        DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH - 1u].bound_bytes += 300u;
+    plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] += 100u;
+    plan->callsites[
+        DS4_LAGUNA_CALLSITE_OTHER_HOST_SESSION - 1u].bound_bytes += 100u;
+    plan->owned_non_cache_bound_bytes =
+        sum_u64(plan->owned_category_bounds, DS4_RUNTIME_OWNED_CATEGORY_COUNT) -
+        plan->cache_payload_bytes;
+    plan->owned_total_bound_bytes =
+        sum_u64(plan->owned_category_bounds, DS4_RUNTIME_OWNED_CATEGORY_COUNT);
+    plan->qualification_non_cache_bound_bytes =
+        plan->owned_non_cache_bound_bytes + 1500u;
+    plan->planned_qualification_bytes = plan->owned_total_bound_bytes + 1500u;
+    plan->qualification_total_bound_bytes = 28u * gib;
+
+    char *json = NULL;
+    size_t json_size = 0;
+    char ledger_digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    CHECK(ds4_laguna_qualification_plan_serialize(
+              &fixture.input, &json, &json_size, ledger_digest,
+              error, sizeof(error)),
+          "two-session qualification plan serializes");
+    CHECK(json != NULL &&
+              strstr(json, "\"profile_id\":\"cache-8gib-sessions-2\"") != NULL &&
+              strstr(json, "\"session_count\":2") != NULL &&
+              strstr(json,
+                     "\"qualification_total_bound_bytes\":\"30064771072\"") != NULL,
+          "two-session JSON publishes its distinct profile and envelope");
+    ds4_laguna_qualification_plan_bytes_free(json);
+    ds4_laguna_page_plan_free(&fixture.pages);
+}
+
 static unsigned char *read_file(const char *path, size_t *size_out) {
     FILE *file = fopen(path, "rb");
     if (!file) return NULL;
@@ -820,6 +864,7 @@ static void test_rejections(void) {
 int main(void) {
     test_page_plan();
     test_serialize();
+    test_two_session_serialize();
     test_publish();
     test_rejections();
     test_expert_evidence_rejections();

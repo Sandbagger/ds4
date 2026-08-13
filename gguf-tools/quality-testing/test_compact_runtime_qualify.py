@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import array
 import copy
 import contextlib
 import errno
@@ -14,8 +15,11 @@ import json
 import math
 import os
 import re
+import socket
+import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -2869,6 +2873,713 @@ class QualificationPreflightManifestContractTest(unittest.TestCase):
             schema["$defs"]["nvml_process_inventory"]["properties"]["api"]["const"],
             NVML_COMPUTE_API,
         )
+
+
+QUALIFICATION_CONTROL_MESSAGE = struct.Struct("@IIIIQQQQQ")
+
+
+def _qualification_control_wire_message(
+    message_type: int,
+    sequence: int,
+    identity: os.stat_result | tuple[int, int, int, int] | None = None,
+) -> bytes:
+    if identity is None:
+        fields = (0, 0, 0, 0)
+    elif isinstance(identity, os.stat_result):
+        fields = (
+            identity.st_dev,
+            identity.st_ino,
+            identity.st_size,
+            identity.st_mtime_ns,
+        )
+    else:
+        fields = identity
+    return QUALIFICATION_CONTROL_MESSAGE.pack(
+        1,
+        message_type,
+        QUALIFICATION_CONTROL_MESSAGE.size,
+        0,
+        sequence,
+        *fields,
+    )
+
+
+def _recv_control_wire_message(endpoint: socket.socket) -> tuple[int, int, tuple[int, ...]]:
+    payload = bytearray()
+    while len(payload) != QUALIFICATION_CONTROL_MESSAGE.size:
+        part = endpoint.recv(QUALIFICATION_CONTROL_MESSAGE.size - len(payload))
+        if not part:
+            raise AssertionError("qualification control disconnected")
+        payload.extend(part)
+    values = QUALIFICATION_CONTROL_MESSAGE.unpack(payload)
+    if values[0] != 1 or values[2] != QUALIFICATION_CONTROL_MESSAGE.size:
+        raise AssertionError("invalid qualification control message")
+    return values[1], values[4], values[5:]
+
+
+class QualificationVersionAdmissionContractTest(unittest.TestCase):
+    def _valid_version(self) -> dict[str, object]:
+        return {
+            "schema": "ds4.version/v1",
+            "revision": "1234567890abcdef1234567890abcdef12345678",
+            "dirty": False,
+            "backend": "cuda",
+            "features": ["laguna", "ssd_streaming"],
+        }
+
+    def test_accepts_only_a_clean_cuda_build_with_required_features(self) -> None:
+        version = self._valid_version()
+        admitted = TOOL.validate_qualification_version(version)
+        self.assertEqual(admitted, version)
+        self.assertIsNot(admitted, version)
+        self.assertIsNot(admitted["features"], version["features"])
+
+    def test_rejects_nonclosed_or_mistyped_version_payloads(self) -> None:
+        cases: dict[str, Callable[[dict[str, object]], None]] = {
+            "missing": lambda value: value.pop("revision"),
+            "extra": lambda value: value.__setitem__("path", "/tmp/ds4"),
+            "schema": lambda value: value.__setitem__("schema", "ds4.version/v2"),
+            "dirty number": lambda value: value.__setitem__("dirty", 0),
+            "features tuple": lambda value: value.__setitem__(
+                "features", ("laguna", "ssd_streaming")
+            ),
+            "feature number": lambda value: value.__setitem__(
+                "features", ["laguna", 7, "ssd_streaming"]
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                changed = self._valid_version()
+                mutate(changed)
+                with self.assertRaisesRegex(
+                    ValueError, "missing|unknown|schema|boolean|array|feature"
+                ):
+                    TOOL.validate_qualification_version(changed)
+
+    def test_rejects_invalid_or_placeholder_revisions(self) -> None:
+        for revision in (
+            "0" * 40,
+            "a" * 39,
+            "A" * 40,
+            "g" * 40,
+            7,
+        ):
+            with self.subTest(revision=revision):
+                changed = self._valid_version()
+                changed["revision"] = revision
+                with self.assertRaisesRegex(ValueError, "revision|40-hex|sentinel"):
+                    TOOL.validate_qualification_version(changed)
+
+    def test_rejects_dirty_or_non_cuda_builds(self) -> None:
+        mutations: dict[str, Callable[[dict[str, object]], None]] = {
+            "dirty": lambda value: value.__setitem__("dirty", True),
+            "cpu": lambda value: value.__setitem__("backend", "cpu"),
+            "metal": lambda value: value.__setitem__("backend", "metal"),
+            "rocm": lambda value: value.__setitem__("backend", "rocm"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = self._valid_version()
+                mutate(changed)
+                with self.assertRaisesRegex(ValueError, "clean|dirty|CUDA|cuda|backend"):
+                    TOOL.validate_qualification_version(changed)
+
+    def test_requires_sorted_unique_laguna_and_ssd_streaming_features(self) -> None:
+        candidates: dict[str, object] = {
+            "missing laguna": ["ssd_streaming"],
+            "missing streaming": ["laguna"],
+            "unsorted": ["ssd_streaming", "laguna"],
+            "duplicate": ["laguna", "laguna", "ssd_streaming"],
+            "empty": [],
+            "invalid spelling": ["laguna", "ssd-streaming"],
+        }
+        for label, features in candidates.items():
+            with self.subTest(label=label):
+                changed = self._valid_version()
+                changed["features"] = features
+                with self.assertRaisesRegex(
+                    ValueError, "feature|sorted|unique|laguna|ssd_streaming"
+                ):
+                    TOOL.validate_qualification_version(changed)
+
+
+class QualificationControlParentContractTest(unittest.TestCase):
+    def _channel_and_child(self, **kwargs: object) -> tuple[object, socket.socket]:
+        control = TOOL.QualificationControl.create(**kwargs)
+        self.assertFalse(os.get_inheritable(control.child_fd))
+        child = socket.socket(fileno=os.dup(control.child_fd))
+        child.settimeout(1.0)
+        control.close_child_endpoint()
+        return control, child
+
+    def _send_model(
+        self,
+        child: socket.socket,
+        descriptor: int,
+        *,
+        passed_descriptors: tuple[int, ...] | None = None,
+        identity: os.stat_result | tuple[int, int, int, int] | None = None,
+    ) -> os.stat_result:
+        observed = os.fstat(descriptor)
+        rights = (descriptor,) if passed_descriptors is None else passed_descriptors
+        ancillary = []
+        if rights:
+            ancillary = [
+                (
+                    socket.SOL_SOCKET,
+                    socket.SCM_RIGHTS,
+                    array.array("i", rights),
+                )
+            ]
+        sent = child.sendmsg(
+            [
+                _qualification_control_wire_message(
+                    1,
+                    0,
+                    observed if identity is None else identity,
+                )
+            ],
+            ancillary,
+        )
+        self.assertEqual(sent, QUALIFICATION_CONTROL_MESSAGE.size)
+        return observed
+
+    def _assert_model_ack(
+        self, child: socket.socket, expected: os.stat_result
+    ) -> None:
+        self.assertEqual(
+            _recv_control_wire_message(child),
+            (
+                6,
+                0,
+                (
+                    expected.st_dev,
+                    expected.st_ino,
+                    expected.st_size,
+                    expected.st_mtime_ns,
+                ),
+            ),
+        )
+
+    def test_receives_hashes_and_retains_one_exact_opened_model_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            payload = b"opened descriptor identity\0" * 4096
+            model.write_bytes(payload)
+            descriptor = os.open(model, os.O_RDONLY)
+            control, child = self._channel_and_child(timeout_seconds=1.0)
+            try:
+                expected = self._send_model(child, descriptor)
+                hash_descriptor = TOOL._sha256_open_descriptor
+
+                def hash_cloexec(received_fd: int) -> str:
+                    self.assertFalse(os.get_inheritable(received_fd))
+                    return hash_descriptor(received_fd)
+
+                with mock.patch.object(
+                    TOOL,
+                    "_sha256_open_descriptor",
+                    side_effect=hash_cloexec,
+                ):
+                    evidence = control.receive_model()
+                self._assert_model_ack(child, expected)
+                self.assertEqual(
+                    evidence.identity.inode,
+                    expected.st_ino,
+                    "child must remain blocked until the parent acknowledges the "
+                    "verified model identity",
+                )
+                self.assertEqual(evidence.sha256, hashlib.sha256(payload).hexdigest())
+                self.assertEqual(evidence.identity.device, expected.st_dev)
+                self.assertEqual(evidence.identity.inode, expected.st_ino)
+                self.assertEqual(evidence.identity.size_bytes, expected.st_size)
+                self.assertEqual(evidence.identity.mtime_ns, expected.st_mtime_ns)
+                self.assertEqual(control.verify_model_unchanged(), evidence.identity)
+                with self.assertRaisesRegex(ValueError, "already.*received"):
+                    control.receive_model()
+            finally:
+                control.close()
+                child.close()
+                os.close(descriptor)
+
+    def test_model_ack_waits_for_descriptor_bound_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"cold preparation before allocation")
+            descriptor = os.open(model, os.O_RDONLY)
+            control, child = self._channel_and_child(timeout_seconds=1.0)
+            order: list[str] = []
+            try:
+                expected = self._send_model(child, descriptor)
+
+                def prepare(received_fd: int, evidence: object) -> None:
+                    order.append("prepare")
+                    self.assertEqual(os.fstat(received_fd).st_ino, expected.st_ino)
+                    self.assertEqual(evidence.identity.inode, expected.st_ino)
+                    child.settimeout(0.01)
+                    with self.assertRaises(socket.timeout):
+                        child.recv(1)
+                    child.settimeout(1.0)
+
+                evidence = control.receive_model(prepare_descriptor=prepare)
+                order.append("returned")
+                self._assert_model_ack(child, expected)
+                self.assertEqual(order, ["prepare", "returned"])
+                self.assertEqual(evidence.identity.inode, expected.st_ino)
+            finally:
+                control.close()
+                child.close()
+                os.close(descriptor)
+
+    def test_model_receive_rejects_missing_multiple_and_mismatched_rights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"model")
+            descriptor = os.open(model, os.O_RDONLY)
+            cases = {
+                "missing": (),
+                "multiple": (descriptor, descriptor),
+            }
+            try:
+                for label, rights in cases.items():
+                    with self.subTest(label=label):
+                        control, child = self._channel_and_child(timeout_seconds=1.0)
+                        try:
+                            self._send_model(
+                                child,
+                                descriptor,
+                                passed_descriptors=rights,
+                            )
+                            with self.assertRaisesRegex(
+                                ValueError, "exactly one.*descriptor|SCM_RIGHTS"
+                            ):
+                                control.receive_model()
+                        finally:
+                            control.close()
+                            child.close()
+
+                control, child = self._channel_and_child(timeout_seconds=1.0)
+                try:
+                    status = os.fstat(descriptor)
+                    changed = (
+                        status.st_dev,
+                        status.st_ino,
+                        status.st_size + 1,
+                        status.st_mtime_ns,
+                    )
+                    self._send_model(child, descriptor, identity=changed)
+                    with self.assertRaisesRegex(ValueError, "identity.*match"):
+                        control.receive_model()
+                finally:
+                    control.close()
+                    child.close()
+            finally:
+                os.close(descriptor)
+
+    def test_model_hash_has_pre_and_post_fstat_identity_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"before")
+            descriptor = os.open(model, os.O_RDWR)
+            control, child = self._channel_and_child(timeout_seconds=1.0)
+            try:
+                self._send_model(child, descriptor)
+
+                def mutate_during_hash(received_fd: int) -> str:
+                    digest = hashlib.sha256(os.pread(received_fd, 6, 0)).hexdigest()
+                    os.ftruncate(received_fd, 7)
+                    return digest
+
+                with mock.patch.object(
+                    TOOL,
+                    "_sha256_open_descriptor",
+                    side_effect=mutate_during_hash,
+                ):
+                    with self.assertRaisesRegex(ValueError, "changed.*hash"):
+                        control.receive_model()
+            finally:
+                control.close()
+                child.close()
+                os.close(descriptor)
+
+    def test_ready_and_result_acknowledgements_bracket_parent_inventories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"checkpoint model")
+            descriptor = os.open(model, os.O_RDONLY)
+            control, child = self._channel_and_child(timeout_seconds=1.0)
+            order: list[str] = []
+            child_failure: list[BaseException] = []
+            try:
+                identity = self._send_model(child, descriptor)
+                evidence = control.receive_model()
+                self._assert_model_ack(child, identity)
+
+                def child_checkpoint() -> None:
+                    try:
+                        order.append("ready-sent")
+                        child.sendall(_qualification_control_wire_message(2, 7))
+                        self.assertEqual(
+                            _recv_control_wire_message(child),
+                            (3, 7, (0, 0, 0, 0)),
+                        )
+                        order.append("ready-ack")
+                        order.append("result-sent")
+                        child.sendall(
+                            _qualification_control_wire_message(4, 7, identity)
+                        )
+                        self.assertEqual(
+                            _recv_control_wire_message(child),
+                            (5, 7, (0, 0, 0, 0)),
+                        )
+                        order.append("result-ack")
+                    except BaseException as exc:
+                        child_failure.append(exc)
+
+                worker = threading.Thread(target=child_checkpoint)
+                worker.start()
+                before, after = control.bracket_sample(
+                    7,
+                    capture_before=lambda: order.append("before") or "before-evidence",
+                    capture_after=lambda: order.append("after") or "after-evidence",
+                )
+                worker.join(1.0)
+                self.assertFalse(worker.is_alive(), "child remained blocked at a barrier")
+                if child_failure:
+                    raise child_failure[0]
+                self.assertEqual(before, "before-evidence")
+                self.assertEqual(after, "after-evidence")
+                self.assertEqual(
+                    order,
+                    [
+                        "ready-sent",
+                        "before",
+                        "ready-ack",
+                        "result-sent",
+                        "after",
+                        "result-ack",
+                    ],
+                )
+                self.assertEqual(control.verify_model_unchanged(), evidence.identity)
+                with self.assertRaisesRegex(ValueError, "strictly increasing"):
+                    control.bracket_sample(
+                        7,
+                        capture_before=lambda: None,
+                        capture_after=lambda: None,
+                    )
+            finally:
+                control.close()
+                child.close()
+                os.close(descriptor)
+
+    def test_wrong_ready_sequence_and_result_identity_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"checkpoint model")
+            descriptor = os.open(model, os.O_RDONLY)
+            try:
+                control, child = self._channel_and_child(timeout_seconds=1.0)
+                try:
+                    self._send_model(child, descriptor)
+                    control.receive_model()
+                    child.sendall(_qualification_control_wire_message(2, 10))
+                    with self.assertRaisesRegex(ValueError, "sequence"):
+                        control.bracket_sample(
+                            9,
+                            capture_before=lambda: None,
+                            capture_after=lambda: None,
+                        )
+                    with self.assertRaisesRegex(ValueError, "unsafe"):
+                        control.bracket_sample(
+                            11,
+                            capture_before=lambda: None,
+                            capture_after=lambda: None,
+                        )
+                finally:
+                    control.close()
+                    child.close()
+
+                control, child = self._channel_and_child(timeout_seconds=1.0)
+                try:
+                    identity = self._send_model(child, descriptor)
+                    control.receive_model()
+                    self._assert_model_ack(child, identity)
+
+                    def mismatched_result() -> None:
+                        child.sendall(_qualification_control_wire_message(2, 1))
+                        _recv_control_wire_message(child)
+                        changed = (
+                            identity.st_dev,
+                            identity.st_ino,
+                            identity.st_size + 1,
+                            identity.st_mtime_ns,
+                        )
+                        child.sendall(_qualification_control_wire_message(4, 1, changed))
+
+                    worker = threading.Thread(target=mismatched_result)
+                    worker.start()
+                    with self.assertRaisesRegex(ValueError, "identity"):
+                        control.bracket_sample(
+                            1,
+                            capture_before=lambda: None,
+                            capture_after=lambda: None,
+                        )
+                    worker.join(1.0)
+                finally:
+                    control.close()
+                    child.close()
+            finally:
+                os.close(descriptor)
+
+    def test_post_receive_protocol_failure_closes_the_retained_model_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"retained model")
+            descriptor = os.open(model, os.O_RDONLY)
+            control, child = self._channel_and_child(timeout_seconds=1.0)
+            received_fds: list[int] = []
+            hash_descriptor = TOOL._sha256_open_descriptor
+            try:
+                self._send_model(child, descriptor)
+
+                def remember_received_fd(received_fd: int) -> str:
+                    received_fds.append(received_fd)
+                    return hash_descriptor(received_fd)
+
+                with mock.patch.object(
+                    TOOL,
+                    "_sha256_open_descriptor",
+                    side_effect=remember_received_fd,
+                ):
+                    control.receive_model()
+                self.assertEqual(len(received_fds), 1)
+                os.fstat(received_fds[0])
+
+                child.sendall(_qualification_control_wire_message(2, 8))
+                with self.assertRaisesRegex(ValueError, "sequence"):
+                    control.bracket_sample(
+                        7,
+                        capture_before=lambda: None,
+                        capture_after=lambda: None,
+                    )
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(received_fds[0])
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+            finally:
+                control.close()
+                child.close()
+                os.close(descriptor)
+
+    def test_child_work_and_parent_acknowledgements_use_separate_deadlines(
+        self,
+    ) -> None:
+        class FakeMonotonic:
+            value = 100.0
+
+            def __call__(self) -> float:
+                return self.value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"sampling deadline model")
+            descriptor = os.open(model, os.O_RDONLY)
+            control, child = self._channel_and_child(timeout_seconds=1.0)
+            clock = FakeMonotonic()
+            receives: list[tuple[int, float]] = []
+            sends: list[tuple[int, float, float]] = []
+            try:
+                self._send_model(child, descriptor)
+                evidence = control.receive_model()
+                control._monotonic = clock
+
+                def receive_message(
+                    *,
+                    expected_type: int,
+                    expected_sequence: int,
+                    expect_model_fd: bool,
+                    deadline: float,
+                ) -> tuple[object, list[int]]:
+                    self.assertEqual(expected_sequence, 17)
+                    self.assertFalse(expect_model_fd)
+                    receives.append((expected_type, deadline))
+                    if expected_type == 2:
+                        clock.value = deadline - 0.05
+                        return TOOL.QualificationFileIdentity(0, 0, 0, 0), []
+                    self.assertEqual(expected_type, 4)
+                    clock.value = deadline - 0.05
+                    return evidence.identity, []
+
+                def send_message(
+                    *, message_type: int, sequence: int, deadline: float
+                ) -> None:
+                    self.assertEqual(sequence, 17)
+                    sends.append((message_type, deadline, clock.value))
+                    if message_type == 3:
+                        clock.value += 0.1
+
+                def capture_before() -> str:
+                    clock.value += 0.1
+                    return "before"
+
+                def capture_after() -> str:
+                    clock.value += 0.2
+                    return "after"
+
+                with (
+                    mock.patch.object(
+                        control, "_receive_message", side_effect=receive_message
+                    ),
+                    mock.patch.object(
+                        control, "_send_message", side_effect=send_message
+                    ),
+                ):
+                    observed = control.bracket_sample(
+                        17,
+                        capture_before=capture_before,
+                        capture_after=capture_after,
+                        sample_timeout_seconds=5.0,
+                    )
+
+                self.assertEqual(observed, ("before", "after"))
+                self.assertEqual(receives[0], (2, 105.0))
+                self.assertEqual(sends[0], (3, 105.95, 105.05))
+                self.assertEqual(receives[1][0], 4)
+                self.assertAlmostEqual(receives[1][1], 110.15)
+                self.assertEqual(sends[1][0], 5)
+                self.assertAlmostEqual(
+                    sends[1][1],
+                    111.1,
+                    msg="RESULT_ACK needs a fresh child-compatible control deadline",
+                )
+                self.assertAlmostEqual(sends[1][2], 110.3)
+            finally:
+                control.close()
+                child.close()
+                os.close(descriptor)
+
+    def test_malformed_or_truncated_rights_close_every_aligned_prefix_fd(self) -> None:
+        class FakeEndpoint:
+            def __init__(self, response: tuple[bytes, list[tuple[int, int, bytes]], int, object]):
+                self.response = response
+                self.closed = False
+
+            def recvmsg(
+                self, _size: int, _ancillary_size: int, _flags: int
+            ) -> tuple[bytes, list[tuple[int, int, bytes]], int, object]:
+                return self.response
+
+            def close(self) -> None:
+                self.closed = True
+
+        wire = _qualification_control_wire_message(1, 0)
+        cases = {
+            "non-int-aligned": lambda descriptor: (
+                struct.pack("@i", descriptor) + b"x",
+                0,
+                "malformed",
+            ),
+            "MSG_CTRUNC": lambda descriptor: (
+                struct.pack("@i", descriptor),
+                socket.MSG_CTRUNC,
+                "truncated",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"ancillary model")
+            for label, response in cases.items():
+                with self.subTest(label=label):
+                    received_fd = os.open(model, os.O_RDONLY)
+                    ancillary, flags, error = response(received_fd)
+                    parent = FakeEndpoint(
+                        (
+                            wire,
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, ancillary)],
+                            flags,
+                            None,
+                        )
+                    )
+                    child = FakeEndpoint((b"", [], 0, None))
+                    control = TOOL.QualificationControl(
+                        parent,
+                        child,
+                        timeout_seconds=1.0,
+                        monotonic=lambda: 1.0,
+                        wait_ready=lambda _endpoint, _write, _timeout: True,
+                    )
+                    try:
+                        with self.assertRaisesRegex(ValueError, error):
+                            control.receive_model()
+                        with self.assertRaises(OSError) as raised:
+                            os.fstat(received_fd)
+                        self.assertEqual(raised.exception.errno, errno.EBADF)
+                    finally:
+                        control.close()
+                        try:
+                            os.close(received_fd)
+                        except OSError:
+                            pass
+
+    def test_fake_monotonic_deadline_bounds_a_missing_model_message(self) -> None:
+        class FakeMonotonic:
+            value = 100.0
+
+            def __call__(self) -> float:
+                return self.value
+
+        clock = FakeMonotonic()
+        waits: list[float] = []
+
+        def wait_ready(_socket: socket.socket, _write: bool, timeout: float) -> bool:
+            waits.append(timeout)
+            clock.value += timeout
+            return False
+
+        control, child = self._channel_and_child(
+            timeout_seconds=0.25,
+            monotonic=clock,
+            wait_ready=wait_ready,
+        )
+        try:
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                control.receive_model()
+            self.assertEqual(waits, [0.25])
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                control.receive_model()
+        finally:
+            control.close()
+            child.close()
+
+        control, child = self._channel_and_child(timeout_seconds=1.0)
+        child.close()
+        try:
+            with self.assertRaisesRegex(ValueError, "disconnected"):
+                control.receive_model()
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                control.receive_model()
+        finally:
+            control.close()
+
+    def test_close_owns_both_socket_ends_and_the_received_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"model")
+            descriptor = os.open(model, os.O_RDONLY)
+            control = TOOL.QualificationControl.create(timeout_seconds=1.0)
+            parent_fd = control.parent_fd
+            child_fd = control.child_fd
+            child = socket.socket(fileno=os.dup(child_fd))
+            try:
+                self._send_model(child, descriptor)
+                control.receive_model()
+                control.close()
+                for owned in (parent_fd, child_fd):
+                    with self.assertRaises(OSError):
+                        os.fstat(owned)
+                control.close()
+            finally:
+                child.close()
+                os.close(descriptor)
 
 
 if __name__ == "__main__":

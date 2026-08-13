@@ -1238,23 +1238,28 @@ end-to-end Python qualification launcher/publication run.
 
 ### Task 17: Expose request metrics and exact token admission
 
-**Files:**
-- Modify: `ds4_runtime.h`, `ds4_runtime.c`
-- Modify: `ds4.h`, `ds4.c`
-- Modify: `ds4_server.c:609-666,2734-2765,3135-3350,4207-4300,5553-5685,7164-7665,11480-11520,12612-12695`
-- Modify: `tests/test_runtime.c`
-- Create: `tests/test_laguna_server_contract.py`
-- Modify: `Makefile`
+**Files (implemented):**
+- Modify: `Makefile`, `ds4.h`, `ds4.c`, `ds4_gpu.h`, `ds4_cuda.cu`
+- Modify: `ds4_kvstore.h`, `ds4_kvstore.c`, `ds4_laguna_plan.c`,
+  `ds4_laguna_stream.c`, `ds4_runtime.h`, `ds4_runtime.c`, `ds4_server.c`
+- Modify: `tests/ds4_test.c`, `tests/test_cuda_build_contract.py`,
+  `tests/test_cuda_laguna_stream.c`, `tests/test_gpu_args_cli.sh`,
+  `tests/test_laguna_plan.c`, `tests/test_laguna_stream.c`,
+  `tests/test_runtime.c`
+- Create: `tests/test_laguna_server_contract.py`,
+  `tests/test_laguna_server_live_contract.py`,
+  `tests/test_session_request_attribution_api.c`,
+  `tests/test_task17_output_ceiling_contract.py`
 
-- [ ] **Step 1: Add RED request-metrics tests**
+- [x] **Step 1: Add RED request-metrics tests**
 
 Start a server child and require a server-generated request ID at acceptance for OpenAI Chat, Responses, and Anthropic requests. Non-streaming responses must contain one `ds4.runtime.request/v1` object; the final streaming usage event must contain the same fields before the protocol terminator. Assert exact prompt/generated token counts, request-scoped cache/I/O deltas, TTFT from acceptance to first emitted token, prefill and visible-decode rates, wall time, terminal status, and nullable/final page-advice completion. Test counter saturation and a request ending before first token.
 
-- [ ] **Step 2: Add RED side-effect-free admission tests**
+- [x] **Step 2: Add RED side-effect-free admission tests**
 
 POST the same logical model/messages/tools/tool-choice request to `/v1/token-admission` and inference. Cover exact fit, one-token overflow, zero/negative/non-integer output, malformed tools, unsupported `tool_choice=required`, mismatched model family, unknown field, native-template revision, and hidden-reasoning/tool/stop tokens sharing one output ceiling. Snapshot session count/KV/cache state before and after admission and require no mutation.
 
-- [ ] **Step 3: Observe RED**
+- [x] **Step 3: Observe RED**
 
 ```sh
 make tests/test_runtime ds4-server
@@ -1265,11 +1270,11 @@ DS4_TEST_MODEL="$LAGUNA_MODEL" \
 
 Expected: request IDs are allocated too late, metrics are process aggregates or absent, and no admission route exists.
 
-- [ ] **Step 4: Factor one parse/render/admit path**
+- [x] **Step 4: Factor one parse/render/admit path**
 
 Allocate `request_id` immediately after HTTP acceptance. Refactor the existing protocol parsers and Laguna native-template renderer into a pure prepare function that returns canonical model identity, rendered tokens, requested output, and a stable rejection code without creating or mutating a session. Use it for `POST /v1/token-admission` and call the exact same context-fit predicate again immediately before inference session mutation. Never truncate or silently reduce the requested output.
 
-- [ ] **Step 5: Thread request-scoped accounting through execution**
+- [x] **Step 5: Thread request-scoped accounting through execution**
 
 Create a `ds4_runtime_request_context` when the request ID is accepted and pass
 its pointer explicitly through session prefill/decode, routing/cache acquire,
@@ -1287,29 +1292,138 @@ same context. Add a two-slot interleaving test with disjoint reads plus a shared
 in-flight cache load and prove each response receives only its own metrics
 while process counters reconcile to the physical operations.
 
-- [ ] **Step 6: Emit metrics in all three protocols**
+- [x] **Step 6: Emit metrics in all three protocols**
 
 Add the request ID and metrics object to each non-streaming response and to the final usage event for Chat Completions, Responses, and Anthropic streaming. Preserve each protocol's native terminator and usage fields. If no page advice applied, emit JSON `null`; otherwise the timestamp must be after final synchronization.
 
-- [ ] **Step 7: Make server-contract tests green**
+- [x] **Step 7: Make server-contract tests green**
 
 ```sh
-./tests/test_runtime
+./tests/test_runtime --case request-metrics
+python3 tests/test_laguna_server_contract.py \
+  --server ./ds4_test --case metrics --case admission
 DS4_TEST_MODEL="$LAGUNA_MODEL" \
-  python3 tests/test_laguna_server_contract.py \
-    --server ./ds4-server --case metrics --case admission
-make test
+  python3 tests/test_laguna_server_live_contract.py \
+    --live ./ds4-server
+DS4_TEST_MODEL="$LAGUNA_MODEL" \
+  make test-cuda-laguna-request-counters
 ```
 
 Expected: schema validation passes for every shape; overflow and malformed requests return stable 4xx results before session mutation; exact-fit inference remains accepted.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
-```sh
-git add ds4_runtime.h ds4_runtime.c ds4.h ds4.c ds4_server.c \
-  tests/test_runtime.c tests/test_laguna_server_contract.py Makefile
-git commit -m "feat: expose request metrics and exact token admission"
-```
+Task 17 landed as 35 focused RED/green/hardening commits from `2390e82`
+through `97ee3b6` (18 `test:`, 13 `feat:`, and 4 `fix:` commits), excluding
+the interleaved Task 16 documentation commit `7aafdc8`; it was not collapsed
+into a mega-commit. The exact accepted revision and its build, host-contract,
+live-CUDA/server, restoration, and transcript identities are recorded below.
+
+Task 17 closed on DGX Spark on 2026-08-14 against exact clean code revision
+`97ee3b60314cfb9d13b71afddc280c393710ece0` (tree
+`ffa8fe70d2e063ca139ff428077c9cae5fe85905`). It was exported with
+`git archive` (SHA-256
+`bb92057e197475438b195bbca793db1ec9e022b3fadd69a822a355672aaee730`)
+into the fresh directory
+`/tmp/ds4-laguna-task17-97ee3b60314cfb9d13b71afddc280c393710ece0`;
+no remote source patching was used. The exact runner had SHA-256
+`f491a322a2217b9f655af9a2f492dfe7f8d4976490d405093e62a6f17bd00eec`.
+The acceptance transcript is
+`/tmp/task17-97ee3b6-maintenance-188009.log`, SHA-256
+`239f13475b927bbb34f007d0e8cc20684497009610f0f150a74f462b5003ff4b`
+(639 lines, 160,367 bytes). Every candidate binary reported
+`ds4.version/v1` with the accepted revision, `dirty=false`, `backend=cuda`,
+and sorted features `laguna,ssd_streaming`.
+
+The implementation allocates a request UUID at HTTP acceptance, shares one
+side-effect-free prepare/admit result between `POST /v1/token-admission` and
+the final pre-mutation inference check, and never truncates an accepted output
+limit. Request contexts carry saturating cache, model-I/O, H2D, timing, token,
+terminal-status, and observed/final page-advice facts through explicit
+attributed operations. Cache-load owners receive the physical read/H2D work;
+same-key later rows receive logical hits without inheriting physical bytes.
+Chat Completions, Responses, and Anthropic responses publish exactly one
+`ds4.runtime.request/v1` object in their native non-streaming response or final
+streaming usage event while preserving protocol IDs, native usage, and
+terminator order.
+
+The fresh accepted plan is
+`/tmp/ds4-task17-97ee3b6-two-session-plan.json`, SHA-256
+`41c7d1d03e36e3cb2f38250451bd2522b1270d62409fe52b077a41317ef99bbb`.
+Its 65-byte sidecar, retained descriptor identity, and every bound were
+rechecked before execution. Profile `cache-8gib-sessions-2` fixes CUDA,
+32,768 context tokens, 4,096 prefill rows, two sessions, an 8,589,934,592-byte
+effective cache, 3,372,220,416 KV bytes, 3,074,105,360 graph bytes, and a
+30,064,771,072-byte qualification bound. The guarded capacity check observed
+50,102,583,296 bytes available against that bound plus an 8,589,934,592-byte
+reserve. Three descriptor-bound cold preparations each attempted and completed
+68,242,178,048 bytes across 671 calls with zero failed calls; measured
+residency never exceeded 6,500,352 bytes, below the declared 6,582,272
+unavoidable bytes.
+
+Before outage, the archive passed 63 request-metrics assertions, 210 external
+attribution assertions, 78 parent-qualifier tests, 7 build-identity tests, 20
+normative schema tests, 9 endpoint tests with 1 intentional live skip, 27 pure
+admission/metrics server tests, and 12 live-launcher tests with 3 intentional
+model-backed skips. It also passed 64 CUDA source/build contracts, 127 Laguna
+option assertions, 290 allocation assertions, 6,522 plan checks, 5 output
+ceiling tests, and the server unit suite. A 60-second quiet window then proved
+zero running/waiting peer requests, stable prompt/generated/success counters,
+no established port-8003 client, and byte-identical unrelated peer
+PID/name/allocation tuples before stopping production.
+
+The hardware phase proved the canonical lock free, cold-prepared the retained
+model descriptor, and passed `request-counters` (27 assertions). That fresh
+process exercised same-key A/B ownership, disjoint D/E ownership, exact sums of
+the eleven process counters, final page-advice barriers, and reused-session C
+isolation. The live-server harness then passed all 12 tests in 751.639 seconds.
+Its three model-backed cases proved exact executable/model/two-session runtime
+identity, pure exact-fit and one-token-overflow admission, and Chat
+Completions, Responses, and Anthropic streaming/non-streaming terminal
+metrics. Native usage matched the request snapshot, request UUIDs remained
+distinct from protocol IDs, snapshot sequences advanced, real visible output
+had non-null TTFT, and each protocol placed its sole metrics object at its
+native terminal boundary. A final runtime read remained ready with no
+violations.
+
+After the last cold preparation, production restarted as PID `193894` with
+`Result=success`, `NRestarts=0`, and `ExecMainCode/Status=0/0`. It reacquired
+the same canonical lock (device `66306`, inode `524639`), restored the exact
+executable, working directory, and NUL-delimited argv, served exactly the Flash
+and Pro model inventory, and completed an independent non-empty chat request.
+The three unrelated vLLM peers remained exactly PID `134571`/68,817 MiB, PID
+`134597`/626 MiB, and PID `134604`/1,683 MiB. No candidate process or
+established port-8003 client remained, and the maintenance-window kernel log
+contained no OOM, killed-process, Xid, NVRM, GPU-fault, or segfault record.
+Only then did the transcript emit
+`TASK17_ACCEPTANCE_GREEN revision=97ee3b60314cfb9d13b71afddc280c393710ece0`.
+
+Three non-acceptance runs are retained as qualification evidence. Attempt 1
+(`/tmp/task17-1ba20c4-maintenance-178664.log`, SHA-256
+`d1a5d67eb76e0ea076eaa6e7db8d867b9078867dc5a013129a243d11d2dbe0b1`)
+stopped before outage because a clean archive had not built the host
+`tests/test_laguna_stream` binary; an untracked local binary had masked that
+prerequisite during runner review. Attempt 2
+(`/tmp/task17-1ba20c4-maintenance-181192.log`, SHA-256
+`85b8ca538a1fd1a8b83fe2cf82e1b7807f80be238eeeb15adcf42c073c834a31`)
+generated the correct plan but a runner regex searched for a literal
+backslash-n in its valid checksum sidecar, so no live test ran; restoration was
+operationally healthy but its evidence gate also rejected stochastic chat text
+equality. Attempt 3
+(`/tmp/task17-1ba20c4-maintenance-184393.log`, SHA-256
+`e2074dcdf3f9bad824d95e2732d3a4a563fd0d84e3ae3cd3915509b1a74d4d55`)
+reached the real CUDA gate and supplied the final RED: its test fixture omitted
+the build identity that enables runtime snapshots. The missing baseline caused
+9 of 27 failures, including every A/B check and the D/E and C process-delta
+reconciliations; D/E and C request-local physical-ownership checks still
+passed. Production restored cleanly and no live HTTP test ran. Commit
+`97ee3b6` added the missing fixture identity plus a host source
+contract pinning identity declaration, option wiring, engine open, and baseline
+snapshot order. These infrastructure/test-harness failures are not counted as
+product acceptance. The reusable lessons are now executable: clean-archive
+prerequisites are explicit, evidence parsers bind actual byte formats, health
+witnesses avoid stochastic content, and every snapshot-driven hardware test
+wires the identity required to make the snapshot observable.
 
 ### Task 18: Lock compact server protocol and lifecycle semantics
 

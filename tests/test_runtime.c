@@ -1981,9 +1981,10 @@ static void test_request_metrics_saturation_and_validation(void) {
           "physical page advice observations retain the latest timestamp");
     const ds4_runtime_request_context after_advice_observation = request;
     CHECK(!ds4_runtime_request_observe_page_advice(&request, 2u) &&
+              !ds4_runtime_request_mark_prefill_complete(&request, 2u) &&
               memcmp(&after_advice_observation, &request,
                      sizeof(request)) == 0,
-          "page advice observation rejects timestamp regression transactionally");
+          "page advice and later milestones reject timestamp regression transactionally");
     CHECK(ds4_runtime_request_add_counters(
               &request, &(ds4_runtime_wire_counters){
                   .page_advice_attempts = 1u,
@@ -2020,8 +2021,9 @@ static void test_request_metrics_saturation_and_validation(void) {
           "visibility chronology fixture records a later emission");
     const ds4_runtime_request_context after_later_visible = request;
     CHECK(!ds4_runtime_request_record_visible_decoded(&request, 1u, 5u) &&
+              !ds4_runtime_request_observe_page_advice(&request, 5u) &&
               memcmp(&after_later_visible, &request, sizeof(request)) == 0,
-          "visible emission rejects a 4/6/5 timestamp regression");
+          "visible output and later advice reject a 4/6/5 timestamp regression");
     ds4_runtime_request_metrics premature_metrics;
     memset(&premature_metrics, 0xa5, sizeof(premature_metrics));
     const ds4_runtime_request_metrics premature_metrics_before =
@@ -2085,6 +2087,9 @@ static void test_request_metrics_saturation_and_validation(void) {
               ds4_runtime_request_set_prompt_tokens(&unsafe_advice, 1u) &&
               ds4_runtime_request_mark_prefill_started(&unsafe_advice, 21u) &&
               ds4_runtime_request_observe_page_advice(&unsafe_advice, 22u) &&
+              !ds4_runtime_request_finish(
+                  &unsafe_advice, DS4_RUNTIME_REQUEST_UNSAFE_ERROR,
+                  21u, &unsafe_advice_metrics) &&
               ds4_runtime_request_finish(
                   &unsafe_advice, DS4_RUNTIME_REQUEST_UNSAFE_ERROR,
                   23u, &unsafe_advice_metrics) &&

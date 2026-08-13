@@ -2918,7 +2918,8 @@ static int cuda_laguna_compact_release_locked(
     if (ctx->tracker &&
         ctx->tracker->violation !=
             DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION &&
-        ds4_runtime_tracker_checkpoint_model_source(ctx->tracker, 0) !=
+        ds4_runtime_tracker_checkpoint_external(
+            ctx->tracker, 0, 0, 0) !=
             DS4_RUNTIME_STATUS_OK) {
         return 0;
     }

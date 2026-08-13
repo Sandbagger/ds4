@@ -1109,11 +1109,11 @@ git commit -m "test: freeze compact runtime wire schemas"
 - Create: `tests/test_task16_gate_contract.py`
 - Modify: `tests/test_cuda_laguna_stream.c`, `tests/test_cuda_build_contract.py`
 
-- [ ] **Step 1: Add RED build/snapshot tests**
+- [x] **Step 1: Add RED build/snapshot tests**
 
-Require every inference binary's `--version-json` to exit `0` before opening a model and validate as `ds4.version/v1`. Test clean/dirty revisions, exact 40-hex revision, backend `cpu|metal|cuda|rocm`, sorted unique compiled features, and no additional fields. In C tests, require one process-lifetime UUID, monotonically increasing saturating `snapshot_seq`, internally consistent allocation totals, executable stat identity, retained opened-model stat identity, exact configured/effective values, and immutable historical violations. Add a Unix-socketpair test for a hidden qualification control fd: exactly one opened model descriptor plus its stat identity must arrive with `SCM_RIGHTS`; external-sample ready/ack/result/ack messages must use a strictly increasing checkpoint sequence and block model progress while the parent brackets its inventories; an invalid/non-socket fd, wrong sequence, timeout, or disconnect fails qualification safely.
+Require every inference binary's `--version-json` to exit `0` before opening a model and validate as `ds4.version/v1`. Test clean/dirty revisions, exact 40-hex revision, backend `cpu|metal|cuda|rocm`, sorted unique compiled features, and no additional fields. In C tests, require one process-lifetime UUID and one process-global `snapshot_seq` that is strictly increasing across engine instances until it saturates at `UINT64_MAX`, internally consistent allocation totals, executable stat identity, retained opened-model stat identity, exact configured/effective values, and immutable historical violations. Add a Unix-socketpair test for a hidden qualification control fd: exactly one opened model descriptor plus its stat identity must arrive with `SCM_RIGHTS`; external-sample ready/ack/result/ack messages must use a strictly increasing checkpoint sequence and block model progress while the parent brackets its inventories; an invalid/non-socket fd, wrong sequence, timeout, or disconnect fails qualification safely.
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 ```sh
 make tests/test_runtime ds4 ds4-server ds4-agent ds4-bench ds4-eval
@@ -1126,19 +1126,19 @@ uv run --with-requirements \
 
 Expected: missing build macros, runtime serializer, or option.
 
-- [ ] **Step 3: Stamp reproducible build facts**
+- [x] **Step 3: Stamp reproducible build facts**
 
 Have the Makefile pass revision, dirty state, selected backend, and compiled feature set into one `ds4_build_info` implementation. Feature sorting happens at construction, not ad hoc per binary. `--version-json` must be handled immediately after argument parsing and before model-path validation or CUDA initialization. A qualification harness rejects `dirty=true`, non-CUDA backend, or missing `laguna`/`ssd_streaming`.
 
-- [ ] **Step 4: Retain executable and opened-model identity**
+- [x] **Step 4: Retain executable and opened-model identity**
 
-At process startup, open/stat the running image through `/proc/self/exe` on Linux and record device, inode, size, and nanosecond mtime. Preserve the model fd identity obtained at engine open rather than reconstructing it from the path. Add harness-only `--qualification-control-fd N` to the common inference options. When present, DS4 sends a duplicated opened model descriptor and exact stat identity to that inherited Unix socket with `SCM_RIGHTS` before model allocation, then retains its own descriptor normally. Keep the socket open as a checkpoint barrier: after CUDA synchronization and before external sampling, DS4 sends `sample_ready(snapshot_seq)` and waits while the parent takes the frozen-baseline/before inventory; after sampling it sends `sample_result(snapshot_seq, identity)` and waits while the parent takes the after inventory, then resumes only on the matching acknowledgement. The Python qualifier hashes the received model descriptor with pre/post `fstat`; ordinary runtime consumers never receive a path or fd number. Close-on-exec, timeout, disconnect, and teardown tests prove neither endpoint leaks or leaves CUDA work pinned. This private control channel is evidence plumbing, not a public wire schema.
+At process startup, open/stat the running image through `/proc/self/exe` on Linux and record device, inode, size, and nanosecond mtime. Preserve the model fd identity obtained at engine open rather than reconstructing it from the path. Add harness-only `--qualification-control-fd N` to the common inference options. When present, DS4 sends a duplicated opened model descriptor and exact stat identity to that inherited Unix socket with `SCM_RIGHTS` before model allocation, then retains its own descriptor normally. Passing the hidden fd transfers that inherited endpoint to the engine-open wrapper: it creates the live close-on-exec duplicate and consumes the original on every return path. After sending exactly one reference to the retained opened-model descriptor, DS4 waits for a sequence-zero `MODEL_FD_ACK` carrying the same identity. The parent hashes with pre/post `fstat`, may cold-prepare that exact descriptor through the preparation callback, rechecks it, and only then acknowledges, so child validation/allocation cannot begin early. The child grants this preparation a distinct 15-minute model-ack budget; READY/RESULT barrier acknowledgements retain the 30-second budget. Keep the socket open as a checkpoint barrier: after CUDA synchronization and before external sampling, DS4 sends `sample_ready(snapshot_seq)` and waits while the parent takes the frozen-baseline/before inventory; after sampling it sends `sample_result(snapshot_seq, identity)` and waits while the parent takes the after inventory, then resumes only on the matching acknowledgement. CUDA holds the compact execution lock from READY through RESULT_ACK, so checkpoint work and concurrent runtime snapshots remain blocked until the corresponding parent acknowledgement. The Python qualifier hashes the received model descriptor with pre/post `fstat`; ordinary runtime consumers never receive a path or fd number. Close-on-exec, timeout, disconnect, and teardown tests prove neither endpoint leaks or leaves CUDA work pinned. This private control channel is evidence plumbing, not a public wire schema.
 
-- [ ] **Step 5: Serialize one coherent runtime snapshot**
+- [x] **Step 5: Serialize one coherent runtime snapshot**
 
-Add `ds4_engine_runtime_snapshot()` and a serializer that takes the tracker/cache/page counters under one snapshot boundary, increments `snapshot_seq` once, and emits every required `ds4.runtime/v1` section. Byte/duration/counter values use checked canonical decimal strings. Add `GET /v1/runtime` and make `/v1/models` return the same canonical model ID/family and opened-file identity used by the runtime snapshot. A healthy process has an empty violations array; a latched bound violation remains visible until exit.
+Add `ds4_engine_runtime_snapshot()` and a serializer that takes the tracker/cache/page counters under one snapshot boundary, increments `snapshot_seq` once, and emits every required `ds4.runtime/v1` section. For compact CUDA, one combined capture holds both the compact execution lock and compact-state lock across counter copying and tracker wire capture; publication then allocates the process-global sequence exactly once. Thus no endpoint can combine counters and ownership from different execution epochs. Byte/duration/counter values use checked canonical decimal strings. Add `GET /v1/runtime` and make `/v1/models` return the same canonical model ID/family and opened-file identity used by the runtime snapshot. A healthy process has an empty violations array; a latched bound violation remains visible until exit.
 
-- [ ] **Step 6: Make identity and live endpoint tests green**
+- [x] **Step 6: Make identity and live endpoint tests green**
 
 ```sh
 make test-laguna-runtime-identity
@@ -1157,12 +1157,84 @@ env -u DS4_LOCK_FILE \
 
 Expected: all JSON validates; model/executable stats match the opened descriptors; repeated runtime reads increase `snapshot_seq` without resetting counters.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
-Commit the RED contracts, runtime/build identity implementation, qualification
-transport, CUDA barrier integration, HTTP endpoint, and acceptance wiring as
-focused reviewable units. Record the exact clean revision used for the live
-CUDA and managed-server run; do not collapse the series into one mega-commit.
+Task 16 landed as a focused RED/green/hardening series from `b99533d` through
+`6ef4123`; it was not collapsed into a mega-commit. The exact accepted revision
+and its build, live CUDA, endpoint, restoration, and transcript identities are
+recorded below.
+
+Task 16 closed on DGX Spark on 2026-08-13 against exact clean code revision
+`6ef4123b2c282ce53de790f0a0adf1e32e9010be`. It was exported with
+`git archive` (SHA-256
+`70da13a7f0fbdaf47f3dea3eee9cc91aca98697fce8b22432b875f099ad89c97`)
+into the fresh directory
+`/tmp/ds4-laguna-task16-6ef4123b2c282ce53de790f0a0adf1e32e9010be`;
+no remote source patching was used. The acceptance transcript is
+`/tmp/task16-6ef4123-maintenance-attempt-1.log`, SHA-256
+`46f4c059d2326e1d9c1981b113b9f3262965778955381f3cafd7a470301ea716`.
+The build reported `ds4.version/v1` with that revision, `dirty=false`,
+`backend=cuda`, and sorted features `laguna,ssd_streaming`.
+
+The guarded maintenance flow left `DS4_LOCK_FILE` absent, stopped only the
+production DS4 service, proved the canonical `/tmp/ds4.lock` available before
+the live stages, and kept the three unrelated GPU peer PID/name/byte tuples
+unchanged. It bound the opened model descriptor to device `66306`, inode
+`16794939`, mtime-ns `1785523774395107433`, size `68,248,759,648`, and SHA-256
+`e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`.
+Four descriptor-bound cold preparations ran before external attribution,
+before the two-process qualification-control target, before the managed
+endpoint, and once more after that endpoint. They used plan
+`/tmp/ds4-task14-plan.json`, SHA-256
+`21b0836316e92c8386fc76cbd4069ec6fe99ff03e7691e5ad07a4a7c11edd8a4`.
+Each attempted and completed `68,242,178,048` advice bytes with zero failed
+calls, then measured `6,361,088` resident bytes, below the plan-declared
+`6,582,272` unavoidable bytes. The pre-CUDA capacity check measured
+`49,946,324,992` bytes available against a `25,769,803,776` qualification
+bound plus an `8,589,934,592` reserve.
+
+The host gate passed 210 runtime-attribution assertions, the qualification
+transport C suite, 7 integration contracts, 4 hidden-CLI contracts, 78 parent
+qualifier tests, 7 build-identity tests, 20 normative schema tests, 8 endpoint
+contracts with the managed live case intentionally skipped, and 61 CUDA
+source/build contracts. The hardware phase then passed external attribution (27
+assertions), two same-engine READY/RESULT transactions and teardown (47), the
+intentional control-disconnect/UNSAFE path (27, including the expected broken
+pipe), and the managed live runtime endpoint (9). The live endpoint bound the
+reported executable and opened model identities, kept build/model facts stable,
+and advanced `snapshot_seq` across repeated reads.
+
+The hardware RED-to-GREEN trail is retained as part of the evidence. Revision
+`34c6c82` stopped before outage on a compile error: the compact counter helper
+was used before declaration. Revision `645e0eb` was an invalid infrastructure
+attempt, not a CUDA or product result: a temporary-git build-identity probe
+inherited the outer exact build stamps through nested Make and failed before
+outage. Revision `895a612` supplied the required live hardware RED: external
+attribution passed 27 assertions, then qualification-control success failed 6
+of 47 teardown assertions because attributed host/CUDA external-report currents
+remained latched, baseline reconciliation failed, and fail-closed teardown
+retained owners. Revision `3fac2a0` fixed that production accounting defect
+without weakening the baseline and made success pass all 47 assertions. One
+`3fac2a0` run was separately invalidated fail-closed by live embedding traffic
+changing an unrelated peer from 620 to 626 MiB; exact peer-byte equality was
+retained. Its stable fresh-process retry reached the expected disconnect EPIPE
+but failed 1 of 26 assertions because the test compared preserved historical
+tracker provenance with a fresh zero observation generation. Production had
+correctly latched unsafe/external attribution without releasing or fabricating
+ownership. The test-only correction at `6ef4123` compares the full tracker and
+active-record state while normalizing only the expected violation transition;
+the clean rerun passed all 27 disconnect assertions. These invalid and RED
+attempts are not counted as acceptance.
+
+After the final cold preparation, production restarted as PID `164601`,
+reacquired the canonical lock, served the expected Flash/Pro model inventory,
+and completed an independent chat request. The unrelated peer inventory was
+byte-identical to its pre-window baseline; no test child remained and the
+kernel recorded no OOM, Xid, NVRM, GPU fault, or segfault. The real-CUDA child
+was driven by the native control harness, while the Python parent independently
+tests descriptor hashing, exact preparation-before-model-ACK, deadlines, and
+failure cleanup against protocol fixtures. Task 20 retains ownership of the
+end-to-end Python qualification launcher/publication run.
 
 ### Task 17: Expose request metrics and exact token admission
 

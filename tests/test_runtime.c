@@ -1971,10 +1971,27 @@ static void test_request_metrics_saturation_and_validation(void) {
           "invalid prompt counts and inverted timing fail transactionally");
 
     CHECK(ds4_runtime_request_set_prompt_tokens(&request, 1u) &&
-              ds4_runtime_request_mark_prefill_started(&request, 1u) &&
-              ds4_runtime_request_mark_prefill_complete(&request, 2u) &&
+              ds4_runtime_request_mark_prefill_started(&request, 1u),
+          "advice observation fixture starts prefill");
+    CHECK(ds4_runtime_request_observe_page_advice(&request, 2u) &&
+              ds4_runtime_request_observe_page_advice(&request, 3u) &&
+              ds4_runtime_request_observe_page_advice(&request, 3u) &&
+              request.page_advice_observed &&
+              request.latest_page_advice_monotonic_ns == 3u,
+          "physical page advice observations retain the latest timestamp");
+    const ds4_runtime_request_context after_advice_observation = request;
+    CHECK(!ds4_runtime_request_observe_page_advice(&request, 2u) &&
+              memcmp(&after_advice_observation, &request,
+                     sizeof(request)) == 0,
+          "page advice observation rejects timestamp regression transactionally");
+    CHECK(ds4_runtime_request_add_counters(
+              &request, &(ds4_runtime_wire_counters){
+                  .page_advice_attempts = 1u,
+                  .page_advice_bytes = 4096u,
+              }) &&
+              ds4_runtime_request_mark_prefill_complete(&request, 3u) &&
               ds4_runtime_request_add_generated_tokens(&request, 2u),
-          "visibility validation fixture records two generated tokens");
+          "advice observation does not freeze counters or later request work");
     const ds4_runtime_request_context before_invalid_visible = request;
     CHECK(!ds4_runtime_request_record_visible_decoded(&request, 3u, 3u) &&
               !ds4_runtime_request_record_visible_decoded(&request, 0u, 3u) &&
@@ -2018,7 +2035,7 @@ static void test_request_metrics_saturation_and_validation(void) {
                      sizeof(premature_metrics)) == 0,
           "final advice and completion cannot precede the last visible output");
     CHECK(ds4_runtime_request_record_page_advice_complete(&request, 7u),
-          "final advice completes after the last visible output");
+          "request barrier seals final advice after the last visible output");
     const ds4_runtime_request_context after_advice = request;
     CHECK(!ds4_runtime_request_record_page_advice_complete(&request, 7u) &&
               !ds4_runtime_request_record_page_advice_complete(&request, 8u) &&
@@ -2030,6 +2047,49 @@ static void test_request_metrics_saturation_and_validation(void) {
                   }) &&
               memcmp(&after_advice, &request, sizeof(request)) == 0,
           "final advice is one-shot and forbids later output or accounting mutation");
+
+    ds4_runtime_request_context advice_cancel;
+    ds4_runtime_request_metrics advice_cancel_metrics;
+    memset(&advice_cancel_metrics, 0xa5, sizeof(advice_cancel_metrics));
+    CHECK(ds4_runtime_request_begin(&advice_cancel, 10u) &&
+              ds4_runtime_request_set_prompt_tokens(&advice_cancel, 1u) &&
+              ds4_runtime_request_mark_prefill_started(&advice_cancel, 11u) &&
+              ds4_runtime_request_mark_prefill_complete(&advice_cancel, 12u) &&
+              ds4_runtime_request_observe_page_advice(&advice_cancel, 13u),
+          "cancelled advice fixture observes physical page work");
+    const ds4_runtime_request_context advice_cancel_before = advice_cancel;
+    const ds4_runtime_request_metrics advice_cancel_metrics_before =
+        advice_cancel_metrics;
+    CHECK(!ds4_runtime_request_finish(
+              &advice_cancel, DS4_RUNTIME_REQUEST_CANCELLED,
+              14u, &advice_cancel_metrics) &&
+              memcmp(&advice_cancel, &advice_cancel_before,
+                     sizeof(advice_cancel)) == 0 &&
+              memcmp(&advice_cancel_metrics,
+                     &advice_cancel_metrics_before,
+                     sizeof(advice_cancel_metrics)) == 0,
+          "ordinary terminal status cannot hide observed advice without a final barrier");
+    CHECK(ds4_runtime_request_record_page_advice_complete(
+              &advice_cancel, 14u) &&
+              ds4_runtime_request_finish(
+                  &advice_cancel, DS4_RUNTIME_REQUEST_CANCELLED,
+                  15u, &advice_cancel_metrics) &&
+              advice_cancel_metrics.page_advice_complete_present &&
+              advice_cancel_metrics.page_advice_complete_monotonic_ns == 14u,
+          "cancelled request publishes the final barrier after observed advice");
+
+    ds4_runtime_request_context unsafe_advice;
+    ds4_runtime_request_metrics unsafe_advice_metrics;
+    memset(&unsafe_advice_metrics, 0, sizeof(unsafe_advice_metrics));
+    CHECK(ds4_runtime_request_begin(&unsafe_advice, 20u) &&
+              ds4_runtime_request_set_prompt_tokens(&unsafe_advice, 1u) &&
+              ds4_runtime_request_mark_prefill_started(&unsafe_advice, 21u) &&
+              ds4_runtime_request_observe_page_advice(&unsafe_advice, 22u) &&
+              ds4_runtime_request_finish(
+                  &unsafe_advice, DS4_RUNTIME_REQUEST_UNSAFE_ERROR,
+                  23u, &unsafe_advice_metrics) &&
+              !unsafe_advice_metrics.page_advice_complete_present,
+          "unsafe terminal may publish null when final advice completion is unprovable");
 
     ds4_runtime_request_context late_emission;
     ds4_runtime_request_metrics late_emission_metrics;

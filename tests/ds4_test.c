@@ -7013,6 +7013,333 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* Host-only NDJSON seam for the Laguna request-preparation contract.  The
+ * actual parse/render/admit operation is supplied by ds4_server.c above; this
+ * driver owns only transport plus deliberately inert state fingerprints. */
+typedef struct {
+    char *op;
+    char *method;
+    char *path;
+    char *body;
+    char *call_id;
+    char *name;
+    char *arguments;
+    char *sampled_text;
+} test_server_rpc;
+
+typedef struct {
+    int context_tokens;
+    int tool_memory_entries;
+    int disk_cache_entries;
+    uint64_t disk_cache_bytes;
+    buf tool_memory_records;
+    buf disk_cache_records;
+    FILE *disk_fixture;
+} test_server_driver;
+
+static void test_server_rpc_free(test_server_rpc *rpc) {
+    if (!rpc) return;
+    free(rpc->op);
+    free(rpc->method);
+    free(rpc->path);
+    free(rpc->body);
+    free(rpc->call_id);
+    free(rpc->name);
+    free(rpc->arguments);
+    free(rpc->sampled_text);
+    memset(rpc, 0, sizeof(*rpc));
+}
+
+static bool test_server_rpc_parse(const char *line, test_server_rpc *rpc) {
+    if (!line || !rpc) return false;
+    memset(rpc, 0, sizeof(*rpc));
+    const char *p = line;
+    json_ws(&p);
+    if (*p++ != '{') return false;
+    json_ws(&p);
+    if (*p == '}') return false;
+
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto fail;
+        json_ws(&p);
+        if (*p++ != ':') {
+            free(key);
+            goto fail;
+        }
+
+        char **string_slot = NULL;
+        bool raw_value = false;
+        if (!strcmp(key, "op")) string_slot = &rpc->op;
+        else if (!strcmp(key, "method")) string_slot = &rpc->method;
+        else if (!strcmp(key, "path")) string_slot = &rpc->path;
+        else if (!strcmp(key, "body")) {
+            string_slot = &rpc->body;
+            raw_value = true;
+        } else if (!strcmp(key, "call_id")) string_slot = &rpc->call_id;
+        else if (!strcmp(key, "name")) string_slot = &rpc->name;
+        else if (!strcmp(key, "arguments")) {
+            string_slot = &rpc->arguments;
+            raw_value = true;
+        } else if (!strcmp(key, "sampled_text")) {
+            string_slot = &rpc->sampled_text;
+        }
+        free(key);
+
+        if (string_slot) {
+            char *value = NULL;
+            const bool ok = raw_value ? json_raw_value(&p, &value) :
+                                       json_string(&p, &value);
+            if (!ok || *string_slot) {
+                free(value);
+                goto fail;
+            }
+            *string_slot = value;
+        } else if (!json_skip_value(&p)) {
+            goto fail;
+        }
+
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p++ != ',') goto fail;
+    }
+    json_ws(&p);
+    if (*p != '\0' || !rpc->op) goto fail;
+    return true;
+
+fail:
+    test_server_rpc_free(rpc);
+    return false;
+}
+
+static void test_server_fingerprint(const void *data, size_t len,
+                                    char out[41]) {
+    const char empty = '\0';
+    ds4_kvstore_sha1_bytes_hex(data ? data : &empty, len, out);
+}
+
+static void test_server_append_record_field(buf *record, const char *value) {
+    const char *text = value ? value : "";
+    const size_t len = strlen(text);
+    buf_printf(record, "%zu:", len);
+    buf_append(record, text, len);
+    buf_putc(record, ';');
+}
+
+static bool test_server_seed_record(test_server_driver *driver,
+                                    const test_server_rpc *rpc,
+                                    bool disk) {
+    if (!driver || !rpc || !rpc->call_id || !rpc->name ||
+        !rpc->arguments || !rpc->sampled_text) {
+        return false;
+    }
+    buf record = {0};
+    test_server_append_record_field(&record, rpc->call_id);
+    test_server_append_record_field(&record, rpc->name);
+    test_server_append_record_field(&record, rpc->arguments);
+    test_server_append_record_field(&record, rpc->sampled_text);
+
+    if (disk) {
+        if (!driver->disk_fixture) {
+            driver->disk_fixture = tmpfile();
+            if (!driver->disk_fixture) {
+                buf_free(&record);
+                return false;
+            }
+        }
+        if (record.len &&
+            fwrite(record.ptr, 1, record.len, driver->disk_fixture) !=
+                record.len) {
+            buf_free(&record);
+            return false;
+        }
+        if (fflush(driver->disk_fixture) != 0) {
+            buf_free(&record);
+            return false;
+        }
+        buf_append(&driver->disk_cache_records, record.ptr, record.len);
+        driver->disk_cache_entries++;
+        driver->disk_cache_bytes += (uint64_t)record.len;
+    } else {
+        buf_append(&driver->tool_memory_records, record.ptr, record.len);
+        driver->tool_memory_entries++;
+    }
+    buf_free(&record);
+    return true;
+}
+
+static void test_server_snapshot_json(const test_server_driver *driver,
+                                      buf *out) {
+    char empty_hash[41];
+    char tool_hash[41];
+    char disk_hash[41];
+    test_server_fingerprint(NULL, 0, empty_hash);
+    test_server_fingerprint(driver->tool_memory_records.ptr,
+                            driver->tool_memory_records.len, tool_hash);
+    test_server_fingerprint(driver->disk_cache_records.ptr,
+                            driver->disk_cache_records.len, disk_hash);
+    buf_printf(out,
+        "{\"session_count\":0,"
+        "\"session_positions\":[],"
+        "\"session_token_hashes\":[],"
+        "\"tool_memory_entries\":%d,"
+        "\"tool_memory_fingerprint\":\"%s\","
+        "\"tool_memory_lru_fingerprint\":\"%s\","
+        "\"live_tool_state_fingerprint\":\"%s\","
+        "\"memory_cache_entries\":0,"
+        "\"memory_cache_fingerprint\":\"%s\","
+        "\"memory_cache_lru_fingerprint\":\"%s\","
+        "\"disk_cache_entries\":%d,"
+        "\"disk_cache_bytes\":%" PRIu64 ","
+        "\"disk_cache_fingerprint\":\"%s\","
+        "\"disk_cache_lru_fingerprint\":\"%s\"}",
+        driver->tool_memory_entries,
+        tool_hash, tool_hash, empty_hash,
+        empty_hash, empty_hash,
+        driver->disk_cache_entries, driver->disk_cache_bytes,
+        disk_hash, disk_hash);
+}
+
+static void test_server_write_json(const buf *response) {
+    if (response && response->ptr && response->len) {
+        (void)fwrite(response->ptr, 1, response->len, stdout);
+    } else {
+        (void)fwrite("{}", 1, 2, stdout);
+    }
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+static void test_server_write_error(const char *message) {
+    buf response = {0};
+    buf_puts(&response, "{\"error\":");
+    json_escape(&response, message ? message : "invalid driver request");
+    buf_putc(&response, '}');
+    test_server_write_json(&response);
+    buf_free(&response);
+}
+
+static bool test_server_tokenize_deterministic(void *ctx, const char *text,
+                                               ds4_tokens *tokens) {
+    (void)ctx;
+    if (!text || !tokens) return false;
+    const unsigned char *p = (const unsigned char *)text;
+    const size_t len = strlen(text);
+    /* Four bytes per synthetic token keeps ordinary fixture prompts well below
+     * the test context while retaining exact deterministic boundary counts. */
+    for (size_t at = 0; at < len; at += 4) {
+        uint32_t token = 2166136261u;
+        const size_t end = at + 4 < len ? at + 4 : len;
+        for (size_t i = at; i < end; i++) {
+            token ^= (uint32_t)p[i];
+            token *= 16777619u;
+        }
+        ds4_tokens_push(tokens, (int)(token & 0x7fffffffu));
+    }
+    return true;
+}
+
+static bool test_server_append_prepare_response(
+        const test_server_driver *driver,
+        const test_server_rpc *rpc,
+        buf *response) {
+    if (!driver || !rpc || !rpc->path || !rpc->body || !response) {
+        return false;
+    }
+    laguna_prepare_mode mode;
+    if (!strcmp(rpc->path, "/v1/token-admission")) {
+        mode = LAGUNA_PREPARE_ADMISSION;
+    } else if (!strcmp(rpc->path, "/v1/chat/completions")) {
+        mode = LAGUNA_PREPARE_INFERENCE;
+    } else {
+        return false;
+    }
+
+    request prepared = {0};
+    const laguna_admission_result result = laguna_prepare_chat_request(
+        rpc->body, mode, driver->context_tokens, driver->context_tokens,
+        test_server_tokenize_deterministic, NULL, &prepared);
+    buf_printf(response, "{\"http_status\":%d,\"body\":",
+               result.code == REQUEST_ADMISSION_FITS ? 200 : 400);
+    append_laguna_admission_json(response, &result);
+    buf_putc(response, '}');
+    request_free(&prepared);
+    return true;
+}
+
+static int test_server_token_admission_stdio(int context_tokens) {
+    test_server_driver driver = {
+        .context_tokens = context_tokens,
+    };
+    char *line = NULL;
+    size_t line_cap = 0;
+    int rc = 0;
+    bool done = false;
+
+    while (!done) {
+        errno = 0;
+        const ssize_t line_len = getline(&line, &line_cap, stdin);
+        if (line_len < 0) {
+            if (feof(stdin)) break;
+            fprintf(stderr, "ds4-test: token-admission stdio read failed: %s\n",
+                    strerror(errno));
+            rc = 1;
+            break;
+        }
+
+        test_server_rpc rpc = {0};
+        if (!test_server_rpc_parse(line, &rpc)) {
+            test_server_write_error("invalid NDJSON request");
+            continue;
+        }
+
+        buf response = {0};
+        if (!strcmp(rpc.op, "ping")) {
+            buf_puts(&response, "{\"ok\":true}");
+        } else if (!strcmp(rpc.op, "snapshot")) {
+            test_server_snapshot_json(&driver, &response);
+        } else if (!strcmp(rpc.op, "seed_tool_replay") ||
+                   !strcmp(rpc.op, "seed_disk_tool_replay")) {
+            const bool disk = !strcmp(rpc.op, "seed_disk_tool_replay");
+            if (test_server_seed_record(&driver, &rpc, disk)) {
+                buf_puts(&response, "{\"ok\":true}");
+            } else {
+                buf_puts(&response,
+                         "{\"error\":\"invalid replay seed\"}");
+            }
+        } else if (!strcmp(rpc.op, "request")) {
+            if (!rpc.method || strcmp(rpc.method, "POST") || !rpc.path ||
+                !rpc.body) {
+                buf_puts(&response,
+                         "{\"error\":\"invalid request operation\"}");
+            } else if (!test_server_append_prepare_response(
+                           &driver, &rpc, &response)) {
+                buf_puts(&response,
+                         "{\"error\":\"request preparation failed\"}");
+            }
+        } else if (!strcmp(rpc.op, "quit")) {
+            buf_puts(&response, "{\"ok\":true}");
+            done = true;
+        } else {
+            buf_puts(&response, "{\"error\":\"unknown operation\"}");
+        }
+        test_server_write_json(&response);
+        buf_free(&response);
+        test_server_rpc_free(&rpc);
+    }
+
+    free(line);
+    if (driver.disk_fixture && fclose(driver.disk_fixture) != 0 && rc == 0) {
+        rc = 1;
+    }
+    buf_free(&driver.tool_memory_records);
+    buf_free(&driver.disk_cache_records);
+    return rc;
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -7096,6 +7423,25 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--server-token-admission-stdio")) {
+        if (argc != 4 || strcmp(argv[2], "--context-tokens")) {
+            fprintf(stderr,
+                    "ds4-test: --server-token-admission-stdio requires "
+                    "--context-tokens N\n");
+            return 2;
+        }
+        errno = 0;
+        char *end = NULL;
+        const long context_tokens = strtol(argv[3], &end, 10);
+        if (errno || end == argv[3] || *end || context_tokens <= 0 ||
+            context_tokens > INT_MAX) {
+            fprintf(stderr, "ds4-test: invalid --context-tokens value: %s\n",
+                    argv[3]);
+            return 2;
+        }
+        return test_server_token_admission_stdio((int)context_tokens);
+    }
+
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 

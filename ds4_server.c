@@ -5723,6 +5723,1133 @@ static request_admission_code request_prepare_token_admission(
     return request_token_admission(r, ctx_size);
 }
 
+#define LAGUNA_ADMISSION_SCHEMA "ds4.token-admission/v1"
+#define LAGUNA_ADMISSION_MODEL "laguna-s-2.1"
+#define LAGUNA_ADMISSION_TEMPLATE_REVISION \
+    "poolside-laguna-s-2.1-native-nothink-v1"
+
+typedef enum {
+    LAGUNA_PREPARE_ADMISSION,
+    LAGUNA_PREPARE_INFERENCE,
+} laguna_prepare_mode;
+
+typedef struct {
+    int templated_input_tokens;
+    uint64_t requested_output_tokens;
+    int context_tokens;
+    request_admission_code code;
+    /* Same-family aliases with thinking semantics stay on the legacy inference
+     * path.  The v1 admission surface reports invalid_request because it
+     * pins one explicit no-thinking template revision. */
+    bool legacy_model_semantics;
+} laguna_admission_result;
+
+typedef bool (*laguna_tokenize_fn)(void *context,
+                                   const char *rendered_prompt,
+                                   ds4_tokens *tokens);
+
+static const char *request_admission_code_name(request_admission_code code) {
+    switch (code) {
+    case REQUEST_ADMISSION_FITS: return NULL;
+    case REQUEST_ADMISSION_MODEL_MISMATCH: return "model_mismatch";
+    case REQUEST_ADMISSION_INVALID_REQUEST: return "invalid_request";
+    case REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS:
+        return "invalid_output_tokens";
+    case REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE:
+        return "unsupported_tool_choice";
+    case REQUEST_ADMISSION_CONTEXT_OVERFLOW: return "context_overflow";
+    }
+    return "invalid_request";
+}
+
+static bool laguna_model_family_known(const char *model) {
+    return model &&
+           (!strcmp(model, "laguna-s-2.1") ||
+            !strcmp(model, "laguna-s-2.1-chat") ||
+            !strcmp(model, "laguna-s-2.1-no-think") ||
+            !strcmp(model, "laguna-s-2.1-nothink") ||
+            !strcmp(model, "laguna-s-2.1-reasoner") ||
+            !strcmp(model, "poolside/laguna-s-2.1"));
+}
+
+static bool laguna_model_alias_uses_nothink_template(const char *model) {
+    return model &&
+           (!strcmp(model, "laguna-s-2.1-chat") ||
+            !strcmp(model, "laguna-s-2.1-no-think") ||
+            !strcmp(model, "laguna-s-2.1-nothink"));
+}
+
+static bool laguna_validate_function_schema(const char *json) {
+    const char *p = json ? json : "";
+    bool got_name = false;
+    bool got_parameters = false;
+    bool got_description = false;
+    bool got_strict = false;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    if (*p == '}') return false;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        bool valid = true;
+        if (!strcmp(key, "name")) {
+            char *name = NULL;
+            valid = !got_name && json_string(&p, &name) && name[0] != '\0';
+            got_name = true;
+            free(name);
+        } else if (!strcmp(key, "description")) {
+            char *description = NULL;
+            valid = !got_description && json_string(&p, &description);
+            got_description = true;
+            free(description);
+        } else if (!strcmp(key, "parameters")) {
+            const char *value = p;
+            json_ws(&value);
+            valid = !got_parameters && *value == '{' && json_skip_value(&p);
+            got_parameters = true;
+        } else if (!strcmp(key, "strict")) {
+            bool strict = false;
+            valid = !got_strict && json_bool(&p, &strict);
+            got_strict = true;
+        } else {
+            valid = false;
+            (void)json_skip_value(&p);
+        }
+        free(key);
+        if (!valid) return false;
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            json_ws(&p);
+            return *p == '\0' && got_name && got_parameters;
+        }
+        if (*p != ',') return false;
+        p++;
+        json_ws(&p);
+        if (*p == '}') return false;
+    }
+}
+
+static bool laguna_unwrap_function_tool(const char *json,
+                                        char **function_out) {
+    const char *p = json ? json : "";
+    char *type = NULL;
+    char *function = NULL;
+    bool got_type = false;
+    bool got_function = false;
+    bool valid = false;
+    json_ws(&p);
+    if (*p != '{') goto done;
+    p++;
+    json_ws(&p);
+    if (*p == '}') goto done;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "type") && !got_type) {
+            got_type = json_string(&p, &type);
+            if (!got_type) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "function") && !got_function) {
+            got_function = json_raw_value(&p, &function);
+            if (!got_function) {
+                free(key);
+                goto done;
+            }
+        } else {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p != ',') goto done;
+        p++;
+        json_ws(&p);
+        if (*p == '}') goto done;
+    }
+    json_ws(&p);
+    valid = *p == '\0' && got_type && got_function &&
+            !strcmp(type, "function") &&
+            laguna_validate_function_schema(function);
+done:
+    free(type);
+    if (!valid) {
+        free(function);
+        function = NULL;
+    }
+    if (function_out) *function_out = function;
+    else free(function);
+    return valid;
+}
+
+static bool laguna_parse_function_tools(const char **p,
+                                        char **schemas_out,
+                                        tool_schema_orders *orders) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    buf schemas = {0};
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        *schemas_out = buf_take(&schemas);
+        return true;
+    }
+    for (;;) {
+        char *raw = NULL;
+        char *function = NULL;
+        if (!json_raw_value(p, &raw) ||
+            !laguna_unwrap_function_tool(raw, &function))
+        {
+            free(raw);
+            free(function);
+            buf_free(&schemas);
+            return false;
+        }
+        append_raw_json_line(&schemas, function);
+        tool_schema_orders_add_json(orders, function);
+        free(raw);
+        free(function);
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            *schemas_out = buf_take(&schemas);
+            return true;
+        }
+        if (**p != ',') {
+            buf_free(&schemas);
+            return false;
+        }
+        (*p)++;
+        json_ws(p);
+        if (**p == ']') {
+            buf_free(&schemas);
+            return false;
+        }
+    }
+}
+
+static bool laguna_parse_tool_call(const char **p, tool_call *call) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    bool got_id = false;
+    bool got_type = false;
+    bool got_function = false;
+    json_ws(p);
+    if (**p == '}') return false;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        bool valid = true;
+        if (!strcmp(key, "id") && !got_id) {
+            valid = json_string(p, &call->id) && call->id[0] != '\0';
+            got_id = true;
+        } else if (!strcmp(key, "type") && !got_type) {
+            char *type = NULL;
+            valid = json_string(p, &type) && !strcmp(type, "function");
+            got_type = true;
+            free(type);
+        } else if (!strcmp(key, "function") && !got_function) {
+            got_function = true;
+            json_ws(p);
+            if (**p != '{') {
+                valid = false;
+            } else {
+                (*p)++;
+                bool got_name = false;
+                bool got_arguments = false;
+                json_ws(p);
+                if (**p == '}') valid = false;
+                while (valid && **p && **p != '}') {
+                    char *function_key = NULL;
+                    if (!json_string(p, &function_key)) {
+                        valid = false;
+                        break;
+                    }
+                    json_ws(p);
+                    if (**p != ':') {
+                        free(function_key);
+                        valid = false;
+                        break;
+                    }
+                    (*p)++;
+                    if (!strcmp(function_key, "name") && !got_name) {
+                        valid = json_string(p, &call->name) &&
+                                call->name[0] != '\0';
+                        got_name = true;
+                    } else if (!strcmp(function_key, "arguments") &&
+                               !got_arguments)
+                    {
+                        json_ws(p);
+                        if (**p == '"') {
+                            valid = json_string(p, &call->arguments);
+                        } else {
+                            const char *value = *p;
+                            json_ws(&value);
+                            valid = *value == '{' &&
+                                    json_raw_value(p, &call->arguments);
+                        }
+                        got_arguments = true;
+                        if (valid) {
+                            const char *arguments = call->arguments;
+                            json_ws(&arguments);
+                            valid = *arguments == '{' &&
+                                    json_skip_value(&arguments);
+                            json_ws(&arguments);
+                            valid = valid && *arguments == '\0';
+                        }
+                    } else {
+                        valid = false;
+                    }
+                    free(function_key);
+                    if (!valid) break;
+                    json_ws(p);
+                    if (**p == '}') break;
+                    if (**p != ',') {
+                        valid = false;
+                        break;
+                    }
+                    (*p)++;
+                    json_ws(p);
+                    if (**p == '}') valid = false;
+                }
+                if (valid && **p == '}') (*p)++;
+                else valid = false;
+                valid = valid && got_name && got_arguments;
+            }
+        } else {
+            valid = false;
+        }
+        free(key);
+        if (!valid) return false;
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            return got_id && got_type && got_function;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+        json_ws(p);
+        if (**p == '}') return false;
+    }
+}
+
+static bool laguna_parse_tool_calls(const char **p, tool_calls *calls) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') return false;
+    for (;;) {
+        tool_call call = {0};
+        if (!laguna_parse_tool_call(p, &call)) {
+            tool_call_free(&call);
+            return false;
+        }
+        tool_calls_push(calls, call);
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+        json_ws(p);
+        if (**p == ']') return false;
+    }
+}
+
+static bool laguna_role_known(const char *role) {
+    return role &&
+           (!strcmp(role, "system") || !strcmp(role, "developer") ||
+            !strcmp(role, "user") ||
+            !strcmp(role, "assistant") || !strcmp(role, "tool") ||
+            !strcmp(role, "function"));
+}
+
+static bool laguna_parse_content(const char **p, char **content) {
+    json_ws(p);
+    if (json_lit(p, "null")) {
+        *content = xstrdup("");
+        return true;
+    }
+    if (**p == '"') return json_string(p, content);
+    if (**p != '[') return false;
+    (*p)++;
+    buf text = {0};
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        *content = buf_take(&text);
+        return true;
+    }
+    for (;;) {
+        if (**p == '{') {
+            (*p)++;
+            char *part = NULL;
+            bool got_text = false;
+            bool got_type = false;
+            json_ws(p);
+            if (**p == '}') goto bad;
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) goto bad;
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    goto bad;
+                }
+                (*p)++;
+                bool valid = true;
+                if (!strcmp(key, "text") && !got_text) {
+                    valid = json_string(p, &part);
+                    got_text = true;
+                } else if (!strcmp(key, "type") && !got_type) {
+                    char *type = NULL;
+                    valid = json_string(p, &type) &&
+                            (!strcmp(type, "text") ||
+                             !strcmp(type, "input_text") ||
+                             !strcmp(type, "output_text"));
+                    got_type = true;
+                    free(type);
+                } else {
+                    valid = false;
+                }
+                free(key);
+                if (!valid) {
+                    free(part);
+                    goto bad;
+                }
+                json_ws(p);
+                if (**p == '}') break;
+                if (**p != ',') {
+                    free(part);
+                    goto bad;
+                }
+                (*p)++;
+                json_ws(p);
+                if (**p == '}') {
+                    free(part);
+                    goto bad;
+                }
+            }
+            if (**p != '}' || !got_text || !got_type) {
+                free(part);
+                goto bad;
+            }
+            (*p)++;
+            buf_puts(&text, part);
+            free(part);
+        } else {
+            goto bad;
+        }
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            *content = buf_take(&text);
+            return true;
+        }
+        if (**p != ',') goto bad;
+        (*p)++;
+        json_ws(p);
+        if (**p == ']') goto bad;
+    }
+bad:
+    buf_free(&text);
+    return false;
+}
+
+static bool laguna_parse_messages(const char **p, chat_msgs *messages) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        json_ws(p);
+        if (**p != '{') return false;
+        (*p)++;
+        chat_msg message = {0};
+        bool got_role = false;
+        bool got_content = false;
+        bool got_tool_call_id = false;
+        bool got_tool_calls = false;
+        bool got_name = false;
+        json_ws(p);
+        if (**p == '}') goto bad;
+        while (**p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) goto bad;
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                goto bad;
+            }
+            (*p)++;
+            bool valid = true;
+            if (!strcmp(key, "role") && !got_role) {
+                valid = json_string(p, &message.role) &&
+                        laguna_role_known(message.role);
+                got_role = true;
+            } else if (!strcmp(key, "content") && !got_content) {
+                valid = laguna_parse_content(p, &message.content);
+                got_content = true;
+            } else if (!strcmp(key, "name") && !got_name) {
+                char *name = NULL;
+                valid = json_string(p, &name);
+                got_name = true;
+                free(name);
+            } else if (!strcmp(key, "tool_call_id") &&
+                       !got_tool_call_id)
+            {
+                valid = json_string(p, &message.tool_call_id) &&
+                        message.tool_call_id[0] != '\0';
+                got_tool_call_id = true;
+            } else if (!strcmp(key, "tool_calls") && !got_tool_calls) {
+                valid = laguna_parse_tool_calls(p, &message.calls);
+                got_tool_calls = true;
+            } else {
+                valid = false;
+            }
+            free(key);
+            if (!valid) goto bad;
+            json_ws(p);
+            if (**p == '}') break;
+            if (**p != ',') goto bad;
+            (*p)++;
+            json_ws(p);
+            if (**p == '}') goto bad;
+        }
+        if (**p != '}') goto bad;
+        (*p)++;
+        if (!got_role) goto bad;
+        if (!got_content) message.content = xstrdup("");
+        if (!strcmp(message.role, "tool") && !got_tool_call_id) goto bad;
+        if (got_tool_call_id &&
+            strcmp(message.role, "tool") &&
+            strcmp(message.role, "function"))
+        {
+            goto bad;
+        }
+        if (got_tool_calls && strcmp(message.role, "assistant")) goto bad;
+        chat_msgs_push(messages, message);
+        memset(&message, 0, sizeof(message));
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+        json_ws(p);
+        if (**p == ']') return false;
+        continue;
+bad:
+        chat_msg_free(&message);
+        return false;
+    }
+}
+
+static bool laguna_engine_tokenize(void *context,
+                                   const char *rendered_prompt,
+                                   ds4_tokens *tokens) {
+    ds4_engine *engine = context;
+    if (!engine || !tokens) return false;
+    ds4_tokenize_rendered_chat(engine, rendered_prompt, tokens);
+    return tokens->len >= 0;
+}
+
+static bool laguna_parse_tool_choice(const char **p,
+                                     bool *tools_enabled,
+                                     request_admission_code *code) {
+    json_ws(p);
+    char *choice = NULL;
+    if (!json_string(p, &choice)) {
+        if (!json_skip_value(p)) return false;
+        *code = REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE;
+        return true;
+    }
+    if (!strcmp(choice, "auto")) {
+        *tools_enabled = true;
+    } else if (!strcmp(choice, "none")) {
+        *tools_enabled = false;
+    } else {
+        *code = REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE;
+    }
+    free(choice);
+    return true;
+}
+
+static bool laguna_parse_stream_options_strict(const char **p,
+                                                bool *include_usage) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    bool got_include_usage = false;
+    json_ws(p);
+    if (**p == '}') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        bool valid = !strcmp(key, "include_usage") &&
+                     !got_include_usage && json_bool(p, include_usage);
+        if (!strcmp(key, "include_usage")) got_include_usage = true;
+        free(key);
+        if (!valid) return false;
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+        json_ws(p);
+    }
+}
+
+static bool laguna_parse_exact_seed(const char **p, uint64_t *seed) {
+    uint64_t value = 0u;
+    if (!json_exact_u64(p, &value)) return false;
+    *seed = value;
+    return true;
+}
+
+/* One pure ownership boundary for native no-thinking Chat preparation.
+ *
+ * The only injected dependency is tokenization; parsing and rendering do not
+ * receive a server/session/cache handle.  The returned request owns the exact
+ * rendered text and token vector that inference will enqueue, so the endpoint
+ * and inference cannot disagree or reparse after admission. */
+static laguna_admission_result laguna_prepare_chat_request(
+        const char *body,
+        laguna_prepare_mode mode,
+        int default_tokens,
+        int context_tokens,
+        laguna_tokenize_fn tokenize,
+        void *tokenizer_context,
+        request *prepared) {
+    laguna_admission_result result = {
+        .context_tokens = context_tokens,
+        .code = REQUEST_ADMISSION_INVALID_REQUEST,
+    };
+    request r;
+    request_init(&r, REQ_CHAT, default_tokens);
+    r.model_syntax = SERVER_MODEL_SYNTAX_LAGUNA;
+    r.think_mode = DS4_THINK_NONE;
+    free(r.model);
+    r.model = xstrdup(LAGUNA_ADMISSION_MODEL);
+
+    chat_msgs messages = {0};
+    char *tool_schemas = NULL;
+    bool got_model = false;
+    bool got_messages = false;
+    bool got_tools = false;
+    bool got_tool_choice = false;
+    bool tools_enabled = true;
+    bool got_output = false;
+    bool parsed_object = false;
+    bool got_temperature = false;
+    bool got_top_p = false;
+    bool got_min_p = false;
+    bool got_top_k = false;
+    bool got_seed = false;
+    bool got_stream = false;
+    bool got_stream_options = false;
+    bool got_stop = false;
+    bool legacy_candidate = false;
+    bool legacy_model_alias = false;
+    bool strict_violation = false;
+    bool saw_model_mismatch = false;
+    bool saw_invalid_request = false;
+    bool saw_unsupported_tool_choice = false;
+    bool saw_invalid_output_tokens = false;
+    const char *p = body ? body : "";
+
+    json_ws(&p);
+    if (*p != '{') goto done;
+    p++;
+    json_ws(&p);
+    if (*p == '}') goto done;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        bool valid = true;
+        const bool legacy_duplicate =
+            mode == LAGUNA_PREPARE_INFERENCE &&
+            ((!strcmp(key, "model") && got_model) ||
+             (!strcmp(key, "messages") && got_messages) ||
+             (!strcmp(key, "tools") && got_tools) ||
+             (!strcmp(key, "tool_choice") && got_tool_choice) ||
+             (!strcmp(key, "max_tokens") && got_output) ||
+             (!strcmp(key, "temperature") && got_temperature) ||
+             (!strcmp(key, "top_p") && got_top_p) ||
+             (!strcmp(key, "min_p") && got_min_p) ||
+             (!strcmp(key, "top_k") && got_top_k) ||
+             (!strcmp(key, "seed") && got_seed) ||
+             (!strcmp(key, "stream") && got_stream) ||
+             (!strcmp(key, "stream_options") && got_stream_options) ||
+             (!strcmp(key, "stop") && got_stop));
+        if (legacy_duplicate) {
+            /* The compatibility parser is last-value-wins.  Keep v1 strict,
+             * but preserve that established production behavior by routing
+             * the complete request through the old parser after this pure
+             * classification pass. */
+            legacy_candidate = true;
+            saw_invalid_request = true;
+            if (!strcmp(key, "model")) {
+                const char *value = p;
+                char *model = NULL;
+                valid = json_string(&p, &model);
+                if (!valid) {
+                    p = value;
+                    valid = json_skip_value(&p);
+                    strict_violation = true;
+                } else if (!laguna_model_family_known(model)) {
+                    saw_model_mismatch = true;
+                    strict_violation = true;
+                }
+                free(model);
+            } else if (!strcmp(key, "messages")) {
+                const char *value = p;
+                chat_msgs duplicate_messages = {0};
+                valid = laguna_parse_messages(&p, &duplicate_messages);
+                if (!valid) {
+                    p = value;
+                    valid = json_skip_value(&p);
+                    strict_violation = true;
+                }
+                chat_msgs_free(&duplicate_messages);
+            } else if (!strcmp(key, "tools")) {
+                const char *value = p;
+                if (json_lit(&value, "null")) {
+                    p = value;
+                } else {
+                    char *duplicate_schemas = NULL;
+                    tool_schema_orders duplicate_orders = {0};
+                    valid = laguna_parse_function_tools(
+                        &p, &duplicate_schemas, &duplicate_orders);
+                    if (!valid) {
+                        p = value;
+                        valid = json_skip_value(&p);
+                        strict_violation = true;
+                    }
+                    free(duplicate_schemas);
+                    tool_schema_orders_free(&duplicate_orders);
+                }
+            } else if (!strcmp(key, "tool_choice")) {
+                bool duplicate_tools_enabled = true;
+                request_admission_code duplicate_code =
+                    REQUEST_ADMISSION_FITS;
+                valid = laguna_parse_tool_choice(
+                    &p, &duplicate_tools_enabled, &duplicate_code);
+                if (duplicate_code ==
+                    REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE)
+                {
+                    saw_unsupported_tool_choice = true;
+                    strict_violation = true;
+                }
+            } else if (!strcmp(key, "max_tokens")) {
+                request duplicate_request;
+                request_init(&duplicate_request, REQ_CHAT, 0);
+                valid = request_parse_output_tokens(&p, &duplicate_request);
+                if (valid && !duplicate_request.max_tokens_valid) {
+                    saw_invalid_output_tokens = true;
+                    strict_violation = true;
+                }
+                request_free(&duplicate_request);
+            } else {
+                valid = json_skip_value(&p);
+            }
+        } else if (!strcmp(key, "model") && !got_model) {
+            const char *value = p;
+            char *model = NULL;
+            valid = json_string(&p, &model);
+            got_model = true;
+            if (!valid) {
+                p = value;
+                valid = json_skip_value(&p);
+                saw_invalid_request = true;
+                strict_violation = true;
+            } else if (!laguna_model_family_known(model)) {
+                saw_model_mismatch = true;
+                strict_violation = true;
+            } else if (!laguna_model_alias_uses_nothink_template(model)) {
+                /* The v1 result pins the native no-thinking template.  A
+                 * same-family alias whose public semantics enable reasoning
+                 * cannot truthfully share that template revision. */
+                saw_invalid_request = true;
+                legacy_model_alias = true;
+            }
+            free(model);
+        } else if (!strcmp(key, "messages") && !got_messages) {
+            got_messages = true;
+            const char *value = p;
+            valid = laguna_parse_messages(&p, &messages);
+            if (!valid) {
+                chat_msgs_free(&messages);
+                p = value;
+                valid = json_skip_value(&p);
+                saw_invalid_request = true;
+                strict_violation = true;
+            } else if (messages.len == 0) {
+                if (mode == LAGUNA_PREPARE_INFERENCE) {
+                    legacy_candidate = true;
+                    saw_invalid_request = true;
+                } else {
+                    valid = false;
+                }
+            }
+        } else if (!strcmp(key, "tools") && !got_tools) {
+            got_tools = true;
+            const char *value = p;
+            if (json_lit(&value, "null"))
+            {
+                p = value;
+            } else {
+                valid = laguna_parse_function_tools(
+                    &p, &tool_schemas, &r.tool_orders);
+                if (!valid) {
+                    free(tool_schemas);
+                    tool_schemas = NULL;
+                    tool_schema_orders_free(&r.tool_orders);
+                    p = value;
+                    valid = json_skip_value(&p);
+                    saw_invalid_request = true;
+                    strict_violation = true;
+                }
+            }
+        } else if (!strcmp(key, "tool_choice") && !got_tool_choice) {
+            got_tool_choice = true;
+            request_admission_code tool_choice_code =
+                REQUEST_ADMISSION_FITS;
+            valid = laguna_parse_tool_choice(
+                &p, &tools_enabled, &tool_choice_code);
+            if (tool_choice_code ==
+                REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE)
+            {
+                saw_unsupported_tool_choice = true;
+                strict_violation = true;
+            }
+        } else if (mode == LAGUNA_PREPARE_ADMISSION &&
+                   !strcmp(key, "requested_output_tokens") && !got_output)
+        {
+            got_output = true;
+            const char *value = p;
+            uint64_t requested = 0u;
+            r.max_tokens_set = true;
+            r.max_tokens_valid = json_exact_u64(&value, &requested) &&
+                                 requested > 0u &&
+                                 requested <= DS4_RUNTIME_JSON_SAFE_INTEGER_MAX;
+            if (!r.max_tokens_valid) {
+                value = p;
+                valid = json_skip_value(&value);
+                if (valid) {
+                    saw_invalid_output_tokens = true;
+                    strict_violation = true;
+                }
+            } else {
+                r.requested_output_tokens = requested;
+            }
+            p = value;
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "max_tokens") && !got_output)
+        {
+            got_output = true;
+            valid = request_parse_output_tokens(&p, &r);
+            if (valid && !r.max_tokens_valid) {
+                saw_invalid_output_tokens = true;
+                strict_violation = true;
+            }
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "max_completion_tokens"))
+        {
+            legacy_candidate = true;
+            valid = json_skip_value(&p);
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   (!strcmp(key, "thinking") ||
+                    !strcmp(key, "think") ||
+                    !strcmp(key, "reasoning_effort")))
+        {
+            legacy_candidate = true;
+            valid = json_skip_value(&p);
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "temperature") && !got_temperature)
+        {
+            double value = 0.0;
+            got_temperature = true;
+            valid = json_number(&p, &value) && isfinite(value);
+            if (valid) {
+                r.temperature = (float)value;
+                r.temperature_set = true;
+            }
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "top_p") && !got_top_p)
+        {
+            double value = 0.0;
+            got_top_p = true;
+            valid = json_number(&p, &value) && isfinite(value);
+            if (valid) {
+                r.top_p = (float)value;
+                r.top_p_set = true;
+            }
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "min_p") && !got_min_p)
+        {
+            double value = 0.0;
+            got_min_p = true;
+            valid = json_number(&p, &value) && isfinite(value);
+            if (valid) {
+                r.min_p = (float)value;
+                r.min_p_set = true;
+            }
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "top_k") && !got_top_k)
+        {
+            got_top_k = true;
+            valid = json_int(&p, &r.top_k);
+            r.top_k_set = valid;
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "seed") && !got_seed)
+        {
+            got_seed = true;
+            const char *value = p;
+            valid = laguna_parse_exact_seed(&value, &r.seed);
+            if (valid) {
+                p = value;
+            } else {
+                value = p;
+                double legacy_seed = 0.0;
+                valid = json_number(&value, &legacy_seed);
+                if (valid) {
+                    p = value;
+                    legacy_candidate = true;
+                }
+            }
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "stream") && !got_stream)
+        {
+            got_stream = true;
+            valid = json_bool(&p, &r.stream);
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "stream_options") && !got_stream_options)
+        {
+            got_stream_options = true;
+            const char *value = p;
+            valid = laguna_parse_stream_options_strict(
+                &value, &r.stream_include_usage);
+            if (valid) {
+                p = value;
+            } else {
+                value = p;
+                valid = json_skip_value(&value);
+                if (valid) {
+                    p = value;
+                    legacy_candidate = true;
+                }
+            }
+        } else if (mode == LAGUNA_PREPARE_INFERENCE &&
+                   !strcmp(key, "stop") && !got_stop)
+        {
+            got_stop = true;
+            valid = parse_stop(&p, &r.stops);
+        } else {
+            /* Every unknown, duplicate, wrong-mode, or reasoning-control field
+             * is invalid. In particular no accepted request can ask for a
+             * thinking template while advertising the pinned nothink revision. */
+            valid = json_skip_value(&p);
+            saw_invalid_request = true;
+            strict_violation = true;
+        }
+        free(key);
+        if (!valid) goto done;
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            parsed_object = true;
+            break;
+        }
+        if (*p != ',') goto done;
+        p++;
+        json_ws(&p);
+        if (*p == '}') goto done;
+    }
+    json_ws(&p);
+    if (*p != '\0' || !parsed_object || !got_messages) goto done;
+    if (!got_model) {
+        /* Omitted-model inference historically selects the server's base
+         * Laguna alias, whose thinking semantics do not match this pinned
+         * no-thinking contract.  Signal client_main to preserve the legacy
+         * parser; admission itself remains a stable invalid request. */
+        if (mode == LAGUNA_PREPARE_INFERENCE) {
+            legacy_candidate = true;
+        }
+    }
+    if (mode == LAGUNA_PREPARE_INFERENCE &&
+        legacy_candidate && !strict_violation &&
+        !saw_model_mismatch && !saw_unsupported_tool_choice &&
+        !saw_invalid_output_tokens)
+    {
+        result.legacy_model_semantics = true;
+        result.code = REQUEST_ADMISSION_INVALID_REQUEST;
+        goto done;
+    }
+    if (mode == LAGUNA_PREPARE_INFERENCE &&
+        legacy_model_alias && !strict_violation &&
+        !saw_model_mismatch && !saw_unsupported_tool_choice &&
+        !saw_invalid_output_tokens)
+    {
+        /* Unlike other legacy shapes, fully prepare this logical request so
+         * the dry-run contract can return the same deterministic rejection
+         * details as admission.  client_main uses only this private flag to
+         * retain the established thinking parser for actual inference. */
+        result.legacy_model_semantics = true;
+    }
+    bool output_omitted = false;
+    if (mode == LAGUNA_PREPARE_ADMISSION && !got_output &&
+        !saw_model_mismatch && !saw_invalid_request &&
+        !saw_unsupported_tool_choice) {
+        saw_invalid_output_tokens = true;
+    } else if (mode == LAGUNA_PREPARE_INFERENCE && !got_output &&
+               !saw_model_mismatch && !saw_invalid_request &&
+               !saw_unsupported_tool_choice) {
+        if (default_tokens <= 0) {
+            saw_invalid_output_tokens = true;
+        } else {
+            output_omitted = true;
+        }
+    }
+
+    r.has_tools = tools_enabled && tool_schemas && tool_schemas[0];
+    r.prompt_preserves_reasoning = chat_history_uses_tool_context(
+        &messages, r.has_tools ? tool_schemas : NULL);
+    r.prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, &messages,
+        r.has_tools ? tool_schemas : NULL, &r.tool_orders, DS4_THINK_NONE);
+    if (!r.prompt_text || !tokenize ||
+        !tokenize(tokenizer_context, r.prompt_text, &r.prompt))
+    {
+        saw_invalid_request = true;
+    }
+
+    result.templated_input_tokens = r.prompt.len;
+    if (!saw_model_mismatch && !saw_invalid_request &&
+        !saw_unsupported_tool_choice && !saw_invalid_output_tokens &&
+        output_omitted)
+    {
+        if (r.prompt.len < 0 || context_tokens <= 0 ||
+            r.prompt.len >= context_tokens)
+        {
+            result.code = REQUEST_ADMISSION_CONTEXT_OVERFLOW;
+        } else {
+            const int remaining = context_tokens - r.prompt.len;
+            r.max_tokens = default_tokens < remaining ?
+                default_tokens : remaining;
+            r.max_tokens_set = false;
+            r.max_tokens_valid = true;
+            r.requested_output_tokens = (uint64_t)r.max_tokens;
+        }
+    }
+    result.requested_output_tokens =
+        (r.max_tokens_valid && (got_output || output_omitted)) ?
+            r.requested_output_tokens : 0u;
+    if (saw_model_mismatch) {
+        result.code = REQUEST_ADMISSION_MODEL_MISMATCH;
+    } else if (saw_invalid_request) {
+        result.code = REQUEST_ADMISSION_INVALID_REQUEST;
+    } else if (saw_unsupported_tool_choice) {
+        result.code = REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE;
+    } else if (saw_invalid_output_tokens) {
+        result.code = REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS;
+    } else if (result.code != REQUEST_ADMISSION_CONTEXT_OVERFLOW) {
+        result.code = request_token_counts_admit(
+            r.prompt.len, result.requested_output_tokens, context_tokens);
+    }
+    if (result.code == REQUEST_ADMISSION_FITS) {
+        r.max_tokens = (int)r.requested_output_tokens;
+        r.model_from_request = true;
+        if (prepared) {
+            *prepared = r;
+            memset(&r, 0, sizeof(r));
+        }
+    }
+
+done:
+    chat_msgs_free(&messages);
+    free(tool_schemas);
+    request_free(&r);
+    return result;
+}
+
+static void append_laguna_admission_json(
+        buf *b,
+        const laguna_admission_result *result) {
+    const request_admission_code code = result ? result->code :
+        REQUEST_ADMISSION_INVALID_REQUEST;
+    buf_puts(b,
+        "{\"schema\":\"" LAGUNA_ADMISSION_SCHEMA
+        "\",\"model\":\"" LAGUNA_ADMISSION_MODEL
+        "\",\"template_revision\":\"" LAGUNA_ADMISSION_TEMPLATE_REVISION
+        "\",\"templated_input_tokens\":");
+    buf_printf(b, "%d", result ? result->templated_input_tokens : 0);
+    buf_puts(b, ",\"requested_output_tokens\":");
+    buf_printf(b, "%" PRIu64,
+               result ? result->requested_output_tokens : 0u);
+    buf_puts(b, ",\"context_tokens\":");
+    buf_printf(b, "%d", result ? result->context_tokens : 0);
+    buf_puts(b, ",\"fits\":");
+    buf_puts(b, code == REQUEST_ADMISSION_FITS ? "true" : "false");
+    buf_puts(b, ",\"rejection_code\":");
+    const char *name = request_admission_code_name(code);
+    if (name) json_escape(b, name);
+    else buf_puts(b, "null");
+    buf_putc(b, '}');
+}
+
 #ifdef DS4_SERVER_TEST
 static bool request_exceeds_context(const request *r, int ctx_size) {
     return request_token_admission(r, ctx_size) ==
@@ -13066,7 +14193,53 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") &&
+        !strcmp(hr.path, "/v1/token-admission"))
+    {
+        laguna_admission_result result = {
+            .context_tokens = ctx_size,
+            .code = REQUEST_ADMISSION_MODEL_MISMATCH,
+        };
+        if (ds4_engine_is_laguna(s->engine)) {
+            result = laguna_prepare_chat_request(
+                hr.body, LAGUNA_PREPARE_ADMISSION, 0, ctx_size,
+                laguna_engine_tokenize, s->engine, NULL);
+        }
+        buf body = {0};
+        append_laguna_admission_json(&body, &result);
+        buf_putc(&body, '\n');
+        http_response(fd, s->enable_cors,
+                      result.code == REQUEST_ADMISSION_FITS ? 200 : 400,
+                      "application/json", body.ptr);
+        buf_free(&body);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "POST") &&
+        !strcmp(hr.path, "/v1/chat/completions") &&
+        ds4_engine_is_laguna(s->engine))
+    {
+        const laguna_admission_result result =
+            laguna_prepare_chat_request(
+                hr.body, LAGUNA_PREPARE_INFERENCE, s->default_tokens,
+                ctx_size, laguna_engine_tokenize, s->engine, &req);
+        if (result.legacy_model_semantics) {
+            /* Exact replay and thinking aliases retain their established
+             * stateful parser.  The v1 pure/no-thinking path deliberately uses
+             * canonical cold tokens; a future non-touch replay candidate may
+             * optimize those tokens in the worker without affecting admission. */
+            ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
+                                    ctx_size, &req, err, sizeof(err));
+        } else if (result.code != REQUEST_ADMISSION_FITS) {
+            (void)http_reject_token_admission(
+                fd, s->enable_cors, NULL, ctx_size, result.code);
+            http_request_free(&hr);
+            goto done;
+        } else {
+            ok = true;
+        }
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -13102,7 +14275,6 @@ static void *client_main(void *arg) {
         request_free(&req);
         goto done;
     }
-
     set_client_socket_nonblocking(fd);
     job j;
     memset(&j, 0, sizeof(j));
@@ -14280,6 +15452,195 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static bool test_laguna_fixed_tokenize(void *context,
+                                       const char *rendered_prompt,
+                                       ds4_tokens *tokens) {
+    const int count = context ? *(const int *)context : -1;
+    TEST_ASSERT(rendered_prompt != NULL);
+    if (!rendered_prompt || count < 0 || !tokens) return false;
+    for (int i = 0; i < count; i++) ds4_tokens_push(tokens, i);
+    return true;
+}
+
+static void test_laguna_prepare_omitted_output_resolves_after_tokenize(void) {
+    const char *body =
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
+    const int prompt_tokens = 12;
+    request prepared = {0};
+    const laguna_admission_result result = laguna_prepare_chat_request(
+        body, LAGUNA_PREPARE_INFERENCE, 393216, 16,
+        test_laguna_fixed_tokenize, (void *)&prompt_tokens, &prepared);
+    TEST_ASSERT(result.code == REQUEST_ADMISSION_FITS);
+    TEST_ASSERT(result.templated_input_tokens == 12);
+    TEST_ASSERT(result.requested_output_tokens == 4u);
+    TEST_ASSERT(prepared.prompt.len == 12);
+    TEST_ASSERT(prepared.max_tokens == 4);
+    TEST_ASSERT(!prepared.max_tokens_set);
+    TEST_ASSERT(request_prepare_token_admission(&prepared, 16) ==
+                REQUEST_ADMISSION_FITS);
+    TEST_ASSERT(prepared.max_tokens == 4);
+    request_free(&prepared);
+}
+
+static void test_laguna_prepare_omitted_model_requires_legacy_inference(void) {
+    const char *body =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"max_tokens\":4}";
+    const int prompt_tokens = 12;
+    request prepared = {0};
+    const laguna_admission_result inference = laguna_prepare_chat_request(
+        body, LAGUNA_PREPARE_INFERENCE, 393216, 16,
+        test_laguna_fixed_tokenize, (void *)&prompt_tokens, &prepared);
+    TEST_ASSERT(inference.code == REQUEST_ADMISSION_INVALID_REQUEST);
+    TEST_ASSERT(inference.legacy_model_semantics);
+    TEST_ASSERT(prepared.prompt.v == NULL);
+
+    const laguna_admission_result admission = laguna_prepare_chat_request(
+        body, LAGUNA_PREPARE_ADMISSION, 0, 16,
+        test_laguna_fixed_tokenize, (void *)&prompt_tokens, NULL);
+    TEST_ASSERT(admission.code == REQUEST_ADMISSION_INVALID_REQUEST);
+    TEST_ASSERT(!admission.legacy_model_semantics);
+}
+
+static void test_laguna_prepare_legacy_shapes_fallback_without_bypass(void) {
+    const char *legacy[] = {
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"max_completion_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"thinking\":{\"type\":\"disabled\"},\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"think\":false,\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"reasoning_effort\":\"none\",\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"stream_options\":null,\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"stream_options\":{\"include_usage\":true,\"legacy\":1},"
+        "\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"seed\":1.5,\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"seed\":1e3,\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[],\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"max_tokens\":4}",
+    };
+    const int prompt_tokens = 12;
+    for (size_t i = 0; i < sizeof(legacy) / sizeof(legacy[0]); i++) {
+        request prepared = {0};
+        const laguna_admission_result result = laguna_prepare_chat_request(
+            legacy[i], LAGUNA_PREPARE_INFERENCE, 393216, 16,
+            test_laguna_fixed_tokenize, (void *)&prompt_tokens, &prepared);
+        TEST_ASSERT(result.code == REQUEST_ADMISSION_INVALID_REQUEST);
+        TEST_ASSERT(result.legacy_model_semantics);
+        TEST_ASSERT(prepared.prompt.v == NULL);
+        request_free(&prepared);
+    }
+
+    const char *strict[] = {
+        "{\"model\":\"deepseek-v4-flash\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"max_completion_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"max_completion_tokens\":4,\"unexpected\":true}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"requested_output_tokens\":4,\"max_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"tool_choice\":\"required\",\"max_completion_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"tools\":[{\"type\":\"function\","
+        "\"function\":{\"parameters\":{\"type\":\"object\"}}}],"
+        "\"max_completion_tokens\":4}",
+    };
+    for (size_t i = 0; i < sizeof(strict) / sizeof(strict[0]); i++) {
+        request prepared = {0};
+        const laguna_admission_result result = laguna_prepare_chat_request(
+            strict[i], LAGUNA_PREPARE_INFERENCE, 393216, 16,
+            test_laguna_fixed_tokenize, (void *)&prompt_tokens, &prepared);
+        TEST_ASSERT(!result.legacy_model_semantics);
+        TEST_ASSERT(result.code != REQUEST_ADMISSION_FITS);
+        TEST_ASSERT(prepared.prompt.v == NULL);
+        request_free(&prepared);
+    }
+}
+
+static void test_laguna_prepare_structural_errors_keep_model_precedence(void) {
+    const char *body[] = {
+        "{\"model\":\"deepseek-v4-flash\","
+        "\"messages\":[{\"role\":\"user\",\"content\":true}],"
+        "\"requested_output_tokens\":8}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":true}],"
+        "\"requested_output_tokens\":8,"
+        "\"model\":\"deepseek-v4-flash\"}",
+        "{\"model\":\"deepseek-v4-flash\","
+        "\"tools\":[{\"type\":\"function\",\"function\":\"bad\"}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"requested_output_tokens\":8}",
+        "{\"tools\":[{\"type\":\"function\",\"function\":\"bad\"}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"requested_output_tokens\":8,"
+        "\"model\":\"deepseek-v4-flash\"}",
+    };
+    const int prompt_tokens = 12;
+    for (size_t i = 0; i < sizeof(body) / sizeof(body[0]); i++) {
+        const laguna_admission_result result = laguna_prepare_chat_request(
+            body[i], LAGUNA_PREPARE_ADMISSION, 0, 16,
+            test_laguna_fixed_tokenize, (void *)&prompt_tokens, NULL);
+        TEST_ASSERT(result.code == REQUEST_ADMISSION_MODEL_MISMATCH);
+        TEST_ASSERT(!result.legacy_model_semantics);
+    }
+}
+
+static void test_laguna_prepare_legacy_valid_messages_stay_pure(void) {
+    const char *body[] = {
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"developer\",\"content\":\"rules\"},"
+        "{\"role\":\"user\",\"name\":\"will\",\"content\":\"hello\"}],"
+        "\"requested_output_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"one\"},"
+        "{\"type\":\"text\",\"text\":\" two\"}]}],"
+        "\"requested_output_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"assistant\",\"content\":\"\","
+        "\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"get_weather\","
+        "\"arguments\":{\"city\":\"Brussels\"}}}]}],"
+        "\"requested_output_tokens\":4}",
+        "{\"model\":\"laguna-s-2.1-chat\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"tools\":null,\"requested_output_tokens\":4}",
+    };
+    const int prompt_tokens = 12;
+    for (size_t i = 0; i < sizeof(body) / sizeof(body[0]); i++) {
+        request prepared = {0};
+        const laguna_admission_result result = laguna_prepare_chat_request(
+            body[i], LAGUNA_PREPARE_ADMISSION, 0, 16,
+            test_laguna_fixed_tokenize, (void *)&prompt_tokens, &prepared);
+        TEST_ASSERT(result.code == REQUEST_ADMISSION_FITS);
+        TEST_ASSERT(!result.legacy_model_semantics);
+        TEST_ASSERT(prepared.prompt.len == 12);
+        request_free(&prepared);
+    }
 }
 
 static void test_request_admission_exact_boundary_is_pure(void) {
@@ -18546,6 +19907,11 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
+    test_laguna_prepare_omitted_output_resolves_after_tokenize();
+    test_laguna_prepare_omitted_model_requires_legacy_inference();
+    test_laguna_prepare_legacy_shapes_fallback_without_bypass();
+    test_laguna_prepare_structural_errors_keep_model_precedence();
+    test_laguna_prepare_legacy_valid_messages_stay_pure();
     test_request_admission_exact_boundary_is_pure();
     test_effective_prompt_admission_action_table();
     test_request_output_budget_is_cumulative_and_transactional();

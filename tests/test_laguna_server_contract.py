@@ -128,10 +128,13 @@ class Driver:
             raise
 
     def rpc(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.rpc_line(json.dumps(payload, separators=(",", ":")))
+
+    def rpc_line(self, payload: str) -> dict[str, Any]:
         if self.proc.stdin is None or self.proc.stdout is None:
             raise AssertionError("token-admission driver pipes are unavailable")
         try:
-            self.proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self.proc.stdin.write(payload + "\n")
             self.proc.stdin.flush()
         except BrokenPipeError:
             self._raise_missing_seam()
@@ -229,6 +232,28 @@ class AdmissionContract(unittest.TestCase):
         self.assertIsInstance(response["body"], dict)
         return response["http_status"], response["body"]
 
+    def request_raw(
+        self, path: str, body_json: str
+    ) -> tuple[int, dict[str, Any]]:
+        wire = (
+            '{"op":"request","method":"POST","path":'
+            + json.dumps(path, separators=(",", ":"))
+            + ',"body":'
+            + body_json
+            + "}"
+        )
+        response = self.driver.rpc_line(wire)
+        self.assertEqual(set(response), {"http_status", "body"})
+        self.assertIsInstance(response["http_status"], int)
+        self.assertIsInstance(response["body"], dict)
+        return response["http_status"], response["body"]
+
+    @staticmethod
+    def raw_object(fields: list[tuple[str, str]]) -> str:
+        return "{" + ",".join(
+            json.dumps(key) + ":" + value for key, value in fields
+        ) + "}"
+
     def assert_result_shape(self, result: dict[str, Any]) -> None:
         self.assertEqual(set(result), RESULT_KEYS)
         self.assertEqual(result["schema"], SCHEMA)
@@ -261,6 +286,21 @@ class AdmissionContract(unittest.TestCase):
         )
         self.assert_result_shape(result)
         return status, result
+
+    def assert_accepted_with_parity(self, body: dict[str, Any]) -> dict[str, Any]:
+        before = self.snapshot()
+        admission_status, admission = self.admission(body)
+        after_admission = self.snapshot()
+        inference_status, inference = self.inference(body)
+        after_inference = self.snapshot()
+        self.assertEqual(admission_status, 200)
+        self.assertEqual(inference_status, 200)
+        self.assertTrue(admission["fits"])
+        self.assertIsNone(admission["rejection_code"])
+        self.assertEqual(inference, admission)
+        self.assertEqual(after_admission, before)
+        self.assertEqual(after_inference, before)
+        return admission
 
     def assert_rejected(
         self, body: dict[str, Any], code: str
@@ -304,6 +344,35 @@ class AdmissionContract(unittest.TestCase):
         self.assertEqual(result["rejection_code"], code)
         self.assertEqual(after, before)
         return result
+
+    def assert_raw_rejected(
+        self,
+        admission_body: str,
+        inference_body: str,
+        code: str,
+    ) -> dict[str, Any]:
+        before = self.snapshot()
+        admission_status, admission = self.request_raw(
+            "/v1/token-admission", admission_body
+        )
+        after_admission = self.snapshot()
+        inference_status, inference = self.request_raw(
+            "/v1/chat/completions", inference_body
+        )
+        after_inference = self.snapshot()
+        for status, result in (
+            (admission_status, admission),
+            (inference_status, inference),
+        ):
+            self.assertGreaterEqual(status, 400)
+            self.assertLess(status, 500)
+            self.assert_result_shape(result)
+            self.assertFalse(result["fits"])
+            self.assertEqual(result["rejection_code"], code)
+        self.assertEqual(inference, admission)
+        self.assertEqual(after_admission, before)
+        self.assertEqual(after_inference, before)
+        return admission
 
     def test_exact_fit_and_one_token_overflow_are_not_clamped(self) -> None:
         probe_body = _chat_body(requested_output_tokens=1)
@@ -363,6 +432,63 @@ class AdmissionContract(unittest.TestCase):
         self.assertEqual(admission["template_revision"], TEMPLATE_REVISION)
         self.assertEqual(inference, admission)
 
+    def test_inference_omitted_limit_resolves_exact_policy_count(self) -> None:
+        before = self.snapshot()
+        status, result = self.request(
+            "/v1/chat/completions",
+            _chat_body(model=INPUT_MODEL),
+        )
+        self.assertEqual(self.snapshot(), before)
+        self.assert_result_shape(result)
+        self.assertEqual(status, 200)
+        self.assertTrue(result["fits"])
+        self.assertIsNone(result["rejection_code"])
+        self.assertGreater(result["requested_output_tokens"], 0)
+        self.assertEqual(
+            result["requested_output_tokens"],
+            CONTEXT_TOKENS - result["templated_input_tokens"],
+            "omitted inference limit was not resolved to one exact policy count",
+        )
+
+    def test_native_nothink_template_alias_policy_is_explicit(self) -> None:
+        accepted_aliases = (
+            INPUT_MODEL,
+            "laguna-s-2.1-no-think",
+            "laguna-s-2.1-nothink",
+        )
+        for alias in accepted_aliases:
+            with self.subTest(alias=alias, policy="accepted"):
+                admission_status, admission = self.admission(
+                    _chat_body(model=alias, requested_output_tokens=8)
+                )
+                inference_status, inference = self.inference(
+                    _chat_body(model=alias, requested_output_tokens=8)
+                )
+                self.assertEqual(admission_status, 200)
+                self.assertEqual(inference_status, 200)
+                self.assertTrue(admission["fits"])
+                self.assertEqual(admission["model"], MODEL)
+                self.assertEqual(
+                    admission["template_revision"], TEMPLATE_REVISION
+                )
+                self.assertEqual(inference, admission)
+
+        semantic_changing_aliases = (
+            MODEL,
+            "laguna-s-2.1-reasoner",
+            "poolside/laguna-s-2.1",
+        )
+        for alias in semantic_changing_aliases:
+            with self.subTest(alias=alias, policy="rejected"):
+                result = self.assert_rejected(
+                    _chat_body(model=alias, requested_output_tokens=8),
+                    "invalid_request",
+                )
+                self.assertEqual(result["model"], MODEL)
+                self.assertEqual(
+                    result["template_revision"], TEMPLATE_REVISION
+                )
+
     def test_invalid_output_token_numbers_have_stable_rejection(self) -> None:
         for value in (0, -1, 1.5):
             with self.subTest(value=value):
@@ -402,6 +528,326 @@ class AdmissionContract(unittest.TestCase):
             _chat_body(requested_output_tokens=8, unexpected_extension=True),
             "invalid_request",
         )
+
+    def test_developer_role_is_accepted_with_endpoint_parity(self) -> None:
+        result = self.assert_accepted_with_parity(
+            _chat_body(
+                messages=[
+                    {
+                        "role": "developer",
+                        "content": "Answer with one short sentence.",
+                    },
+                    {"role": "user", "content": "Say hello."},
+                ],
+                requested_output_tokens=8,
+            )
+        )
+        self.assertGreater(result["templated_input_tokens"], 0)
+
+    def test_optional_message_name_is_accepted_without_token_difference(self) -> None:
+        unnamed = self.assert_accepted_with_parity(
+            _chat_body(
+                messages=[{"role": "user", "content": "Say hello."}],
+                requested_output_tokens=8,
+            )
+        )
+        named = self.assert_accepted_with_parity(
+            _chat_body(
+                messages=[
+                    {"role": "user", "name": "operator", "content": "Say hello."}
+                ],
+                requested_output_tokens=8,
+            )
+        )
+        self.assertEqual(
+            named["templated_input_tokens"],
+            unnamed["templated_input_tokens"],
+        )
+
+    def test_strict_text_content_array_is_accepted_with_endpoint_parity(self) -> None:
+        structured = self.assert_accepted_with_parity(
+            _chat_body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Say"},
+                            {"type": "text", "text": " hello."},
+                        ],
+                    }
+                ],
+                requested_output_tokens=8,
+            )
+        )
+        flattened = self.assert_accepted_with_parity(
+            _chat_body(
+                messages=[{"role": "user", "content": "Say hello."}],
+                requested_output_tokens=8,
+            )
+        )
+        self.assertEqual(
+            structured["templated_input_tokens"],
+            flattened["templated_input_tokens"],
+        )
+
+        malformed_or_nontext = (
+            [{"type": "text"}],
+            [{"type": "text", "text": 7}],
+            [{"text": "missing type"}],
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.invalid/image.png"},
+                }
+            ],
+            ["bare string part"],
+            [7],
+            [{"type": "text", "text": "extra field", "extra": True}],
+        )
+        for content in malformed_or_nontext:
+            with self.subTest(content=content):
+                self.assert_rejected(
+                    _chat_body(
+                        messages=[{"role": "user", "content": content}],
+                        requested_output_tokens=8,
+                    ),
+                    "invalid_request",
+                )
+
+    def test_tool_call_arguments_object_matches_string_form(self) -> None:
+        def body_with_arguments(arguments: str | dict[str, str]) -> dict[str, Any]:
+            return _chat_body(
+                messages=[
+                    {"role": "user", "content": "Check Brussels weather."},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_arguments_object",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_arguments_object",
+                        "content": "12 C and cloudy",
+                    },
+                ],
+                requested_output_tokens=8,
+            )
+
+        object_result = self.assert_accepted_with_parity(
+            body_with_arguments({"city": "Brussels"})
+        )
+        string_result = self.assert_accepted_with_parity(
+            body_with_arguments('{"city":"Brussels"}')
+        )
+        self.assertEqual(
+            object_result["templated_input_tokens"],
+            string_result["templated_input_tokens"],
+        )
+
+    def test_null_tools_are_treated_as_an_empty_tool_list(self) -> None:
+        null_tools = self.assert_accepted_with_parity(
+            _chat_body(tools=None, requested_output_tokens=8)
+        )
+        empty_tools = self.assert_accepted_with_parity(
+            _chat_body(tools=[], requested_output_tokens=8)
+        )
+        self.assertEqual(null_tools, empty_tools)
+
+    def test_nested_message_content_must_have_a_supported_shape(self) -> None:
+        malformed_content = (True, 7, {"text": "not a content block"})
+        for content in malformed_content:
+            with self.subTest(content=content):
+                self.assert_rejected(
+                    _chat_body(
+                        messages=[{"role": "user", "content": content}],
+                        requested_output_tokens=8,
+                    ),
+                    "invalid_request",
+                )
+
+    def test_message_role_is_required_unique_and_known(self) -> None:
+        for message in (
+            {"content": "missing role"},
+            {"role": "moderator", "content": "bogus role"},
+        ):
+            with self.subTest(message=message):
+                self.assert_rejected(
+                    _chat_body(messages=[message], requested_output_tokens=8),
+                    "invalid_request",
+                )
+
+        duplicate_role_messages = (
+            '[{"role":"user","role":"assistant","content":"duplicate"}]'
+        )
+        admission = self.raw_object(
+            [
+                ("model", json.dumps(INPUT_MODEL)),
+                ("messages", duplicate_role_messages),
+                ("requested_output_tokens", "8"),
+            ]
+        )
+        inference = self.raw_object(
+            [
+                ("model", json.dumps(INPUT_MODEL)),
+                ("messages", duplicate_role_messages),
+                ("max_tokens", "8"),
+            ]
+        )
+        self.assert_raw_rejected(admission, inference, "invalid_request")
+
+    def test_assistant_tool_calls_must_be_complete_and_unique(self) -> None:
+        incomplete_calls = (
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"},
+            },
+            {
+                "id": "call_missing_type",
+                "function": {"name": "get_weather", "arguments": "{}"},
+            },
+            {
+                "id": "call_missing_name",
+                "type": "function",
+                "function": {"arguments": "{}"},
+            },
+            {
+                "id": "call_missing_arguments",
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+        )
+        for tool_call in incomplete_calls:
+            with self.subTest(tool_call=tool_call):
+                self.assert_rejected(
+                    _chat_body(
+                        messages=[
+                            {"role": "user", "content": "Use the tool."},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [tool_call],
+                            },
+                        ],
+                        requested_output_tokens=8,
+                    ),
+                    "invalid_request",
+                )
+
+        complete_call = (
+            '[{"id":"call_duplicate","type":"function",'
+            '"function":{"name":"get_weather","arguments":"{}"}}]'
+        )
+        duplicate_tool_calls_messages = (
+            '[{"role":"assistant","content":"",'
+            '"tool_calls":'
+            + complete_call
+            + ',"tool_calls":'
+            + complete_call
+            + "}]"
+        )
+        admission = self.raw_object(
+            [
+                ("model", json.dumps(INPUT_MODEL)),
+                ("messages", duplicate_tool_calls_messages),
+                ("requested_output_tokens", "8"),
+            ]
+        )
+        inference = self.raw_object(
+            [
+                ("model", json.dumps(INPUT_MODEL)),
+                ("messages", duplicate_tool_calls_messages),
+                ("max_tokens", "8"),
+            ]
+        )
+        self.assert_raw_rejected(admission, inference, "invalid_request")
+
+    def test_rejection_precedence_is_independent_of_field_order(self) -> None:
+        normal_messages = '[{"role":"user","content":"hello"}]'
+        oversized_messages = json.dumps(
+            [{"role": "user", "content": "overflow " * CONTEXT_TOKENS}],
+            separators=(",", ":"),
+        )
+        precedence_cases: tuple[
+            tuple[str, list[tuple[str, str]], str], ...
+        ] = (
+            (
+                "model_mismatch_over_invalid_output_tokens",
+                [("model", '"deepseek-v4-flash"'), ("__output__", "0")],
+                "model_mismatch",
+            ),
+            (
+                "model_mismatch_over_invalid_request",
+                [("model", '"deepseek-v4-flash"'), ("unexpected", "true")],
+                "model_mismatch",
+            ),
+            (
+                "invalid_request_over_unsupported_tool_choice",
+                [("unexpected", "true"), ("tool_choice", '"required"')],
+                "invalid_request",
+            ),
+            (
+                "invalid_request_over_invalid_output_tokens",
+                [("unexpected", "true"), ("__output__", "0")],
+                "invalid_request",
+            ),
+            (
+                "unsupported_tool_choice_over_invalid_output_tokens",
+                [("tool_choice", '"required"'), ("__output__", "0")],
+                "unsupported_tool_choice",
+            ),
+            (
+                "unsupported_tool_choice_over_context_overflow",
+                [
+                    ("tool_choice", '"required"'),
+                    ("__output__", str(CONTEXT_TOKENS)),
+                ],
+                "unsupported_tool_choice",
+            ),
+            (
+                "invalid_output_tokens_over_context_overflow",
+                [("__output__", "0"), ("messages", oversized_messages)],
+                "invalid_output_tokens",
+            ),
+        )
+
+        def body_for(
+            conflicts: list[tuple[str, str]], output_field: str
+        ) -> str:
+            fields = [
+                (output_field if key == "__output__" else key, value)
+                for key, value in conflicts
+            ]
+            keys = {key for key, _ in fields}
+            if "model" not in keys:
+                fields.append(("model", json.dumps(INPUT_MODEL)))
+            if "messages" not in keys:
+                fields.append(("messages", normal_messages))
+            if output_field not in keys:
+                fields.append((output_field, "8"))
+            return self.raw_object(fields)
+
+        for name, conflicts, expected in precedence_cases:
+            for order, ordered_conflicts in (
+                ("forward", conflicts),
+                ("reverse", list(reversed(conflicts))),
+            ):
+                with self.subTest(case=name, order=order):
+                    self.assert_raw_rejected(
+                        body_for(
+                            ordered_conflicts, "requested_output_tokens"
+                        ),
+                        body_for(ordered_conflicts, "max_tokens"),
+                        expected,
+                    )
 
     def test_output_field_mapping_is_endpoint_specific(self) -> None:
         admission_wrong = _chat_body(max_tokens=8)

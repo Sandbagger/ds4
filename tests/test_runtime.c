@@ -10,12 +10,15 @@
 
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int g_assertions;
@@ -1136,6 +1139,68 @@ static ds4_runtime_wire_snapshot_input wire_input(void) {
     return input;
 }
 
+enum {
+    WIRE_CAPTURE_THREAD_COUNT = 4,
+    WIRE_CAPTURES_PER_THREAD = 1024,
+    WIRE_CAPTURE_TOTAL =
+        WIRE_CAPTURE_THREAD_COUNT * WIRE_CAPTURES_PER_THREAD,
+};
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    size_t ready_count;
+    bool start;
+    ds4_runtime_snapshot_context *context;
+    const ds4_runtime_tracker *tracker;
+    const ds4_runtime_wire_snapshot_input *input;
+} wire_capture_gate;
+
+typedef struct {
+    wire_capture_gate *gate;
+    uint64_t sequences[WIRE_CAPTURES_PER_THREAD];
+    bool ok;
+} wire_capture_worker;
+
+static void *wire_capture_thread(void *opaque) {
+    wire_capture_worker *worker = (wire_capture_worker *)opaque;
+    wire_capture_gate *gate = worker->gate;
+    worker->ok = false;
+    if (pthread_mutex_lock(&gate->mutex) != 0) return NULL;
+    gate->ready_count++;
+    pthread_cond_broadcast(&gate->condition);
+    while (!gate->start) {
+        if (pthread_cond_wait(&gate->condition, &gate->mutex) != 0) {
+            pthread_mutex_unlock(&gate->mutex);
+            return NULL;
+        }
+    }
+    pthread_mutex_unlock(&gate->mutex);
+
+    for (size_t i = 0; i < WIRE_CAPTURES_PER_THREAD; i++) {
+        ds4_runtime_wire_snapshot snapshot;
+        if (!ds4_runtime_wire_snapshot_capture(
+                gate->context, gate->tracker, gate->input, &snapshot)) {
+            return NULL;
+        }
+        worker->sequences[i] = snapshot.snapshot_seq;
+        sched_yield();
+    }
+    worker->ok = true;
+    return NULL;
+}
+
+static bool read_exact_bytes(int fd, void *buffer, size_t bytes) {
+    uint8_t *output = (uint8_t *)buffer;
+    size_t received = 0;
+    while (received < bytes) {
+        const ssize_t result = read(fd, output + received, bytes - received);
+        if (result <= 0) return false;
+        received += (size_t)result;
+    }
+    return true;
+}
+
 static bool uuid_shape_valid(const char *uuid) {
     static const size_t hyphens[] = {8u, 13u, 18u, 23u};
     bool nonzero = false;
@@ -1380,6 +1445,165 @@ static void test_runtime_wire_snapshot(void) {
               saturated.snapshot_seq == UINT64_MAX &&
               context.next_snapshot_seq == UINT64_MAX,
           "runtime snapshot sequence saturates instead of wrapping");
+
+    ds4_runtime_snapshot_context invalid_context = context;
+    memcpy(invalid_context.instance_id, "x", sizeof("x"));
+    invalid_context.next_snapshot_seq = 41u;
+    ds4_runtime_wire_snapshot invalid_snapshot = first;
+    memcpy(invalid_snapshot.instance_id, "x", sizeof("x"));
+    char invalid_json[DS4_RUNTIME_JSON_CAPACITY];
+    size_t invalid_json_length = 77u;
+    CHECK(!ds4_runtime_wire_snapshot_capture(
+              &invalid_context, &tracker, &input, &invalid_snapshot) &&
+              invalid_context.next_snapshot_seq == 41u,
+          "capture rejects a noncanonical process UUID without consuming sequence");
+    CHECK(!ds4_runtime_wire_snapshot_json(
+              &invalid_snapshot, invalid_json, sizeof(invalid_json),
+              &invalid_json_length) &&
+              invalid_json_length == 0u,
+          "serializer rejects a noncanonical process UUID");
+
+    ds4_runtime_snapshot_context invalid_utf8_context = context;
+    invalid_utf8_context.next_snapshot_seq = 42u;
+    invalid_utf8_context.model_id[0] = (char)0x80;
+    invalid_utf8_context.model_id[1] = '\0';
+    CHECK(!ds4_runtime_wire_snapshot_capture(
+              &invalid_utf8_context, &tracker, &input, &invalid_snapshot) &&
+              invalid_utf8_context.next_snapshot_seq == 42u,
+          "capture rejects invalid UTF-8 model identity transactionally");
+    invalid_snapshot = first;
+    invalid_snapshot.model_family[0] = (char)0xc0;
+    invalid_snapshot.model_family[1] = (char)0x80;
+    invalid_snapshot.model_family[2] = '\0';
+    invalid_json_length = 77u;
+    CHECK(!ds4_runtime_wire_snapshot_json(
+              &invalid_snapshot, invalid_json, sizeof(invalid_json),
+              &invalid_json_length) &&
+              invalid_json_length == 0u,
+          "serializer rejects overlong UTF-8 instead of emitting invalid JSON bytes");
+
+    ds4_runtime_snapshot_context invalid_violation_context = context;
+    invalid_violation_context.next_snapshot_seq = 43u;
+    tracker.violation = (ds4_runtime_violation)999;
+    const ds4_runtime_snapshot_context invalid_violation_before =
+        invalid_violation_context;
+    memset(&invalid_snapshot, 0xa5, sizeof(invalid_snapshot));
+    const ds4_runtime_wire_snapshot invalid_snapshot_before = invalid_snapshot;
+    CHECK(!ds4_runtime_wire_snapshot_capture(
+              &invalid_violation_context, &tracker, &input,
+              &invalid_snapshot) &&
+              memcmp(&invalid_violation_context,
+                     &invalid_violation_before,
+                     sizeof(invalid_violation_context)) == 0 &&
+              memcmp(&invalid_snapshot, &invalid_snapshot_before,
+                     sizeof(invalid_snapshot)) == 0,
+          "invalid violation enum fails without consuming sequence or mutating outputs");
+    tracker.violation = DS4_RUNTIME_VIOLATION_OVERFLOW;
+
+    ds4_runtime_snapshot_context forced_unsafe_context = context;
+    forced_unsafe_context.next_snapshot_seq = 44u;
+    input.state = DS4_RUNTIME_WIRE_STATE_READY;
+    ds4_runtime_wire_snapshot forced_unsafe;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &forced_unsafe_context, &tracker, &input, &forced_unsafe) &&
+              forced_unsafe.state == DS4_RUNTIME_WIRE_STATE_UNSAFE &&
+              forced_unsafe.violation_count >= 1u,
+          "any latched hard violation forces the wire snapshot state unsafe");
+
+    tracker.violation = DS4_RUNTIME_VIOLATION_NONE;
+    ds4_runtime_snapshot_context concurrent_context = peer_context;
+    concurrent_context.next_snapshot_seq = 1u;
+    input.state = DS4_RUNTIME_WIRE_STATE_READY;
+    wire_capture_gate gate;
+    memset(&gate, 0, sizeof(gate));
+    CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0 &&
+              pthread_cond_init(&gate.condition, NULL) == 0,
+          "concurrent runtime capture gate initializes");
+    gate.context = &concurrent_context;
+    gate.tracker = &tracker;
+    gate.input = &input;
+    pthread_t capture_threads[WIRE_CAPTURE_THREAD_COUNT];
+    wire_capture_worker capture_workers[WIRE_CAPTURE_THREAD_COUNT];
+    size_t capture_threads_started = 0u;
+    for (size_t i = 0; i < WIRE_CAPTURE_THREAD_COUNT; i++) {
+        memset(&capture_workers[i], 0, sizeof(capture_workers[i]));
+        capture_workers[i].gate = &gate;
+        if (pthread_create(
+                &capture_threads[i], NULL, wire_capture_thread,
+                &capture_workers[i]) != 0) {
+            break;
+        }
+        capture_threads_started++;
+    }
+    if (pthread_mutex_lock(&gate.mutex) == 0) {
+        while (gate.ready_count < capture_threads_started) {
+            if (pthread_cond_wait(&gate.condition, &gate.mutex) != 0) break;
+        }
+        gate.start = true;
+        pthread_cond_broadcast(&gate.condition);
+        pthread_mutex_unlock(&gate.mutex);
+    }
+    bool captures_joined =
+        capture_threads_started == WIRE_CAPTURE_THREAD_COUNT;
+    for (size_t i = 0; i < capture_threads_started; i++) {
+        if (pthread_join(capture_threads[i], NULL) != 0 ||
+            !capture_workers[i].ok) {
+            captures_joined = false;
+        }
+    }
+    bool sequence_seen[WIRE_CAPTURE_TOTAL + 1u];
+    memset(sequence_seen, 0, sizeof(sequence_seen));
+    bool unique_sequences = captures_joined;
+    for (size_t i = 0; i < capture_threads_started; i++) {
+        for (size_t j = 0; j < WIRE_CAPTURES_PER_THREAD; j++) {
+            const uint64_t sequence = capture_workers[i].sequences[j];
+            if (sequence == 0u || sequence > WIRE_CAPTURE_TOTAL ||
+                sequence_seen[sequence]) {
+                unique_sequences = false;
+            } else {
+                sequence_seen[sequence] = true;
+            }
+        }
+    }
+    CHECK(unique_sequences && concurrent_context.next_snapshot_seq ==
+              (uint64_t)WIRE_CAPTURE_TOTAL + 1u,
+          "concurrent captures serialize one unique monotonic process sequence");
+    pthread_cond_destroy(&gate.condition);
+    pthread_mutex_destroy(&gate.mutex);
+
+    int fork_pipe[2] = {-1, -1};
+    CHECK(pipe(fork_pipe) == 0,
+          "fork UUID fixture creates an identity pipe");
+    if (fork_pipe[0] >= 0 && fork_pipe[1] >= 0) {
+        const pid_t child = fork();
+        if (child == 0) {
+            close(fork_pipe[0]);
+            ds4_runtime_snapshot_context child_context;
+            const bool initialized = ds4_runtime_snapshot_context_init(
+                &child_context, model_fd, "laguna-s-2.1", "laguna");
+            const bool written = initialized &&
+                write(fork_pipe[1], child_context.instance_id,
+                      sizeof(child_context.instance_id)) ==
+                    (ssize_t)sizeof(child_context.instance_id);
+            close(fork_pipe[1]);
+            _exit(written ? 0 : 1);
+        }
+        close(fork_pipe[1]);
+        fork_pipe[1] = -1;
+        char child_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY] = {0};
+        const bool child_identity_read = child > 0 && read_exact_bytes(
+            fork_pipe[0], child_instance_id, sizeof(child_instance_id));
+        int child_status = 0;
+        const bool child_reaped = child > 0 &&
+            waitpid(child, &child_status, 0) == child &&
+            WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
+        CHECK(child_identity_read && child_reaped &&
+                  uuid_shape_valid(child_instance_id) &&
+                  strcmp(child_instance_id, context.instance_id) != 0,
+              "a forked process regenerates a distinct process-lifetime UUID");
+        close(fork_pipe[0]);
+        fork_pipe[0] = -1;
+    }
 
     close(model_fd);
     unlink(model_path);

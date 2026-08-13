@@ -551,7 +551,10 @@ bool ds4_runtime_snapshot_context_init(
     const char *model_family);
 
 /* Copy tracker, cache, page, and configuration facts into one coherent wire
- * value. Sequence numbers begin at one and saturate at UINT64_MAX. */
+ * value. Calls sharing a context serialize its sequence/history internally;
+ * the caller must hold the tracker/counter snapshot boundary quiescent for the
+ * duration of this call. Sequence numbers begin at one and saturate at
+ * UINT64_MAX. */
 bool ds4_runtime_wire_snapshot_capture(
     ds4_runtime_snapshot_context *context,
     const ds4_runtime_tracker *tracker,

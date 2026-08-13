@@ -72,8 +72,11 @@ static bool runtime_executable_identity_capture(
 }
 
 static pthread_once_t runtime_instance_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t runtime_instance_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t runtime_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char runtime_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
 static bool runtime_instance_id_valid;
+static pid_t runtime_instance_pid;
 
 static void runtime_instance_id_initialize(void) {
     uint8_t bytes[16];
@@ -106,6 +109,7 @@ static void runtime_instance_id_initialize(void) {
     }
     runtime_instance_id[output] = '\0';
     runtime_instance_id_valid = output == 36u;
+    runtime_instance_pid = getpid();
 }
 
 static bool add_u64(uint64_t a, uint64_t b, uint64_t *out) {
@@ -2022,6 +2026,66 @@ static bool runtime_wire_text_length(
     return false;
 }
 
+static bool runtime_wire_uuid_valid(
+        const char uuid[DS4_RUNTIME_INSTANCE_ID_CAPACITY]) {
+    bool nonzero = false;
+    for (size_t i = 0; i < 36u; i++) {
+        const bool hyphen = i == 8u || i == 13u || i == 18u || i == 23u;
+        const char byte = uuid[i];
+        if (hyphen) {
+            if (byte != '-') return false;
+        } else {
+            if (!((byte >= '0' && byte <= '9') ||
+                  (byte >= 'a' && byte <= 'f'))) {
+                return false;
+            }
+            if (byte != '0') nonzero = true;
+        }
+    }
+    return uuid[36] == '\0' && nonzero;
+}
+
+static bool runtime_wire_utf8_valid(const char *text, size_t length) {
+    size_t i = 0;
+    while (i < length) {
+        const uint8_t first = (uint8_t)text[i];
+        if (first <= 0x7fu) {
+            i++;
+            continue;
+        }
+        size_t continuation_count = 0u;
+        uint32_t codepoint = 0u;
+        uint32_t minimum = 0u;
+        if (first >= 0xc2u && first <= 0xdfu) {
+            continuation_count = 1u;
+            codepoint = first & 0x1fu;
+            minimum = 0x80u;
+        } else if (first >= 0xe0u && first <= 0xefu) {
+            continuation_count = 2u;
+            codepoint = first & 0x0fu;
+            minimum = 0x800u;
+        } else if (first >= 0xf0u && first <= 0xf4u) {
+            continuation_count = 3u;
+            codepoint = first & 0x07u;
+            minimum = 0x10000u;
+        } else {
+            return false;
+        }
+        if (continuation_count > length - i - 1u) return false;
+        for (size_t j = 1u; j <= continuation_count; j++) {
+            const uint8_t continuation = (uint8_t)text[i + j];
+            if ((continuation & 0xc0u) != 0x80u) return false;
+            codepoint = (codepoint << 6u) | (continuation & 0x3fu);
+        }
+        if (codepoint < minimum || codepoint > 0x10ffffu ||
+            (codepoint >= 0xd800u && codepoint <= 0xdfffu)) {
+            return false;
+        }
+        i += continuation_count + 1u;
+    }
+    return true;
+}
+
 static bool runtime_wire_model_text(
         const char *text, size_t capacity, size_t *length_out) {
     size_t length = 0;
@@ -2030,6 +2094,7 @@ static bool runtime_wire_model_text(
         const unsigned char byte = (unsigned char)text[i];
         if (byte <= 0x20u || byte == 0x7fu) return false;
     }
+    if (!runtime_wire_utf8_valid(text, length)) return false;
     if (length_out) *length_out = length;
     return true;
 }
@@ -2155,13 +2220,27 @@ bool ds4_runtime_snapshot_context_init(
     memset(&staged, 0, sizeof(staged));
     if (pthread_once(
             &runtime_instance_once, runtime_instance_id_initialize) != 0 ||
-        !runtime_instance_id_valid ||
+        pthread_mutex_lock(&runtime_instance_mutex) != 0) {
+        return false;
+    }
+    if (runtime_instance_pid != getpid()) {
+        memset(runtime_instance_id, 0, sizeof(runtime_instance_id));
+        runtime_instance_id_valid = false;
+        runtime_instance_pid = 0;
+        runtime_instance_id_initialize();
+    }
+    const bool instance_valid = runtime_instance_id_valid &&
+        runtime_wire_uuid_valid(runtime_instance_id);
+    if (instance_valid) {
+        memcpy(staged.instance_id, runtime_instance_id,
+               sizeof(staged.instance_id));
+    }
+    pthread_mutex_unlock(&runtime_instance_mutex);
+    if (!instance_valid ||
         !runtime_executable_identity_capture(&staged.executable) ||
         !runtime_file_identity_capture(opened_model_fd, &staged.model)) {
         return false;
     }
-    memcpy(staged.instance_id, runtime_instance_id,
-           sizeof(staged.instance_id));
     memcpy(staged.model_id, model_id, id_length + 1u);
     memcpy(staged.model_family, model_family, family_length + 1u);
     staged.next_snapshot_seq = 1u;
@@ -2178,16 +2257,41 @@ static bool runtime_wire_violation_present(
     return false;
 }
 
+static bool runtime_wire_violation_valid(ds4_runtime_violation violation) {
+    return violation >= DS4_RUNTIME_VIOLATION_NONE &&
+        violation <= DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION;
+}
+
 bool ds4_runtime_wire_snapshot_capture(
         ds4_runtime_snapshot_context *context,
         const ds4_runtime_tracker *tracker,
         const ds4_runtime_wire_snapshot_input *input,
         ds4_runtime_wire_snapshot *snapshot) {
     if (!context || !tracker || !snapshot ||
-        context->next_snapshot_seq == 0u ||
-        context->violation_count > DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY ||
         !runtime_wire_input_valid(input)) {
         return false;
+    }
+    if (pthread_mutex_lock(&runtime_snapshot_mutex) != 0) return false;
+    if (context->next_snapshot_seq == 0u ||
+        !runtime_wire_uuid_valid(context->instance_id) ||
+        !runtime_wire_model_text(
+            context->model_id, sizeof(context->model_id), NULL) ||
+        !runtime_wire_model_text(
+            context->model_family, sizeof(context->model_family), NULL) ||
+        context->violation_count > DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY ||
+        !runtime_wire_violation_valid(tracker->violation)) {
+        pthread_mutex_unlock(&runtime_snapshot_mutex);
+        return false;
+    }
+    for (size_t i = 0; i < context->violation_count; i++) {
+        if (context->violations[i].code == DS4_RUNTIME_VIOLATION_NONE ||
+            !runtime_wire_violation_valid(context->violations[i].code) ||
+            context->violations[i].latched_snapshot_seq == 0u ||
+            context->violations[i].latched_snapshot_seq >
+                context->next_snapshot_seq) {
+            pthread_mutex_unlock(&runtime_snapshot_mutex);
+            return false;
+        }
     }
     ds4_runtime_snapshot_context staged_context = *context;
     const uint64_t sequence = staged_context.next_snapshot_seq;
@@ -2196,6 +2300,7 @@ bool ds4_runtime_wire_snapshot_capture(
             &staged_context, tracker->violation)) {
         if (staged_context.violation_count >=
             DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY) {
+            pthread_mutex_unlock(&runtime_snapshot_mutex);
             return false;
         }
         staged_context.violations[staged_context.violation_count++] =
@@ -2210,7 +2315,10 @@ bool ds4_runtime_wire_snapshot_capture(
     memcpy(staged_snapshot.instance_id, staged_context.instance_id,
            sizeof(staged_snapshot.instance_id));
     staged_snapshot.snapshot_seq = sequence;
-    staged_snapshot.state = input->state;
+    staged_snapshot.state = tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+            staged_context.violation_count != 0u
+        ? DS4_RUNTIME_WIRE_STATE_UNSAFE
+        : input->state;
     staged_snapshot.build = input->build;
     staged_snapshot.executable = staged_context.executable;
     staged_snapshot.model = staged_context.model;
@@ -2252,6 +2360,7 @@ bool ds4_runtime_wire_snapshot_capture(
     }
     *context = staged_context;
     *snapshot = staged_snapshot;
+    pthread_mutex_unlock(&runtime_snapshot_mutex);
     return true;
 }
 
@@ -2437,8 +2546,7 @@ bool ds4_runtime_wire_snapshot_json(
             snapshot->model_id, sizeof(snapshot->model_id), &ignored) ||
         !runtime_wire_model_text(
             snapshot->model_family, sizeof(snapshot->model_family), &ignored) ||
-        !runtime_wire_text_length(
-            snapshot->instance_id, sizeof(snapshot->instance_id), &ignored) ||
+        !runtime_wire_uuid_valid(snapshot->instance_id) ||
         snapshot->configured_context_tokens == 0u ||
         snapshot->configured_prefill_chunk_tokens == 0u ||
         snapshot->configured_session_slots == 0u ||

@@ -2050,6 +2050,51 @@ static void test_request_metrics_saturation_and_validation(void) {
               memcmp(&after_advice, &request, sizeof(request)) == 0,
           "final advice is one-shot and forbids later output or accounting mutation");
 
+    ds4_runtime_request_context projected_visibility;
+    CHECK(ds4_runtime_request_begin(&projected_visibility, 100u) &&
+              ds4_runtime_request_set_prompt_tokens(
+                  &projected_visibility, 3u) &&
+              ds4_runtime_request_mark_prefill_started(
+                  &projected_visibility, 110u) &&
+              ds4_runtime_request_mark_prefill_complete(
+                  &projected_visibility, 120u) &&
+              ds4_runtime_request_add_generated_tokens(
+                  &projected_visibility, 6u) &&
+              ds4_runtime_request_observe_page_advice(
+                  &projected_visibility, 190u),
+          "deferred visibility fixture interleaves page advice after decode");
+    const ds4_runtime_request_context before_bad_window =
+        projected_visibility;
+    CHECK(!ds4_runtime_request_publish_visible_decode_window(
+              &projected_visibility, 0u, 130u, 180u) &&
+              !ds4_runtime_request_publish_visible_decode_window(
+                  &projected_visibility, 7u, 130u, 180u) &&
+              !ds4_runtime_request_publish_visible_decode_window(
+                  &projected_visibility, 2u, 119u, 180u) &&
+              !ds4_runtime_request_publish_visible_decode_window(
+                  &projected_visibility, 2u, 180u, 170u) &&
+              memcmp(&projected_visibility, &before_bad_window,
+                     sizeof(projected_visibility)) == 0,
+          "invalid deferred visibility windows fail transactionally");
+    CHECK(ds4_runtime_request_publish_visible_decode_window(
+              &projected_visibility, 2u, 130u, 180u) &&
+              projected_visibility.visible_generated_tokens == 2u &&
+              projected_visibility.first_visible_decode_monotonic_ns == 130u &&
+              projected_visibility.last_visible_decode_monotonic_ns == 180u,
+          "one-shot projection publishes historical visibility after later advice");
+    const ds4_runtime_request_context after_projected_visibility =
+        projected_visibility;
+    CHECK(!ds4_runtime_request_publish_visible_decode_window(
+              &projected_visibility, 2u, 130u, 180u) &&
+              memcmp(&projected_visibility, &after_projected_visibility,
+                     sizeof(projected_visibility)) == 0,
+          "deferred visibility publication is one-shot and transactional");
+    CHECK(ds4_runtime_request_mark_first_visible_emitted(
+              &projected_visibility, 200u) &&
+              ds4_runtime_request_record_page_advice_complete(
+                  &projected_visibility, 210u),
+          "historical visibility composes with emission and final advice chronology");
+
     ds4_runtime_request_context advice_cancel;
     ds4_runtime_request_metrics advice_cancel_metrics;
     memset(&advice_cancel_metrics, 0xa5, sizeof(advice_cancel_metrics));

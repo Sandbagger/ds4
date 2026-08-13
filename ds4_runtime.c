@@ -2415,6 +2415,33 @@ bool ds4_runtime_request_record_visible_decoded(
     return true;
 }
 
+bool ds4_runtime_request_publish_visible_decode_window(
+        ds4_runtime_request_context *context,
+        uint64_t visible_tokens,
+        uint64_t first_decoded_monotonic_ns,
+        uint64_t last_decoded_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || !context->prefill_complete ||
+        context->page_advice_complete || context->visible_decode_started ||
+        context->visible_generated_tokens != 0u || visible_tokens == 0u ||
+        visible_tokens > context->generated_tokens ||
+        first_decoded_monotonic_ns == 0u ||
+        last_decoded_monotonic_ns < first_decoded_monotonic_ns ||
+        first_decoded_monotonic_ns <
+            context->prefill_complete_monotonic_ns) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.visible_generated_tokens = visible_tokens;
+    staged.first_visible_decode_monotonic_ns =
+        first_decoded_monotonic_ns;
+    staged.last_visible_decode_monotonic_ns =
+        last_decoded_monotonic_ns;
+    staged.visible_decode_started = true;
+    *context = staged;
+    return true;
+}
+
 bool ds4_runtime_request_mark_first_visible_emitted(
         ds4_runtime_request_context *context,
         uint64_t emitted_monotonic_ns) {

@@ -372,6 +372,70 @@ typedef struct {
     size_t violation_count;
 } ds4_runtime_wire_snapshot;
 
+/* Private same-host qualification transport.  Messages have one fixed native
+ * layout because both endpoints are created from the same qualified build;
+ * this is evidence plumbing, not a public or cross-platform wire schema. */
+enum {
+    DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION = 1,
+    DS4_QUALIFICATION_CONTROL_DEFAULT_TIMEOUT_MS = 30000,
+};
+
+typedef enum {
+    DS4_QUALIFICATION_CONTROL_MODEL_FD = 1,
+    DS4_QUALIFICATION_CONTROL_SAMPLE_READY = 2,
+    DS4_QUALIFICATION_CONTROL_SAMPLE_READY_ACK = 3,
+    DS4_QUALIFICATION_CONTROL_SAMPLE_RESULT = 4,
+    DS4_QUALIFICATION_CONTROL_SAMPLE_RESULT_ACK = 5,
+} ds4_qualification_control_message_type;
+
+typedef struct {
+    uint32_t protocol_version;
+    uint32_t message_type;
+    uint32_t message_size;
+    uint32_t reserved;
+    uint64_t checkpoint_sequence;
+    ds4_runtime_file_identity model_identity;
+} ds4_qualification_control_message;
+
+typedef struct ds4_qualification_control ds4_qualification_control;
+
+/* Open owns a close-on-exec duplicate of inherited_fd and leaves the caller's
+ * descriptor untouched.  Zero timeout is invalid.  Every protocol, I/O,
+ * timeout, or peer-disconnect error latches the control unsafe. */
+int ds4_qualification_control_open(
+    ds4_qualification_control **out,
+    int inherited_fd,
+    uint32_t timeout_ms,
+    char *err,
+    size_t errcap);
+
+/* Send exactly one retained opened-model descriptor in one SCM_RIGHTS record.
+ * The identity is checked against fstat before it is placed on the wire. */
+int ds4_qualification_control_send_model_fd(
+    ds4_qualification_control *control,
+    int model_fd,
+    const ds4_runtime_file_identity *expected_identity,
+    char *err,
+    size_t errcap);
+
+/* Bracket a synchronized external sample.  begin sends READY and waits for
+ * its matching ACK; finish re-stats the retained model descriptor, sends
+ * RESULT, and waits for its matching ACK.  A sequence must be strictly newer
+ * than the last successfully finished sequence. */
+int ds4_qualification_control_begin_sample(
+    ds4_qualification_control *control,
+    uint64_t checkpoint_sequence,
+    char *err,
+    size_t errcap);
+int ds4_qualification_control_finish_sample(
+    ds4_qualification_control *control,
+    uint64_t checkpoint_sequence,
+    int model_fd,
+    char *err,
+    size_t errcap);
+void ds4_qualification_control_close(
+    ds4_qualification_control *control);
+
 typedef struct {
     uint64_t allocation_id;
     uint32_t callsite_id;

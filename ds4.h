@@ -193,6 +193,8 @@ typedef struct {
     /* Qualification harness only: normal frontends never populate this. */
     int qualification_model_fd;
     bool qualification_model_fd_set;
+    int qualification_control_fd;
+    bool qualification_control_fd_set;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

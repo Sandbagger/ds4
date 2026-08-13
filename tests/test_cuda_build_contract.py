@@ -2874,6 +2874,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "static int ds4_session_sync_internal(ds4_session *s,\n"
             "                                     const ds4_tokens *prompt,\n"
             "                                     bool allow_exact_context,\n"
+            "                                     ds4_runtime_request_context *request,\n"
             "                                     char *err,\n"
             "                                     size_t errlen) {",
             "ds4.c",
@@ -3244,6 +3245,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "static int ds4_session_sync_internal(ds4_session *s,\n"
             "                                     const ds4_tokens *prompt,\n"
             "                                     bool allow_exact_context,\n"
+            "                                     ds4_runtime_request_context *request,\n"
             "                                     char *err,\n"
             "                                     size_t errlen) {",
             "ds4.c",
@@ -3348,7 +3350,10 @@ class CudaBuildContractTest(unittest.TestCase):
             "ds4.c",
         )
         self.assertIn("if (!compact) return current;", finish_adapter)
-        self.assertIn("ds4_gpu_laguna_compact_finish_graph(compact)", finish_adapter)
+        self.assertIn(
+            "ds4_gpu_laguna_compact_finish_graph(compact, request)",
+            finish_adapter,
+        )
         self.assertRegex(
             finish_adapter,
             r"finished\s*==\s*DS4_GPU_LAGUNA_EXEC_SUCCESS\s*\?\s*"
@@ -3385,6 +3390,21 @@ class CudaBuildContractTest(unittest.TestCase):
                 self.assertIn("ok = false", graph[finish_call:fallback])
 
     def test_laguna_graph_does_not_synthesize_unlatched_unsafe(self) -> None:
+        end_adapter = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result "
+            "laguna_graph_end_compact_scope(",
+            "ds4.c",
+        )
+        self.assertIn(
+            "ds4_gpu_laguna_compact_graph_end(compact, request)",
+            end_adapter,
+        )
+        self.assertRegex(
+            end_adapter,
+            r"graph_end\(compact, request\)\s*\?\s*"
+            r"current\s*:\s*DS4_GPU_LAGUNA_EXEC_UNSAFE",
+        )
         for signature in (
             "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
             "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
@@ -3420,6 +3440,75 @@ class CudaBuildContractTest(unittest.TestCase):
                     "execution_result = DS4_GPU_LAGUNA_EXEC_UNSAFE",
                     body[command_end:fallback],
                 )
+                self.assertIn(
+                    "execution_result = laguna_graph_end_compact_scope(",
+                    body[command_end:fallback],
+                )
+
+    def test_laguna_speculative_eval_uses_compact_tracker_boundary(self) -> None:
+        body = source_function_body(
+            DS4_SOURCE,
+            "int ds4_session_eval_speculative_argmax(",
+            "ds4.c",
+        )
+        lock_at = body.find("ds4_engine_compact_tracker_lock(e)")
+        eval_at = body.find("ds4_session_eval_probe_tp(", lock_at)
+        unlock_at = body.find("ds4_engine_compact_tracker_unlock(e)", eval_at)
+        self.assertGreaterEqual(lock_at, 0)
+        self.assertGreater(eval_at, lock_at)
+        self.assertGreater(unlock_at, eval_at)
+
+        lock_failure = body[lock_at:eval_at]
+        unlock_failure = body[unlock_at:]
+        self.assertIn("return -1;", lock_failure)
+        self.assertIn("ds4_session_invalidate(s);", unlock_failure)
+        self.assertIn("return -1;", unlock_failure)
+
+    def test_laguna_graph_tracker_lifecycle_shares_snapshot_boundary(self) -> None:
+        create = source_function_body(
+            DS4_SOURCE, "int ds4_session_create(", "ds4.c"
+        )
+        create_lock = create.find("ds4_engine_compact_tracker_lock(e)")
+        create_mutation = create.find(
+            "ds4_session_create_unchecked(out, e, ctx_size)", create_lock
+        )
+        create_unlock = create.find(
+            "ds4_engine_compact_tracker_unlock(e)", create_mutation
+        )
+        self.assertGreaterEqual(create_lock, 0)
+        self.assertGreater(create_mutation, create_lock)
+        self.assertGreater(create_unlock, create_mutation)
+
+        free = source_function_body(
+            DS4_SOURCE, "void ds4_session_free(", "ds4.c"
+        )
+        free_lock = free.find(
+            "ds4_engine_compact_tracker_lock(s->engine)"
+        )
+        free_mutation = free.find("laguna_graph_free(&s->laguna_graph)")
+        free_unlock = free.find(
+            "ds4_engine_compact_tracker_unlock(s->engine)", free_mutation
+        )
+        self.assertGreaterEqual(free_lock, 0)
+        self.assertGreater(free_mutation, free_lock)
+        self.assertGreater(free_unlock, free_mutation)
+
+        snapshot = source_function_body(
+            DS4_SOURCE, "bool ds4_engine_runtime_snapshot(", "ds4.c"
+        )
+        snapshot_lock = snapshot.find(
+            "pthread_mutex_lock(&engine->runtime_snapshot_mutex)"
+        )
+        snapshot_capture = snapshot.find(
+            "ds4_gpu_laguna_compact_runtime_snapshot(", snapshot_lock
+        )
+        snapshot_unlock = snapshot.find(
+            "pthread_mutex_unlock(&engine->runtime_snapshot_mutex)",
+            snapshot_capture,
+        )
+        self.assertGreaterEqual(snapshot_lock, 0)
+        self.assertGreater(snapshot_capture, snapshot_lock)
+        self.assertGreater(snapshot_unlock, snapshot_capture)
 
     def test_laguna_decode_capture_binds_release_and_hook_logits(self) -> None:
         producer = (

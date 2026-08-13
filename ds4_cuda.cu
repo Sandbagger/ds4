@@ -729,6 +729,10 @@ struct ds4_gpu_laguna_compact {
     uint64_t page_advice_post_sample_sequence;
     uint64_t page_advice_complete_sequence;
     uint64_t page_advice_complete_monotonic_ns;
+    ds4_runtime_request_context *active_request;
+    uint32_t active_graph_scope;
+    uint32_t active_request_group;
+    uint32_t active_request_group_remaining;
     uint64_t lifecycle_epoch;
     uint64_t active_execution_count;
     ds4_laguna_cache_handle active_load_handle;
@@ -779,7 +783,7 @@ static std::mutex g_laguna_compact_cache_io_mutex;
 /* Compact admission currently permits one session, but keep graph-final
  * disposal serialized with routed wrappers so a future caller cannot enter
  * between the final CUDA synchronization and the source-page flush. */
-static std::mutex g_laguna_compact_exec_mutex;
+static std::recursive_mutex g_laguna_compact_exec_mutex;
 static std::atomic<bool> g_laguna_compact_cache_cancel_requested{false};
 static std::atomic<uint64_t> g_laguna_compact_lifecycle_epoch{0};
 static std::atomic<uint64_t> g_laguna_compact_published_epoch{0};
@@ -2388,7 +2392,10 @@ static int cuda_laguna_compact_page_note_syscall_locked(
         ds4_laguna_page_advice_counters *specific,
         uint64_t page_size,
         const ds4_laguna_page_range *range,
-        int error_number) {
+        int error_number,
+        ds4_runtime_request_context *request_staged,
+        int *request_touched,
+        int *request_stage_failed) {
     if (!ctx || !specific || !range || error_number < 0) return 0;
     size_t advised_count = ctx->page_advice_advised_range_count;
     uint64_t new_bytes = 0;
@@ -2396,6 +2403,17 @@ static int cuda_laguna_compact_page_note_syscall_locked(
     ds4_laguna_page_advice_counters specific_next = *specific;
     ds4_laguna_page_advice_counters aggregate_next =
         ctx->page_advice_counters;
+    ds4_runtime_request_context request_next;
+    int request_ok = 1;
+    if (request_staged) {
+        request_next = *request_staged;
+        ds4_runtime_wire_counters delta = {};
+        delta.page_advice_attempts = 1u;
+        delta.page_advice_bytes = range->bytes;
+        delta.page_advice_failures = error_number != 0 ? 1u : 0u;
+        request_ok = ds4_runtime_request_add_counters(
+            &request_next, &delta) ? 1 : 0;
+    }
     if ((error_number == 0 &&
          (!ds4_laguna_page_range_union_preview(
               ctx->page_advice_advised_ranges,
@@ -2428,6 +2446,12 @@ static int cuda_laguna_compact_page_note_syscall_locked(
     *specific = specific_next;
     ctx->page_advice_counters = aggregate_next;
     ctx->page_advice_advised_range_bytes += new_bytes;
+    if (request_touched) *request_touched = 1;
+    if (!request_ok) {
+        if (request_stage_failed) *request_stage_failed = 1;
+        return 0;
+    }
+    if (request_staged) *request_staged = request_next;
     return 1;
 }
 
@@ -2510,7 +2534,10 @@ static int cuda_laguna_compact_page_dispose_locked(
         uint64_t injected_pre,
         uint64_t injected_post,
         int injected_fadvise_errno,
-        int injected_madvise_errno) {
+        int injected_madvise_errno,
+        ds4_runtime_request_context *request_staged,
+        int *request_touched,
+        int *request_stage_failed) {
     if (!ctx || ctx->page_advice_since_range_count == 0) return 1;
     struct stat before;
     struct stat after;
@@ -2618,7 +2645,9 @@ static int cuda_laguna_compact_page_dispose_locked(
         }
         if (!cuda_laguna_compact_page_note_syscall_locked(
                 ctx, &ctx->page_advice_madvise_counters,
-                page_size, range, madvise_error)) {
+                page_size, range, madvise_error,
+                request_staged, request_touched,
+                request_stage_failed)) {
             return 0;
         }
 
@@ -2637,7 +2666,9 @@ static int cuda_laguna_compact_page_dispose_locked(
         }
         if (!cuda_laguna_compact_page_note_syscall_locked(
                 ctx, &ctx->page_advice_fadvise_counters,
-                page_size, range, fadvise_error)) {
+                page_size, range, fadvise_error,
+                request_staged, request_touched,
+                request_stage_failed)) {
             return 0;
         }
     }
@@ -2694,9 +2725,33 @@ static int cuda_laguna_compact_page_flush_locked(
         ctx->page_advice_test_injection_armed = 0;
     }
 #endif
-    return cuda_laguna_compact_page_dispose_locked(
+    ds4_runtime_request_context request_staged;
+    ds4_runtime_request_context *request_stage = NULL;
+    if (ctx->active_request) {
+        request_staged = *ctx->active_request;
+        request_stage = &request_staged;
+    }
+    int request_touched = 0;
+    int request_stage_failed = 0;
+    const int disposed = cuda_laguna_compact_page_dispose_locked(
         ctx, page_size, sample_pre, injected, exact_pre, exact_post,
-        fadvise_error, madvise_error);
+        fadvise_error, madvise_error, request_stage,
+        &request_touched, &request_stage_failed);
+    if (request_stage && request_touched && !request_stage_failed &&
+        disposed && !ds4_runtime_request_observe_page_advice(
+            request_stage, ctx->page_advice_complete_monotonic_ns)) {
+        request_stage_failed = 1;
+    }
+    if (request_stage && request_touched && !request_stage_failed &&
+        disposed) {
+        *ctx->active_request = *request_stage;
+    }
+    if (request_stage && request_touched &&
+        (request_stage_failed || !disposed)) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    return disposed;
 }
 
 static int cuda_laguna_compact_page_flush_pending_locked(
@@ -3760,7 +3815,7 @@ cuda_laguna_compact_external_checkpoint_device_zero(
         return cuda_laguna_external_checkpoint_fail(ctx, out);
     }
 
-    std::lock_guard<std::mutex> execution_guard(
+    std::lock_guard<std::recursive_mutex> execution_guard(
         g_laguna_compact_exec_mutex);
     uint64_t execution_epoch = 0u;
     if (!cuda_laguna_external_checkpoint_enter(ctx, &execution_epoch) ||
@@ -3984,6 +4039,40 @@ static int cuda_laguna_compact_cache_active_locked(
         !ctx->cache_unsafe;
 }
 
+/* The compact mutex is the publication boundary for process and request
+ * counters.  Stage the borrowed request first, then expose both views before
+ * releasing that mutex.  A policy acquire has already changed bounded cache
+ * state, so a staging failure publishes process truth and poisons the cache. */
+static int cuda_laguna_compact_publish_cache_acquire_locked(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t hits,
+        uint64_t misses,
+        uint64_t evictions) {
+    if (!ctx) return 0;
+    ds4_runtime_request_context request_staged;
+    int request_ok = 1;
+    if (ctx->active_request) {
+        request_staged = *ctx->active_request;
+        ds4_runtime_wire_counters delta = {};
+        delta.cache_acquire_hits = hits;
+        delta.cache_acquire_misses = misses;
+        delta.cache_evictions = evictions;
+        request_ok = ds4_runtime_request_add_counters(
+            &request_staged, &delta) ? 1 : 0;
+    }
+    cuda_laguna_compact_counter_add(&ctx->cache_acquire_hits, hits);
+    cuda_laguna_compact_counter_add(&ctx->cache_acquire_misses, misses);
+    cuda_laguna_compact_counter_add(&ctx->cache_evictions, evictions);
+    if (!request_ok) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    if (ctx->active_request) {
+        *ctx->active_request = request_staged;
+    }
+    return 1;
+}
+
 #ifdef DS4_TEST_HOOKS
 enum { DS4_GPU_LAGUNA_CACHE_FAULT_SHORT_EOF_INTERNAL = 100 };
 
@@ -4079,10 +4168,23 @@ static int cuda_laguna_compact_cache_sync_device_map_locked(
     return 0;
 }
 
-static void cuda_laguna_compact_cache_merge_stats_locked(
+static int cuda_laguna_compact_cache_merge_stats_locked(
         ds4_gpu_laguna_compact *ctx,
         const cuda_laguna_compact_cache_transfer_stats *stats) {
-    if (!ctx || !stats) return;
+    if (!ctx || !stats) return 0;
+    ds4_runtime_request_context request_staged;
+    int request_ok = 1;
+    if (ctx->active_request) {
+        request_staged = *ctx->active_request;
+        ds4_runtime_wire_counters delta = {};
+        delta.model_file_read_operations = stats->model_file_read_calls;
+        delta.model_file_read_bytes = stats->model_file_read_bytes;
+        delta.model_file_read_ns = stats->model_file_read_ns;
+        delta.host_to_device_bytes = stats->host_to_device_bytes;
+        delta.host_to_device_ns = stats->host_to_device_ns;
+        request_ok = ds4_runtime_request_add_counters(
+            &request_staged, &delta) ? 1 : 0;
+    }
     cuda_laguna_compact_counter_add(
         &ctx->model_file_read_calls, stats->model_file_read_calls);
     cuda_laguna_compact_counter_add(
@@ -4108,6 +4210,14 @@ static void cuda_laguna_compact_cache_merge_stats_locked(
     cuda_laguna_compact_counter_add(
         &ctx->event_completion_failures,
         stats->event_completion_failures);
+    if (!request_ok) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    if (ctx->active_request) {
+        *ctx->active_request = request_staged;
+    }
+    return 1;
 }
 
 static int cuda_laguna_compact_cache_dispose_sources_locked(
@@ -4569,7 +4679,10 @@ ds4_gpu_laguna_compact_cache_begin(
     }
     handle->lifecycle_epoch = ctx->lifecycle_epoch;
     if (*outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED) {
-        cuda_laguna_compact_counter_increment(&ctx->cache_acquire_hits);
+        if (!cuda_laguna_compact_publish_cache_acquire_locked(
+                ctx, 1u, 0u, 0u)) {
+            return DS4_LAGUNA_CACHE_UNSAFE;
+        }
         return DS4_LAGUNA_CACHE_OK;
     }
     if (*outcome != DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER ||
@@ -4579,9 +4692,9 @@ ds4_gpu_laguna_compact_cache_begin(
         ctx->cache_unsafe = 1;
         return DS4_LAGUNA_CACHE_UNSAFE;
     }
-    cuda_laguna_compact_counter_increment(&ctx->cache_acquire_misses);
-    if (!had_empty) {
-        cuda_laguna_compact_counter_increment(&ctx->cache_evictions);
+    if (!cuda_laguna_compact_publish_cache_acquire_locked(
+            ctx, 0u, 1u, had_empty ? 0u : 1u)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
     }
     ctx->active_load_handle = *handle;
     ctx->active_load_phase = DS4_LAGUNA_CACHE_LOAD_RESERVED;
@@ -4641,8 +4754,10 @@ cuda_laguna_compact_cache_complete_internal(
     if (transfer_cause) *transfer_cause = transfer;
 
     guard.lock();
-    cuda_laguna_compact_cache_merge_stats_locked(ctx, &stats);
-    if (!cuda_laguna_compact_cache_handle_current_locked(
+    const int counters_merged =
+        cuda_laguna_compact_cache_merge_stats_locked(ctx, &stats);
+    if (!counters_merged ||
+        !cuda_laguna_compact_cache_handle_current_locked(
             ctx, load_handle) ||
         ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_TRANSFERRING ||
         !cuda_laguna_compact_cache_handle_equal(
@@ -4987,7 +5102,7 @@ ds4_gpu_laguna_compact_runtime_snapshot(
     if (out) memset(out, 0, sizeof(*out));
     if (unsafe_out) *unsafe_out = false;
     if (!ctx || !out || !unsafe_out || !capture) return false;
-    std::lock_guard<std::mutex> execution_guard(
+    std::lock_guard<std::recursive_mutex> execution_guard(
         g_laguna_compact_exec_mutex);
     std::lock_guard<std::recursive_mutex> compact_guard(
         g_laguna_compact_mutex);
@@ -32292,6 +32407,180 @@ static ds4_gpu_laguna_exec_result cuda_laguna_compact_exec_unsafe(
     return DS4_GPU_LAGUNA_EXEC_UNSAFE;
 }
 
+static int cuda_laguna_compact_request_valid(
+        const ds4_runtime_request_context *request) {
+    if (!request || !request->prefill_started) return 0;
+    ds4_runtime_request_context staged = *request;
+    const ds4_runtime_wire_counters zero = {};
+    return ds4_runtime_request_add_counters(&staged, &zero) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_laguna_compact_graph_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    if (!ctx || (request && !cuda_laguna_compact_request_valid(request))) {
+        return 0;
+    }
+    g_laguna_compact_exec_mutex.lock();
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx) ||
+        ctx->active_graph_scope != 0u || ctx->active_request != NULL ||
+        ctx->active_request_group_remaining > ctx->active_request_group ||
+        (ctx->active_request_group != 0u &&
+         (ctx->active_request_group_remaining == 0u || !request))) {
+        g_laguna_compact_exec_mutex.unlock();
+        return 0;
+    }
+    if (ctx->page_advice_since_range_count != 0u ||
+        ctx->active_execution_count != 0u ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE) {
+        ctx->cache_unsafe = 1;
+        g_laguna_compact_exec_mutex.unlock();
+        return 0;
+    }
+    if (ctx->active_request_group != 0u) {
+        ctx->active_request_group_remaining--;
+    }
+    ctx->active_request = request;
+    ctx->active_graph_scope = 1u;
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_compact_graph_end(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    if (!ctx) return 0;
+    int valid = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+        const cudaError_t synchronized = cudaDeviceSynchronize();
+        if (synchronized != cudaSuccess) {
+            (void)cudaGetLastError();
+            ctx->cache_unsafe = 1;
+        }
+        if (ctx->page_advice_since_range_count != 0u &&
+            (synchronized != cudaSuccess ||
+             !cuda_laguna_compact_page_flush_pending_locked(ctx, 0))) {
+            /* The borrowed owner cannot outlive this synchronous call.  Once
+             * unsafe, abandon the unresolved union together with its owner;
+             * already-issued syscall counters remain process-global truth. */
+            memset(ctx->page_advice_since_ranges, 0,
+                   ctx->page_advice_since_range_count *
+                       sizeof(ctx->page_advice_since_ranges[0]));
+            ctx->page_advice_since_range_count = 0u;
+            ctx->page_advice_since_range_bytes = 0u;
+            ctx->cache_unsafe = 1;
+        }
+        valid = ctx->active_graph_scope == 1u &&
+            ctx->active_request == request &&
+            ctx->active_execution_count == 0u &&
+            ctx->active_load_phase == DS4_LAGUNA_CACHE_LOAD_NONE &&
+            ctx->page_advice_since_range_count == 0u;
+        if (!valid) {
+            ctx->cache_unsafe = 1;
+        }
+        ctx->active_request = NULL;
+        ctx->active_graph_scope = 0u;
+        if (ctx->cache_unsafe) valid = 0;
+    }
+    g_laguna_compact_exec_mutex.unlock();
+    return valid;
+}
+
+static int cuda_laguna_compact_routed_layer_count_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t *count_out) {
+    if (count_out) *count_out = 0u;
+    if (!ctx || !ctx->ledger || !ctx->ledger->expert_entries ||
+        ctx->ledger->expert_entry_count == 0u || !count_out) {
+        return 0;
+    }
+    uint64_t count = 0u;
+    uint32_t prior = UINT32_MAX;
+    for (uint64_t i = 0u; i < ctx->ledger->expert_entry_count; i++) {
+        const uint32_t layer = ctx->ledger->expert_entries[i].layer;
+        if (i == 0u || layer != prior) {
+            if (count == UINT64_MAX ||
+                (i != 0u && layer <= prior)) return 0;
+            count++;
+            prior = layer;
+        }
+    }
+    *count_out = count;
+    return count != 0u;
+}
+
+extern "C" int ds4_gpu_laguna_compact_request_group_begin(
+        ds4_gpu_laguna_compact *ctx,
+        uint32_t request_count) {
+    if (!ctx || request_count == 0u) return 0;
+    g_laguna_compact_exec_mutex.lock();
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    uint64_t layers = 0u;
+    uint64_t per_request = 0u;
+    uint64_t required = 0u;
+    uint64_t empty_slots = 0u;
+    int cache_quiescent = 1;
+    if (ctx->cache_policy_live) {
+        for (size_t i = 0u; i < ctx->cache_policy.slot_count; i++) {
+            const ds4_laguna_cache_slot *slot = &ctx->cache_slots[i];
+            if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+                empty_slots++;
+            }
+            if (slot->state == DS4_LAGUNA_CACHE_SLOT_LOADING ||
+                slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE ||
+                slot->refs != 0u) {
+                cache_quiescent = 0;
+                break;
+            }
+        }
+    }
+    if (!cuda_laguna_compact_cache_active_locked(ctx) ||
+        ctx->active_request_group != 0u || ctx->active_graph_scope != 0u ||
+        ctx->active_request_group_remaining != 0u ||
+        ctx->active_execution_count != 0u ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE ||
+        !cache_quiescent ||
+        !ctx->plan ||
+        !cuda_laguna_compact_routed_layer_count_locked(ctx, &layers) ||
+        layers > UINT64_MAX / CUDA_LAGUNA_ROUTED_SELECTED ||
+        (per_request = layers * CUDA_LAGUNA_ROUTED_SELECTED) >
+            UINT64_MAX / request_count ||
+        (required = per_request * request_count) > empty_slots) {
+        g_laguna_compact_exec_mutex.unlock();
+        return 0;
+    }
+    ctx->active_request_group = request_count;
+    ctx->active_request_group_remaining = request_count;
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_compact_request_group_end(
+        ds4_gpu_laguna_compact *ctx) {
+    if (!ctx) return 0;
+    int valid = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+        valid = ctx->active_request_group != 0u &&
+            ctx->active_request_group_remaining == 0u &&
+            ctx->active_graph_scope == 0u &&
+            ctx->active_request == NULL &&
+            ctx->active_execution_count == 0u &&
+            ctx->active_load_phase == DS4_LAGUNA_CACHE_LOAD_NONE &&
+            ctx->page_advice_since_range_count == 0u;
+        if (!valid) {
+            ctx->cache_unsafe = 1;
+        }
+        ctx->active_request = NULL;
+        ctx->active_graph_scope = 0u;
+        ctx->active_request_group = 0u;
+        ctx->active_request_group_remaining = 0u;
+        if (ctx->cache_unsafe) valid = 0;
+    }
+    g_laguna_compact_exec_mutex.unlock();
+    return valid;
+}
+
 static ds4_laguna_cache_status cuda_laguna_compact_exec_note_routes(
         ds4_gpu_laguna_compact *ctx,
         uint64_t execution_epoch,
@@ -32309,6 +32598,18 @@ static ds4_laguna_cache_status cuda_laguna_compact_exec_note_routes(
             &ctx->cache_policy, keys, key_count);
     if (status == DS4_LAGUNA_CACHE_UNSAFE) ctx->cache_unsafe = 1;
     return status;
+}
+
+static int cuda_laguna_compact_request_scope_matches_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        const ds4_runtime_request_context *request) {
+    if (!ctx) return 0;
+    if (request) {
+        return ctx->active_graph_scope == 1u &&
+            ctx->active_request == request;
+    }
+    return ctx->active_graph_scope == 0u ||
+        (ctx->active_graph_scope == 1u && ctx->active_request == NULL);
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -32952,21 +33253,31 @@ ds4_gpu_laguna_compact_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
         ds4_gpu_laguna_cancel_fn cancel,
-        void *userdata) {
-    std::lock_guard<std::mutex> execution_guard(
+        void *userdata,
+        ds4_runtime_request_context *request) {
+    std::lock_guard<std::recursive_mutex> execution_guard(
         g_laguna_compact_exec_mutex);
     uint64_t execution_epoch = 0u;
     if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
-    ds4_gpu_laguna_exec_result result =
+    int scope_matches = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        scope_matches = cuda_laguna_compact_request_scope_matches_locked(
+            ctx, request);
+        if (!scope_matches) ctx->cache_unsafe = 1;
+    }
+    ds4_gpu_laguna_exec_result result = scope_matches ?
         cuda_laguna_compact_routed_moe_batch_tensor_core(
             ctx, execution_epoch, out, mid,
             input_q8_scratch, mid_q8_scratch, aux_scratch,
             layer_id, gate_type, up_type, down_type,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_selected, x,
-            n_tokens, cancel, userdata);
+            n_tokens, cancel, userdata) :
+        DS4_GPU_LAGUNA_EXEC_UNSAFE;
     if (!cuda_laguna_compact_exec_leave(
             ctx, execution_epoch, &result)) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
@@ -32995,21 +33306,31 @@ ds4_gpu_laguna_compact_routed_moe_one_tensor(
         uint32_t n_selected,
         const ds4_gpu_tensor *x,
         ds4_gpu_laguna_cancel_fn cancel,
-        void *userdata) {
-    std::lock_guard<std::mutex> execution_guard(
+        void *userdata,
+        ds4_runtime_request_context *request) {
+    std::lock_guard<std::recursive_mutex> execution_guard(
         g_laguna_compact_exec_mutex);
     uint64_t execution_epoch = 0u;
     if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
-    ds4_gpu_laguna_exec_result result =
+    int scope_matches = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        scope_matches = cuda_laguna_compact_request_scope_matches_locked(
+            ctx, request);
+        if (!scope_matches) ctx->cache_unsafe = 1;
+    }
+    ds4_gpu_laguna_exec_result result = scope_matches ?
         cuda_laguna_compact_routed_moe_batch_tensor_core(
             ctx, execution_epoch, out, mid,
             input_q8_scratch, mid_q8_scratch, aux_scratch,
             layer_id, gate_type, up_type, down_type,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_selected, x,
-            1u, cancel, userdata);
+            1u, cancel, userdata) :
+        DS4_GPU_LAGUNA_EXEC_UNSAFE;
     if (!cuda_laguna_compact_exec_leave(
             ctx, execution_epoch, &result)) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
@@ -33018,16 +33339,27 @@ ds4_gpu_laguna_compact_routed_moe_one_tensor(
 }
 
 extern "C" ds4_gpu_laguna_exec_result
-ds4_gpu_laguna_compact_finish_graph(ds4_gpu_laguna_compact *ctx) {
-    std::lock_guard<std::mutex> execution_guard(
+ds4_gpu_laguna_compact_finish_graph(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    std::lock_guard<std::recursive_mutex> execution_guard(
         g_laguna_compact_exec_mutex);
     uint64_t execution_epoch = 0u;
     if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
     ds4_gpu_laguna_exec_result result = DS4_GPU_LAGUNA_EXEC_SUCCESS;
-    const cudaError_t synchronized = cudaDeviceSynchronize();
-    if (synchronized != cudaSuccess) {
+    int scope_matches = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        scope_matches = cuda_laguna_compact_request_scope_matches_locked(
+            ctx, request);
+        if (!scope_matches) ctx->cache_unsafe = 1;
+    }
+    const cudaError_t synchronized = scope_matches ?
+        cudaDeviceSynchronize() : cudaErrorUnknown;
+    if (!scope_matches || synchronized != cudaSuccess) {
         (void)cudaGetLastError();
         result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
     } else {
@@ -33046,6 +33378,56 @@ ds4_gpu_laguna_compact_finish_graph(ds4_gpu_laguna_compact *ctx) {
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
     return result;
+}
+
+extern "C" ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_request_barrier(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    if (!ctx || !cuda_laguna_compact_request_valid(request)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    const cudaError_t synchronized = cudaDeviceSynchronize();
+    if (synchronized != cudaSuccess) {
+        (void)cudaGetLastError();
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx) ||
+        ctx->active_graph_scope != 0u || ctx->active_request != NULL ||
+        ctx->active_request_group != 0u ||
+        ctx->active_request_group_remaining != 0u ||
+        ctx->active_execution_count != 0u ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE ||
+        ctx->page_advice_since_range_count != 0u) {
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    if (!request->page_advice_observed) {
+        return DS4_GPU_LAGUNA_EXEC_SUCCESS;
+    }
+    ds4_runtime_request_context staged = *request;
+    uint64_t lower_bound = staged.latest_page_advice_monotonic_ns;
+    if (lower_bound < staged.prefill_complete_monotonic_ns) {
+        lower_bound = staged.prefill_complete_monotonic_ns;
+    }
+    if (lower_bound < staged.last_visible_decode_monotonic_ns) {
+        lower_bound = staged.last_visible_decode_monotonic_ns;
+    }
+    const uint64_t complete =
+        cuda_laguna_compact_monotonic_ns_after(lower_bound);
+    if (!ds4_runtime_request_record_page_advice_complete(
+            &staged, complete)) {
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    *request = staged;
+    return DS4_GPU_LAGUNA_EXEC_SUCCESS;
 }
 
 /* Scalar-correct GLM routed MoE (q2_K experts): per (token, slot) block

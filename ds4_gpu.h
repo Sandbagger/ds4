@@ -251,6 +251,26 @@ typedef enum {
  * nonblocking, side-effect-free, no-CUDA/no-device-change contract. */
 typedef bool (*ds4_gpu_laguna_cancel_fn)(void *userdata);
 
+/* Borrow one request context for exactly one synchronous Laguna graph.  The
+ * compact executor holds its global execution lock until graph_end(), so page
+ * ranges and cache deltas cannot change owners between routed layers. */
+int ds4_gpu_laguna_compact_graph_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+int ds4_gpu_laguna_compact_graph_end(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+
+/* Keep a bounded row-ordered set of independent graphs under one compact
+ * cache epoch.  Admission proves the fixed cache can retain the worst-case
+ * routed union for every row; callers must still bracket each row with the
+ * graph scope above. */
+int ds4_gpu_laguna_compact_request_group_begin(
+        ds4_gpu_laguna_compact *ctx,
+        uint32_t request_count);
+int ds4_gpu_laguna_compact_request_group_end(
+        ds4_gpu_laguna_compact *ctx);
+
 /* One-token Q4_K routed execution through ten pinned compact-cache slots.
  * Scratch is caller-owned, preallocated, and live for the synchronous call:
  * aux_scratch stores ten L2 floats at byte zero and the immutable ten-entry
@@ -276,7 +296,8 @@ ds4_gpu_laguna_compact_routed_moe_one_tensor(
         uint32_t n_selected,
         const ds4_gpu_tensor *x,
         ds4_gpu_laguna_cancel_fn cancel,
-        void *userdata);
+        void *userdata,
+        ds4_runtime_request_context *request);
 
 /* Batched Q4_K routed execution through the same fixed compact cache.  The
  * selected/weight tensors are token-major with ten entries per token; all
@@ -304,14 +325,24 @@ ds4_gpu_laguna_compact_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
         ds4_gpu_laguna_cancel_fn cancel,
-        void *userdata);
+        void *userdata,
+        ds4_runtime_request_context *request);
 
 /* Drain source-page disposal accumulated by routed layers after the caller's
  * whole Laguna graph is quiescent.  This is mandatory even on a cancelled or
  * recoverable graph result; an accounting or synchronization failure poisons
  * the compact context and returns UNSAFE. */
 ds4_gpu_laguna_exec_result
-ds4_gpu_laguna_compact_finish_graph(ds4_gpu_laguna_compact *ctx);
+ds4_gpu_laguna_compact_finish_graph(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+
+/* Final request-owned CUDA/advice barrier.  It seals page-advice time only
+ * when this request observed physical advice; hit-only requests stay null. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_request_barrier(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
 
 #ifdef DS4_TEST_HOOKS
 typedef enum {

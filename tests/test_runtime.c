@@ -1356,6 +1356,7 @@ static void test_runtime_wire_snapshot(void) {
     ds4_runtime_wire_snapshot_input input = wire_input();
     ds4_runtime_wire_snapshot first;
     ds4_runtime_wire_snapshot second;
+    ds4_runtime_wire_snapshot peer;
     CHECK(ds4_runtime_wire_snapshot_capture(
               &context, &tracker, &input, &first),
           "first coherent runtime wire snapshot succeeds");
@@ -1365,6 +1366,11 @@ static void test_runtime_wire_snapshot(void) {
     CHECK(first.snapshot_seq == 1u && second.snapshot_seq == 2u &&
               strcmp(first.instance_id, second.instance_id) == 0,
           "runtime snapshot sequence starts at one and increases per capture");
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &peer_context, &tracker, &input, &peer) &&
+              peer.snapshot_seq == 3u &&
+              strcmp(peer.instance_id, first.instance_id) == 0,
+          "distinct contexts share one monotonic process snapshot sequence");
     CHECK(first.allocations.owned_total_current ==
               first.allocations.category_current[
                   DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] &&
@@ -1402,11 +1408,11 @@ static void test_runtime_wire_snapshot(void) {
     ds4_runtime_wire_snapshot violated;
     CHECK(ds4_runtime_wire_snapshot_capture(
               &context, &tracker, &input, &violated) &&
-              violated.snapshot_seq == 3u &&
+              violated.snapshot_seq == 4u &&
               violated.violation_count == 1u &&
               violated.violations[0].code ==
                   DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
-              violated.violations[0].latched_snapshot_seq == 3u,
+              violated.violations[0].latched_snapshot_seq == 4u,
           "a hard-bound violation records its exact first-observed snapshot");
     tracker.violation = DS4_RUNTIME_VIOLATION_NONE;
     ds4_runtime_wire_snapshot historical;
@@ -1415,7 +1421,7 @@ static void test_runtime_wire_snapshot(void) {
               historical.violation_count == 1u &&
               historical.violations[0].code ==
                   DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
-              historical.violations[0].latched_snapshot_seq == 3u,
+              historical.violations[0].latched_snapshot_seq == 4u,
           "clearing a tracker cannot erase an immutable historical violation");
     tracker.violation = DS4_RUNTIME_VIOLATION_OVERFLOW;
     ds4_runtime_wire_snapshot two_violations;
@@ -1424,27 +1430,11 @@ static void test_runtime_wire_snapshot(void) {
               two_violations.violation_count == 2u &&
               two_violations.violations[0].code ==
                   DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
-              two_violations.violations[0].latched_snapshot_seq == 3u &&
+              two_violations.violations[0].latched_snapshot_seq == 4u &&
               two_violations.violations[1].code ==
                   DS4_RUNTIME_VIOLATION_OVERFLOW &&
-              two_violations.violations[1].latched_snapshot_seq == 5u,
+              two_violations.violations[1].latched_snapshot_seq == 6u,
           "later violations append without mutating historical entries");
-
-    context.next_snapshot_seq = UINT64_MAX - 1u;
-    ds4_runtime_wire_snapshot near_max;
-    ds4_runtime_wire_snapshot at_max;
-    ds4_runtime_wire_snapshot saturated;
-    CHECK(ds4_runtime_wire_snapshot_capture(
-              &context, &tracker, &input, &near_max) &&
-              ds4_runtime_wire_snapshot_capture(
-                  &context, &tracker, &input, &at_max) &&
-              ds4_runtime_wire_snapshot_capture(
-                  &context, &tracker, &input, &saturated) &&
-              near_max.snapshot_seq == UINT64_MAX - 1u &&
-              at_max.snapshot_seq == UINT64_MAX &&
-              saturated.snapshot_seq == UINT64_MAX &&
-              context.next_snapshot_seq == UINT64_MAX,
-          "runtime snapshot sequence saturates instead of wrapping");
 
     ds4_runtime_snapshot_context invalid_context = context;
     memcpy(invalid_context.instance_id, "x", sizeof("x"));
@@ -1501,7 +1491,6 @@ static void test_runtime_wire_snapshot(void) {
     tracker.violation = DS4_RUNTIME_VIOLATION_OVERFLOW;
 
     ds4_runtime_snapshot_context forced_unsafe_context = context;
-    forced_unsafe_context.next_snapshot_seq = 44u;
     input.state = DS4_RUNTIME_WIRE_STATE_READY;
     ds4_runtime_wire_snapshot forced_unsafe;
     CHECK(ds4_runtime_wire_snapshot_capture(
@@ -1551,25 +1540,46 @@ static void test_runtime_wire_snapshot(void) {
             captures_joined = false;
         }
     }
-    bool sequence_seen[WIRE_CAPTURE_TOTAL + 1u];
+    const uint64_t first_concurrent_sequence =
+        forced_unsafe.snapshot_seq + 1u;
+    const uint64_t last_concurrent_sequence =
+        first_concurrent_sequence + WIRE_CAPTURE_TOTAL - 1u;
+    bool sequence_seen[WIRE_CAPTURE_TOTAL];
     memset(sequence_seen, 0, sizeof(sequence_seen));
     bool unique_sequences = captures_joined;
     for (size_t i = 0; i < capture_threads_started; i++) {
         for (size_t j = 0; j < WIRE_CAPTURES_PER_THREAD; j++) {
             const uint64_t sequence = capture_workers[i].sequences[j];
-            if (sequence == 0u || sequence > WIRE_CAPTURE_TOTAL ||
-                sequence_seen[sequence]) {
+            if (sequence < first_concurrent_sequence ||
+                sequence > last_concurrent_sequence ||
+                sequence_seen[sequence - first_concurrent_sequence]) {
                 unique_sequences = false;
             } else {
-                sequence_seen[sequence] = true;
+                sequence_seen[sequence - first_concurrent_sequence] = true;
             }
         }
     }
     CHECK(unique_sequences && concurrent_context.next_snapshot_seq ==
-              (uint64_t)WIRE_CAPTURE_TOTAL + 1u,
+              last_concurrent_sequence + 1u,
           "concurrent captures serialize one unique monotonic process sequence");
     pthread_cond_destroy(&gate.condition);
     pthread_mutex_destroy(&gate.mutex);
+
+    context.next_snapshot_seq = UINT64_MAX - 1u;
+    ds4_runtime_wire_snapshot near_max;
+    ds4_runtime_wire_snapshot at_max;
+    ds4_runtime_wire_snapshot saturated;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &near_max) &&
+              ds4_runtime_wire_snapshot_capture(
+                  &context, &tracker, &input, &at_max) &&
+              ds4_runtime_wire_snapshot_capture(
+                  &context, &tracker, &input, &saturated) &&
+              near_max.snapshot_seq == UINT64_MAX - 1u &&
+              at_max.snapshot_seq == UINT64_MAX &&
+              saturated.snapshot_seq == UINT64_MAX &&
+              context.next_snapshot_seq == UINT64_MAX,
+          "runtime snapshot sequence saturates instead of wrapping");
 
     int fork_pipe[2] = {-1, -1};
     CHECK(pipe(fork_pipe) == 0,

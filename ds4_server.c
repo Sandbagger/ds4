@@ -5628,6 +5628,61 @@ static request_admission_code request_token_counts_admit(
     return REQUEST_ADMISSION_FITS;
 }
 
+typedef enum {
+    EFFECTIVE_PROMPT_USE = 0,
+    EFFECTIVE_PROMPT_FALLBACK_CANONICAL,
+    EFFECTIVE_PROMPT_REJECT,
+} effective_prompt_action;
+
+static effective_prompt_action request_effective_prompt_action(
+        int candidate_tokens,
+        int requested_output_tokens,
+        int context_tokens,
+        bool live_state_required) {
+    const request_admission_code code = request_token_counts_admit(
+        candidate_tokens,
+        requested_output_tokens > 0 ?
+            (uint64_t)requested_output_tokens : 0u,
+        context_tokens);
+    if (code == REQUEST_ADMISSION_FITS) return EFFECTIVE_PROMPT_USE;
+    return live_state_required ? EFFECTIVE_PROMPT_REJECT :
+        EFFECTIVE_PROMPT_FALLBACK_CANONICAL;
+}
+
+typedef struct {
+    int limit;
+    int used;
+} request_output_budget;
+
+static request_output_budget request_output_budget_make(int limit) {
+    return (request_output_budget){ .limit = limit > 0 ? limit : 0 };
+}
+
+static int request_output_budget_remaining(const request_output_budget *budget) {
+    if (!budget || budget->limit <= budget->used) return 0;
+    return budget->limit - budget->used;
+}
+
+static bool request_output_budget_take(request_output_budget *budget,
+                                       int tokens) {
+    if (!budget || tokens < 0 ||
+        tokens > request_output_budget_remaining(budget))
+    {
+        return false;
+    }
+    budget->used += tokens;
+    return true;
+}
+
+static bool request_allows_speculative_decode(const request *r) {
+    (void)r;
+    /* A speculative cycle commits every accepted token before the server can
+     * inspect protocol stop sequences, no-thinking control markers, or DSML
+     * recovery state.  Keep request serving on coordinated one-token decode
+     * until the speculative API can roll back to the first logical stop. */
+    return false;
+}
+
 static request_admission_code request_token_admission(
         const request *r,
         int ctx_size) {
@@ -9789,15 +9844,44 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
-static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
-                             ds4_tokens *effective_prompt,
-                             char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+static int kv_cache_preview_text(server *s,
+                                 const char *prompt_text,
+                                 ds4_kvstore_text_preview *preview) {
+    if (!s || !prompt_text || !preview) return 0;
+    const int model_id = ds4_engine_model_id(s->engine);
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    pthread_mutex_lock(&s->kv_mu);
+    int selected = ds4_kvstore_preview_text(
+        &s->kv, s->engine, prompt_text, model_id, quant_bits,
+        s->ctx_size, preview);
+    pthread_mutex_unlock(&s->kv_mu);
+    return selected;
+}
+
+static int kv_cache_load_preview(server *s, server_slot *slot,
+                                 ds4_kvstore_text_preview *preview,
+                                 ds4_tokens *effective_prompt,
+                                 char **loaded_path_out,
+                                 uint8_t *loaded_ext_flags_out,
+                                 bool responses_protocol) {
+    if (!s || !slot || !preview) return 0;
+    if (loaded_path_out) *loaded_path_out = NULL;
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    ds4_kvstore_load_result lr = {0};
+    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    pthread_mutex_lock(&s->inference_mu);
+    pthread_mutex_lock(&s->kv_mu);
+    int loaded = ds4_kvstore_load_text_preview(
+        &s->kv, s->engine, slot->session, effective_prompt, preview, &lr,
+        &hooks, responses_protocol);
+    pthread_mutex_unlock(&s->kv_mu);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (loaded > 0) {
+        if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+    }
+    ds4_kvstore_load_result_free(&lr);
+    return loaded;
 }
 
 static int live_text_prefix_prompt(server *s, server_slot *slot,
@@ -10389,6 +10473,9 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static int server_eval_token(server *s, server_slot *slot, int token,
+                             char *err, size_t errlen);
+
 /* Live recovery for a tool call started inside an unclosed <think> block.
  *
  * The model sometimes opens a DSML stanza without closing its thinking first.
@@ -10413,14 +10500,14 @@ static thinking_state thinking_state_from_prompt(const request *r) {
  * Returns 1 when an injection was performed (text extended, thinking closed),
  * 0 when there is nothing to do or no budget, -1 on eval failure. */
 static int chat_think_tool_recovery(server *s,
+                                    server_slot *slot,
                                     buf *text,
                                     thinking_state *thinking,
                                     size_t *scan_from,
-                                    int *completion,
-                                    int max_tokens,
+                                    request_output_budget *budget,
                                     char *err,
                                     size_t errlen) {
-    if (!thinking->inside || !text->ptr) return 0;
+    if (!s || !slot || !thinking->inside || !text->ptr) return 0;
     if (*scan_from > text->len) *scan_from = text->len;
     if (!find_any_tool_start(text->ptr + *scan_from)) {
         const size_t hold = 80; /* > longest stanza opening */
@@ -10433,10 +10520,11 @@ static int chat_think_tool_recovery(server *s,
     ds4_tokens toks = {0};
     ds4_tokenize_rendered_chat(s->engine, inject, &toks);
 
-    const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    const int room = ds4_session_ctx(slot->session) -
+        ds4_session_pos(slot->session);
     if (toks.len <= 0 ||
         toks.len >= room ||
-        *completion + toks.len >= max_tokens) {
+        toks.len >= request_output_budget_remaining(budget)) {
         /* Not enough budget to recover; leave the stream as generated and let
          * the parse-time fallback deal with it.  Skip past this marker so the
          * scan does not retry it every token. */
@@ -10446,11 +10534,14 @@ static int chat_think_tool_recovery(server *s,
     }
 
     for (int i = 0; i < toks.len; i++) {
-        if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
+        if (server_eval_token(s, slot, toks.v[i], err, errlen) != 0) {
             ds4_tokens_free(&toks);
             return -1;
         }
-        (*completion)++;
+        if (!request_output_budget_take(budget, 1)) {
+            ds4_tokens_free(&toks);
+            return -1;
+        }
     }
     buf_append(text, inject, inject_len);
     thinking_state_feed(thinking, inject, inject_len);
@@ -10702,6 +10793,7 @@ static int server_session_sync(server *s, server_slot *slot,
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    const char *suffix,
+                                                   request_output_budget *budget,
                                                    int *tokens_appended,
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
@@ -10715,10 +10807,20 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
     const int before = ds4_session_pos(slot->session);
+    const int delta = target.len - before;
+    if (delta <= 0 || delta >= request_output_budget_remaining(budget)) {
+        if (err && errlen) snprintf(err, errlen, "output token ceiling exhausted");
+        ds4_tokens_free(&target);
+        return false;
+    }
     bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
-    if (ok && tokens_appended) {
-        int delta = ds4_session_pos(slot->session) - before;
-        *tokens_appended = delta > 0 ? delta : 0;
+    if (ok) {
+        const int appended = ds4_session_pos(slot->session) - before;
+        ok = appended == delta && request_output_budget_take(budget, appended);
+        if (ok && tokens_appended) *tokens_appended = appended;
+        if (!ok && err && errlen) {
+            snprintf(err, errlen, "tool recovery token accounting failed");
+        }
     }
     ds4_tokens_free(&target);
     return ok;
@@ -10728,10 +10830,12 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
                                         const request *r,
                                         const thinking_state *thinking,
                                         const char *detail,
+                                        request_output_budget *budget,
                                         int *tokens_appended,
                                         char *err, size_t errlen) {
     char *suffix = build_invalid_tool_call_error_suffix(r, thinking, detail);
     bool ok = append_rendered_suffix_to_live_session(s, slot, suffix,
+                                                     budget,
                                                      tokens_appended,
                                                      err, errlen);
     free(suffix);
@@ -11426,6 +11530,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
+    ds4_kvstore_text_preview disk_preview = {0};
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
@@ -11434,6 +11539,66 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             cache_source = "memory-text";
             prompt_for_sync = &effective_prompt;
         }
+    }
+    if (prompt_for_sync == &effective_prompt) {
+        const bool live_state_required =
+            (responses_live_continuation &&
+             j->req.responses_requires_live_tool_state) ||
+            (anthropic_live_continuation &&
+             j->req.anthropic_requires_live_tool_state);
+        const effective_prompt_action action =
+            request_effective_prompt_action(
+                prompt_for_sync->len, j->req.max_tokens, s->ctx_size,
+                live_state_required);
+        if (action == EFFECTIVE_PROMPT_REJECT) {
+            const int rejected_tokens = prompt_for_sync->len;
+            ds4_tokens_free(&effective_prompt);
+            (void)http_error_context_length_exceeded(
+                j->fd, s->enable_cors, &j->req, rejected_tokens, s->ctx_size);
+            return;
+        }
+        if (action == EFFECTIVE_PROMPT_FALLBACK_CANONICAL) {
+            ds4_tokens_free(&effective_prompt);
+            prompt_for_sync = &j->req.prompt;
+            cached = common == old_pos && j->req.prompt.len >= old_pos ?
+                common : 0;
+            cache_source = cached > 0 ? "memory-token" : "none";
+            responses_live_continuation = false;
+            anthropic_live_continuation = false;
+            thinking_live_continuation = false;
+            responses_live_match = NULL;
+            responses_live_match_ids = 0;
+            anthropic_live_match_ids = 0;
+        }
+    }
+    if (cached == 0 &&
+        kv_cache_preview_text(s, j->req.prompt_text, &disk_preview) > 0)
+    {
+        /* The preview owns an open descriptor for this exact checkpoint.  Its
+         * effective token count is sufficient for admission; the exact token
+         * prefix is restored from that descriptor only after the request fits. */
+        effective_prompt.len = disk_preview.effective_tokens;
+        prompt_for_sync = &effective_prompt;
+        if (request_effective_prompt_action(
+                prompt_for_sync->len, j->req.max_tokens, s->ctx_size,
+                false) == EFFECTIVE_PROMPT_FALLBACK_CANONICAL)
+        {
+            ds4_kvstore_text_preview_free(&disk_preview);
+            memset(&effective_prompt, 0, sizeof(effective_prompt));
+            prompt_for_sync = &j->req.prompt;
+        }
+    }
+    const request_admission_code effective_admission =
+        request_token_counts_admit(prompt_for_sync->len,
+                                   (uint64_t)j->req.max_tokens,
+                                   s->ctx_size);
+    if (effective_admission != REQUEST_ADMISSION_FITS) {
+        const int rejected_tokens = prompt_for_sync->len;
+        ds4_kvstore_text_preview_free(&disk_preview);
+        ds4_tokens_free(&effective_prompt);
+        (void)http_error_context_length_exceeded(
+            j->fd, s->enable_cors, &j->req, rejected_tokens, s->ctx_size);
+        return;
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
@@ -11449,14 +11614,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
-    if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
-                                        &disk_cache_path,
-                                        &disk_cache_ext_flags);
+    if (cached == 0 && disk_preview.state) {
+        disk_cached = kv_cache_load_preview(
+            s, slot, &disk_preview, &effective_prompt, &disk_cache_path,
+            &disk_cache_ext_flags, responses_protocol);
+        ds4_kvstore_text_preview_free(&disk_preview);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
-            prompt_for_sync = &effective_prompt;
+        } else {
+            /* A stale/corrupt preview never redirects the request to a
+             * different file.  Continue from the already-admitted canonical
+             * prompt without changing the selected prompt pointer. */
+            ds4_tokens_free(&effective_prompt);
+            tokens_copy_prefix(&effective_prompt, &j->req.prompt,
+                               j->req.prompt.len);
+            disk_cached = 0;
+            disk_cache_ext_flags = 0;
+            cache_source = "none";
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -11710,24 +11885,27 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ (response_seq << 1) ^
          (uint64_t)(uintptr_t)j);
+    int completion = 0;
+    const int max_tokens = j->req.max_tokens;
+    request_output_budget output_budget =
+        request_output_budget_make(max_tokens);
 decode_again:
     ;
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
     const char *finish = "length";
-    int completion = 0;
-    int max_tokens = j->req.max_tokens;
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
-    int next_decode_log = 50;
-    if (max_tokens < 0) max_tokens = 0;
-    if (max_tokens > room) max_tokens = room;
-    trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    int next_decode_log = completion + 50;
+    trace_event(s, trace_id,
+                "prefill done; decode_max=%d decode_remaining=%d ctx_room=%d",
+                max_tokens, request_output_budget_remaining(&output_budget),
+                room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
@@ -11777,19 +11955,23 @@ decode_again:
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
+            (void)request_output_budget_take(&output_budget, 1);
+            completion = output_budget.used;
             finish = "stop";
             break;
         }
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode && temperature <= 0.0f &&
+        if (request_allows_speculative_decode(&j->req) &&
+            !s->batched_mode && temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(slot->session,
                                                        token,
-                                                       max_tokens - completion,
+                                                       request_output_budget_remaining(
+                                                           &output_budget),
                                                        ds4_token_eos(s->engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
@@ -11814,6 +11996,8 @@ decode_again:
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
+                (void)request_output_budget_take(&output_budget, 1);
+                completion = output_budget.used;
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -11821,7 +12005,14 @@ decode_again:
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
-            completion++;
+            if (!request_output_budget_take(&output_budget, 1)) {
+                free(piece);
+                finish = "error";
+                snprintf(err, sizeof(err), "output token ceiling exhausted");
+                stop_decode = true;
+                break;
+            }
+            completion = output_budget.used;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -11899,10 +12090,11 @@ decode_again:
                      * close so the model restarts the call on the executable
                      * side. */
                     const int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, &text, &thinking,
+                        chat_think_tool_recovery(s, slot, &text, &thinking,
                                                  &think_recovery_scan_from,
-                                                 &completion, max_tokens,
+                                                 &output_budget,
                                                  err, sizeof(err)) : 0;
+                    completion = output_budget.used;
                     if (recovered < 0) {
                         finish = "error";
                         stop_decode = true;
@@ -12057,10 +12249,12 @@ decode_again:
                             "unterminated tool call; continuing with model-visible tool error");
                 if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 "unterminated tool call",
+                                                &output_budget,
                                                 &recovery_tokens,
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
+                    completion = output_budget.used;
                     dsml_recovery_attempted = true;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
@@ -12141,10 +12335,12 @@ decode_again:
                             "invalid tool call; continuing with model-visible tool error");
                 if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 detail,
+                                                &output_budget,
                                                 &recovery_tokens,
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
+                    completion = output_budget.used;
                     dsml_recovery_attempted = true;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
@@ -14145,6 +14341,39 @@ static void test_request_admission_exact_boundary_is_pure(void) {
 
     request_free(&omitted);
     request_free(&explicit_request);
+}
+
+static void test_effective_prompt_admission_action_table(void) {
+    TEST_ASSERT(request_effective_prompt_action(12, 4, 16, false) ==
+                EFFECTIVE_PROMPT_USE);
+    TEST_ASSERT(request_effective_prompt_action(13, 4, 16, false) ==
+                EFFECTIVE_PROMPT_FALLBACK_CANONICAL);
+    TEST_ASSERT(request_effective_prompt_action(13, 4, 16, true) ==
+                EFFECTIVE_PROMPT_REJECT);
+}
+
+static void test_request_output_budget_is_cumulative_and_transactional(void) {
+    request_output_budget budget = request_output_budget_make(4);
+    TEST_ASSERT(request_output_budget_remaining(&budget) == 4);
+    TEST_ASSERT(request_output_budget_take(&budget, 2));
+    TEST_ASSERT(budget.used == 2);
+    TEST_ASSERT(request_output_budget_remaining(&budget) == 2);
+    TEST_ASSERT(!request_output_budget_take(&budget, 3));
+    TEST_ASSERT(budget.used == 2);
+    TEST_ASSERT(request_output_budget_take(&budget, 2));
+    TEST_ASSERT(budget.used == 4);
+    TEST_ASSERT(request_output_budget_remaining(&budget) == 0);
+    TEST_ASSERT(!request_output_budget_take(&budget, 1));
+    TEST_ASSERT(budget.used == 4);
+}
+
+static void test_requests_disable_speculative_decode(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    TEST_ASSERT(!request_allows_speculative_decode(&r));
+    r.has_tools = true;
+    TEST_ASSERT(!request_allows_speculative_decode(&r));
+    request_free(&r);
 }
 
 static void test_request_output_count_requires_exact_json_integer(void) {
@@ -17455,6 +17684,76 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_text_preview_is_pure_and_file_bound(void) {
+    char tmpl[] = "/tmp/ds4-kv-preview-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "exact rendered cache prefix";
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 512, 0);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.continued_last_store_tokens = 77;
+
+    ds4_kvstore_text_preview preview;
+    memset(&preview, 0xa5, sizeof(preview));
+    TEST_ASSERT(ds4_kvstore_preview_text(&kc, NULL, text,
+                                         0, 2, 32768, &preview) == 512);
+    TEST_ASSERT(preview.tokens == 512);
+    TEST_ASSERT(preview.effective_tokens == 512);
+    TEST_ASSERT(preview.state != NULL);
+    TEST_ASSERT(kc.len == 0);
+    TEST_ASSERT(kc.continued_last_store_tokens == 77);
+    TEST_ASSERT(request_token_counts_admit(preview.effective_tokens,
+                                           32257, 32768) ==
+                REQUEST_ADMISSION_CONTEXT_OVERFLOW);
+    FILE *unchanged = fopen(path, "rb");
+    TEST_ASSERT(unchanged != NULL);
+    if (unchanged) {
+        kv_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        TEST_ASSERT(kv_read_header(unchanged, &hdr, &text_bytes));
+        TEST_ASSERT(hdr.hits == 0);
+        TEST_ASSERT(hdr.last_used == 100);
+        fclose(unchanged);
+    }
+    /* Dropping an overflowing optional preview closes the exact descriptor;
+     * no session load or cache-policy mutation has occurred. */
+    ds4_kvstore_text_preview_free(&preview);
+    TEST_ASSERT(preview.state == NULL);
+    TEST_ASSERT(kc.continued_last_store_tokens == 77);
+
+    TEST_ASSERT(ds4_kvstore_preview_text(&kc, NULL, text,
+                                         0, 2, 32768, &preview) == 512);
+
+    char *old_path = path_join(dir, "selected-entry.old");
+    TEST_ASSERT(rename(path, old_path) == 0);
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 512, 0);
+    TEST_ASSERT(ds4_kvstore_load_text_preview(&kc, NULL, NULL, NULL,
+                                              &preview, NULL,
+                                              NULL, false) < 0);
+    ds4_kvstore_text_preview_free(&preview);
+    TEST_ASSERT(preview.state == NULL);
+    TEST_ASSERT(kc.len == 0);
+    TEST_ASSERT(kc.continued_last_store_tokens == 77);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    unlink(old_path);
+    free(old_path);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     char tmpl[] = "/tmp/ds4-kv-stale-abi-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -18248,6 +18547,9 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_request_admission_exact_boundary_is_pure();
+    test_effective_prompt_admission_action_table();
+    test_request_output_budget_is_cumulative_and_transactional();
+    test_requests_disable_speculative_decode();
     test_request_output_count_requires_exact_json_integer();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
@@ -18323,6 +18625,7 @@ static void ds4_server_unit_tests_run(void) {
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
+    test_kv_cache_text_preview_is_pure_and_file_bound();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();

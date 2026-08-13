@@ -6614,7 +6614,8 @@ static void test_think_tool_recovery(void) {
     server srv;
     memset(&srv, 0, sizeof(srv));
     srv.engine = engine;
-    srv.session = session;
+    pthread_mutex_init(&srv.inference_mu, NULL);
+    server_slot recovery_slot = { .session = session };
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza
@@ -6626,7 +6627,7 @@ static void test_think_tool_recovery(void) {
     ds4_tokenize_rendered_chat(engine, forced.ptr, &toks);
     TEST_ASSERT(toks.len > 1);
     size_t scan_from = 0;
-    int completion = 0;
+    request_output_budget output_budget = request_output_budget_make(512);
     int rec = 0;
     int triggered_at = -1;
     for (int i = 0; i < toks.len; i++) {
@@ -6637,8 +6638,9 @@ static void test_think_tool_recovery(void) {
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
         TEST_ASSERT(thinking.inside);
-        rec = chat_think_tool_recovery(&srv, &text, &thinking, &scan_from,
-                                       &completion, 512, err, sizeof(err));
+        rec = chat_think_tool_recovery(&srv, &recovery_slot, &text, &thinking,
+                                       &scan_from, &output_budget,
+                                       err, sizeof(err));
         TEST_ASSERT(rec >= 0);
         if (rec == 1) {
             triggered_at = i;
@@ -6647,13 +6649,13 @@ static void test_think_tool_recovery(void) {
     }
     fprintf(stderr,
             "ds4-test: think-tool-recovery trigger=%d/%d injected_tokens=%d\n",
-            triggered_at, toks.len, completion);
+            triggered_at, toks.len, output_budget.used);
     TEST_ASSERT(rec == 1);
     TEST_ASSERT(triggered_at == toks.len - 1);
     ds4_tokens_free(&toks);
     buf_free(&forced);
     TEST_ASSERT(!thinking.inside);
-    TEST_ASSERT(completion > 0);
+    TEST_ASSERT(output_budget.used > 0);
     TEST_ASSERT(text.ptr && text.len >= 10 &&
                 !memcmp(text.ptr + text.len - 10, "</think>\n\n", 10));
 
@@ -6692,12 +6694,14 @@ static void test_think_tool_recovery(void) {
 
     fprintf(stderr,
             "ds4-test: think-tool-recovery recovered=%d gen_tokens=%d calls=%d name=%s\n",
-            rec, completion, calls.len, calls.len ? calls.v[0].name : "-");
+            rec, output_budget.used, calls.len,
+            calls.len ? calls.v[0].name : "-");
 
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
     buf_free(&text);
+    pthread_mutex_destroy(&srv.inference_mu);
     ds4_session_free(session);
     request_free(&r);
     test_close_engine(false);

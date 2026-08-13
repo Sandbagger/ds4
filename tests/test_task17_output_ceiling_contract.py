@@ -124,6 +124,26 @@ class Task17OutputCeilingContractTest(unittest.TestCase):
             "slot",
         )
 
+    def test_requests_never_enter_multi_token_speculation(self) -> None:
+        helper = function_body("static bool request_allows_speculative_decode")
+        self.assertRegex(
+            helper,
+            r"\breturn\s+false\s*;",
+            "server request decoding must remain one-token-at-a-time until "
+            "the speculative API can roll back at protocol stop conditions",
+        )
+        speculative = self.generate.find("ds4_session_eval_speculative_argmax(")
+        self.assertGreaterEqual(speculative, 0)
+        guard_start = self.generate.rfind("if (", 0, speculative)
+        self.assertGreaterEqual(guard_start, 0)
+        guard = self.generate[guard_start:speculative]
+        self.assertIn(
+            "request_allows_speculative_decode(&j->req)",
+            guard,
+            "request serving must stay on one-token coordinated decode so "
+            "logical stops cannot leave a hidden precommitted tail",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

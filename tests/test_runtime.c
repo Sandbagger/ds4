@@ -8,12 +8,15 @@
 
 #include "ds4_runtime.h"
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int g_assertions;
 static int g_failures;
@@ -36,6 +39,34 @@ static const uint64_t kib = UINT64_C(1024);
 static const uint64_t mib = UINT64_C(1024) * 1024u;
 static const char device_uuid[] = "GPU-01234567-89ab-cdef-0123-456789abcdef";
 static const char nvml_library_version[] = "580.95.05";
+static const char *program_path;
+
+static uint64_t stat_mtime_ns(const struct stat *status) {
+#if defined(__APPLE__)
+    return (uint64_t)status->st_mtime * UINT64_C(1000000000) +
+           (uint64_t)status->st_mtimensec;
+#else
+    return (uint64_t)status->st_mtim.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)status->st_mtim.tv_nsec;
+#endif
+}
+
+static ds4_runtime_file_identity identity_from_stat(
+        const struct stat *status) {
+    return (ds4_runtime_file_identity){
+        .device = (uint64_t)status->st_dev,
+        .inode = (uint64_t)status->st_ino,
+        .size_bytes = (uint64_t)status->st_size,
+        .mtime_ns = stat_mtime_ns(status),
+    };
+}
+
+static bool identity_equal(
+        const ds4_runtime_file_identity *a,
+        const ds4_runtime_file_identity *b) {
+    return a->device == b->device && a->inode == b->inode &&
+           a->size_bytes == b->size_bytes && a->mtime_ns == b->mtime_ns;
+}
 
 /* Eight VMAs deliberately exercise exact-inode matching and physical-domain
  * exclusions.  The model mapping has 64 KiB PSS but is charged separately by
@@ -1038,6 +1069,322 @@ static void test_peer_inventory_and_ceilings(void) {
           "exactly 512 MiB host unattributed remains admissible");
 }
 
+static bool wire_tracker_init(
+        ds4_runtime_tracker *tracker,
+        ds4_runtime_allocation_record records[4]) {
+    static const ds4_runtime_callsite callsites[] = {
+        { 1u, "static", DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS,
+          DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 100u },
+    };
+    ds4_runtime_tracker_config config;
+    memset(&config, 0, sizeof(config));
+    config.callsites = callsites;
+    config.callsite_count = sizeof(callsites) / sizeof(callsites[0]);
+    config.records = records;
+    config.record_capacity = 4u;
+    config.category_bounds[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 100u;
+    config.report_bounds[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 30u;
+    config.report_bounds[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = 20u;
+    config.report_bounds[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 10u;
+    config.owned_total_bound_bytes = 100u;
+    config.qualification_total_bound_bytes = 160u;
+    return ds4_runtime_tracker_init(tracker, &config) ==
+               DS4_RUNTIME_STATUS_OK &&
+           ds4_runtime_tracker_allocate(
+               tracker, 1u, 1u, UINT64_C(0x90000000), 40u, 40u) ==
+               DS4_RUNTIME_STATUS_OK &&
+           ds4_runtime_tracker_checkpoint_external(tracker, 5u, 6u, 7u) ==
+               DS4_RUNTIME_STATUS_OK;
+}
+
+static ds4_runtime_wire_snapshot_input wire_input(void) {
+    ds4_runtime_wire_snapshot_input input;
+    memset(&input, 0, sizeof(input));
+    input.state = DS4_RUNTIME_WIRE_STATE_READY;
+    memcpy(input.build.revision,
+           "1111111111111111111111111111111111111111",
+           DS4_RUNTIME_REVISION_CAPACITY);
+    memcpy(input.build.backend, "cuda", sizeof("cuda"));
+    memcpy(input.build.features[0], "laguna", sizeof("laguna"));
+    memcpy(input.build.features[1], "ssd_streaming",
+           sizeof("ssd_streaming"));
+    input.build.feature_count = 2u;
+    input.configured_context_tokens = 32768u;
+    input.configured_prefill_chunk_tokens = 4096u;
+    input.configured_session_slots = 1u;
+    input.configured_ssd_streaming = true;
+    input.configured_ssd_streaming_cache_bytes = UINT64_C(8589934592);
+    input.effective_context_tokens = 32768u;
+    input.effective_prefill_chunk_tokens = 4096u;
+    input.effective_session_slots = 1u;
+    input.expert_cache_limit_bytes = UINT64_C(8589934592);
+    input.configured_prefill_rows = 4096u;
+    input.allocated_prefill_rows = 4096u;
+    input.counters = (ds4_runtime_wire_counters){
+        .cache_acquire_hits = 1u,
+        .cache_acquire_misses = 2u,
+        .cache_evictions = 3u,
+        .model_file_read_operations = 4u,
+        .model_file_read_bytes = 5u,
+        .model_file_read_ns = 6u,
+        .host_to_device_bytes = 7u,
+        .host_to_device_ns = 8u,
+        .page_advice_attempts = 9u,
+        .page_advice_bytes = 10u,
+        .page_advice_failures = 11u,
+    };
+    return input;
+}
+
+static bool uuid_shape_valid(const char *uuid) {
+    static const size_t hyphens[] = {8u, 13u, 18u, 23u};
+    bool nonzero = false;
+    if (!uuid || strlen(uuid) != 36u) return false;
+    for (size_t i = 0; i < 36u; i++) {
+        bool hyphen = false;
+        for (size_t j = 0; j < sizeof(hyphens) / sizeof(hyphens[0]); j++) {
+            if (i == hyphens[j]) hyphen = true;
+        }
+        if (hyphen) {
+            if (uuid[i] != '-') return false;
+        } else {
+            if (!((uuid[i] >= '0' && uuid[i] <= '9') ||
+                  (uuid[i] >= 'a' && uuid[i] <= 'f'))) {
+                return false;
+            }
+            if (uuid[i] != '0') nonzero = true;
+        }
+    }
+    return nonzero;
+}
+
+static void check_wire_json_golden(
+        const ds4_runtime_wire_snapshot *snapshot) {
+    char json[DS4_RUNTIME_JSON_CAPACITY];
+    size_t length = 0;
+    CHECK(ds4_runtime_wire_snapshot_json(
+              snapshot, json, sizeof(json), &length),
+          "runtime wire serializer accepts one coherent snapshot");
+    if (length == 0u || length >= sizeof(json)) return;
+    CHECK(json[length] == '\0' && length == strlen(json),
+          "runtime wire serializer returns one NUL-terminated JSON value");
+
+    char expected[DS4_RUNTIME_JSON_CAPACITY];
+    const int expected_length = snprintf(
+        expected, sizeof(expected),
+        "{\"schema\":\"ds4.runtime/v1\",\"instance_id\":\"%s\","
+        "\"snapshot_seq\":\"1\",\"state\":\"ready\","
+        "\"build\":{\"revision\":\"1111111111111111111111111111111111111111\","
+        "\"dirty\":false,\"backend\":\"cuda\","
+        "\"features\":[\"laguna\",\"ssd_streaming\"]},"
+        "\"executable\":{\"device\":\"%" PRIu64 "\",\"inode\":\"%" PRIu64
+        "\",\"size_bytes\":\"%" PRIu64 "\",\"mtime_ns\":\"%" PRIu64 "\"},"
+        "\"model\":{\"id\":\"laguna-s-2.1\",\"family\":\"laguna\","
+        "\"device\":\"%" PRIu64 "\",\"inode\":\"%" PRIu64
+        "\",\"size_bytes\":\"%" PRIu64 "\",\"mtime_ns\":\"%" PRIu64 "\"},"
+        "\"config\":{\"context_tokens\":32768,\"prefill_chunk_tokens\":4096,"
+        "\"session_slots\":1,\"ssd_streaming\":true,"
+        "\"ssd_streaming_cache_bytes\":\"8589934592\"},"
+        "\"limits\":{\"effective_context_tokens\":32768,"
+        "\"effective_prefill_chunk_tokens\":4096,"
+        "\"effective_session_slots\":1,"
+        "\"expert_cache_limit_bytes\":\"8589934592\"},"
+        "\"allocations\":{\"categories\":{"
+        "\"static_weights\":{\"current_bytes\":\"40\",\"bound_bytes\":\"100\",\"peak_bytes\":\"40\"},"
+        "\"expert_cache_payload\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"cache_metadata_address_tables\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"kv_state\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"graph_scratch\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"pinned_staging\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"other_host\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"other_cuda\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"}},"
+        "\"reports\":{"
+        "\"model_mapped_virtual\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"model_mapping_registered\":{\"current_bytes\":\"0\",\"bound_bytes\":\"0\",\"peak_bytes\":\"0\"},"
+        "\"model_source_resident\":{\"current_bytes\":\"5\",\"bound_bytes\":\"30\",\"peak_bytes\":\"5\"},"
+        "\"host_library_unattributed\":{\"current_bytes\":\"6\",\"bound_bytes\":\"20\",\"peak_bytes\":\"6\"},"
+        "\"cuda_library_unattributed\":{\"current_bytes\":\"7\",\"bound_bytes\":\"10\",\"peak_bytes\":\"7\"}},"
+        "\"owned_total\":{\"current_bytes\":\"40\",\"bound_bytes\":\"100\",\"peak_bytes\":\"40\"},"
+        "\"qualification_total\":{\"current_bytes\":\"58\",\"bound_bytes\":\"160\",\"peak_bytes\":\"58\"},"
+        "\"configured_prefill_rows\":4096,\"allocated_prefill_rows\":4096},"
+        "\"counters\":{\"cache_acquire_hits\":\"1\",\"cache_acquire_misses\":\"2\","
+        "\"cache_evictions\":\"3\",\"model_file_read_operations\":\"4\","
+        "\"model_file_read_bytes\":\"5\",\"model_file_read_ns\":\"6\","
+        "\"host_to_device_bytes\":\"7\",\"host_to_device_ns\":\"8\","
+        "\"page_advice_attempts\":\"9\",\"page_advice_bytes\":\"10\","
+        "\"page_advice_failures\":\"11\"},\"violations\":[]}",
+        snapshot->instance_id,
+        snapshot->executable.device, snapshot->executable.inode,
+        snapshot->executable.size_bytes, snapshot->executable.mtime_ns,
+        snapshot->model.device, snapshot->model.inode,
+        snapshot->model.size_bytes, snapshot->model.mtime_ns);
+    CHECK(expected_length > 0 && (size_t)expected_length < sizeof(expected),
+          "runtime wire golden JSON fits its test buffer");
+    CHECK(expected_length >= 0 && length == (size_t)expected_length &&
+              memcmp(json, expected, length + 1u) == 0,
+          "runtime wire serializer is deterministic and schema-shaped byte for byte");
+
+    char repeated[DS4_RUNTIME_JSON_CAPACITY];
+    size_t repeated_length = 0;
+    CHECK(ds4_runtime_wire_snapshot_json(
+              snapshot, repeated, sizeof(repeated), &repeated_length) &&
+              repeated_length == length &&
+              memcmp(repeated, json, length + 1u) == 0,
+          "serializing the same runtime snapshot twice is byte-identical");
+}
+
+static void test_runtime_wire_snapshot(void) {
+    char model_path[] = "/tmp/ds4-runtime-wire-XXXXXX";
+    const int model_fd = mkstemp(model_path);
+    CHECK(model_fd >= 0, "runtime wire fixture opens a retained model descriptor");
+    if (model_fd < 0) return;
+    static const char model_bytes[32] = "runtime-wire-opened-model-bytes";
+    CHECK(write(model_fd, model_bytes, sizeof(model_bytes)) ==
+              (ssize_t)sizeof(model_bytes),
+          "runtime wire fixture writes model identity bytes");
+    struct stat model_status;
+    CHECK(fstat(model_fd, &model_status) == 0,
+          "runtime wire fixture stats the opened model descriptor");
+    const ds4_runtime_file_identity expected_model =
+        identity_from_stat(&model_status);
+
+    ds4_runtime_snapshot_context context;
+    ds4_runtime_snapshot_context peer_context;
+    CHECK(ds4_runtime_snapshot_context_init(
+              &context, model_fd, "laguna-s-2.1", "laguna"),
+          "runtime snapshot context captures process and opened-model identity");
+    CHECK(ds4_runtime_snapshot_context_init(
+              &peer_context, model_fd, "laguna-s-2.1", "laguna"),
+          "a second runtime snapshot context initializes in the same process");
+    CHECK(uuid_shape_valid(context.instance_id) &&
+              strcmp(context.instance_id, peer_context.instance_id) == 0,
+          "all runtime contexts share one nonzero process-lifetime UUID");
+    CHECK(identity_equal(&context.model, &expected_model),
+          "runtime context retains identity from the exact opened model fd");
+
+    struct stat executable_status;
+    CHECK(stat(program_path, &executable_status) == 0,
+          "runtime wire fixture stats the running test image");
+    const ds4_runtime_file_identity expected_executable =
+        identity_from_stat(&executable_status);
+    CHECK(identity_equal(&context.executable, &expected_executable),
+          "runtime context records the running executable stat identity");
+
+    CHECK(unlink(model_path) == 0,
+          "runtime wire fixture removes the opened model pathname");
+    const int replacement_fd = open(
+        model_path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    CHECK(replacement_fd >= 0,
+          "runtime wire fixture replaces the model pathname with another inode");
+    if (replacement_fd >= 0) close(replacement_fd);
+    struct stat replacement_status;
+    CHECK(stat(model_path, &replacement_status) == 0 &&
+              (uint64_t)replacement_status.st_ino != context.model.inode,
+          "replaced model pathname no longer identifies the retained opened file");
+    CHECK(identity_equal(&context.model, &expected_model),
+          "runtime context never reconstructs opened-model identity from its path");
+
+    ds4_runtime_tracker tracker;
+    ds4_runtime_allocation_record records[4];
+    CHECK(wire_tracker_init(&tracker, records),
+          "runtime wire allocation tracker fixture initializes");
+    ds4_runtime_wire_snapshot_input input = wire_input();
+    ds4_runtime_wire_snapshot first;
+    ds4_runtime_wire_snapshot second;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &first),
+          "first coherent runtime wire snapshot succeeds");
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &second),
+          "second coherent runtime wire snapshot succeeds");
+    CHECK(first.snapshot_seq == 1u && second.snapshot_seq == 2u &&
+              strcmp(first.instance_id, second.instance_id) == 0,
+          "runtime snapshot sequence starts at one and increases per capture");
+    CHECK(first.allocations.owned_total_current ==
+              first.allocations.category_current[
+                  DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] &&
+              first.allocations.qualification_total_current ==
+                  first.allocations.owned_total_current +
+                  first.allocations.report_current[
+                      DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] +
+                  first.allocations.report_current[
+                      DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] +
+                  first.allocations.report_current[
+                      DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED],
+          "one wire snapshot contains internally consistent allocation totals");
+    CHECK(first.configured_context_tokens == 32768u &&
+              first.configured_prefill_chunk_tokens == 4096u &&
+              first.configured_session_slots == 1u &&
+              first.configured_ssd_streaming &&
+              first.configured_ssd_streaming_cache_bytes ==
+                  UINT64_C(8589934592) &&
+              first.effective_context_tokens == 32768u &&
+              first.effective_prefill_chunk_tokens == 4096u &&
+              first.effective_session_slots == 1u &&
+              first.expert_cache_limit_bytes == UINT64_C(8589934592) &&
+              first.configured_prefill_rows == 4096u &&
+              first.allocated_prefill_rows == 4096u,
+          "wire snapshot preserves every configured and effective value exactly");
+    CHECK(memcmp(&first.counters, &input.counters,
+                 sizeof(first.counters)) == 0,
+          "wire snapshot preserves all eleven monotonic counters exactly");
+    CHECK(first.violation_count == 0u,
+          "a healthy runtime snapshot has an empty violation history");
+    check_wire_json_golden(&first);
+
+    tracker.violation = DS4_RUNTIME_VIOLATION_CATEGORY_BOUND;
+    input.state = DS4_RUNTIME_WIRE_STATE_UNSAFE;
+    ds4_runtime_wire_snapshot violated;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &violated) &&
+              violated.snapshot_seq == 3u &&
+              violated.violation_count == 1u &&
+              violated.violations[0].code ==
+                  DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
+              violated.violations[0].latched_snapshot_seq == 3u,
+          "a hard-bound violation records its exact first-observed snapshot");
+    tracker.violation = DS4_RUNTIME_VIOLATION_NONE;
+    ds4_runtime_wire_snapshot historical;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &historical) &&
+              historical.violation_count == 1u &&
+              historical.violations[0].code ==
+                  DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
+              historical.violations[0].latched_snapshot_seq == 3u,
+          "clearing a tracker cannot erase an immutable historical violation");
+    tracker.violation = DS4_RUNTIME_VIOLATION_OVERFLOW;
+    ds4_runtime_wire_snapshot two_violations;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &two_violations) &&
+              two_violations.violation_count == 2u &&
+              two_violations.violations[0].code ==
+                  DS4_RUNTIME_VIOLATION_CATEGORY_BOUND &&
+              two_violations.violations[0].latched_snapshot_seq == 3u &&
+              two_violations.violations[1].code ==
+                  DS4_RUNTIME_VIOLATION_OVERFLOW &&
+              two_violations.violations[1].latched_snapshot_seq == 5u,
+          "later violations append without mutating historical entries");
+
+    context.next_snapshot_seq = UINT64_MAX - 1u;
+    ds4_runtime_wire_snapshot near_max;
+    ds4_runtime_wire_snapshot at_max;
+    ds4_runtime_wire_snapshot saturated;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &context, &tracker, &input, &near_max) &&
+              ds4_runtime_wire_snapshot_capture(
+                  &context, &tracker, &input, &at_max) &&
+              ds4_runtime_wire_snapshot_capture(
+                  &context, &tracker, &input, &saturated) &&
+              near_max.snapshot_seq == UINT64_MAX - 1u &&
+              at_max.snapshot_seq == UINT64_MAX &&
+              saturated.snapshot_seq == UINT64_MAX &&
+              context.next_snapshot_seq == UINT64_MAX,
+          "runtime snapshot sequence saturates instead of wrapping");
+
+    close(model_fd);
+    unlink(model_path);
+}
+
 static int run_external_attribution(void) {
     test_valid_external_attribution();
     test_partial_vma_credit_and_managed_deduplication();
@@ -1050,6 +1397,7 @@ static int run_external_attribution(void) {
     test_smaps_fail_closed();
     test_nvml_fail_closed();
     test_peer_inventory_and_ceilings();
+    test_runtime_wire_snapshot();
     if (g_failures != 0) {
         fprintf(stderr,
                 "external-attribution: %d/%d assertions failed\n",
@@ -1065,6 +1413,7 @@ static void usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+    program_path = argv[0];
     if (argc != 3 || strcmp(argv[1], "--case") != 0) {
         usage(argv[0]);
         return 2;

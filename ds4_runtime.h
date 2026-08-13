@@ -97,7 +97,30 @@ enum {
     DS4_RUNTIME_DEVICE_UUID_CAPACITY = 96,
     DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY = 96,
     DS4_RUNTIME_BUILD_IDENTITY_BYTES = 32,
+    DS4_RUNTIME_INSTANCE_ID_CAPACITY = 37,
+    DS4_RUNTIME_REVISION_CAPACITY = 41,
+    DS4_RUNTIME_MODEL_ID_CAPACITY = 64,
+    DS4_RUNTIME_MODEL_FAMILY_CAPACITY = 64,
+    DS4_RUNTIME_FEATURE_CAPACITY = 32,
+    DS4_RUNTIME_FEATURE_COUNT = 16,
+    DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY = 20,
+    DS4_RUNTIME_JSON_CAPACITY = 16384,
 };
+
+typedef struct {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t size_bytes;
+    uint64_t mtime_ns;
+} ds4_runtime_file_identity;
+
+typedef struct {
+    char revision[DS4_RUNTIME_REVISION_CAPACITY];
+    bool dirty;
+    char backend[DS4_RUNTIME_FEATURE_CAPACITY];
+    char features[DS4_RUNTIME_FEATURE_COUNT][DS4_RUNTIME_FEATURE_CAPACITY];
+    size_t feature_count;
+} ds4_runtime_build_info;
 
 typedef enum {
     DS4_RUNTIME_EXTERNAL_FAILURE_NONE = 0,
@@ -265,6 +288,90 @@ typedef struct {
     size_t active_record_count;
 } ds4_runtime_snapshot;
 
+/* Public ds4.runtime/v1 snapshot.  This is deliberately distinct from the
+ * allocation tracker's copy-only ds4_runtime_snapshot above. */
+typedef enum {
+    DS4_RUNTIME_WIRE_STATE_STARTING = 0,
+    DS4_RUNTIME_WIRE_STATE_READY = 1,
+    DS4_RUNTIME_WIRE_STATE_DRAINING = 2,
+    DS4_RUNTIME_WIRE_STATE_UNSAFE = 3,
+} ds4_runtime_wire_state;
+
+typedef struct {
+    uint64_t cache_acquire_hits;
+    uint64_t cache_acquire_misses;
+    uint64_t cache_evictions;
+    uint64_t model_file_read_operations;
+    uint64_t model_file_read_bytes;
+    uint64_t model_file_read_ns;
+    uint64_t host_to_device_bytes;
+    uint64_t host_to_device_ns;
+    uint64_t page_advice_attempts;
+    uint64_t page_advice_bytes;
+    uint64_t page_advice_failures;
+} ds4_runtime_wire_counters;
+
+typedef struct {
+    ds4_runtime_violation code;
+    uint64_t latched_snapshot_seq;
+} ds4_runtime_wire_violation;
+
+typedef struct {
+    ds4_runtime_wire_state state;
+    ds4_runtime_build_info build;
+    uint32_t configured_context_tokens;
+    uint32_t configured_prefill_chunk_tokens;
+    uint32_t configured_session_slots;
+    bool configured_ssd_streaming;
+    uint64_t configured_ssd_streaming_cache_bytes;
+    uint32_t effective_context_tokens;
+    uint32_t effective_prefill_chunk_tokens;
+    uint32_t effective_session_slots;
+    uint64_t expert_cache_limit_bytes;
+    uint32_t configured_prefill_rows;
+    uint32_t allocated_prefill_rows;
+    ds4_runtime_wire_counters counters;
+} ds4_runtime_wire_snapshot_input;
+
+typedef struct {
+    char instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    uint64_t next_snapshot_seq;
+    ds4_runtime_file_identity executable;
+    ds4_runtime_file_identity model;
+    char model_id[DS4_RUNTIME_MODEL_ID_CAPACITY];
+    char model_family[DS4_RUNTIME_MODEL_FAMILY_CAPACITY];
+    ds4_runtime_wire_violation
+        violations[DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY];
+    size_t violation_count;
+} ds4_runtime_snapshot_context;
+
+typedef struct {
+    char instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    uint64_t snapshot_seq;
+    ds4_runtime_wire_state state;
+    ds4_runtime_build_info build;
+    ds4_runtime_file_identity executable;
+    ds4_runtime_file_identity model;
+    char model_id[DS4_RUNTIME_MODEL_ID_CAPACITY];
+    char model_family[DS4_RUNTIME_MODEL_FAMILY_CAPACITY];
+    uint32_t configured_context_tokens;
+    uint32_t configured_prefill_chunk_tokens;
+    uint32_t configured_session_slots;
+    bool configured_ssd_streaming;
+    uint64_t configured_ssd_streaming_cache_bytes;
+    uint32_t effective_context_tokens;
+    uint32_t effective_prefill_chunk_tokens;
+    uint32_t effective_session_slots;
+    uint64_t expert_cache_limit_bytes;
+    ds4_runtime_snapshot allocations;
+    uint32_t configured_prefill_rows;
+    uint32_t allocated_prefill_rows;
+    ds4_runtime_wire_counters counters;
+    ds4_runtime_wire_violation
+        violations[DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY];
+    size_t violation_count;
+} ds4_runtime_wire_snapshot;
+
 typedef struct {
     uint64_t allocation_id;
     uint32_t callsite_id;
@@ -371,6 +478,28 @@ bool ds4_runtime_tracker_snapshot_copy(
     ds4_runtime_snapshot *snapshot,
     ds4_runtime_allocation_record *active_records,
     size_t active_record_capacity);
+
+/* Capture process/executable and retained opened-model identity once. */
+bool ds4_runtime_snapshot_context_init(
+    ds4_runtime_snapshot_context *context,
+    int opened_model_fd,
+    const char *model_id,
+    const char *model_family);
+
+/* Copy tracker, cache, page, and configuration facts into one coherent wire
+ * value. Sequence numbers begin at one and saturate at UINT64_MAX. */
+bool ds4_runtime_wire_snapshot_capture(
+    ds4_runtime_snapshot_context *context,
+    const ds4_runtime_tracker *tracker,
+    const ds4_runtime_wire_snapshot_input *input,
+    ds4_runtime_wire_snapshot *snapshot);
+
+/* Deterministic compact JSON in ds4.runtime/v1 field order. */
+bool ds4_runtime_wire_snapshot_json(
+    const ds4_runtime_wire_snapshot *snapshot,
+    char *buffer,
+    size_t capacity,
+    size_t *length_out);
 
 bool ds4_runtime_reduction_qualified(
     uint64_t resident_qualification_total_peak,

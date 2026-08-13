@@ -2304,7 +2304,10 @@ bool ds4_runtime_request_mark_prefill_complete(
         !context->prompt_tokens_set || !context->prefill_started ||
         context->prefill_complete ||
         complete_monotonic_ns == 0u ||
-        complete_monotonic_ns < context->prefill_started_monotonic_ns) {
+        complete_monotonic_ns < context->prefill_started_monotonic_ns ||
+        (context->page_advice_observed &&
+         complete_monotonic_ns <
+             context->latest_page_advice_monotonic_ns)) {
         return false;
     }
     ds4_runtime_request_context staged = *context;
@@ -2392,6 +2395,9 @@ bool ds4_runtime_request_record_visible_decoded(
         visible_delta >
             context->generated_tokens - context->visible_generated_tokens ||
         decoded_monotonic_ns < context->prefill_complete_monotonic_ns ||
+        (context->page_advice_observed &&
+         decoded_monotonic_ns <
+             context->latest_page_advice_monotonic_ns) ||
         (context->visible_decode_started &&
          decoded_monotonic_ns <
              context->last_visible_decode_monotonic_ns)) {
@@ -2433,6 +2439,12 @@ bool ds4_runtime_request_observe_page_advice(
         !context->prompt_tokens_set || !context->prefill_started ||
         context->page_advice_complete || complete_monotonic_ns == 0u ||
         complete_monotonic_ns < context->prefill_started_monotonic_ns ||
+        (context->prefill_complete &&
+         complete_monotonic_ns <
+             context->prefill_complete_monotonic_ns) ||
+        (context->visible_decode_started &&
+         complete_monotonic_ns <
+             context->last_visible_decode_monotonic_ns) ||
         (context->page_advice_observed &&
          complete_monotonic_ns <
              context->latest_page_advice_monotonic_ns)) {
@@ -2502,6 +2514,9 @@ bool ds4_runtime_request_finish(
         (context->page_advice_observed &&
          !context->page_advice_complete &&
          status != DS4_RUNTIME_REQUEST_UNSAFE_ERROR) ||
+        (context->page_advice_observed &&
+         finished_monotonic_ns <
+             context->latest_page_advice_monotonic_ns) ||
         finished_monotonic_ns < context->accepted_monotonic_ns ||
         (context->prefill_complete &&
          finished_monotonic_ns <

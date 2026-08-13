@@ -2219,6 +2219,8 @@ static bool runtime_request_context_mutable(
           context->last_visible_decode_monotonic_ns != 0u)) &&
         (context->first_visible_emitted ==
          (context->first_visible_emitted_monotonic_ns != 0u)) &&
+        (context->page_advice_observed ==
+         (context->latest_page_advice_monotonic_ns != 0u)) &&
         (context->page_advice_complete ==
          (context->page_advice_complete_monotonic_ns != 0u)) &&
         (!context->prefill_started ||
@@ -2238,10 +2240,16 @@ static bool runtime_request_context_mutable(
          (context->visible_decode_started &&
           context->first_visible_emitted_monotonic_ns >=
               context->first_visible_decode_monotonic_ns)) &&
+        (!context->page_advice_observed ||
+         (context->prefill_started &&
+          context->latest_page_advice_monotonic_ns >=
+              context->prefill_started_monotonic_ns)) &&
         (!context->page_advice_complete ||
-         (context->prefill_complete &&
+         (context->page_advice_observed && context->prefill_complete &&
           context->page_advice_complete_monotonic_ns >=
               context->prefill_complete_monotonic_ns &&
+          context->page_advice_complete_monotonic_ns >=
+              context->latest_page_advice_monotonic_ns &&
           (!context->visible_decode_started ||
            context->page_advice_complete_monotonic_ns >=
                context->last_visible_decode_monotonic_ns)));
@@ -2418,6 +2426,25 @@ bool ds4_runtime_request_mark_first_visible_emitted(
     return true;
 }
 
+bool ds4_runtime_request_observe_page_advice(
+        ds4_runtime_request_context *context,
+        uint64_t complete_monotonic_ns) {
+    if (!runtime_request_context_mutable(context) ||
+        !context->prompt_tokens_set || !context->prefill_started ||
+        context->page_advice_complete || complete_monotonic_ns == 0u ||
+        complete_monotonic_ns < context->prefill_started_monotonic_ns ||
+        (context->page_advice_observed &&
+         complete_monotonic_ns <
+             context->latest_page_advice_monotonic_ns)) {
+        return false;
+    }
+    ds4_runtime_request_context staged = *context;
+    staged.latest_page_advice_monotonic_ns = complete_monotonic_ns;
+    staged.page_advice_observed = true;
+    *context = staged;
+    return true;
+}
+
 bool ds4_runtime_request_record_page_advice_complete(
         ds4_runtime_request_context *context,
         uint64_t complete_monotonic_ns) {
@@ -2426,12 +2453,19 @@ bool ds4_runtime_request_record_page_advice_complete(
         context->page_advice_complete ||
         complete_monotonic_ns == 0u ||
         complete_monotonic_ns < context->prefill_complete_monotonic_ns ||
+        (context->page_advice_observed &&
+         complete_monotonic_ns <
+             context->latest_page_advice_monotonic_ns) ||
         (context->visible_decode_started &&
          complete_monotonic_ns <
              context->last_visible_decode_monotonic_ns)) {
         return false;
     }
     ds4_runtime_request_context staged = *context;
+    if (!staged.page_advice_observed) {
+        staged.latest_page_advice_monotonic_ns = complete_monotonic_ns;
+        staged.page_advice_observed = true;
+    }
     staged.page_advice_complete_monotonic_ns = complete_monotonic_ns;
     staged.page_advice_complete = true;
     *context = staged;
@@ -2461,6 +2495,13 @@ bool ds4_runtime_request_finish(
         status >= DS4_RUNTIME_REQUEST_TERMINAL_STATUS_COUNT ||
         (status == DS4_RUNTIME_REQUEST_COMPLETED &&
          !context->prefill_complete) ||
+        (status == DS4_RUNTIME_REQUEST_REJECTED &&
+         (context->prefill_started || context->page_advice_observed ||
+          context->generated_tokens != 0u ||
+          context->visible_generated_tokens != 0u)) ||
+        (context->page_advice_observed &&
+         !context->page_advice_complete &&
+         status != DS4_RUNTIME_REQUEST_UNSAFE_ERROR) ||
         finished_monotonic_ns < context->accepted_monotonic_ns ||
         (context->prefill_complete &&
          finished_monotonic_ns <

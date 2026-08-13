@@ -397,6 +397,7 @@ typedef struct {
     uint64_t first_visible_decode_monotonic_ns;
     uint64_t last_visible_decode_monotonic_ns;
     uint64_t first_visible_emitted_monotonic_ns;
+    uint64_t latest_page_advice_monotonic_ns;
     uint64_t page_advice_complete_monotonic_ns;
     uint64_t prompt_tokens;
     uint64_t generated_tokens;
@@ -409,6 +410,7 @@ typedef struct {
     bool prefill_complete;
     bool visible_decode_started;
     bool first_visible_emitted;
+    bool page_advice_observed;
     bool page_advice_complete;
     bool terminal;
 } ds4_runtime_request_context;
@@ -473,6 +475,14 @@ bool ds4_runtime_request_record_visible_decoded(
 bool ds4_runtime_request_mark_first_visible_emitted(
     ds4_runtime_request_context *context,
     uint64_t emitted_monotonic_ns);
+
+/* Record physical page-advice completion without sealing request accounting.
+ * Repeated equal/later observations are allowed so prefill and decode can
+ * contribute independently; the explicit request barrier seals the final
+ * post-request completion with record_page_advice_complete(). */
+bool ds4_runtime_request_observe_page_advice(
+    ds4_runtime_request_context *context,
+    uint64_t complete_monotonic_ns);
 
 bool ds4_runtime_request_record_page_advice_complete(
     ds4_runtime_request_context *context,

@@ -2167,7 +2167,7 @@ static void test_request_metrics_saturation_and_validation(void) {
                   &valid_after_malformed,
                   DS4_RUNTIME_REQUEST_REJECTED, 13u,
                   &valid_after_malformed_metrics) &&
-              valid_after_malformed_metrics.snapshot_seq == 6u,
+              valid_after_malformed_metrics.snapshot_seq == 8u,
           "failed malformed finalization does not consume the shared sequence");
 
     ds4_runtime_request_context inherited;

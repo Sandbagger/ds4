@@ -107,8 +107,12 @@ static void test_qualification_option_preflight(void) {
     opt = reference_qualification_options(8u * gib);
     opt.session_slots = 2u;
     CHECK(ds4_test_qualification_plan_preflight(
+              &opt, false, err, sizeof(err)) == 0,
+          "qualification prices the exact two-session profile");
+    opt.session_slots = 3u;
+    CHECK(ds4_test_qualification_plan_preflight(
               &opt, false, err, sizeof(err)) == 2,
-          "qualification prices exactly one live session");
+          "qualification rejects an unpriced third live session");
     opt = reference_qualification_options(8u * gib);
     opt.warm_weights = true;
     CHECK(ds4_test_qualification_plan_preflight(
@@ -658,9 +662,16 @@ static void test_options(void) {
     CHECK(ds4_test_engine_exact_cache_preflight(
               true, dgx_recommended, 16u * gib, 32768u, 4096u,
               2u, false,
+              err, sizeof(err)) == 0,
+          "exact graph cache admits two-session serving with doubled graph pricing");
+
+    memset(err, 0, sizeof(err));
+    CHECK(ds4_test_engine_exact_cache_preflight(
+              true, dgx_recommended, 16u * gib, 32768u, 4096u,
+              3u, false,
               err, sizeof(err)) == 2 &&
-          strstr(err, "--session-slots") != NULL,
-          "exact graph cache rejects unpriced multi-session serving");
+          strstr(err, "session") != NULL,
+          "exact graph cache rejects an unpriced third session");
 
     memset(err, 0, sizeof(err));
     CHECK(ds4_test_engine_exact_cache_preflight(

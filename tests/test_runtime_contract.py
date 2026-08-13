@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import importlib.metadata
 import json
 import math
@@ -14,6 +15,7 @@ from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = ROOT / "schemas"
+SCHEMA_PROFILE = ROOT / "gguf-tools" / "quality-testing" / "compact_runtime_schema.py"
 REQUIREMENTS = ROOT / "gguf-tools/quality-testing/requirements-compact-runtime.txt"
 DRAFT = "https://json-schema.org/draft/2020-12/schema"
 U64_MAX, SAFE_INT = "18446744073709551615", (1 << 53) - 1
@@ -312,6 +314,43 @@ class DependencyTests(unittest.TestCase):
                 except importlib.metadata.PackageNotFoundError:
                     self.fail(f"missing qualification dependency: {name}=={expected}")
                 self.assertEqual(actual, expected)
+
+
+class ValidationProfileTests(unittest.TestCase):
+    def test_shared_profile_is_the_normative_strict_schema_entrypoint(self) -> None:
+        self.assertTrue(SCHEMA_PROFILE.is_file(), f"missing {SCHEMA_PROFILE}")
+        spec = importlib.util.spec_from_file_location("compact_runtime_schema", SCHEMA_PROFILE)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with self.assertRaisesRegex(ValueError, "duplicate key"):
+            module.loads_strict('{"schema":"x","schema":"y"}')
+        for payload in ('{"value":NaN}', '{"value":Infinity}', '{"value":1e9999}'):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "non-finite"):
+                module.loads_strict(payload)
+
+        version_schema = module.loads_strict(
+            (SCHEMA_DIR / SCHEMA_FILES["version"][0]).read_text(encoding="utf-8")
+        )
+        version_validator = module.validator_for(version_schema)
+        self.assertFalse(version_validator.is_valid({**version(), "features": ["ssd_streaming", "laguna"]}))
+
+        request_schema = module.loads_strict(
+            (SCHEMA_DIR / SCHEMA_FILES["request"][0]).read_text(encoding="utf-8")
+        )
+        request_validator = module.validator_for(request_schema)
+        for field, value in (
+            ("prompt_tokens", 1.0),
+            ("prompt_tokens", True),
+            ("visible_decode_tokens_per_second", math.nan),
+            ("visible_decode_tokens_per_second", math.inf),
+        ):
+            changed = request()
+            changed[field] = value
+            with self.subTest(field=field, value=value):
+                self.assertFalse(request_validator.is_valid(changed))
 
 
 class SchemaPresenceTests(unittest.TestCase):

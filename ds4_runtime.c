@@ -77,6 +77,8 @@ static pthread_mutex_t runtime_snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char runtime_instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
 static bool runtime_instance_id_valid;
 static pid_t runtime_instance_pid;
+static uint64_t runtime_process_snapshot_seq = 1u;
+static pid_t runtime_snapshot_pid;
 
 static void runtime_instance_id_initialize(void) {
     uint8_t bytes[16];
@@ -2243,7 +2245,13 @@ bool ds4_runtime_snapshot_context_init(
     }
     memcpy(staged.model_id, model_id, id_length + 1u);
     memcpy(staged.model_family, model_family, family_length + 1u);
-    staged.next_snapshot_seq = 1u;
+    if (pthread_mutex_lock(&runtime_snapshot_mutex) != 0) return false;
+    if (runtime_snapshot_pid != getpid()) {
+        runtime_process_snapshot_seq = 1u;
+        runtime_snapshot_pid = getpid();
+    }
+    staged.next_snapshot_seq = runtime_process_snapshot_seq;
+    pthread_mutex_unlock(&runtime_snapshot_mutex);
     *context = staged;
     return true;
 }
@@ -2272,7 +2280,9 @@ bool ds4_runtime_wire_snapshot_capture(
         return false;
     }
     if (pthread_mutex_lock(&runtime_snapshot_mutex) != 0) return false;
-    if (context->next_snapshot_seq == 0u ||
+    if (runtime_snapshot_pid != getpid() ||
+        runtime_process_snapshot_seq == 0u ||
+        context->next_snapshot_seq == 0u ||
         !runtime_wire_uuid_valid(context->instance_id) ||
         !runtime_wire_model_text(
             context->model_id, sizeof(context->model_id), NULL) ||
@@ -2294,7 +2304,10 @@ bool ds4_runtime_wire_snapshot_capture(
         }
     }
     ds4_runtime_snapshot_context staged_context = *context;
-    const uint64_t sequence = staged_context.next_snapshot_seq;
+    const uint64_t sequence =
+        staged_context.next_snapshot_seq > runtime_process_snapshot_seq
+        ? staged_context.next_snapshot_seq
+        : runtime_process_snapshot_seq;
     if (tracker->violation != DS4_RUNTIME_VIOLATION_NONE &&
         !runtime_wire_violation_present(
             &staged_context, tracker->violation)) {
@@ -2355,9 +2368,10 @@ bool ds4_runtime_wire_snapshot_capture(
                sizeof(staged_context.violations[0]));
     staged_snapshot.violation_count = staged_context.violation_count;
 
-    if (staged_context.next_snapshot_seq != UINT64_MAX) {
-        staged_context.next_snapshot_seq++;
-    }
+    const uint64_t next_sequence = sequence == UINT64_MAX
+        ? UINT64_MAX : sequence + 1u;
+    staged_context.next_snapshot_seq = next_sequence;
+    runtime_process_snapshot_seq = next_sequence;
     *context = staged_context;
     *snapshot = staged_snapshot;
     pthread_mutex_unlock(&runtime_snapshot_mutex);

@@ -134,6 +134,7 @@ help:
 	@echo "  make test-cuda-laguna-resident  Run the pinned Poolside resident-CUDA oracle"
 	@echo "  make test-cuda-laguna-streaming DS4_TEST_MODEL=/abs/model.gguf DS4_QUALIFICATION_PLAN=/abs/plan.json DS4_QUALIFICATION_PLAN_SHA256=<sha256>  Run the descriptor-bound streamed CUDA gate"
 	@echo "  make test-cuda-laguna-model-page-advice DS4_TEST_MODEL=/abs/model.gguf  Run exact-inode page-disposal qualification"
+	@echo "  make test-cuda-laguna-request-counters DS4_TEST_MODEL=/abs/model.gguf  Run two-session request-counter attribution"
 	@echo "  make test-cuda-laguna-external-attribution DS4_TEST_MODEL=/abs/model.gguf  Reconcile live smaps/mincore/NVML footprint"
 	@echo "  make test-cuda-laguna-qualification-control DS4_TEST_MODEL=/abs/model.gguf  Run live descriptor/barrier fail-closed qualification"
 	@echo "  make test-cuda-laguna-runtime-identity DS4_TEST_MODEL=/abs/model.gguf  Run the complete Task 16 host + live CUDA gate"
@@ -577,6 +578,16 @@ test-cuda-laguna-model-page-advice: tests/test_cuda_laguna_stream
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" timeout --kill-after=5s 900s \
 		./tests/test_cuda_laguna_stream --case model-page-advice
 
+# Run in a fresh process so the process-level physical baseline contains only
+# the two explicitly attributed sessions created by this case.
+test-cuda-laguna-request-counters: tests/test_cuda_laguna_stream
+	@if [ "$(DS4_TEST_MODEL)" = ds4flash.gguf ]; then \
+		echo "error: set DS4_TEST_MODEL to the explicit Laguna GGUF path" >&2; \
+		exit 2; \
+	fi
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" timeout --kill-after=5s 900s \
+		./tests/test_cuda_laguna_stream --case request-counters
+
 # Capture the frozen peer inventory before the test process makes any CUDA
 # call.  Descriptor-bound safe-union cold preparation remains the Python
 # qualification harness's responsibility; this target measures live state.
@@ -640,6 +651,9 @@ test-cuda-laguna-streaming:
 
 test-cuda-laguna-model-page-advice:
 	@echo "error: test-cuda-laguna-model-page-advice is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-laguna-request-counters:
+	@echo "error: test-cuda-laguna-request-counters is unsupported; requires CUDA on Linux" >&2; exit 2
 
 test-cuda-laguna-external-attribution:
 	@echo "error: test-cuda-laguna-external-attribution is unsupported; requires CUDA on Linux" >&2; exit 2

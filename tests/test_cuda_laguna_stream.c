@@ -6249,6 +6249,424 @@ static void qualification_live_completion_destroy(
     completion->initialized = false;
 }
 
+#define REQUEST_COUNTER_FIELDS(APPLY)                  \
+    APPLY(cache_acquire_hits)                          \
+    APPLY(cache_acquire_misses)                        \
+    APPLY(cache_evictions)                             \
+    APPLY(model_file_read_operations)                  \
+    APPLY(model_file_read_bytes)                       \
+    APPLY(model_file_read_ns)                          \
+    APPLY(host_to_device_bytes)                        \
+    APPLY(host_to_device_ns)                           \
+    APPLY(page_advice_attempts)                        \
+    APPLY(page_advice_bytes)                           \
+    APPLY(page_advice_failures)
+
+static bool request_counter_delta(
+        const ds4_runtime_wire_counters *before,
+        const ds4_runtime_wire_counters *after,
+        ds4_runtime_wire_counters *delta) {
+    if (!before || !after || !delta) return false;
+    memset(delta, 0, sizeof(*delta));
+#define SUBTRACT_COUNTER(field)                        \
+    do {                                               \
+        if (after->field < before->field) return false;\
+        delta->field = after->field - before->field;   \
+    } while (0);
+    REQUEST_COUNTER_FIELDS(SUBTRACT_COUNTER)
+#undef SUBTRACT_COUNTER
+    return true;
+}
+
+static bool request_counter_sum_equals(
+        const ds4_runtime_wire_counters *total,
+        const ds4_runtime_wire_counters *first,
+        const ds4_runtime_wire_counters *second) {
+    if (!total || !first || !second) return false;
+#define COUNTER_SUM_EQUALS(field)                      \
+    do {                                               \
+        if (first->field > UINT64_MAX - second->field ||\
+            total->field != first->field + second->field) {\
+            return false;                              \
+        }                                              \
+    } while (0);
+    REQUEST_COUNTER_FIELDS(COUNTER_SUM_EQUALS)
+#undef COUNTER_SUM_EQUALS
+    return true;
+}
+
+static bool request_counters_equal(
+        const ds4_runtime_wire_counters *left,
+        const ds4_runtime_wire_counters *right) {
+    if (!left || !right) return false;
+#define COUNTER_EQUALS(field)                          \
+    do {                                               \
+        if (left->field != right->field) return false; \
+    } while (0);
+    REQUEST_COUNTER_FIELDS(COUNTER_EQUALS)
+#undef COUNTER_EQUALS
+    return true;
+}
+
+static bool request_counters_are_zero(
+        const ds4_runtime_wire_counters *counters) {
+    const ds4_runtime_wire_counters zero = {0};
+    return request_counters_equal(counters, &zero);
+}
+
+static uint64_t request_counter_monotonic_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) {
+        return 0u;
+    }
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+        (uint64_t)now.tv_nsec;
+}
+
+/* Fresh-process, real-model Task 17 RED.  Two grouped Laguna rows first route
+ * the same key: row A deterministically owns physical load work and row B
+ * receives only logical cache-hit accounting.  A second grouped operation uses
+ * different tokens so both rows own disjoint physical loads.  Finally C
+ * reuses B's session with a fresh context and eviction pressure.  Each phase
+ * reconciles all eleven process counters to its operation-scoped owners. */
+static int run_request_counters(void) {
+    const char *model = getenv("DS4_TEST_MODEL");
+    if (!model || !model[0]) {
+        fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
+        return 1;
+    }
+
+    int model_fd = -1;
+    bool model_fd_set = false;
+    if (!inherited_model_fd(&model_fd, &model_fd_set)) return 1;
+
+    saved_environment saved;
+    save_and_clear_forbidden_environment(&saved);
+    const ds4_engine_options options = {
+        .model_path = model,
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = 32768,
+        .prefill_chunk = 4096,
+        .session_slots = 2,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes =
+            UINT64_C(8) * 1024u * 1024u * 1024u,
+        .ssd_streaming_cache_bytes_set = true,
+        .qualification_model_fd = model_fd,
+        .qualification_model_fd_set = model_fd_set,
+    };
+
+    char preflight_error[256] = {0};
+    const int preflight = ds4_engine_options_preflight(
+        &options, preflight_error, sizeof(preflight_error));
+    if (preflight != 0) {
+        fprintf(stderr,
+                "FAIL: Task17 two-session compact prerequisite rejected: %s\n",
+                preflight_error[0] ? preflight_error : "unknown preflight error");
+    }
+    CHECK(preflight == 0,
+          "compact Laguna accepts two explicitly attributed session slots");
+    if (preflight != 0) {
+        restore_forbidden_environment(&saved);
+        return 1;
+    }
+
+    ds4_engine *engine = NULL;
+    const int opened = ds4_engine_open(&engine, &options);
+    CHECK(opened == 0 && engine != NULL,
+          "two-slot compact Laguna engine opens for request accounting");
+    if (opened != 0 || !engine) {
+        restore_forbidden_environment(&saved);
+        return 1;
+    }
+
+    ds4_session *session_a = NULL;
+    ds4_session *session_b = NULL;
+    const bool sessions_created =
+        ds4_session_create(&session_a, engine, 32768) == 0 && session_a &&
+        ds4_session_create(&session_b, engine, 32768) == 0 && session_b;
+    CHECK(sessions_created,
+          "two independent compact sessions coexist on one cache");
+    if (!sessions_created) {
+        ds4_session_free(session_b);
+        ds4_session_free(session_a);
+        ds4_engine_close(engine);
+        restore_forbidden_environment(&saved);
+        return 1;
+    }
+
+    ds4_runtime_request_context request_a;
+    ds4_runtime_request_context request_b;
+    ds4_runtime_request_context request_d;
+    ds4_runtime_request_context request_e;
+    ds4_runtime_request_context request_c;
+    memset(&request_a, 0, sizeof(request_a));
+    memset(&request_b, 0, sizeof(request_b));
+    memset(&request_d, 0, sizeof(request_d));
+    memset(&request_e, 0, sizeof(request_e));
+    memset(&request_c, 0, sizeof(request_c));
+    uint64_t accepted = request_counter_monotonic_ns();
+    const bool requests_begun = accepted != 0u &&
+        ds4_runtime_request_begin(&request_a, accepted) &&
+        ds4_runtime_request_begin(&request_b, accepted) &&
+        ds4_runtime_request_set_prompt_tokens(&request_a, 1u) &&
+        ds4_runtime_request_set_prompt_tokens(&request_b, 1u) &&
+        ds4_runtime_request_mark_prefill_started(
+            &request_a, request_counter_monotonic_ns()) &&
+        ds4_runtime_request_mark_prefill_started(
+            &request_b, request_counter_monotonic_ns());
+    CHECK(requests_begun &&
+              strcmp(request_a.request_id, request_b.request_id) != 0 &&
+              request_c.initialized == false,
+          "A and B begin as distinct request owners while C remains detached");
+
+    ds4_runtime_wire_snapshot process_before;
+    memset(&process_before, 0, sizeof(process_before));
+    const bool baseline_captured = requests_begun &&
+        ds4_engine_runtime_snapshot(engine, &process_before);
+    CHECK(baseline_captured &&
+              process_before.configured_session_slots == 2u &&
+              process_before.effective_session_slots == 2u,
+          "process baseline is captured after startup with two effective slots");
+
+    char batch_error[256] = {0};
+    ds4_attributed_decode_item rows[2] = {
+        { .session = session_a, .token = 0, .request = &request_a },
+        { .session = session_b, .token = 0, .request = &request_b },
+    };
+    const uint64_t fallback_before =
+        ds4_test_laguna_decode_fallback_count();
+    const int shared_batch = baseline_captured ?
+        ds4_sessions_eval_batch_attributed(
+            rows, 2, batch_error, sizeof(batch_error)) : -1;
+    CHECK(shared_batch == 0 &&
+              ds4_test_laguna_decode_fallback_count() == fallback_before,
+          "two attributed Laguna rows share one guarded compact group");
+    if (shared_batch != 0 && batch_error[0]) {
+        fprintf(stderr, "FAIL: attributed row batch: %s\n", batch_error);
+    }
+
+    const bool prefills_complete = shared_batch == 0 &&
+        ds4_runtime_request_mark_prefill_complete(
+            &request_a, request_counter_monotonic_ns()) &&
+        ds4_runtime_request_mark_prefill_complete(
+            &request_b, request_counter_monotonic_ns());
+    CHECK(prefills_complete,
+          "both native rows reach the request barrier independently");
+
+    char barrier_error[256] = {0};
+    const int barrier_a = prefills_complete ?
+        ds4_session_request_barrier(
+            session_a, &request_a,
+            barrier_error, sizeof(barrier_error)) : -1;
+    memset(barrier_error, 0, sizeof(barrier_error));
+    const int barrier_b = barrier_a == 0 ?
+        ds4_session_request_barrier(
+            session_b, &request_b,
+            barrier_error, sizeof(barrier_error)) : -1;
+    CHECK(barrier_a == 0 && barrier_b == 0,
+          "both native rows close their own final CUDA/advice barriers");
+
+    ds4_runtime_wire_snapshot process_after_ab;
+    ds4_runtime_wire_counters process_ab_delta;
+    memset(&process_after_ab, 0, sizeof(process_after_ab));
+    memset(&process_ab_delta, 0, sizeof(process_ab_delta));
+    const bool after_ab_captured = barrier_a == 0 && barrier_b == 0 &&
+        ds4_engine_runtime_snapshot(engine, &process_after_ab) &&
+        request_counter_delta(
+            &process_before.counters, &process_after_ab.counters,
+            &process_ab_delta);
+    CHECK(after_ab_captured &&
+              request_counter_sum_equals(
+                  &process_ab_delta,
+                  &request_a.counters, &request_b.counters),
+          "native row-batch physical delta reconciles exactly to A plus B");
+    CHECK(request_a.counters.cache_acquire_misses > 0u &&
+              request_a.counters.model_file_read_operations > 0u &&
+              request_a.counters.model_file_read_bytes > 0u &&
+              request_a.counters.host_to_device_bytes > 0u &&
+              request_a.counters.page_advice_attempts > 0u &&
+              request_a.counters.page_advice_bytes > 0u &&
+              request_a.page_advice_complete,
+          "first routed row A owns every shared miss, read, H2D, and advice");
+    CHECK(request_b.counters.cache_acquire_hits > 0u &&
+              request_b.counters.cache_acquire_misses == 0u &&
+              request_b.counters.cache_evictions == 0u &&
+              request_b.counters.model_file_read_operations == 0u &&
+              request_b.counters.model_file_read_bytes == 0u &&
+              request_b.counters.host_to_device_bytes == 0u &&
+              request_b.counters.page_advice_attempts == 0u &&
+              request_b.counters.page_advice_bytes == 0u &&
+              !request_b.page_advice_complete,
+          "second routed row B receives logical hits but no physical I/O");
+
+    const ds4_runtime_request_context request_a_frozen = request_a;
+    const ds4_runtime_request_context request_b_frozen = request_b;
+    accepted = request_counter_monotonic_ns();
+    const bool disjoint_requests_begun = accepted != 0u &&
+        ds4_runtime_request_begin(&request_d, accepted) &&
+        ds4_runtime_request_begin(&request_e, accepted) &&
+        ds4_runtime_request_set_prompt_tokens(&request_d, 1u) &&
+        ds4_runtime_request_set_prompt_tokens(&request_e, 1u) &&
+        ds4_runtime_request_mark_prefill_started(
+            &request_d, request_counter_monotonic_ns()) &&
+        ds4_runtime_request_mark_prefill_started(
+            &request_e, request_counter_monotonic_ns());
+    CHECK(disjoint_requests_begun &&
+              request_c.initialized == false,
+          "D and E begin independently for disjoint grouped routes");
+
+    rows[0].token = 1;
+    rows[0].request = &request_d;
+    rows[1].token = 2;
+    rows[1].request = &request_e;
+    memset(batch_error, 0, sizeof(batch_error));
+    const uint64_t disjoint_fallback_before =
+        ds4_test_laguna_decode_fallback_count();
+    const int disjoint_batch = disjoint_requests_begun ?
+        ds4_sessions_eval_batch_attributed(
+            rows, 2, batch_error, sizeof(batch_error)) : -1;
+    CHECK(disjoint_batch == 0 &&
+              ds4_test_laguna_decode_fallback_count() ==
+                  disjoint_fallback_before,
+          "different-token rows run through one guarded attributed group");
+    if (disjoint_batch != 0 && batch_error[0]) {
+        fprintf(stderr,
+                "FAIL: attributed disjoint row batch: %s\n", batch_error);
+    }
+
+    const bool disjoint_prefills_complete = disjoint_batch == 0 &&
+        ds4_runtime_request_mark_prefill_complete(
+            &request_d, request_counter_monotonic_ns()) &&
+        ds4_runtime_request_mark_prefill_complete(
+            &request_e, request_counter_monotonic_ns());
+    CHECK(disjoint_prefills_complete,
+          "both disjoint rows reach independent request barriers");
+
+    memset(barrier_error, 0, sizeof(barrier_error));
+    const int barrier_d = disjoint_prefills_complete ?
+        ds4_session_request_barrier(
+            session_a, &request_d,
+            barrier_error, sizeof(barrier_error)) : -1;
+    memset(barrier_error, 0, sizeof(barrier_error));
+    const int barrier_e = barrier_d == 0 ?
+        ds4_session_request_barrier(
+            session_b, &request_e,
+            barrier_error, sizeof(barrier_error)) : -1;
+    CHECK(barrier_d == 0 && barrier_e == 0,
+          "both disjoint rows close their own final advice barriers");
+
+    ds4_runtime_wire_snapshot process_after_de;
+    ds4_runtime_wire_counters process_de_delta;
+    memset(&process_after_de, 0, sizeof(process_after_de));
+    memset(&process_de_delta, 0, sizeof(process_de_delta));
+    const bool after_de_captured = barrier_d == 0 && barrier_e == 0 &&
+        ds4_engine_runtime_snapshot(engine, &process_after_de) &&
+        request_counter_delta(
+            &process_after_ab.counters, &process_after_de.counters,
+            &process_de_delta);
+    CHECK(after_de_captured &&
+              request_counter_sum_equals(
+                  &process_de_delta,
+                  &request_d.counters, &request_e.counters),
+          "disjoint native batch reconciles exactly to D plus E");
+    CHECK(request_d.counters.cache_acquire_misses > 0u &&
+              request_d.counters.model_file_read_operations > 0u &&
+              request_d.counters.model_file_read_bytes > 0u &&
+              request_d.counters.host_to_device_bytes > 0u &&
+              request_d.counters.page_advice_attempts > 0u &&
+              request_d.page_advice_complete &&
+              request_e.counters.cache_acquire_misses > 0u &&
+              request_e.counters.model_file_read_operations > 0u &&
+              request_e.counters.model_file_read_bytes > 0u &&
+              request_e.counters.host_to_device_bytes > 0u &&
+              request_e.counters.page_advice_attempts > 0u &&
+              request_e.page_advice_complete,
+          "each disjoint row owns at least one physical miss/read/H2D/advice");
+    CHECK(memcmp(&request_a, &request_a_frozen, sizeof(request_a)) == 0 &&
+              memcmp(&request_b, &request_b_frozen, sizeof(request_b)) == 0,
+          "disjoint grouped work cannot bleed into completed A or B");
+
+    const ds4_runtime_request_context request_e_frozen = request_e;
+    ds4_tokens pressure = {0};
+    ds4_tokens_push(&pressure, 0);
+    ds4_tokens_push(&pressure, 2);
+    for (int token = 3; token < 19; token++) {
+        ds4_tokens_push(&pressure, token);
+    }
+    CHECK(pressure.len == 18,
+          "C extends B's exact checkpoint with sixteen pressure rows");
+
+    accepted = request_counter_monotonic_ns();
+    const bool request_c_begun = accepted != 0u &&
+        ds4_runtime_request_begin(&request_c, accepted) &&
+        ds4_runtime_request_set_prompt_tokens(
+            &request_c, (uint64_t)pressure.len) &&
+        ds4_runtime_request_mark_prefill_started(
+            &request_c, request_counter_monotonic_ns()) &&
+        request_counters_are_zero(&request_c.counters) &&
+        !request_c.page_advice_complete;
+    CHECK(request_c_begun,
+          "reused session starts C with zero detached request accounting");
+
+    char c_error[256] = {0};
+    const int c_sync = request_c_begun ?
+        ds4_session_sync_attributed(
+            session_b, &pressure, &request_c,
+            c_error, sizeof(c_error)) : -1;
+    CHECK(c_sync == 0,
+          "C reuses B's session and drives bounded eviction pressure");
+    if (c_sync != 0 && c_error[0]) {
+        fprintf(stderr, "FAIL: attributed C sync: %s\n", c_error);
+    }
+    const bool c_prefill_complete = c_sync == 0 &&
+        ds4_runtime_request_mark_prefill_complete(
+            &request_c, request_counter_monotonic_ns());
+    CHECK(c_prefill_complete,
+          "C records prefill completion before testing barrier ownership");
+
+    memset(barrier_error, 0, sizeof(barrier_error));
+    const int barrier_c = c_prefill_complete ?
+        ds4_session_request_barrier(
+            session_b, &request_c,
+            barrier_error, sizeof(barrier_error)) : -1;
+    CHECK(barrier_c == 0,
+          "C's owning session closes its final CUDA/advice barrier");
+
+    ds4_runtime_wire_snapshot process_after_c;
+    ds4_runtime_wire_counters process_c_delta;
+    memset(&process_after_c, 0, sizeof(process_after_c));
+    memset(&process_c_delta, 0, sizeof(process_c_delta));
+    const bool after_c_captured = barrier_c == 0 &&
+        ds4_engine_runtime_snapshot(engine, &process_after_c) &&
+        request_counter_delta(
+            &process_after_de.counters, &process_after_c.counters,
+            &process_c_delta);
+    CHECK(after_c_captured &&
+              request_counters_equal(
+                  &process_c_delta, &request_c.counters),
+          "C alone owns the reused-session process counter delta");
+    CHECK(memcmp(&request_b, &request_b_frozen, sizeof(request_b)) == 0,
+          "C cannot mutate B after the request-owner handoff");
+    CHECK(memcmp(&request_e, &request_e_frozen, sizeof(request_e)) == 0,
+          "C cannot mutate E after reusing its session");
+    CHECK(request_c.counters.cache_acquire_misses > 0u &&
+              request_c.counters.cache_evictions > 0u &&
+              request_c.counters.model_file_read_operations > 0u &&
+              request_c.counters.host_to_device_bytes > 0u &&
+              request_c.counters.page_advice_attempts > 0u &&
+              request_c.page_advice_complete,
+          "C alone receives eviction, reload, H2D, and advice accounting");
+    ds4_session_free(session_b);
+    ds4_session_free(session_a);
+    ds4_tokens_free(&pressure);
+    ds4_engine_close(engine);
+    restore_forbidden_environment(&saved);
+    return g_failures == 0 ? 0 : 1;
+}
+
+#undef REQUEST_COUNTER_FIELDS
+
 typedef struct {
     qualification_live_completion completion;
     ds4_engine_options options;
@@ -7912,7 +8330,7 @@ static void usage(const char *program) {
             "model-teardown-second-recoverable|cache-validation|cache-io|"
             "cache-faults|cache-unsafe|cache-unsafe-race|"
             "prefill-allocation|page-advice|model-page-advice|"
-            "session-pressure|"
+            "session-pressure|request-counters|"
             "qualification-control-success|"
             "qualification-control-disconnect|"
             "external-attribution\n",
@@ -7963,6 +8381,8 @@ static int run_named_case(const char *name) {
         return run_model_page_advice();
     } else if (strcmp(name, "session-pressure") == 0) {
         return run_session_pressure();
+    } else if (strcmp(name, "request-counters") == 0) {
+        return run_request_counters();
     } else if (strcmp(name, "qualification-control-success") == 0) {
         return run_qualification_control_success();
     } else if (strcmp(name, "qualification-control-disconnect") == 0) {

@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) -I. -c -o $@ $<
@@ -126,6 +126,8 @@ help:
 	@echo "  make test-cuda-laguna-streaming DS4_TEST_MODEL=/abs/model.gguf DS4_QUALIFICATION_PLAN=/abs/plan.json DS4_QUALIFICATION_PLAN_SHA256=<sha256>  Run the descriptor-bound streamed CUDA gate"
 	@echo "  make test-cuda-laguna-model-page-advice DS4_TEST_MODEL=/abs/model.gguf  Run exact-inode page-disposal qualification"
 	@echo "  make test-cuda-laguna-external-attribution DS4_TEST_MODEL=/abs/model.gguf  Reconcile live smaps/mincore/NVML footprint"
+	@echo "  make test-cuda-laguna-qualification-control DS4_TEST_MODEL=/abs/model.gguf  Run live descriptor/barrier fail-closed qualification"
+	@echo "  make test-cuda-laguna-runtime-identity DS4_TEST_MODEL=/abs/model.gguf  Run the complete Task 16 host + live CUDA gate"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
@@ -367,6 +369,7 @@ tests/test_qualification_control: tests/test_qualification_control.o ds4_qualifi
 test-qualification-control: tests/test_qualification_control
 	./tests/test_qualification_control
 	python3 tests/test_qualification_control_contract.py -v
+	python3 tests/test_qualification_control_cli_contract.py -v
 
 ds4_plan_io.o: ds4_plan_io.c ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_plan_io.c
@@ -534,7 +537,7 @@ tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h
 tests/ds4_cuda_laguna_stream_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_cuda.cu
 
-tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_stream_test_hooks.o ds4_layer_pack.o
+tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_stream_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-stream: tests/test_cuda_laguna_stream
@@ -572,6 +575,26 @@ test-cuda-laguna-external-attribution: tests/test_cuda_laguna_stream
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" timeout --kill-after=5s 900s \
 		./tests/test_cuda_laguna_stream --case external-attribution
 
+# Run success and peer-loss as separate processes: an unsafe attribution
+# latch is intentionally process lifetime state and must not contaminate the
+# successful transaction's evidence or teardown assertions.
+test-cuda-laguna-qualification-control: tests/test_cuda_laguna_stream
+	@if [ "$(origin DS4_LOCK_FILE)" != undefined ]; then \
+		echo "error: DS4_LOCK_FILE is forbidden in test-cuda-laguna-qualification-control" >&2; \
+		exit 2; \
+	fi
+	@if [ -z "$${DS4_TEST_MODEL:-}" ] || [ "$${DS4_TEST_MODEL}" = ds4flash.gguf ]; then \
+		echo "error: set DS4_TEST_MODEL to the explicit Laguna GGUF path" >&2; \
+		exit 2; \
+	fi
+	DS4_TEST_MODEL="$${DS4_TEST_MODEL}" timeout --kill-after=5s 900s \
+		./tests/test_cuda_laguna_stream --case qualification-control-success
+	DS4_TEST_MODEL="$${DS4_TEST_MODEL}" timeout --kill-after=5s 900s \
+		./tests/test_cuda_laguna_stream --case qualification-control-disconnect
+test-cuda-laguna-qualification-control: override DS4_TEST_MODEL := $(value DS4_TEST_MODEL)
+
+test-cuda-laguna-runtime-identity: test-laguna-runtime-identity test-cuda-laguna-qualification-control
+
 export DS4_TEST_MODEL
 export LAGUNA_TOKENIZER_RUNTIME_COMMIT
 export DS4_QUALIFICATION_PLAN
@@ -607,6 +630,12 @@ test-cuda-laguna-model-page-advice:
 
 test-cuda-laguna-external-attribution:
 	@echo "error: test-cuda-laguna-external-attribution is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-laguna-qualification-control:
+	@echo "error: test-cuda-laguna-qualification-control is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-laguna-runtime-identity:
+	@echo "error: test-cuda-laguna-runtime-identity is unsupported; requires CUDA on Linux" >&2; exit 2
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -651,6 +680,30 @@ test-laguna-compact-contract:
 	}
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python tests/test_runtime_contract.py -v
+
+test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_control ds4 ds4-server ds4-agent ds4-bench ds4-eval
+	@command -v uv >/dev/null 2>&1 || { \
+		echo "error: test-laguna-runtime-identity requires uv" >&2; \
+		exit 127; \
+	}
+	@uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python -c 'from jsonschema import Draft202012Validator; import rfc3339_validator, rfc8785' || { \
+		echo "error: unable to provision pinned compact-runtime requirements with uv" >&2; \
+		exit 1; \
+	}
+	python3 tests/test_task16_gate_contract.py -v
+	./tests/test_runtime --case external-attribution
+	./tests/test_qualification_control
+	python3 tests/test_qualification_control_contract.py -v
+	python3 tests/test_qualification_control_cli_contract.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_compact_runtime_qualify.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python tests/test_version_json.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python tests/test_runtime_contract.py -v
+	DS4_RUNTIME_SERVER_URL= uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python tests/test_runtime_endpoint_contract.py -v
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \

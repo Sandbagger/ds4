@@ -456,6 +456,10 @@ int ds4_gpu_test_laguna_compact_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out);
 int ds4_gpu_test_laguna_compact_active_snapshot(
         ds4_gpu_laguna_compact_test_snapshot *out);
+/* Return one only when the caller can acquire and immediately release the
+ * compact execution mutex.  Test barriers call this from a different thread
+ * to distinguish execution-lock ownership from compact-state locking. */
+int ds4_gpu_test_laguna_compact_exec_mutex_try_lock(void);
 int ds4_gpu_test_laguna_compact_routed_origin_snapshot(
         ds4_gpu_laguna_routed_origin_test_snapshot *out);
 uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);

@@ -5022,6 +5022,12 @@ extern "C" void ds4_gpu_test_laguna_compact_fail_release_once(void) {
 }
 
 #ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_laguna_compact_exec_mutex_try_lock(void) {
+    if (!g_laguna_compact_exec_mutex.try_lock()) return 0;
+    g_laguna_compact_exec_mutex.unlock();
+    return 1;
+}
+
 extern "C" void ds4_gpu_test_laguna_compact_fail_after_identity_once(void) {
     g_laguna_compact_fail_after_identity.store(
         true, std::memory_order_relaxed);

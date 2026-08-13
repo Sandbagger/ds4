@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,8 +29,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -5918,6 +5921,873 @@ static bool nvml_snapshots_add_or_change_peer(
     return true;
 }
 
+typedef union {
+    struct cmsghdr alignment;
+    unsigned char bytes[CMSG_SPACE(sizeof(int) * 8u)];
+} qualification_live_ancillary;
+
+typedef struct {
+    ds4_qualification_control_message message;
+    int descriptors[8];
+    size_t descriptor_count;
+} qualification_live_wire_message;
+
+static void qualification_live_wire_close(
+        qualification_live_wire_message *wire) {
+    if (!wire) return;
+    for (size_t i = 0; i < wire->descriptor_count; i++) {
+        if (wire->descriptors[i] >= 0) {
+            (void)close(wire->descriptors[i]);
+            wire->descriptors[i] = -1;
+        }
+    }
+    wire->descriptor_count = 0;
+}
+
+static int qualification_live_wait_readable(int fd, int timeout_ms) {
+    struct pollfd descriptor = {
+        .fd = fd,
+        .events = POLLIN,
+    };
+    int result;
+    do {
+        result = poll(&descriptor, 1, timeout_ms);
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0) return result;
+    if ((descriptor.revents & POLLIN) != 0) return 1;
+    return -1;
+}
+
+static bool qualification_live_receive(
+        int fd,
+        int timeout_ms,
+        qualification_live_wire_message *wire) {
+    if (fd < 0 || timeout_ms <= 0 || !wire) return false;
+    memset(wire, 0, sizeof(*wire));
+    for (size_t i = 0; i < ARRAY_LEN(wire->descriptors); i++) {
+        wire->descriptors[i] = -1;
+    }
+
+    qualification_live_ancillary ancillary;
+    memset(&ancillary, 0, sizeof(ancillary));
+    struct iovec vector = {
+        .iov_base = &wire->message,
+        .iov_len = sizeof(wire->message),
+    };
+    struct msghdr header;
+    memset(&header, 0, sizeof(header));
+    header.msg_iov = &vector;
+    header.msg_iovlen = 1;
+    header.msg_control = ancillary.bytes;
+    header.msg_controllen = sizeof(ancillary.bytes);
+
+    if (qualification_live_wait_readable(fd, timeout_ms) != 1) return false;
+    int flags = 0;
+#ifdef MSG_CMSG_CLOEXEC
+    flags |= MSG_CMSG_CLOEXEC;
+#endif
+    ssize_t received;
+    do {
+        received = recvmsg(fd, &header, flags);
+    } while (received < 0 && errno == EINTR);
+    if (received <= 0 ||
+        (header.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0 ||
+        (size_t)received > sizeof(wire->message)) {
+        return false;
+    }
+
+    bool ancillary_valid = true;
+    for (struct cmsghdr *item = CMSG_FIRSTHDR(&header);
+         item != NULL;
+         item = CMSG_NXTHDR(&header, item)) {
+        if (item->cmsg_level != SOL_SOCKET ||
+            item->cmsg_type != SCM_RIGHTS ||
+            item->cmsg_len < CMSG_LEN(0)) {
+            ancillary_valid = false;
+            continue;
+        }
+        const size_t bytes = item->cmsg_len - CMSG_LEN(0);
+        if (bytes == 0 || bytes % sizeof(int) != 0) {
+            ancillary_valid = false;
+            continue;
+        }
+        const size_t count = bytes / sizeof(int);
+        const int *received_descriptors =
+            (const int *)CMSG_DATA(item);
+        for (size_t i = 0; i < count; i++) {
+            if (wire->descriptor_count >=
+                    ARRAY_LEN(wire->descriptors)) {
+                (void)close(received_descriptors[i]);
+                ancillary_valid = false;
+                continue;
+            }
+            wire->descriptors[wire->descriptor_count++] =
+                received_descriptors[i];
+        }
+    }
+    if (!ancillary_valid) {
+        qualification_live_wire_close(wire);
+        return false;
+    }
+
+    size_t offset = (size_t)received;
+    while (offset < sizeof(wire->message)) {
+        if (qualification_live_wait_readable(fd, timeout_ms) != 1) {
+            qualification_live_wire_close(wire);
+            return false;
+        }
+        ssize_t part;
+        do {
+            part = recv(fd, (unsigned char *)&wire->message + offset,
+                        sizeof(wire->message) - offset, 0);
+        } while (part < 0 && errno == EINTR);
+        if (part <= 0) {
+            qualification_live_wire_close(wire);
+            return false;
+        }
+        offset += (size_t)part;
+    }
+    return true;
+}
+
+static bool qualification_live_identity_equal(
+        const ds4_runtime_file_identity *left,
+        const ds4_runtime_file_identity *right) {
+    return left && right &&
+        left->device == right->device &&
+        left->inode == right->inode &&
+        left->size_bytes == right->size_bytes &&
+        left->mtime_ns == right->mtime_ns;
+}
+
+static int qualification_live_model_fd_count(
+        const ds4_laguna_file_identity *identity) {
+    if (!identity) return -1;
+    DIR *directory = opendir("/proc/self/fd");
+    if (!directory) return -1;
+    const int directory_fd = dirfd(directory);
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        char *end = NULL;
+        errno = 0;
+        const long parsed = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == entry->d_name || *end != '\0' ||
+            parsed < 0 || parsed > INT_MAX || (int)parsed == directory_fd) {
+            continue;
+        }
+        struct stat status;
+        if (fstat((int)parsed, &status) == 0 &&
+            (uint64_t)status.st_dev == identity->device &&
+            (uint64_t)status.st_ino == identity->inode &&
+            status.st_size >= 0 &&
+            (uint64_t)status.st_size == identity->size_bytes) {
+            count++;
+        }
+    }
+    if (closedir(directory) != 0) return -1;
+    return count;
+}
+
+static int qualification_live_socket_fd_count(
+        uint64_t device,
+        uint64_t inode) {
+    DIR *directory = opendir("/proc/self/fd");
+    if (!directory) return -1;
+    const int directory_fd = dirfd(directory);
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        char *end = NULL;
+        errno = 0;
+        const long parsed = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == entry->d_name || *end != '\0' ||
+            parsed < 0 || parsed > INT_MAX || (int)parsed == directory_fd) {
+            continue;
+        }
+        struct stat status;
+        if (fstat((int)parsed, &status) == 0 && S_ISSOCK(status.st_mode) &&
+            (uint64_t)status.st_dev == device &&
+            (uint64_t)status.st_ino == inode) {
+            count++;
+        }
+    }
+    if (closedir(directory) != 0) return -1;
+    return count;
+}
+
+static bool qualification_live_peer_eof(int fd) {
+    if (fd < 0) return false;
+    struct pollfd descriptor = {
+        .fd = fd,
+        .events = POLLIN,
+    };
+    int result;
+    do {
+        result = poll(&descriptor, 1, 2000);
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0 ||
+        (descriptor.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+        return false;
+    }
+    unsigned char byte = 0;
+    ssize_t received;
+    do {
+        received = recv(fd, &byte, sizeof(byte), MSG_DONTWAIT);
+    } while (received < 0 && errno == EINTR);
+    return received == 0;
+}
+
+static ds4_runtime_file_identity qualification_live_runtime_identity(
+        const ds4_laguna_file_identity *identity) {
+    ds4_runtime_file_identity result;
+    memset(&result, 0, sizeof(result));
+    if (identity) {
+        result.device = identity->device;
+        result.inode = identity->inode;
+        result.size_bytes = identity->size_bytes;
+        result.mtime_ns = identity->mtime_ns;
+    }
+    return result;
+}
+
+static bool qualification_live_wire_valid(
+        const qualification_live_wire_message *wire,
+        uint32_t expected_type,
+        uint64_t expected_sequence,
+        const ds4_runtime_file_identity *expected_identity,
+        size_t expected_descriptor_count) {
+    if (!wire || !expected_identity) return false;
+    return wire->message.protocol_version ==
+            DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION &&
+        wire->message.message_type == expected_type &&
+        wire->message.message_size == sizeof(wire->message) &&
+        wire->message.reserved == 0u &&
+        wire->message.checkpoint_sequence == expected_sequence &&
+        qualification_live_identity_equal(
+            &wire->message.model_identity, expected_identity) &&
+        wire->descriptor_count == expected_descriptor_count;
+}
+
+static bool qualification_live_send_ack(
+        int fd,
+        uint32_t message_type,
+        uint64_t sequence,
+        const ds4_runtime_file_identity *identity) {
+    if (fd < 0 || !identity) return false;
+    ds4_qualification_control_message message;
+    memset(&message, 0, sizeof(message));
+    message.protocol_version = DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION;
+    message.message_type = message_type;
+    message.message_size = (uint32_t)sizeof(message);
+    message.checkpoint_sequence = sequence;
+    message.model_identity = *identity;
+    size_t offset = 0;
+    while (offset < sizeof(message)) {
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        ssize_t written = send(
+            fd, (const unsigned char *)&message + offset,
+            sizeof(message) - offset, flags);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return false;
+        offset += (size_t)written;
+    }
+    return true;
+}
+
+typedef struct {
+    pthread_mutex_t mutex;
+    bool initialized;
+    bool done;
+} qualification_live_completion;
+
+static bool qualification_live_completion_init(
+        qualification_live_completion *completion) {
+    if (!completion) return false;
+    memset(completion, 0, sizeof(*completion));
+    completion->initialized =
+        pthread_mutex_init(&completion->mutex, NULL) == 0;
+    return completion->initialized;
+}
+
+static void qualification_live_completion_finish(
+        qualification_live_completion *completion) {
+    if (!completion || !completion->initialized) return;
+    (void)pthread_mutex_lock(&completion->mutex);
+    completion->done = true;
+    (void)pthread_mutex_unlock(&completion->mutex);
+}
+
+static bool qualification_live_completion_done(
+        qualification_live_completion *completion) {
+    if (!completion || !completion->initialized) return false;
+    (void)pthread_mutex_lock(&completion->mutex);
+    const bool done = completion->done;
+    (void)pthread_mutex_unlock(&completion->mutex);
+    return done;
+}
+
+static bool qualification_live_completion_stays_blocked(
+        qualification_live_completion *completion,
+        long milliseconds) {
+    if (!completion || milliseconds <= 0) return false;
+    struct timespec delay = {
+        .tv_sec = milliseconds / 1000,
+        .tv_nsec = (milliseconds % 1000) * 1000000L,
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    return !qualification_live_completion_done(completion);
+}
+
+static void qualification_live_completion_destroy(
+        qualification_live_completion *completion) {
+    if (!completion || !completion->initialized) return;
+    (void)pthread_mutex_destroy(&completion->mutex);
+    completion->initialized = false;
+}
+
+typedef struct {
+    qualification_live_completion completion;
+    ds4_engine_options options;
+    ds4_engine *engine;
+    int result;
+} qualification_live_open_worker;
+
+static void *qualification_live_open_main(void *userdata) {
+    qualification_live_open_worker *worker =
+        (qualification_live_open_worker *)userdata;
+    worker->result = ds4_engine_open(&worker->engine, &worker->options);
+    qualification_live_completion_finish(&worker->completion);
+    return NULL;
+}
+
+typedef struct {
+    qualification_live_completion completion;
+    ds4_engine *engine;
+    ds4_gpu_nvml_inventory_snapshot pre_child;
+    uint8_t build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+    ds4_engine_laguna_external_checkpoint_observation observation;
+    ds4_runtime_status status;
+} qualification_live_checkpoint_worker;
+
+static void *qualification_live_checkpoint_main(void *userdata) {
+    qualification_live_checkpoint_worker *worker =
+        (qualification_live_checkpoint_worker *)userdata;
+    worker->status = ds4_engine_laguna_external_checkpoint(
+        worker->engine, &worker->pre_child,
+        worker->build_identity, &worker->observation);
+    qualification_live_completion_finish(&worker->completion);
+    return NULL;
+}
+
+typedef struct {
+    qualification_live_completion completion;
+    ds4_engine *engine;
+    ds4_runtime_wire_snapshot snapshot;
+    bool result;
+} qualification_live_runtime_worker;
+
+static void *qualification_live_runtime_main(void *userdata) {
+    qualification_live_runtime_worker *worker =
+        (qualification_live_runtime_worker *)userdata;
+    worker->result =
+        ds4_engine_runtime_snapshot(worker->engine, &worker->snapshot);
+    qualification_live_completion_finish(&worker->completion);
+    return NULL;
+}
+
+typedef struct {
+    const char *model_path;
+    int model_fd;
+    int control_pair[2];
+    bool environment_saved;
+    saved_environment environment;
+    ds4_laguna_file_identity model_identity;
+    ds4_runtime_file_identity runtime_model_identity;
+    uint64_t control_device;
+    uint64_t control_inode;
+    bool control_identity_set;
+    ds4_gpu_nvml_inventory_snapshot pre_child;
+    uint8_t build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+    ds4_runtime_build_info runtime_build_info;
+    ds4_engine *engine;
+} qualification_live_fixture;
+
+static bool qualification_live_fixture_open(
+        qualification_live_fixture *fixture) {
+    if (!fixture) return false;
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->model_fd = -1;
+    fixture->control_pair[0] = -1;
+    fixture->control_pair[1] = -1;
+    fixture->model_path = getenv("DS4_TEST_MODEL");
+    CHECK(fixture->model_path && fixture->model_path[0],
+          "qualification gate requires DS4_TEST_MODEL");
+    if (!fixture->model_path || !fixture->model_path[0]) {
+        return false;
+    }
+
+    const bool frozen =
+        ds4_gpu_nvml_inventory_capture(&fixture->pre_child) != 0;
+    CHECK(frozen && nvml_snapshot_contract(&fixture->pre_child),
+          "qualification control freezes process NVML before CUDA init");
+    CHECK(frozen &&
+              nvml_snapshot_process(
+                  &fixture->pre_child, (uint32_t)getpid()) == NULL,
+          "qualification control pre-child capture creates no CUDA context");
+    const bool build_captured =
+        capture_running_build_identity(fixture->build_identity);
+    CHECK(build_captured,
+          "qualification control binds the running test executable");
+    if (!frozen || !nvml_snapshot_contract(&fixture->pre_child) ||
+        nvml_snapshot_process(
+            &fixture->pre_child, (uint32_t)getpid()) != NULL ||
+        !build_captured) {
+        return false;
+    }
+
+    fixture->model_fd = open(
+        fixture->model_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    CHECK(fixture->model_fd >= 0 &&
+              capture_file_identity(
+                  fixture->model_fd, &fixture->model_identity),
+          "qualification control opens one exact model descriptor");
+    if (fixture->model_fd < 0 || fixture->model_identity.size_bytes == 0u) {
+        return false;
+    }
+    fixture->runtime_model_identity =
+        qualification_live_runtime_identity(&fixture->model_identity);
+    fixture->runtime_build_info = (ds4_runtime_build_info){
+        .revision = "0123456789abcdef0123456789abcdef01234567",
+        .dirty = false,
+        .backend = "cuda",
+        .features = {"laguna", "ssd_streaming"},
+        .feature_count = 2u,
+    };
+
+    CHECK(socketpair(
+              AF_UNIX, SOCK_STREAM, 0, fixture->control_pair) == 0,
+          "qualification control creates one private Unix socketpair");
+    if (fixture->control_pair[0] < 0 || fixture->control_pair[1] < 0) {
+        return false;
+    }
+    struct stat control_status;
+    fixture->control_identity_set =
+        fstat(fixture->control_pair[0], &control_status) == 0 &&
+        S_ISSOCK(control_status.st_mode);
+    if (fixture->control_identity_set) {
+        fixture->control_device = (uint64_t)control_status.st_dev;
+        fixture->control_inode = (uint64_t)control_status.st_ino;
+    }
+    CHECK(fixture->control_identity_set,
+          "qualification child endpoint has a stable sockfs identity");
+    if (!fixture->control_identity_set) return false;
+    bool cloexec = true;
+    for (size_t i = 0; i < ARRAY_LEN(fixture->control_pair); i++) {
+        const int current = fcntl(fixture->control_pair[i], F_GETFD);
+        if (current < 0 || fcntl(
+                fixture->control_pair[i], F_SETFD,
+                current | FD_CLOEXEC) != 0) {
+            cloexec = false;
+        }
+    }
+    CHECK(cloexec, "qualification socket endpoints are close-on-exec");
+    if (!cloexec) return false;
+
+    save_and_clear_forbidden_environment(&fixture->environment);
+    fixture->environment_saved = true;
+    const uint64_t allocation_attempts_before =
+        ds4_gpu_test_laguna_compact_static_allocation_attempts();
+    qualification_live_open_worker worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.result = -1;
+    worker.options = (ds4_engine_options){
+        .model_path = fixture->model_path,
+        .backend = DS4_BACKEND_CUDA,
+        .context_size = 32768,
+        .prefill_chunk = 4096,
+        .session_slots = 1,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes =
+            UINT64_C(8) * 1024u * 1024u * 1024u,
+        .ssd_streaming_cache_bytes_set = true,
+        .runtime_build_info = &fixture->runtime_build_info,
+        .qualification_model_fd = fixture->model_fd,
+        .qualification_model_fd_set = true,
+        .qualification_control_fd = fixture->control_pair[0],
+        .qualification_control_fd_set = true,
+    };
+    const bool completion_ready =
+        qualification_live_completion_init(&worker.completion);
+    pthread_t thread;
+    const bool started = completion_ready &&
+        pthread_create(
+            &thread, NULL, qualification_live_open_main, &worker) == 0;
+    CHECK(started,
+          "qualification control starts compact engine creation concurrently");
+    if (!started) {
+        qualification_live_completion_destroy(&worker.completion);
+        return false;
+    }
+
+    qualification_live_wire_message model_message = {0};
+    const bool received = qualification_live_receive(
+        fixture->control_pair[1], 120000, &model_message);
+    const bool model_wire_valid = received &&
+        qualification_live_wire_valid(
+            &model_message, DS4_QUALIFICATION_CONTROL_MODEL_FD, 0u,
+            &fixture->runtime_model_identity, 1u);
+    CHECK(model_wire_valid,
+          "engine sends one exact model fd before compact allocation");
+    ds4_laguna_file_identity received_identity;
+    memset(&received_identity, 0, sizeof(received_identity));
+    const bool descriptor_valid = model_wire_valid &&
+        capture_file_identity(
+            model_message.descriptors[0], &received_identity) &&
+        identities_equal(&received_identity, &fixture->model_identity);
+    CHECK(descriptor_valid,
+          "SCM_RIGHTS model descriptor fstat matches the retained inode");
+    ds4_gpu_laguna_compact_test_snapshot premature;
+    memset(&premature, 0, sizeof(premature));
+    CHECK(received &&
+              qualification_live_completion_stays_blocked(
+                  &worker.completion, 50) &&
+              allocation_attempts_before ==
+                  ds4_gpu_test_laguna_compact_static_allocation_attempts() &&
+              !ds4_gpu_test_laguna_compact_active_snapshot(&premature),
+          "MODEL_FD blocks all compact allocation until identity ACK");
+
+    const bool acknowledged = descriptor_valid &&
+        qualification_live_send_ack(
+            fixture->control_pair[1],
+            DS4_QUALIFICATION_CONTROL_MODEL_FD_ACK, 0u,
+            &fixture->runtime_model_identity);
+    CHECK(acknowledged,
+          "parent accepts the exact model descriptor identity");
+    qualification_live_wire_close(&model_message);
+    if (!acknowledged) {
+        (void)close(fixture->control_pair[1]);
+        fixture->control_pair[1] = -1;
+    }
+    (void)pthread_join(thread, NULL);
+    qualification_live_completion_destroy(&worker.completion);
+
+    fixture->control_pair[0] = -1;
+    fixture->engine = worker.engine;
+    CHECK(worker.result == 0 && fixture->engine != NULL,
+          "exact descriptor ACK releases compact engine creation");
+    ds4_gpu_laguna_compact_test_snapshot active;
+    memset(&active, 0, sizeof(active));
+    CHECK(fixture->engine &&
+              ds4_gpu_test_laguna_compact_active_snapshot(&active) &&
+              identities_equal(
+                  &active.model_identity, &fixture->model_identity),
+          "ACK-released engine publishes one exact compact attachment");
+    CHECK(qualification_live_model_fd_count(&fixture->model_identity) == 3,
+          "active qualification owns only harness, engine, and compact model descriptors");
+    CHECK(qualification_live_socket_fd_count(
+              fixture->control_device, fixture->control_inode) == 1,
+          "active engine owns exactly one duplicate of the child control endpoint");
+    return worker.result == 0 && fixture->engine != NULL;
+}
+
+static void qualification_live_fixture_close(
+        qualification_live_fixture *fixture,
+        bool expect_clean_history) {
+    if (!fixture) return;
+    int owned_model_fd = -1;
+    if (fixture->engine) {
+        ds4_gpu_laguna_compact_test_snapshot active;
+        memset(&active, 0, sizeof(active));
+        if (ds4_gpu_test_laguna_compact_active_snapshot(&active)) {
+            owned_model_fd = active.model_fd;
+        }
+        const uint64_t cleanup_before =
+            ds4_gpu_test_generic_cleanup_attempts();
+        ds4_engine_close(fixture->engine);
+        fixture->engine = NULL;
+        ds4_test_laguna_compact_close_observation observation;
+        ds4_gpu_laguna_compact_test_snapshot residue;
+        memset(&observation, 0, sizeof(observation));
+        memset(&residue, 0, sizeof(residue));
+        CHECK(ds4_test_laguna_compact_close_observation_get(&observation) &&
+                  observation.first_destroy_result ==
+                      DS4_GPU_LAGUNA_DESTROY_OK &&
+                  observation.destroy_result ==
+                      DS4_GPU_LAGUNA_DESTROY_OK &&
+                  observation.destroy_attempt_count == 1u &&
+                  !observation.engine_retained &&
+                  observation.gpu_cleanup_before == cleanup_before &&
+                  observation.gpu_cleanup_after == cleanup_before + 1u &&
+                  !ds4_gpu_test_laguna_compact_active_snapshot(&residue) &&
+                  !ds4_gpu_test_laguna_compact_nonidle_snapshot(&residue),
+              "qualification teardown releases its execution lease and all compact owners");
+        if (owned_model_fd >= 0) {
+            struct stat reused_status;
+            const bool still_same_model =
+                fstat(owned_model_fd, &reused_status) == 0 &&
+                (uint64_t)reused_status.st_dev ==
+                    fixture->model_identity.device &&
+                (uint64_t)reused_status.st_ino ==
+                    fixture->model_identity.inode &&
+                reused_status.st_size >= 0 &&
+                (uint64_t)reused_status.st_size ==
+                    fixture->model_identity.size_bytes;
+            CHECK(!still_same_model,
+                  "qualification teardown retains no compact model descriptor");
+        }
+        CHECK(qualification_live_model_fd_count(
+                  &fixture->model_identity) == 1,
+              "qualification teardown closes every engine-owned model descriptor");
+        CHECK(fixture->control_identity_set &&
+                  qualification_live_socket_fd_count(
+                      fixture->control_device,
+                      fixture->control_inode) == 0,
+              "qualification teardown closes every child control endpoint duplicate");
+        if (fixture->control_pair[1] >= 0) {
+            CHECK(qualification_live_peer_eof(fixture->control_pair[1]),
+                  "qualification teardown closes its private control endpoint");
+        }
+        ds4_runtime_snapshot closed_runtime;
+        memset(&closed_runtime, 0, sizeof(closed_runtime));
+        if (expect_clean_history) {
+            CHECK(ds4_test_laguna_last_close_snapshot(&closed_runtime) &&
+                      runtime_snapshot_is_clean(&closed_runtime),
+                  "successful qualification teardown publishes clean ownership");
+        } else {
+            CHECK(!ds4_test_laguna_last_close_snapshot(&closed_runtime),
+                  "unsafe qualification teardown does not relabel history clean");
+        }
+    }
+    for (size_t i = 0; i < ARRAY_LEN(fixture->control_pair); i++) {
+        if (fixture->control_pair[i] >= 0) {
+            (void)close(fixture->control_pair[i]);
+            fixture->control_pair[i] = -1;
+        }
+    }
+    if (fixture->model_fd >= 0) {
+        (void)close(fixture->model_fd);
+        fixture->model_fd = -1;
+    }
+    if (fixture->environment_saved) {
+        restore_forbidden_environment(&fixture->environment);
+        fixture->environment_saved = false;
+    }
+}
+
+typedef struct {
+    uint64_t sequence;
+    ds4_engine_laguna_external_checkpoint_observation observation;
+    ds4_runtime_wire_snapshot runtime;
+} qualification_live_transaction;
+
+static bool qualification_live_run_transaction(
+        qualification_live_fixture *fixture,
+        qualification_live_transaction *transaction) {
+    if (!fixture || !fixture->engine || !transaction) return false;
+    memset(transaction, 0, sizeof(*transaction));
+    qualification_live_checkpoint_worker worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.engine = fixture->engine;
+    worker.pre_child = fixture->pre_child;
+    memcpy(worker.build_identity, fixture->build_identity,
+           sizeof(worker.build_identity));
+    worker.status = DS4_RUNTIME_STATUS_UNSAFE;
+    const bool completion_ready =
+        qualification_live_completion_init(&worker.completion);
+    pthread_t thread;
+    const bool started = completion_ready && pthread_create(
+        &thread, NULL, qualification_live_checkpoint_main, &worker) == 0;
+    CHECK(started, "qualification control starts one checkpoint worker");
+    if (!started) {
+        qualification_live_completion_destroy(&worker.completion);
+        return false;
+    }
+
+    static const ds4_runtime_file_identity zero_identity;
+    qualification_live_wire_message ready = {0};
+    const bool ready_received = qualification_live_receive(
+        fixture->control_pair[1], 120000, &ready);
+    const uint64_t sequence = ready_received
+        ? ready.message.checkpoint_sequence : 0u;
+    const bool ready_valid = ready_received && sequence != 0u &&
+        qualification_live_wire_valid(
+            &ready, DS4_QUALIFICATION_CONTROL_SAMPLE_READY,
+            sequence, &zero_identity, 0u);
+    CHECK(ready_valid,
+          "checkpoint emits one sequenced READY inside CUDA quiescence");
+
+    const bool ready_exec_locked =
+        ds4_gpu_test_laguna_compact_exec_mutex_try_lock() == 0;
+    const bool ready_blocked = ready_valid &&
+        ready_exec_locked &&
+        qualification_live_completion_stays_blocked(
+            &worker.completion, 50) &&
+        qualification_live_wait_readable(
+            fixture->control_pair[1], 50) == 0;
+    CHECK(ready_blocked,
+          "READY holds checkpoint progress and the compact execution lock until ACK");
+    const bool ready_ack = ready_blocked &&
+        qualification_live_send_ack(
+            fixture->control_pair[1],
+            DS4_QUALIFICATION_CONTROL_SAMPLE_READY_ACK,
+            sequence, &zero_identity);
+    CHECK(ready_ack, "parent releases the READY barrier");
+    qualification_live_wire_close(&ready);
+
+    qualification_live_wire_message result = {0};
+    const bool result_received = ready_ack && qualification_live_receive(
+        fixture->control_pair[1], 600000, &result);
+    const bool result_valid = result_received &&
+        qualification_live_wire_valid(
+            &result, DS4_QUALIFICATION_CONTROL_SAMPLE_RESULT,
+            sequence, &fixture->runtime_model_identity, 0u);
+    CHECK(result_valid,
+          "checkpoint emits exact RESULT after synchronized evidence capture");
+    const bool result_exec_locked = result_valid &&
+        ds4_gpu_test_laguna_compact_exec_mutex_try_lock() == 0;
+
+    qualification_live_runtime_worker runtime_worker;
+    memset(&runtime_worker, 0, sizeof(runtime_worker));
+    pthread_t runtime_thread;
+    const bool runtime_completion_ready = result_exec_locked &&
+        qualification_live_completion_init(&runtime_worker.completion);
+    runtime_worker.engine = fixture->engine;
+    const bool runtime_started = runtime_completion_ready &&
+        pthread_create(
+            &runtime_thread, NULL,
+            qualification_live_runtime_main, &runtime_worker) == 0;
+    CHECK(runtime_started,
+          "RESULT starts a coherent snapshot probe behind the execution lock");
+    const bool result_blocked = result_exec_locked &&
+        qualification_live_completion_stays_blocked(
+            &worker.completion, 50) &&
+        runtime_started &&
+        qualification_live_completion_stays_blocked(
+            &runtime_worker.completion, 50);
+    CHECK(result_blocked,
+          "RESULT holds checkpoint commit and the compact execution lock until ACK");
+    const bool result_ack = result_blocked &&
+        qualification_live_send_ack(
+            fixture->control_pair[1],
+            DS4_QUALIFICATION_CONTROL_SAMPLE_RESULT_ACK,
+            sequence, &zero_identity);
+    CHECK(result_ack, "parent accepts the checkpoint RESULT");
+    qualification_live_wire_close(&result);
+    if (!result_ack && fixture->control_pair[1] >= 0) {
+        (void)close(fixture->control_pair[1]);
+        fixture->control_pair[1] = -1;
+    }
+    (void)pthread_join(thread, NULL);
+    qualification_live_completion_destroy(&worker.completion);
+    if (runtime_started) (void)pthread_join(runtime_thread, NULL);
+    qualification_live_completion_destroy(&runtime_worker.completion);
+
+    const bool exec_released =
+        ds4_gpu_test_laguna_compact_exec_mutex_try_lock() == 1;
+    const bool checkpoint_ok = worker.status == DS4_RUNTIME_STATUS_OK &&
+              worker.observation.sample.attributed_valid &&
+              worker.observation.sample.failure ==
+                  DS4_RUNTIME_EXTERNAL_FAILURE_NONE &&
+              worker.observation.sample.attributed_generation != 0u;
+    CHECK(checkpoint_ok,
+          "ACKed READY/RESULT transaction commits one attributed sample");
+    const bool runtime_ok = runtime_started && runtime_worker.result &&
+              runtime_worker.snapshot.state ==
+                  DS4_RUNTIME_WIRE_STATE_READY &&
+              runtime_worker.snapshot.allocations.violation ==
+                  DS4_RUNTIME_VIOLATION_NONE &&
+              runtime_worker.snapshot.allocations.external_sample
+                      .attributed_generation ==
+                  worker.observation.sample.attributed_generation;
+    CHECK(runtime_ok,
+          "snapshot probe runs after RESULT ACK and sees the committed transaction");
+    CHECK(exec_released,
+          "RESULT ACK releases the compact execution mutex before progress resumes");
+
+    transaction->sequence = sequence;
+    transaction->observation = worker.observation;
+    transaction->runtime = runtime_worker.snapshot;
+    return ready_ack && result_ack && checkpoint_ok && runtime_ok &&
+        exec_released;
+}
+
+static int run_qualification_control_success(void) {
+    qualification_live_fixture fixture;
+    const bool opened = qualification_live_fixture_open(&fixture);
+    if (!opened) {
+        qualification_live_fixture_close(&fixture, false);
+        return 1;
+    }
+
+    qualification_live_transaction first = {0};
+    qualification_live_transaction second = {0};
+    const bool first_ok =
+        qualification_live_run_transaction(&fixture, &first);
+    const uint64_t first_sequence = first.sequence;
+    const bool second_ok = first_ok && first_sequence != UINT64_MAX &&
+        qualification_live_run_transaction(&fixture, &second);
+    const uint64_t second_sequence = second.sequence;
+    CHECK(first_ok && second_ok && first_sequence == 1u &&
+              second_sequence == first_sequence + 1u,
+          "one engine owns strictly monotonic checkpoint sequences");
+    CHECK(first_ok && second_ok &&
+              first.observation.sample.attributed_generation != UINT64_MAX &&
+              second.observation.sample.attributed_generation ==
+                  first.observation.sample.attributed_generation + 1u &&
+              second.runtime.allocations.external_sample
+                      .attributed_generation ==
+                  second.observation.sample.attributed_generation,
+          "second exact barrier transaction coherently commits the next generation");
+
+    qualification_live_fixture_close(&fixture, true);
+    return g_failures == 0 ? 0 : 1;
+}
+
+static int run_qualification_control_disconnect(void) {
+    qualification_live_fixture fixture;
+    const bool opened = qualification_live_fixture_open(&fixture);
+    if (!opened) {
+        qualification_live_fixture_close(&fixture, false);
+        return 1;
+    }
+
+    CHECK(close(fixture.control_pair[1]) == 0,
+          "qualification parent disconnects before checkpoint READY");
+    fixture.control_pair[1] = -1;
+    ds4_engine_laguna_external_checkpoint_observation observation;
+    memset(&observation, 0, sizeof(observation));
+    const ds4_runtime_status status =
+        ds4_engine_laguna_external_checkpoint(
+            fixture.engine, &fixture.pre_child,
+            fixture.build_identity, &observation);
+    CHECK(status == DS4_RUNTIME_STATUS_UNSAFE &&
+              !observation.sample.attributed_valid &&
+              observation.sample.attributed_generation == 0u,
+          "barrier peer disconnect fails the checkpoint UNSAFE");
+
+    ds4_gpu_laguna_compact_test_snapshot active;
+    memset(&active, 0, sizeof(active));
+    CHECK(ds4_gpu_test_laguna_compact_active_snapshot(&active),
+          "disconnect releases the checkpoint lease while engine remains inspectable");
+    ds4_runtime_wire_snapshot runtime;
+    memset(&runtime, 0, sizeof(runtime));
+    CHECK(ds4_engine_runtime_snapshot(fixture.engine, &runtime) &&
+              runtime.state == DS4_RUNTIME_WIRE_STATE_UNSAFE &&
+              runtime.allocations.violation ==
+                  DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION &&
+              runtime.allocations.external_sample.attributed_generation ==
+                  0u &&
+              runtime.allocations.active_record_count != 0u,
+          "disconnect latches unsafe without fabricating or releasing live ownership");
+
+    qualification_live_fixture_close(&fixture, false);
+    return g_failures == 0 ? 0 : 1;
+}
+
 /* Live Task 13 integration.  Python owns descriptor-bound safe-union cold
  * preparation, so this case intentionally does not issue whole-file advice.
  * It consumes an inherited qualification fd when supplied, captures NVML
@@ -6994,6 +7864,8 @@ static void usage(const char *program) {
             "cache-faults|cache-unsafe|cache-unsafe-race|"
             "prefill-allocation|page-advice|model-page-advice|"
             "session-pressure|"
+            "qualification-control-success|"
+            "qualification-control-disconnect|"
             "external-attribution\n",
             program);
 }
@@ -7042,6 +7914,10 @@ static int run_named_case(const char *name) {
         return run_model_page_advice();
     } else if (strcmp(name, "session-pressure") == 0) {
         return run_session_pressure();
+    } else if (strcmp(name, "qualification-control-success") == 0) {
+        return run_qualification_control_success();
+    } else if (strcmp(name, "qualification-control-disconnect") == 0) {
+        return run_qualification_control_disconnect();
     } else if (strcmp(name, "external-attribution") == 0) {
         return run_external_attribution();
     }

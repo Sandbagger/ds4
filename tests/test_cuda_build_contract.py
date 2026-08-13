@@ -3776,6 +3776,140 @@ class CudaBuildContractTest(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, diagnostic)
 
+    def test_qualification_control_live_gate_is_two_fresh_processes(self) -> None:
+        phony_targets = rule_prerequisites(".PHONY").split()
+        self.assertIn("test-cuda-laguna-qualification-control", phony_targets)
+
+        prerequisites = rule_prerequisites(
+            "test-cuda-laguna-qualification-control"
+        ).split()
+        self.assertEqual(prerequisites, ["tests/test_cuda_laguna_stream"])
+        recipes = rule_recipe_lines("test-cuda-laguna-qualification-control")
+        self.assertIn("$(origin DS4_LOCK_FILE)", recipes[0])
+        self.assertIn("DS4_LOCK_FILE is forbidden", recipes[1])
+        self.assertLess(
+            next(i for i, line in enumerate(recipes) if "DS4_LOCK_FILE" in line),
+            next(
+                i
+                for i, line in enumerate(recipes)
+                if "qualification-control-success" in line
+            ),
+        )
+        self.assertEqual(
+            sum("qualification-control-success" in line for line in recipes),
+            1,
+        )
+        self.assertEqual(
+            sum("qualification-control-disconnect" in line for line in recipes),
+            1,
+        )
+        self.assertFalse(
+            any(
+                "qualification-control-success" in line
+                and "qualification-control-disconnect" in line
+                for line in recipes
+            ),
+            "success and disconnect must execute in fresh processes",
+        )
+
+        self.assertIn("run_qualification_control_success", LAGUNA_STREAM_TEST)
+        self.assertIn("run_qualification_control_disconnect", LAGUNA_STREAM_TEST)
+        self.assertIn("qualification_live_runtime_main", LAGUNA_STREAM_TEST)
+        self.assertIn(
+            "ds4_engine_runtime_snapshot(worker->engine, &worker->snapshot)",
+            LAGUNA_STREAM_TEST,
+        )
+        self.assertIn(
+            "READY holds checkpoint progress and the compact execution lock",
+            LAGUNA_STREAM_TEST,
+        )
+        self.assertIn(
+            "RESULT holds checkpoint commit and the compact execution lock",
+            LAGUNA_STREAM_TEST,
+        )
+        exec_probe = "ds4_gpu_test_laguna_compact_exec_mutex_try_lock"
+        self.assertIn(exec_probe, GPU_HEADER)
+        probe_body = function_body(f'extern "C" int {exec_probe}(')
+        self.assertIn("g_laguna_compact_exec_mutex.try_lock()", probe_body)
+        self.assertIn("g_laguna_compact_exec_mutex.unlock()", probe_body)
+        self.assertGreaterEqual(
+            LAGUNA_STREAM_TEST.count(f"{exec_probe}()"),
+            3,
+            "live READY, RESULT, and post-ACK phases need direct mutex probes",
+        )
+        self.assertIn("second_sequence == first_sequence + 1u", LAGUNA_STREAM_TEST)
+        self.assertIn(
+            'strcmp(name, "qualification-control-success")',
+            LAGUNA_STREAM_TEST,
+        )
+        self.assertIn(
+            'strcmp(name, "qualification-control-disconnect")',
+            LAGUNA_STREAM_TEST,
+        )
+
+        link_prerequisites = rule_prerequisites(
+            "tests/test_cuda_laguna_stream"
+        ).split()
+        self.assertIn("ds4_qualification_control.o", link_prerequisites)
+
+        self.assertIn(
+            "test-cuda-laguna-runtime-identity", phony_targets
+        )
+        self.assertEqual(
+            rule_prerequisites(
+                "test-cuda-laguna-runtime-identity"
+            ).split(),
+            [
+                "test-laguna-runtime-identity",
+                "test-cuda-laguna-qualification-control",
+            ],
+            "the Task 16 CUDA gate must include host contracts and live barriers",
+        )
+
+        hostile_model = 'model"; printf QUALIFICATION_INJECTED >&2; #.gguf'
+        rendered = subprocess.run(
+            [
+                "make",
+                "--no-print-directory",
+                "-n",
+                "UNAME_S=Linux",
+                "-o",
+                "tests/test_cuda_laguna_stream",
+                f"DS4_TEST_MODEL={hostile_model}",
+                "test-cuda-laguna-qualification-control",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertNotIn(hostile_model, rendered.stdout)
+        self.assertNotIn("QUALIFICATION_INJECTED", rendered.stdout)
+
+        make_sentinel = "QUALIFICATION_MODEL_MAKE_EXPANDED"
+        literal_make_model = f"$(warning {make_sentinel})"
+        make_rendered = subprocess.run(
+            [
+                "make",
+                "--no-print-directory",
+                "-n",
+                "UNAME_S=Linux",
+                "-o",
+                "tests/test_cuda_laguna_stream",
+                f"DS4_TEST_MODEL={literal_make_model}",
+                "test-cuda-laguna-qualification-control",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(make_rendered.returncode, 0, make_rendered.stderr)
+        self.assertNotIn(
+            make_sentinel, make_rendered.stdout + make_rendered.stderr
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

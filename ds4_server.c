@@ -15312,6 +15312,19 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* Live request accounting is owned by the queued job, not by a test adapter
+ * or a process-wide before/after snapshot.  These declarations define the
+ * minimal server seam exercised below; production supplies the storage and
+ * implementations next to struct job. */
+static bool server_job_runtime_accept(job *j, uint64_t accepted_monotonic_ns);
+static ds4_runtime_request_context *server_job_runtime_context(job *j);
+static bool server_job_runtime_finish(
+    job *j,
+    ds4_runtime_request_terminal_status status,
+    uint64_t finished_monotonic_ns);
+static const ds4_runtime_request_metrics *server_job_runtime_terminal_metrics(
+    const job *j);
+
 static void test_server_bind_slot(server *s, server_slot *slot) {
     memset(slot, 0, sizeof(*slot));
     slot->srv = s;
@@ -15671,6 +15684,221 @@ static bool test_laguna_fixed_tokenize(void *context,
     if (!rendered_prompt || count < 0 || !tokens) return false;
     for (int i = 0; i < count; i++) ds4_tokens_push(tokens, i);
     return true;
+}
+
+static void test_server_job_runtime_completed_lifecycle(void) {
+    const uint64_t accepted_ns = UINT64_C(1000000000);
+    const uint64_t prefill_started_ns = UINT64_C(1100000000);
+    const uint64_t prefill_complete_ns = UINT64_C(1300000000);
+    const uint64_t first_visible_decode_ns = UINT64_C(1500000000);
+    const uint64_t last_visible_decode_ns = UINT64_C(2000000000);
+    const uint64_t advice_complete_ns = UINT64_C(2700000000);
+    const uint64_t first_emitted_ns = UINT64_C(2800000000);
+    const uint64_t finished_ns = UINT64_C(3000000000);
+
+    job accepted = {0};
+    request_init(&accepted.req, REQ_CHAT, 8);
+    for (int i = 0; i < 22; i++) ds4_tokens_push(&accepted.req.prompt, i);
+
+    TEST_ASSERT(server_job_runtime_terminal_metrics(&accepted) == NULL);
+    TEST_ASSERT(server_job_runtime_accept(&accepted, accepted_ns));
+    ds4_runtime_request_context *accepted_context =
+        server_job_runtime_context(&accepted);
+    TEST_ASSERT(accepted_context != NULL);
+    TEST_ASSERT(accepted_context && accepted_context->initialized);
+    TEST_ASSERT(accepted_context && accepted_context->prompt_tokens_set);
+    TEST_ASSERT(accepted_context && accepted_context->prompt_tokens ==
+                (uint64_t)accepted.req.prompt.len);
+    TEST_ASSERT(accepted_context && accepted_context->accepted_monotonic_ns ==
+                accepted_ns);
+    TEST_ASSERT(accepted_context && !accepted_context->terminal);
+
+    /* Acceptance is single-shot and a rejected reuse cannot replace the
+     * canonical UUID, timestamps, or exact prepared prompt count. */
+    ds4_runtime_request_context accepted_snapshot = *accepted_context;
+    TEST_ASSERT(!server_job_runtime_accept(&accepted, accepted_ns + 1));
+    TEST_ASSERT(!memcmp(accepted_context, &accepted_snapshot,
+                        sizeof(accepted_snapshot)));
+
+    /* Exercise the real FIFO boundary: the worker must receive the same job
+     * and therefore the same context object created by the client thread. */
+    server queue = {0};
+    TEST_ASSERT(pthread_mutex_init(&queue.mu, NULL) == 0);
+    TEST_ASSERT(pthread_cond_init(&queue.cv, NULL) == 0);
+    TEST_ASSERT(enqueue(&queue, &accepted));
+    job *worker_job = dequeue(&queue);
+    TEST_ASSERT(worker_job == &accepted);
+    TEST_ASSERT(server_job_runtime_context(worker_job) == accepted_context);
+    pthread_cond_destroy(&queue.cv);
+    pthread_mutex_destroy(&queue.mu);
+
+    ds4_runtime_request_context *runtime =
+        server_job_runtime_context(worker_job);
+    TEST_ASSERT(runtime != NULL);
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(
+        runtime, prefill_started_ns));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(
+        runtime, prefill_complete_ns));
+
+    /* Two sampled hidden tokens precede client-visible decoding.  Visibility
+     * and actual socket emission remain separate milestones. */
+    TEST_ASSERT(ds4_runtime_request_add_generated_tokens(runtime, 2));
+    TEST_ASSERT(ds4_runtime_request_add_generated_tokens(runtime, 1));
+    TEST_ASSERT(ds4_runtime_request_record_visible_decoded(
+        runtime, 1, first_visible_decode_ns));
+    TEST_ASSERT(ds4_runtime_request_add_generated_tokens(runtime, 5));
+    TEST_ASSERT(ds4_runtime_request_record_visible_decoded(
+        runtime, 5, last_visible_decode_ns));
+    TEST_ASSERT(runtime->generated_tokens == 8);
+    TEST_ASSERT(runtime->visible_generated_tokens == 6);
+    TEST_ASSERT(runtime->first_visible_decode_monotonic_ns ==
+                first_visible_decode_ns);
+    TEST_ASSERT(!runtime->first_visible_emitted);
+
+    TEST_ASSERT(ds4_runtime_request_record_page_advice_complete(
+        runtime, advice_complete_ns));
+    TEST_ASSERT(ds4_runtime_request_mark_first_visible_emitted(
+        runtime, first_emitted_ns));
+    TEST_ASSERT(runtime->first_visible_emitted_monotonic_ns == first_emitted_ns);
+    TEST_ASSERT(runtime->first_visible_emitted_monotonic_ns !=
+                runtime->first_visible_decode_monotonic_ns);
+    TEST_ASSERT(runtime->page_advice_complete_monotonic_ns == advice_complete_ns);
+
+    TEST_ASSERT(server_job_runtime_terminal_metrics(worker_job) == NULL);
+    TEST_ASSERT(server_job_runtime_finish(
+        worker_job, DS4_RUNTIME_REQUEST_COMPLETED, finished_ns));
+    const ds4_runtime_request_metrics *terminal =
+        server_job_runtime_terminal_metrics(worker_job);
+    TEST_ASSERT(terminal != NULL);
+    TEST_ASSERT(terminal && terminal->terminal_status ==
+                DS4_RUNTIME_REQUEST_COMPLETED);
+    TEST_ASSERT(terminal && terminal->prompt_tokens == 22);
+    TEST_ASSERT(terminal && terminal->generated_tokens == 8);
+    TEST_ASSERT(terminal && terminal->ttft_present);
+    TEST_ASSERT(terminal && terminal->ttft_ns ==
+                first_emitted_ns - accepted_ns);
+    TEST_ASSERT(terminal && terminal->prefill_tokens_per_second == 110.0);
+    TEST_ASSERT(terminal && terminal->visible_decode_tokens_per_second == 10.0);
+    TEST_ASSERT(terminal && terminal->wall_time_ns == finished_ns - accepted_ns);
+    TEST_ASSERT(terminal && terminal->page_advice_complete_present);
+    TEST_ASSERT(terminal && terminal->page_advice_complete_monotonic_ns ==
+                advice_complete_ns);
+
+    /* The job owns one immutable terminal value.  A second finish and every
+     * post-terminal mutation reject without changing context or metrics. */
+    ds4_runtime_request_context finished_context = *runtime;
+    ds4_runtime_request_metrics finished_metrics = *terminal;
+    ds4_runtime_wire_counters counter_delta = {0};
+    counter_delta.cache_acquire_hits = 1;
+    TEST_ASSERT(!server_job_runtime_finish(
+        worker_job, DS4_RUNTIME_REQUEST_CANCELLED, finished_ns + 1));
+    TEST_ASSERT(!ds4_runtime_request_set_prompt_tokens(runtime, 23));
+    TEST_ASSERT(!ds4_runtime_request_mark_prefill_started(runtime,
+                                                          finished_ns + 1));
+    TEST_ASSERT(!ds4_runtime_request_mark_prefill_complete(runtime,
+                                                           finished_ns + 1));
+    TEST_ASSERT(!ds4_runtime_request_add_counters(runtime, &counter_delta));
+    TEST_ASSERT(!ds4_runtime_request_add_generated_tokens(runtime, 1));
+    TEST_ASSERT(!ds4_runtime_request_record_visible_decoded(
+        runtime, 1, finished_ns + 1));
+    TEST_ASSERT(!ds4_runtime_request_mark_first_visible_emitted(
+        runtime, finished_ns + 1));
+    TEST_ASSERT(!ds4_runtime_request_record_page_advice_complete(
+        runtime, finished_ns + 1));
+    TEST_ASSERT(!memcmp(runtime, &finished_context, sizeof(finished_context)));
+    TEST_ASSERT(server_job_runtime_terminal_metrics(worker_job) == terminal);
+    TEST_ASSERT(!memcmp(terminal, &finished_metrics, sizeof(finished_metrics)));
+
+    /* The native protocol ID is transport-owned and deliberately distinct
+     * from the runtime request UUID embedded in the immutable metrics. */
+    const char *protocol_request_id = "chatcmpl_job_lifecycle_contract";
+    TEST_ASSERT(strcmp(protocol_request_id, terminal->request_id) != 0);
+    TEST_ASSERT(terminal->prompt_tokens <= (uint64_t)INT_MAX);
+    TEST_ASSERT(terminal->generated_tokens <= (uint64_t)INT_MAX);
+    server_protocol_terminal_options options = {
+        .protocol = SERVER_PROTOCOL_TERMINAL_OPENAI_CHAT,
+        .responses_terminal = SERVER_RESPONSES_TERMINAL_COMPLETED,
+        .stream = false,
+        .include_usage = true,
+        .enable_cors = false,
+        .model = "laguna-s-2.1-chat",
+        .prompt_tokens = (int)terminal->prompt_tokens,
+        .completion_tokens = (int)terminal->generated_tokens,
+    };
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(server_emit_protocol_terminal_metrics(
+            sv[0], &options, protocol_request_id, terminal));
+        shutdown(sv[0], SHUT_WR);
+        char *wire = read_socket_text(sv[1]);
+        char protocol_member[128];
+        char runtime_member[DS4_RUNTIME_INSTANCE_ID_CAPACITY + 32];
+        snprintf(protocol_member, sizeof(protocol_member), "\"id\":\"%s\"",
+                 protocol_request_id);
+        snprintf(runtime_member, sizeof(runtime_member),
+                 "\"request_id\":\"%s\"", terminal->request_id);
+        TEST_ASSERT(wire != NULL);
+        TEST_ASSERT(wire && strstr(wire, protocol_member) != NULL);
+        TEST_ASSERT(wire && strstr(wire, runtime_member) != NULL);
+        TEST_ASSERT(!memcmp(terminal, &finished_metrics,
+                            sizeof(finished_metrics)));
+        free(wire);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    request_free(&accepted.req);
+}
+
+static void test_server_job_runtime_pre_token_terminals(void) {
+    const ds4_runtime_request_terminal_status statuses[] = {
+        DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR,
+        DS4_RUNTIME_REQUEST_CANCELLED,
+    };
+    for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); i++) {
+        const uint64_t accepted_ns = UINT64_C(10000000000) +
+                                     (uint64_t)i * UINT64_C(1000000000);
+        const uint64_t finished_ns = accepted_ns + UINT64_C(400000000);
+        job prepared = {0};
+        request_init(&prepared.req, REQ_CHAT, 4);
+        ds4_tokens_push(&prepared.req.prompt, 101);
+        ds4_tokens_push(&prepared.req.prompt, 102);
+        ds4_tokens_push(&prepared.req.prompt, 103);
+
+        TEST_ASSERT(server_job_runtime_accept(&prepared, accepted_ns));
+        ds4_runtime_request_context *runtime =
+            server_job_runtime_context(&prepared);
+        TEST_ASSERT(runtime != NULL);
+        TEST_ASSERT(runtime && runtime->prompt_tokens == 3);
+        TEST_ASSERT(runtime && !runtime->prefill_started);
+        TEST_ASSERT(runtime && runtime->generated_tokens == 0);
+        TEST_ASSERT(server_job_runtime_finish(
+            &prepared, statuses[i], finished_ns));
+
+        const ds4_runtime_request_metrics *terminal =
+            server_job_runtime_terminal_metrics(&prepared);
+        TEST_ASSERT(terminal != NULL);
+        TEST_ASSERT(terminal && terminal->terminal_status == statuses[i]);
+        TEST_ASSERT(terminal && terminal->prompt_tokens == 3);
+        TEST_ASSERT(terminal && terminal->generated_tokens == 0);
+        TEST_ASSERT(terminal && !terminal->ttft_present);
+        TEST_ASSERT(terminal && terminal->prefill_tokens_per_second == 0.0);
+        TEST_ASSERT(terminal && terminal->visible_decode_tokens_per_second == 0.0);
+        TEST_ASSERT(terminal && terminal->wall_time_ns == UINT64_C(400000000));
+        TEST_ASSERT(terminal && !terminal->page_advice_complete_present);
+
+        ds4_runtime_request_context context_snapshot = *runtime;
+        ds4_runtime_request_metrics metrics_snapshot = *terminal;
+        TEST_ASSERT(!server_job_runtime_finish(
+            &prepared, statuses[i], finished_ns + 1));
+        TEST_ASSERT(!ds4_runtime_request_add_generated_tokens(runtime, 1));
+        TEST_ASSERT(!memcmp(runtime, &context_snapshot,
+                            sizeof(context_snapshot)));
+        TEST_ASSERT(!memcmp(terminal, &metrics_snapshot,
+                            sizeof(metrics_snapshot)));
+        request_free(&prepared.req);
+    }
 }
 
 static void test_laguna_prepare_omitted_output_resolves_after_tokenize(void) {
@@ -20088,6 +20316,8 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_batched_live_continuation_slot_binding();
+    test_server_job_runtime_completed_lifecycle();
+    test_server_job_runtime_pre_token_terminals();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();

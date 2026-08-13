@@ -51,7 +51,8 @@
 extern int ds4_qualification_control_open(
     ds4_qualification_control **out,
     int inherited_fd,
-    uint32_t timeout_ms,
+    uint32_t barrier_timeout_ms,
+    uint32_t model_timeout_ms,
     char *err,
     size_t errcap) DS4_TEST_WEAK;
 extern int ds4_qualification_control_send_model_fd(
@@ -76,6 +77,11 @@ extern void ds4_qualification_control_close(
 
 typedef char ds4_qualification_control_message_size_is_stable[
     sizeof(ds4_qualification_control_message) == 56 ? 1 : -1];
+typedef char ds4_qualification_control_model_timeout_covers_large_models[
+    DS4_QUALIFICATION_CONTROL_MODEL_TIMEOUT_MS >= 15u * 60u * 1000u &&
+        DS4_QUALIFICATION_CONTROL_MODEL_TIMEOUT_MS >
+            DS4_QUALIFICATION_CONTROL_DEFAULT_TIMEOUT_MS
+        ? 1 : -1];
 
 static int failures;
 
@@ -235,6 +241,21 @@ static bool send_control_message(
     return send_all(fd, &message, sizeof(message));
 }
 
+static bool send_model_fd_ack(
+        int fd,
+        uint32_t type,
+        uint64_t sequence,
+        const ds4_runtime_file_identity *identity) {
+    ds4_qualification_control_message message = {
+        .protocol_version = DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION,
+        .message_type = type,
+        .message_size = sizeof(message),
+        .checkpoint_sequence = sequence,
+    };
+    if (identity) message.model_identity = *identity;
+    return send_all(fd, &message, sizeof(message));
+}
+
 static bool receive_control_message(
         int fd,
         ds4_qualification_control_message *message,
@@ -317,7 +338,10 @@ typedef struct {
     size_t baseline_count;
 } control_fixture;
 
-static bool fixture_open(control_fixture *fixture, uint32_t timeout_ms) {
+static bool fixture_open_with_timeouts(
+        control_fixture *fixture,
+        uint32_t barrier_timeout_ms,
+        uint32_t model_timeout_ms) {
     int before[256];
     int after[256];
     memset(fixture, 0, sizeof(*fixture));
@@ -337,7 +361,8 @@ static bool fixture_open(control_fixture *fixture, uint32_t timeout_ms) {
 
     char error[256] = {0};
     if (ds4_qualification_control_open(
-            &fixture->control, fixture->pair[0], timeout_ms,
+            &fixture->control, fixture->pair[0],
+            barrier_timeout_ms, model_timeout_ms,
             error, sizeof(error)) != 0 || !fixture->control) {
         fprintf(stderr, "qualification control open failed: %s\n", error);
         return false;
@@ -354,6 +379,11 @@ static bool fixture_open(control_fixture *fixture, uint32_t timeout_ms) {
     if (added != 1u || fixture->owned_fd < 0) return false;
     const int flags = fcntl(fixture->owned_fd, F_GETFD);
     return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+static bool fixture_open(control_fixture *fixture, uint32_t timeout_ms) {
+    return fixture_open_with_timeouts(
+        fixture, timeout_ms, timeout_ms);
 }
 
 static bool fixture_close(control_fixture *fixture) {
@@ -390,6 +420,57 @@ typedef struct {
     uint64_t elapsed_ms;
     char error[256];
 } sample_worker;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    ds4_qualification_control *control;
+    int model_fd;
+    ds4_runtime_file_identity model_identity;
+    int result;
+    bool done;
+    uint64_t elapsed_ms;
+    char error[256];
+} model_worker;
+
+static void *model_worker_main(void *argument) {
+    model_worker *worker = argument;
+    const uint64_t started = monotonic_ms();
+    const int result = ds4_qualification_control_send_model_fd(
+        worker->control, worker->model_fd, &worker->model_identity,
+        worker->error, sizeof(worker->error));
+    (void)pthread_mutex_lock(&worker->mutex);
+    worker->result = result;
+    worker->done = true;
+    worker->elapsed_ms = monotonic_ms() - started;
+    (void)pthread_mutex_unlock(&worker->mutex);
+    return NULL;
+}
+
+static bool model_worker_init(
+        model_worker *worker,
+        ds4_qualification_control *control,
+        int model_fd,
+        const ds4_runtime_file_identity *identity) {
+    memset(worker, 0, sizeof(*worker));
+    worker->control = control;
+    worker->model_fd = model_fd;
+    worker->model_identity = *identity;
+    worker->result = -1;
+    return pthread_mutex_init(&worker->mutex, NULL) == 0;
+}
+
+static bool wait_model_worker_done(
+        model_worker *worker, uint32_t timeout_ms) {
+    const uint64_t deadline = monotonic_ms() + timeout_ms;
+    for (;;) {
+        (void)pthread_mutex_lock(&worker->mutex);
+        const bool done = worker->done;
+        (void)pthread_mutex_unlock(&worker->mutex);
+        if (done) return true;
+        if (monotonic_ms() > deadline) return false;
+        sleep_ms(1);
+    }
+}
 
 static void worker_set_stage(sample_worker *worker, int stage) {
     (void)pthread_mutex_lock(&worker->mutex);
@@ -533,15 +614,19 @@ static void test_model_fd_and_blocking_sequence(void) {
         return;
     }
 
-    char error[256] = {0};
-    int result = ds4_qualification_control_send_model_fd(
-        fixture.control, model_fd, &model_identity, error, sizeof(error));
-    CHECK(result == 0, "send retained model fd: %s", error);
+    model_worker worker;
+    pthread_t worker_thread;
+    bool worker_initialized = model_worker_init(
+        &worker, fixture.control, model_fd, &model_identity);
+    bool worker_started = worker_initialized &&
+        pthread_create(
+            &worker_thread, NULL, model_worker_main, &worker) == 0;
+    CHECK(worker_started, "start retained-model descriptor worker");
 
     ds4_qualification_control_message message;
     int received_fds[4] = {-1, -1, -1, -1};
     size_t received_count = 0;
-    bool received = result == 0 && receive_control_message(
+    bool received = worker_started && receive_control_message(
         fixture.pair[1], &message, received_fds, 4, &received_count);
     CHECK(received, "receive model SCM_RIGHTS message");
     CHECK(received && valid_message(
@@ -562,11 +647,29 @@ static void test_model_fd_and_blocking_sequence(void) {
                   (fcntl(received_fds[0], F_GETFD) & FD_CLOEXEC) != 0,
               "receiver can retain the delivered model fd CLOEXEC");
     }
+    CHECK(worker_started && !wait_model_worker_done(&worker, 20),
+          "model sender cannot continue before descriptor identity ACK");
+    bool acknowledged = received && received_count == 1 &&
+        send_model_fd_ack(
+            fixture.pair[1], DS4_QUALIFICATION_CONTROL_MODEL_FD_ACK, 0,
+            &model_identity);
+    CHECK(acknowledged,
+          "send exact sequence-zero descriptor identity ACK");
+    if (!acknowledged && fixture.pair[1] >= 0) {
+        (void)close(fixture.pair[1]);
+        fixture.pair[1] = -1;
+    }
+    if (worker_started) (void)pthread_join(worker_thread, NULL);
+    CHECK(worker_started && worker.result == 0,
+          "descriptor sender continues only after exact ACK: %s",
+          worker.error);
+    if (worker_initialized) (void)pthread_mutex_destroy(&worker.mutex);
     for (size_t i = 0; i < received_count; i++) {
         (void)close(received_fds[i]);
     }
 
-    bool first = received && received_count == 1 &&
+    bool first = worker_started && worker.result == 0 &&
+        received && received_count == 1 &&
         run_successful_sample(
             &fixture, model_fd, &model_identity, 7);
     CHECK(first,
@@ -613,12 +716,236 @@ static void test_model_fd_and_blocking_sequence(void) {
           "model/control lifecycle restores the process fd baseline");
 }
 
+static bool receive_model_descriptor(
+        int peer_fd,
+        const ds4_runtime_file_identity *identity) {
+    ds4_qualification_control_message message;
+    int received_fds[4] = {-1, -1, -1, -1};
+    size_t received_count = 0;
+    const bool received = receive_control_message(
+        peer_fd, &message, received_fds, 4, &received_count);
+    const bool valid = received &&
+        valid_message(
+            &message, DS4_QUALIFICATION_CONTROL_MODEL_FD, 0) &&
+        identity_equal(&message.model_identity, identity) &&
+        received_count == 1;
+    for (size_t i = 0; i < received_count; i++) {
+        (void)close(received_fds[i]);
+    }
+    return valid;
+}
+
+static void test_model_fd_ack_validation(void) {
+    const size_t baseline = open_fd_list(NULL, 0);
+    ds4_runtime_file_identity model_identity;
+    const int model_fd = make_model_file(&model_identity);
+    CHECK(model_fd >= 0, "create model for ACK validation");
+    if (model_fd < 0) return;
+
+    for (int variant = 0; variant < 6; variant++) {
+        control_fixture fixture;
+        bool opened = fixture_open(&fixture, 100);
+        CHECK(opened, "open malformed model ACK fixture %d", variant);
+        if (!opened) {
+            (void)fixture_close(&fixture);
+            continue;
+        }
+
+        model_worker worker;
+        pthread_t thread;
+        bool initialized = model_worker_init(
+            &worker, fixture.control, model_fd, &model_identity);
+        bool started = initialized &&
+            pthread_create(&thread, NULL, model_worker_main, &worker) == 0;
+        CHECK(started, "start malformed model ACK worker %d", variant);
+
+        bool received = started && receive_model_descriptor(
+            fixture.pair[1], &model_identity);
+        CHECK(received, "receive descriptor before malformed ACK %d", variant);
+
+        ds4_qualification_control_message acknowledgement = {
+            .protocol_version = DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION,
+            .message_type = DS4_QUALIFICATION_CONTROL_MODEL_FD_ACK,
+            .message_size = sizeof(acknowledgement),
+            .checkpoint_sequence = 0,
+            .model_identity = model_identity,
+        };
+        if (variant == 0) {
+            acknowledgement.message_type =
+                DS4_QUALIFICATION_CONTROL_SAMPLE_READY_ACK;
+        } else if (variant == 1) {
+            acknowledgement.checkpoint_sequence = 1;
+        } else if (variant == 2) {
+            acknowledgement.model_identity.size_bytes++;
+        } else if (variant == 3) {
+            acknowledgement.protocol_version++;
+        } else if (variant == 4) {
+            acknowledgement.message_size--;
+        } else if (variant == 5) {
+            acknowledgement.reserved = 1;
+        }
+        bool sent = received && send_all(
+            fixture.pair[1], &acknowledgement, sizeof(acknowledgement));
+        CHECK(sent, "send malformed model ACK %d", variant);
+        const bool done = started && wait_model_worker_done(&worker, 200);
+        CHECK(done && worker.result != 0,
+              "non-exact model descriptor ACK fails closed (%d)",
+              variant);
+        if (!done && fixture.pair[1] >= 0) {
+            (void)close(fixture.pair[1]);
+            fixture.pair[1] = -1;
+        }
+        if (started) (void)pthread_join(thread, NULL);
+        if (initialized) (void)pthread_mutex_destroy(&worker.mutex);
+
+        char error[256] = {0};
+        CHECK(ds4_qualification_control_begin_sample(
+                  fixture.control, 1, error, sizeof(error)) != 0 &&
+                  strstr(error, "already unsafe") != NULL,
+              "malformed model ACK latches transport unsafe (%d): %s",
+              variant, error);
+        CHECK(wait_readable(fixture.pair[1], 0) == 0,
+              "unsafe transport emits no message after malformed ACK (%d)",
+              variant);
+        CHECK(fixture_close(&fixture),
+              "malformed model ACK fixture %d leaks no descriptors", variant);
+    }
+
+    (void)close(model_fd);
+    CHECK(open_fd_list(NULL, 0) == baseline,
+          "model ACK validation restores the fd baseline");
+}
+
+static void test_model_fd_ack_timeout(void) {
+    const size_t baseline = open_fd_list(NULL, 0);
+    ds4_runtime_file_identity model_identity;
+    const int model_fd = make_model_file(&model_identity);
+    CHECK(model_fd >= 0, "create model for descriptor ACK timeout");
+    if (model_fd < 0) return;
+
+    control_fixture fixture;
+    bool opened = fixture_open(&fixture, 50);
+    CHECK(opened, "open descriptor ACK timeout fixture");
+    if (opened) {
+        model_worker worker;
+        pthread_t thread;
+        bool initialized = model_worker_init(
+            &worker, fixture.control, model_fd, &model_identity);
+        bool started = initialized &&
+            pthread_create(&thread, NULL, model_worker_main, &worker) == 0;
+        CHECK(started, "start descriptor ACK timeout worker");
+        CHECK(started && receive_model_descriptor(
+                  fixture.pair[1], &model_identity),
+              "receive descriptor and deliberately withhold its ACK");
+        const bool done = started && wait_model_worker_done(&worker, 300);
+        CHECK(done && worker.result != 0,
+              "missing descriptor ACK reaches bounded failure");
+        CHECK(done && worker.elapsed_ms >= 20 && worker.elapsed_ms <= 250,
+              "descriptor ACK timeout is bounded around 50ms (got %llu)",
+              (unsigned long long)worker.elapsed_ms);
+        if (!done && fixture.pair[1] >= 0) {
+            (void)close(fixture.pair[1]);
+            fixture.pair[1] = -1;
+        }
+        if (started) (void)pthread_join(thread, NULL);
+        if (initialized) (void)pthread_mutex_destroy(&worker.mutex);
+    }
+    CHECK(fixture_close(&fixture),
+          "descriptor ACK timeout fixture leaks no descriptors");
+    (void)close(model_fd);
+    CHECK(open_fd_list(NULL, 0) == baseline,
+          "descriptor ACK timeout restores the fd baseline");
+}
+
+static void test_model_fd_ack_uses_model_timeout(void) {
+    const size_t baseline = open_fd_list(NULL, 0);
+    ds4_runtime_file_identity model_identity;
+    const int model_fd = make_model_file(&model_identity);
+    CHECK(model_fd >= 0, "create model for split timeout routing");
+    if (model_fd < 0) return;
+
+    control_fixture fixture;
+    bool opened = fixture_open_with_timeouts(&fixture, 5, 200);
+    CHECK(opened, "open split barrier/model timeout fixture");
+    if (opened) {
+        model_worker worker;
+        pthread_t thread;
+        bool initialized = model_worker_init(
+            &worker, fixture.control, model_fd, &model_identity);
+        bool started = initialized &&
+            pthread_create(&thread, NULL, model_worker_main, &worker) == 0;
+        CHECK(started, "start split-timeout model worker");
+        bool received = started && receive_model_descriptor(
+            fixture.pair[1], &model_identity);
+        CHECK(received, "receive descriptor in split-timeout probe");
+        sleep_ms(25);
+        CHECK(started && !wait_model_worker_done(&worker, 0),
+              "model ACK wait outlives the shorter barrier timeout");
+        bool acknowledged = received && send_model_fd_ack(
+            fixture.pair[1], DS4_QUALIFICATION_CONTROL_MODEL_FD_ACK, 0,
+            &model_identity);
+        CHECK(acknowledged, "ACK descriptor within model timeout budget");
+        if (!acknowledged && fixture.pair[1] >= 0) {
+            (void)close(fixture.pair[1]);
+            fixture.pair[1] = -1;
+        }
+        if (started) (void)pthread_join(thread, NULL);
+        CHECK(started && worker.result == 0,
+              "MODEL_FD_ACK uses model timeout, not barrier timeout: %s",
+              worker.error);
+        if (initialized) (void)pthread_mutex_destroy(&worker.mutex);
+    }
+    CHECK(fixture_close(&fixture),
+          "split timeout routing fixture leaks no descriptors");
+    (void)close(model_fd);
+    CHECK(open_fd_list(NULL, 0) == baseline,
+          "split timeout routing restores the fd baseline");
+}
+
+static void test_model_fd_ack_disconnect(void) {
+    const size_t baseline = open_fd_list(NULL, 0);
+    ds4_runtime_file_identity model_identity;
+    const int model_fd = make_model_file(&model_identity);
+    CHECK(model_fd >= 0, "create model for descriptor ACK disconnect");
+    if (model_fd < 0) return;
+
+    control_fixture fixture;
+    bool opened = fixture_open(&fixture, 100);
+    CHECK(opened, "open descriptor ACK disconnect fixture");
+    if (opened) {
+        model_worker worker;
+        pthread_t thread;
+        bool initialized = model_worker_init(
+            &worker, fixture.control, model_fd, &model_identity);
+        bool started = initialized &&
+            pthread_create(&thread, NULL, model_worker_main, &worker) == 0;
+        CHECK(started, "start descriptor ACK disconnect worker");
+        CHECK(started && receive_model_descriptor(
+                  fixture.pair[1], &model_identity),
+              "receive descriptor before peer disconnect");
+        if (fixture.pair[1] >= 0) {
+            (void)close(fixture.pair[1]);
+            fixture.pair[1] = -1;
+        }
+        const bool done = started && wait_model_worker_done(&worker, 200);
+        CHECK(done && worker.result != 0,
+              "descriptor ACK peer disconnect fails closed");
+        if (started) (void)pthread_join(thread, NULL);
+        if (initialized) (void)pthread_mutex_destroy(&worker.mutex);
+    }
+    CHECK(fixture_close(&fixture),
+          "descriptor ACK disconnect fixture leaks no descriptors");
+    (void)close(model_fd);
+    CHECK(open_fd_list(NULL, 0) == baseline,
+          "descriptor ACK disconnect restores the fd baseline");
+}
+
 static void test_invalid_endpoints(void) {
     const size_t baseline = open_fd_list(NULL, 0);
     char error[256] = {0};
     ds4_qualification_control *control = (void *)(uintptr_t)1;
     CHECK(ds4_qualification_control_open(
-              &control, -1, 100, error, sizeof(error)) != 0 &&
+              &control, -1, 100, 100, error, sizeof(error)) != 0 &&
               control == NULL,
           "negative inherited fd fails closed and clears the output");
 
@@ -628,7 +955,8 @@ static void test_invalid_endpoints(void) {
         control = (void *)(uintptr_t)1;
         memset(error, 0, sizeof(error));
         CHECK(ds4_qualification_control_open(
-                  &control, file_fd, 100, error, sizeof(error)) != 0 &&
+                  &control, file_fd, 100, 100,
+                  error, sizeof(error)) != 0 &&
                   control == NULL,
               "non-socket inherited fd fails closed");
         (void)close(file_fd);
@@ -640,9 +968,16 @@ static void test_invalid_endpoints(void) {
     if (pair[0] >= 0) {
         control = (void *)(uintptr_t)1;
         CHECK(ds4_qualification_control_open(
-                  &control, pair[0], 0, error, sizeof(error)) != 0 &&
+                  &control, pair[0], 0, 100,
+                  error, sizeof(error)) != 0 &&
                   control == NULL,
-              "zero timeout fails closed");
+              "zero barrier timeout fails closed");
+        control = (void *)(uintptr_t)1;
+        CHECK(ds4_qualification_control_open(
+                  &control, pair[0], 100, 0,
+                  error, sizeof(error)) != 0 &&
+                  control == NULL,
+              "zero model timeout fails closed");
         (void)close(pair[0]);
         (void)close(pair[1]);
     }
@@ -765,6 +1100,10 @@ int main(void) {
 
     test_invalid_endpoints();
     test_model_fd_and_blocking_sequence();
+    test_model_fd_ack_validation();
+    test_model_fd_ack_timeout();
+    test_model_fd_ack_uses_model_timeout();
+    test_model_fd_ack_disconnect();
     test_wrong_ack_sequence();
     test_timeout();
     test_disconnect();

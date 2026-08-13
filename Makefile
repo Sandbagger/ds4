@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -373,6 +373,10 @@ test-runtime: tests/test_runtime
 
 test-runtime-request: tests/test_runtime
 	./tests/test_runtime --case request-metrics
+
+test-laguna-server-contract: ds4_test
+	python3 tests/test_laguna_server_contract.py --server ./ds4_test --case admission --case metrics -v
+	python3 tests/test_laguna_server_live_contract.py -v
 
 tests/test_qualification_control.o: tests/test_qualification_control.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -732,7 +736,7 @@ test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_contro
 	DS4_RUNTIME_SERVER_URL= uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python tests/test_runtime_endpoint_contract.py -v
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-server-contract \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_session_logits_only tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link \
 	tests/test_plan_io tests/test_laguna_plan $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent

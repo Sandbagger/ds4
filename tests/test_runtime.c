@@ -1619,6 +1619,253 @@ static void test_runtime_wire_snapshot(void) {
     unlink(model_path);
 }
 
+static void test_request_metrics_lifecycle(void) {
+    ds4_runtime_request_context request_a;
+    ds4_runtime_request_context request_b;
+    memset(&request_a, 0, sizeof(request_a));
+    memset(&request_b, 0, sizeof(request_b));
+    CHECK(ds4_runtime_request_begin(&request_a, UINT64_C(1000000000)) &&
+              ds4_runtime_request_begin(&request_b, UINT64_C(1010000000)),
+          "two request contexts begin at their explicit acceptance times");
+    CHECK(uuid_shape_valid(request_a.request_id) &&
+              uuid_shape_valid(request_b.request_id) &&
+              strcmp(request_a.request_id, request_b.request_id) != 0 &&
+              uuid_shape_valid(request_a.instance_id) &&
+              strcmp(request_a.instance_id, request_b.instance_id) == 0 &&
+              strcmp(request_a.request_id, request_a.instance_id) != 0,
+          "request UUIDs are unique and bind to one distinct process UUID");
+
+    char sequence_model_path[] = "/tmp/ds4-request-sequence-XXXXXX";
+    const int sequence_model_fd = mkstemp(sequence_model_path);
+    CHECK(sequence_model_fd >= 0,
+          "request sequence fixture opens one model descriptor");
+    if (sequence_model_fd < 0) return;
+    ds4_runtime_snapshot_context runtime_context;
+    ds4_runtime_tracker runtime_tracker;
+    ds4_runtime_allocation_record runtime_records[4];
+    ds4_runtime_wire_snapshot_input runtime_input = wire_input();
+    ds4_runtime_wire_snapshot runtime_before;
+    const bool sequence_fixture_ready =
+        ds4_runtime_snapshot_context_init(
+            &runtime_context, sequence_model_fd,
+            "laguna-s-2.1", "laguna") &&
+        wire_tracker_init(&runtime_tracker, runtime_records) &&
+        ds4_runtime_wire_snapshot_capture(
+            &runtime_context, &runtime_tracker,
+            &runtime_input, &runtime_before);
+    CHECK(sequence_fixture_ready && runtime_before.snapshot_seq == 1u &&
+              strcmp(runtime_before.instance_id, request_a.instance_id) == 0,
+          "process and request records share one UUID and sequence namespace");
+    if (!sequence_fixture_ready) {
+        close(sequence_model_fd);
+        unlink(sequence_model_path);
+        return;
+    }
+
+    CHECK(ds4_runtime_request_set_prompt_tokens(&request_a, 22u) &&
+              ds4_runtime_request_mark_prefill_complete(
+                  &request_a, UINT64_C(1200000000)) &&
+              ds4_runtime_request_set_prompt_tokens(&request_b, 1u),
+          "interleaved requests retain their own prompt and prefill milestones");
+
+    const ds4_runtime_wire_counters delta = {
+        .cache_acquire_hits = 1u,
+        .cache_acquire_misses = 2u,
+        .cache_evictions = 3u,
+        .model_file_read_operations = 4u,
+        .model_file_read_bytes = 5u,
+        .model_file_read_ns = 6u,
+        .host_to_device_bytes = 7u,
+        .host_to_device_ns = 8u,
+        .page_advice_attempts = 9u,
+        .page_advice_bytes = 10u,
+        .page_advice_failures = 11u,
+    };
+    CHECK(ds4_runtime_request_add_counters(&request_a, &delta) &&
+              memcmp(&request_a.counters, &delta, sizeof(delta)) == 0 &&
+              memcmp(&request_b.counters,
+                     &(ds4_runtime_wire_counters){0},
+                     sizeof(request_b.counters)) == 0,
+          "request-local accounting never leaks across interleaved contexts");
+
+    CHECK(ds4_runtime_request_record_generated(
+              &request_a, 2u, 0u, 0u) &&
+              ds4_runtime_request_record_generated(
+                  &request_a, 1u, 1u, UINT64_C(1500000000)) &&
+              ds4_runtime_request_record_generated(
+                  &request_a, 5u, 5u, UINT64_C(2000000000)) &&
+              ds4_runtime_request_record_page_advice_complete(
+                  &request_a, UINT64_C(2100000000)),
+          "hidden and visible generation plus final advice stay request-scoped");
+
+    ds4_runtime_request_metrics completed;
+    memset(&completed, 0xa5, sizeof(completed));
+    CHECK(ds4_runtime_request_finish(
+              &request_a, DS4_RUNTIME_REQUEST_COMPLETED,
+              UINT64_C(2200000000), &completed),
+          "completed request terminalizes once");
+    CHECK(completed.snapshot_seq == 2u &&
+              completed.prompt_tokens == 22u &&
+              completed.generated_tokens == 8u &&
+              completed.ttft_present &&
+              completed.ttft_ns == UINT64_C(500000000) &&
+              completed.prefill_tokens_per_second == 110.0 &&
+              completed.visible_decode_tokens_per_second == 6.0 &&
+              completed.wall_time_ns == UINT64_C(1200000000) &&
+              completed.page_advice_complete_present &&
+              completed.page_advice_complete_monotonic_ns ==
+                  UINT64_C(2100000000) &&
+              completed.terminal_status == DS4_RUNTIME_REQUEST_COMPLETED &&
+              memcmp(&completed.counters, &delta, sizeof(delta)) == 0,
+          "completed metrics preserve exact counts, timing, rates, and counters");
+
+    ds4_runtime_wire_snapshot runtime_after;
+    CHECK(ds4_runtime_wire_snapshot_capture(
+              &runtime_context, &runtime_tracker,
+              &runtime_input, &runtime_after) &&
+              runtime_after.snapshot_seq == 3u &&
+              strcmp(runtime_after.instance_id, completed.instance_id) == 0,
+          "runtime publication continues immediately after request publication");
+
+    const ds4_runtime_request_context terminal_context = request_a;
+    ds4_runtime_request_metrics rejected_repeat = completed;
+    CHECK(!ds4_runtime_request_finish(
+              &request_a, DS4_RUNTIME_REQUEST_REJECTED,
+              UINT64_C(2300000000), &rejected_repeat) &&
+              memcmp(&request_a, &terminal_context,
+                     sizeof(request_a)) == 0 &&
+              memcmp(&rejected_repeat, &completed,
+                     sizeof(completed)) == 0,
+          "terminal state is immutable and a repeated finish is transactional");
+
+    ds4_runtime_request_metrics rejected;
+    CHECK(ds4_runtime_request_finish(
+              &request_b, DS4_RUNTIME_REQUEST_REJECTED,
+              UINT64_C(1040000000), &rejected) &&
+              rejected.snapshot_seq == 4u &&
+              rejected.prompt_tokens == 1u &&
+              rejected.generated_tokens == 0u &&
+              !rejected.ttft_present &&
+              rejected.visible_decode_tokens_per_second == 0.0 &&
+              rejected.wall_time_ns == UINT64_C(30000000) &&
+              !rejected.page_advice_complete_present &&
+              rejected.terminal_status == DS4_RUNTIME_REQUEST_REJECTED,
+          "a request ending before its first visible token emits nullable TTFT");
+
+    char json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t json_length = 0u;
+    CHECK(ds4_runtime_request_metrics_json(
+              &completed, json, sizeof(json), &json_length) &&
+              json_length == strlen(json),
+          "request metrics serialize as one bounded JSON value");
+    char expected[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    const int expected_length = snprintf(
+        expected, sizeof(expected),
+        "{\"schema\":\"ds4.runtime.request/v1\","
+        "\"request_id\":\"%s\",\"instance_id\":\"%s\","
+        "\"snapshot_seq\":\"2\",\"prompt_tokens\":22,"
+        "\"generated_tokens\":8,\"ttft_ns\":\"500000000\","
+        "\"prefill_tokens_per_second\":110,"
+        "\"visible_decode_tokens_per_second\":6,"
+        "\"wall_time_ns\":\"1200000000\","
+        "\"cache_hits\":\"1\",\"cache_misses\":\"2\","
+        "\"cache_evictions\":\"3\","
+        "\"model_file_read_operations\":\"4\","
+        "\"model_file_read_bytes\":\"5\","
+        "\"model_file_read_ns\":\"6\","
+        "\"host_to_device_bytes\":\"7\","
+        "\"host_to_device_ns\":\"8\","
+        "\"page_advice_attempts\":\"9\","
+        "\"page_advice_bytes\":\"10\","
+        "\"page_advice_failures\":\"11\","
+        "\"page_advice_complete_monotonic_ns\":\"2100000000\","
+        "\"terminal_status\":\"completed\"}",
+        completed.request_id, completed.instance_id);
+    CHECK(expected_length > 0 &&
+              (size_t)expected_length == json_length &&
+              memcmp(json, expected, json_length + 1u) == 0,
+          "request JSON is deterministic and schema-shaped byte for byte");
+
+    char rejected_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t rejected_length = 0u;
+    CHECK(ds4_runtime_request_metrics_json(
+              &rejected, rejected_json, sizeof(rejected_json),
+              &rejected_length) &&
+              strstr(rejected_json, "\"ttft_ns\":null") != NULL &&
+              strstr(rejected_json,
+                     "\"page_advice_complete_monotonic_ns\":null") !=
+                  NULL,
+          "terminal-before-first-token JSON emits both nullable fields as null");
+
+    char small[16];
+    memset(small, 0x5a, sizeof(small));
+    const ds4_runtime_request_metrics metrics_before = completed;
+    size_t small_length = 99u;
+    CHECK(!ds4_runtime_request_metrics_json(
+              &completed, small, sizeof(small), &small_length) &&
+              small_length == 0u &&
+              memcmp(&completed, &metrics_before, sizeof(completed)) == 0,
+          "small-buffer serialization fails without mutating request metrics");
+
+    close(sequence_model_fd);
+    unlink(sequence_model_path);
+}
+
+static void test_request_metrics_saturation_and_validation(void) {
+    ds4_runtime_request_context request;
+    memset(&request, 0, sizeof(request));
+    CHECK(ds4_runtime_request_begin(&request, 1u),
+          "saturation request context begins");
+    const ds4_runtime_wire_counters near_max = {
+        .cache_acquire_hits = UINT64_MAX - 1u,
+        .cache_acquire_misses = UINT64_MAX - 1u,
+        .cache_evictions = UINT64_MAX - 1u,
+        .model_file_read_operations = UINT64_MAX - 1u,
+        .model_file_read_bytes = UINT64_MAX - 1u,
+        .model_file_read_ns = UINT64_MAX - 1u,
+        .host_to_device_bytes = UINT64_MAX - 1u,
+        .host_to_device_ns = UINT64_MAX - 1u,
+        .page_advice_attempts = UINT64_MAX - 1u,
+        .page_advice_bytes = UINT64_MAX - 1u,
+        .page_advice_failures = UINT64_MAX - 1u,
+    };
+    const ds4_runtime_wire_counters overflow = {
+        .cache_acquire_hits = 9u,
+        .cache_acquire_misses = 9u,
+        .cache_evictions = 9u,
+        .model_file_read_operations = 9u,
+        .model_file_read_bytes = 9u,
+        .model_file_read_ns = 9u,
+        .host_to_device_bytes = 9u,
+        .host_to_device_ns = 9u,
+        .page_advice_attempts = 9u,
+        .page_advice_bytes = 9u,
+        .page_advice_failures = 9u,
+    };
+    CHECK(ds4_runtime_request_add_counters(&request, &near_max) &&
+              ds4_runtime_request_add_counters(&request, &overflow) &&
+              request.counters.cache_acquire_hits == UINT64_MAX &&
+              request.counters.cache_acquire_misses == UINT64_MAX &&
+              request.counters.cache_evictions == UINT64_MAX &&
+              request.counters.model_file_read_operations == UINT64_MAX &&
+              request.counters.model_file_read_bytes == UINT64_MAX &&
+              request.counters.model_file_read_ns == UINT64_MAX &&
+              request.counters.host_to_device_bytes == UINT64_MAX &&
+              request.counters.host_to_device_ns == UINT64_MAX &&
+              request.counters.page_advice_attempts == UINT64_MAX &&
+              request.counters.page_advice_bytes == UINT64_MAX &&
+              request.counters.page_advice_failures == UINT64_MAX,
+          "all eleven request counters saturate instead of wrapping");
+
+    const ds4_runtime_request_context before = request;
+    CHECK(!ds4_runtime_request_set_prompt_tokens(&request, 0u) &&
+              !ds4_runtime_request_set_prompt_tokens(
+                  &request, DS4_RUNTIME_JSON_SAFE_INTEGER_MAX + 1u) &&
+              !ds4_runtime_request_mark_prefill_complete(&request, 0u) &&
+              memcmp(&request, &before, sizeof(request)) == 0,
+          "invalid prompt counts and inverted timing fail transactionally");
+}
+
 static int run_external_attribution(void) {
     test_valid_external_attribution();
     test_partial_vma_credit_and_managed_deduplication();
@@ -1642,8 +1889,22 @@ static int run_external_attribution(void) {
     return 0;
 }
 
+static int run_request_metrics(void) {
+    test_request_metrics_lifecycle();
+    test_request_metrics_saturation_and_validation();
+    if (g_failures != 0) {
+        fprintf(stderr, "request-metrics: %d/%d assertions failed\n",
+                g_failures, g_assertions);
+        return 1;
+    }
+    printf("request-metrics: %d assertions passed\n", g_assertions);
+    return 0;
+}
+
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s --case external-attribution\n", program);
+    fprintf(stderr,
+            "Usage: %s --case external-attribution|request-metrics\n",
+            program);
 }
 
 int main(int argc, char **argv) {
@@ -1654,6 +1915,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[2], "external-attribution") == 0) {
         return run_external_attribution();
+    }
+    if (strcmp(argv[2], "request-metrics") == 0) {
+        return run_request_metrics();
     }
     usage(argv[0]);
     return 2;

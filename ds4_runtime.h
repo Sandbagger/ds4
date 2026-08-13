@@ -105,7 +105,10 @@ enum {
     DS4_RUNTIME_FEATURE_COUNT = 16,
     DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY = 20,
     DS4_RUNTIME_JSON_CAPACITY = 16384,
+    DS4_RUNTIME_REQUEST_JSON_CAPACITY = 2048,
 };
+
+#define DS4_RUNTIME_JSON_SAFE_INTEGER_MAX UINT64_C(9007199254740991)
 
 typedef struct {
     uint64_t device;
@@ -371,6 +374,105 @@ typedef struct {
         violations[DS4_RUNTIME_VIOLATION_HISTORY_CAPACITY];
     size_t violation_count;
 } ds4_runtime_wire_snapshot;
+
+/* Public ds4.runtime.request/v1 record. Request contexts are created at HTTP
+ * acceptance, updated explicitly by the work they own, and finalized exactly
+ * once. They never derive request deltas from process snapshots. The caller
+ * supplies one coherent synchronization boundary around each mutation. */
+typedef enum {
+    DS4_RUNTIME_REQUEST_COMPLETED = 0,
+    DS4_RUNTIME_REQUEST_CANCELLED = 1,
+    DS4_RUNTIME_REQUEST_REJECTED = 2,
+    DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR = 3,
+    DS4_RUNTIME_REQUEST_UNSAFE_ERROR = 4,
+    DS4_RUNTIME_REQUEST_TERMINAL_STATUS_COUNT = 5,
+} ds4_runtime_request_terminal_status;
+
+typedef struct {
+    char request_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    char instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    uint64_t accepted_monotonic_ns;
+    uint64_t prefill_complete_monotonic_ns;
+    uint64_t first_visible_token_monotonic_ns;
+    uint64_t page_advice_complete_monotonic_ns;
+    uint64_t prompt_tokens;
+    uint64_t generated_tokens;
+    uint64_t visible_generated_tokens;
+    ds4_runtime_wire_counters counters;
+    bool initialized;
+    bool prompt_tokens_set;
+    bool prefill_complete;
+    bool first_visible_token;
+    bool page_advice_complete;
+    bool terminal;
+} ds4_runtime_request_context;
+
+typedef struct {
+    char request_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    char instance_id[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    uint64_t snapshot_seq;
+    uint64_t prompt_tokens;
+    uint64_t generated_tokens;
+    bool ttft_present;
+    uint64_t ttft_ns;
+    double prefill_tokens_per_second;
+    double visible_decode_tokens_per_second;
+    uint64_t wall_time_ns;
+    ds4_runtime_wire_counters counters;
+    bool page_advice_complete_present;
+    uint64_t page_advice_complete_monotonic_ns;
+    ds4_runtime_request_terminal_status terminal_status;
+} ds4_runtime_request_metrics;
+
+/* Generate a server request UUID and bind it to the process-lifetime runtime
+ * instance at the supplied monotonic acceptance timestamp. */
+bool ds4_runtime_request_begin(
+    ds4_runtime_request_context *context,
+    uint64_t accepted_monotonic_ns);
+
+/* Record the exact rendered prompt before execution. Rejected prepared
+ * requests therefore retain a prompt count without fabricating prefill work. */
+bool ds4_runtime_request_set_prompt_tokens(
+    ds4_runtime_request_context *context,
+    uint64_t prompt_tokens);
+
+bool ds4_runtime_request_mark_prefill_complete(
+    ds4_runtime_request_context *context,
+    uint64_t complete_monotonic_ns);
+
+/* Saturating request-local additions for the same eleven counters published
+ * by ds4.runtime/v1. */
+bool ds4_runtime_request_add_counters(
+    ds4_runtime_request_context *context,
+    const ds4_runtime_wire_counters *delta);
+
+/* Add total generated tokens and the visible subset completed at this
+ * timestamp. Hidden reasoning may therefore increment generated_delta while
+ * visible_delta is zero. */
+bool ds4_runtime_request_record_generated(
+    ds4_runtime_request_context *context,
+    uint64_t generated_delta,
+    uint64_t visible_delta,
+    uint64_t visible_complete_monotonic_ns);
+
+bool ds4_runtime_request_record_page_advice_complete(
+    ds4_runtime_request_context *context,
+    uint64_t complete_monotonic_ns);
+
+/* Allocate one process-global publication sequence and terminalize the
+ * context transactionally. */
+bool ds4_runtime_request_finish(
+    ds4_runtime_request_context *context,
+    ds4_runtime_request_terminal_status status,
+    uint64_t finished_monotonic_ns,
+    ds4_runtime_request_metrics *metrics);
+
+/* Deterministic compact JSON in ds4.runtime.request/v1 field order. */
+bool ds4_runtime_request_metrics_json(
+    const ds4_runtime_request_metrics *metrics,
+    char *buffer,
+    size_t capacity,
+    size_t *length_out);
 
 /* Private same-host qualification transport.  Messages have one fixed native
  * layout because both endpoints are created from the same qualified build;

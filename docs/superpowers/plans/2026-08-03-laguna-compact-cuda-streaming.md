@@ -1028,6 +1028,7 @@ git commit -m "test: gate Laguna warm stability and session pressure"
 - Create: `schemas/ds4-runtime-request-v1.schema.json`
 - Create: `schemas/ds4-token-admission-v1.schema.json`
 - Create: `schemas/ds4-laguna-compact-runtime-v1.schema.json`
+- Create: `gguf-tools/quality-testing/compact_runtime_schema.py`
 - Create: `gguf-tools/quality-testing/requirements-compact-runtime.txt`
 - Create: `tests/test_runtime_contract.py`
 - Modify: `Makefile`
@@ -1059,6 +1060,9 @@ Transcribe the approved wire contracts without optional catch-all objects:
 - `ds4.laguna.compact-runtime/v1` — subject/host/model/schema bindings, oracle, immutable manifest, global gates, all profiles, and evidence root.
 
 Use reusable `$defs` only inside a schema file so each distributed schema validates independently.
+Use the shared strict-parser/Draft-2020-12 profile for the two `x-ds4-*`
+keywords; raw Draft validation alone does not enforce exact JSON number kinds
+or lexically sorted feature arrays.
 
 - [ ] **Step 5: Make schema tests green and wire the target**
 
@@ -1079,6 +1083,7 @@ git add schemas/ds4-version-v1.schema.json schemas/ds4-runtime-v1.schema.json \
   schemas/ds4-runtime-request-v1.schema.json \
   schemas/ds4-token-admission-v1.schema.json \
   schemas/ds4-laguna-compact-runtime-v1.schema.json \
+  gguf-tools/quality-testing/compact_runtime_schema.py \
   gguf-tools/quality-testing/requirements-compact-runtime.txt \
   tests/test_runtime_contract.py Makefile
 git commit -m "test: freeze compact runtime wire schemas"

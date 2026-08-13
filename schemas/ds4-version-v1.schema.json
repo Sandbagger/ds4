@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ds4.version/v1",
+  "title": "DS4 build version",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "revision",
+    "dirty",
+    "backend",
+    "features"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ds4.version/v1"
+    },
+    "revision": {
+      "$ref": "#/$defs/revision"
+    },
+    "dirty": {
+      "type": "boolean"
+    },
+    "backend": {
+      "$ref": "#/$defs/backend"
+    },
+    "features": {
+      "$ref": "#/$defs/features"
+    }
+  },
+  "$defs": {
+    "revision": {
+      "type": "string",
+      "pattern": "^(?!0{40}(?![\\s\\S]))[0-9a-f]{40}(?![\\s\\S])"
+    },
+    "backend": {
+      "type": "string",
+      "enum": [
+        "cpu",
+        "metal",
+        "cuda",
+        "rocm"
+      ]
+    },
+    "feature": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(?![\\s\\S])"
+    },
+    "features": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/feature"
+      },
+      "x-ds4-sorted-unique": true
+    }
+  }
+}

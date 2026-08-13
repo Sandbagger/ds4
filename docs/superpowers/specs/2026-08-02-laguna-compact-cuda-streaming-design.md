@@ -461,6 +461,12 @@ schemas/ds4-token-admission-v1.schema.json
 schemas/ds4-laguna-compact-runtime-v1.schema.json
 ```
 
+Normative acceptance uses `compact_runtime_schema.py`: strict JSON parsing
+rejects duplicate keys and non-finite values, then the DS4 Draft 2020-12
+validation profile enforces exact JSON number kinds and sorted feature arrays
+in addition to the schemas' standard keywords. A raw third-party Draft 2020-12
+validator ignores the `x-ds4-*` profile keywords and is therefore insufficient.
+
 All potentially full-width unsigned 64-bit byte counts, durations, counters,
 and `snapshot_seq` values are canonical decimal strings matching
 `0|[1-9][0-9]*`; the schemas additionally enforce the uint64 maximum. Token

@@ -52,33 +52,28 @@ REV_A, REV_B = "0123456789abcdef0123456789abcdef01234567", "76543210fedcba987654
 UUID_A, UUID_B = "123e4567-e89b-12d3-a456-426614174000", "223e4567-e89b-12d3-a456-426614174001"
 
 try:
-    from jsonschema import Draft202012Validator, FormatChecker, ValidationError, validators
+    from jsonschema import Draft202012Validator
 except ModuleNotFoundError:
-    Draft202012Validator = FormatChecker = ValidationError = validators = None  # type: ignore[assignment,misc]
+    Draft202012Validator = None  # type: ignore[assignment,misc]
 try:
     import rfc8785
 except ModuleNotFoundError:
     rfc8785 = None
 
 
-def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate key: {key}")
-        result[key] = value
-    return result
+def _load_schema_profile() -> Any:
+    if not SCHEMA_PROFILE.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("compact_runtime_schema", SCHEMA_PROFILE)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load {SCHEMA_PROFILE}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def loads_strict(payload: str) -> Any:
-    def reject(value: str) -> None:
-        raise ValueError(f"non-finite JSON value: {value}")
-    def finite(value: str) -> float:
-        parsed = float(value)
-        if not math.isfinite(parsed):
-            reject(value)
-        return parsed
-    return json.loads(payload, object_pairs_hook=_strict_pairs, parse_constant=reject, parse_float=finite)
+SCHEMA_PROFILE_MODULE = _load_schema_profile()
+loads_strict = SCHEMA_PROFILE_MODULE.loads_strict if SCHEMA_PROFILE_MODULE is not None else json.loads
 
 
 def stat(seed: int) -> dict[str, str]:
@@ -283,22 +278,9 @@ def label(path: Path) -> str:
 SCHEMAS_PRESENT = all((SCHEMA_DIR / filename).is_file() for filename, _ in SCHEMA_FILES.values())
 
 
-def exact_number_kind(validator: Any, expected: str, instance: Any, schema: Any) -> Iterator[Any]:
-    exact_integer = type(instance) is int
-    finite_number = type(instance) in (int, float) and math.isfinite(instance)
-    if (expected == "integer" and not exact_integer) or (expected == "number" and not finite_number):
-        yield ValidationError(f"{instance!r} is not an exact finite JSON {expected}")
-
-
-def sorted_unique(validator: Any, enabled: bool, instance: Any, schema: Any) -> Iterator[Any]:
-    if enabled and isinstance(instance, list):
-        if not all(type(item) is str for item in instance) or len(instance) != len(set(instance)) or instance != sorted(instance):
-            yield ValidationError(f"{instance!r} is not sorted and unique")
-
-
 ExactValidator = (
-    validators.extend(Draft202012Validator, {"x-ds4-number-kind": exact_number_kind, "x-ds4-sorted-unique": sorted_unique})
-    if validators is not None else None
+    SCHEMA_PROFILE_MODULE.CompactRuntimeValidator
+    if SCHEMA_PROFILE_MODULE is not None else None
 )
 
 
@@ -367,7 +349,7 @@ class SchemaTests(unittest.TestCase):
         for name, (filename, _) in SCHEMA_FILES.items():
             schema = loads_strict((SCHEMA_DIR / filename).read_text(encoding="utf-8"))
             cls.schemas[name] = schema
-            cls.validators[name] = ExactValidator(schema, format_checker=FormatChecker())
+            cls.validators[name] = SCHEMA_PROFILE_MODULE.validator_for(schema)
 
     def valid(self, name: str, value: Any) -> None:
         errors = list(self.validators[name].iter_errors(value))
@@ -420,7 +402,7 @@ class SchemaTests(unittest.TestCase):
                         changed = copy.deepcopy(value); put(changed, path, None); self.invalid(name, changed)
 
     def test_every_uint64_string_accepts_boundaries_and_rejects_noncanonical_values(self) -> None:
-        invalid_values: tuple[Any, ...] = ("00", "01", "+1", "-1", "1e3", "1.0", 1, 1.0, True, "18446744073709551616")
+        invalid_values: tuple[Any, ...] = ("00", "01", "+1", "-1", "1e3", "1.0", "1\n", 1, 1.0, True, "18446744073709551616")
         seen: set[tuple[str, Path]] = set()
         for name, fixture_list in variants().items():
             for value in fixture_list:
@@ -464,20 +446,21 @@ class SchemaTests(unittest.TestCase):
                 if not isinstance(current, str): continue
                 width = 64 if key == "sha256" or key.endswith("_sha256") else 40 if key in {"revision", "tokenizer_runtime_revision", "llama_revision"} else 0
                 if width:
-                    for candidate in (current.upper(), current[:-1], current + "0", "g" * width, "0" * width):
+                    for candidate in (current.upper(), current[:-1], current + "0", current + "\n", "g" * width, "0" * width):
                         changed = copy.deepcopy(value); put(changed, path, candidate); self.invalid(name, changed)
         for name, value, path in (
             ("runtime", runtime(), ("instance_id",)),
             ("request", request(), ("request_id",)),
             ("request", request(), ("instance_id",)),
         ):
-            for candidate in (UUID_A.upper(), UUID_A.replace("-", ""), "not-a-uuid", "00000000-0000-0000-0000-000000000000"):
+            for candidate in (UUID_A.upper(), UUID_A.replace("-", ""), UUID_A + "\n", "not-a-uuid", "00000000-0000-0000-0000-000000000000"):
                 changed = copy.deepcopy(value); put(changed, path, candidate); self.invalid(name, changed)
         for candidate in ("2026-08-13T12:34:56Z", "2026-08-13T12:34:56.123456789Z"):
             changed = bundle(); changed["created_at"] = candidate; self.valid("bundle", changed)
         for candidate in (
             "2026-08-13T12:34:56+00:00",
             "2026-08-13 12:34:56Z",
+            "2026-08-13T12:34:56Z\n",
             "2026-13-13T12:34:56Z",
             "2026-02-31T12:34:56Z",
         ):
@@ -485,7 +468,7 @@ class SchemaTests(unittest.TestCase):
         for name, value, path in (("version", version(), ("features",)), ("runtime", runtime(), ("build", "features"))):
             for candidate in ([], ["laguna"], ["laguna", "ssd_streaming"]):
                 changed = copy.deepcopy(value); put(changed, path, candidate); self.valid(name, changed)
-            for candidate in (["ssd_streaming", "laguna"], ["laguna", "laguna"], ["laguna", 1], "laguna"):
+            for candidate in (["ssd_streaming", "laguna"], ["laguna", "laguna"], ["laguna\n"], ["laguna", 1], "laguna"):
                 changed = copy.deepcopy(value); put(changed, path, candidate); self.invalid(name, changed)
 
     def test_stable_enums_and_null_coherence(self) -> None:

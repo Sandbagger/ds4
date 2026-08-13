@@ -609,7 +609,7 @@ test-laguna-compact-contract:
 		exit 127; \
 	}
 	@uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
-		python -c 'from jsonschema import Draft202012Validator; import rfc8785' || { \
+		python -c 'from jsonschema import Draft202012Validator; import rfc3339_validator, rfc8785' || { \
 		echo "error: unable to provision pinned compact-runtime requirements with uv" >&2; \
 		exit 1; \
 	}

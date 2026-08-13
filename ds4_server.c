@@ -46,6 +46,8 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#define DS4_SERVER_EXEC_RECOVERABLE 2
+#define DS4_SERVER_EXEC_UNSAFE 3
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
@@ -4739,7 +4741,19 @@ static long long wall_ms(void) {
     return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+#ifdef DS4_SERVER_TEST
+static int server_test_send_all_fail_after = -1;
+static int server_test_send_all_calls = 0;
+#endif
+
 static bool send_all(int fd, const void *p, size_t n) {
+#ifdef DS4_SERVER_TEST
+    if (server_test_send_all_fail_after >= 0 &&
+        server_test_send_all_calls++ == server_test_send_all_fail_after) {
+        errno = EPIPE;
+        return false;
+    }
+#endif
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
@@ -5608,6 +5622,31 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
+    buf_free(&h);
+    return ok;
+}
+
+/* A buffered inference response has one field whose value does not exist
+ * until after the first visible body bytes have actually been accepted by the
+ * socket: TTFT inside request_metrics.  HTTP/1.1 close-delimited framing lets
+ * the server send the native JSON prefix, timestamp that successful payload,
+ * freeze metrics, and append the final member without guessing a future
+ * Content-Length. */
+static bool http_response_close_delimited_begin(
+        int fd, bool enable_cors, int code, const char *type) {
+    const char *reason = code == 200 ? "OK" :
+                         code == 400 ? "Bad Request" :
+                         code == 500 ? "Internal Server Error" : "Error";
+    buf h = {0};
+    buf_printf(&h, "HTTP/1.1 %d %s\r\n", code, reason);
+    if (type && type[0]) {
+        buf_puts(&h, "Content-Type: ");
+        buf_puts(&h, type);
+        buf_puts(&h, "\r\n");
+    }
+    if (enable_cors) append_cors_headers(&h);
+    buf_puts(&h, "Connection: close\r\n\r\n");
+    const bool ok = send_all(fd, h.ptr, h.len);
     buf_free(&h);
     return ok;
 }
@@ -6836,6 +6875,9 @@ static laguna_admission_result laguna_prepare_chat_request(
         result.code = request_token_counts_admit(
             r.prompt.len, result.requested_output_tokens, context_tokens);
     }
+    const bool prepared_prompt_exists =
+        r.prompt.len > 0 && r.prompt_text && !saw_model_mismatch &&
+        !saw_invalid_request && !saw_unsupported_tool_choice;
     if (result.code == REQUEST_ADMISSION_FITS) {
         r.max_tokens = (int)r.requested_output_tokens;
         r.model_from_request = true;
@@ -6843,6 +6885,14 @@ static laguna_admission_result laguna_prepare_chat_request(
             *prepared = r;
             memset(&r, 0, sizeof(r));
         }
+    } else if (mode == LAGUNA_PREPARE_INFERENCE && prepared &&
+               prepared_prompt_exists) {
+        /* Keep the exact wide request count for the rejection envelope, but
+         * never narrow it through int: rejected requests do not execute. */
+        r.max_tokens = 0;
+        r.model_from_request = true;
+        *prepared = r;
+        memset(&r, 0, sizeof(r));
     }
 
 done:
@@ -7081,9 +7131,12 @@ static bool sse_done(int fd, const request *r, const char *id,
            send_all(fd, "data: [DONE]\n\n", 14);
 }
 
-static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
-                            const char *reasoning, const tool_calls *calls, const char *finish,
-                            int prompt_tokens, int completion_tokens) {
+static bool sse_chat_flush_visible(int fd, const request *r, const char *id,
+                                   const char *content,
+                                   const char *reasoning,
+                                   const tool_calls *calls,
+                                   bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
     if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
 
     buf b = {0};
@@ -7094,6 +7147,10 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
         json_escape(&b, reasoning);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        const bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) return false;
+        if (payload_emitted) *payload_emitted = true;
     }
     if (content && content[0]) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7101,6 +7158,10 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
         json_escape(&b, content);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        const bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) return false;
+        if (payload_emitted) *payload_emitted = true;
     }
     if (calls && calls->len) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7108,15 +7169,32 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        const bool ok = send_all(fd, b.ptr, b.len);
+        buf_free(&b);
+        if (!ok) return false;
+        if (payload_emitted) *payload_emitted = true;
     }
+    return true;
+}
+
+static bool sse_chat_finish(int fd, const request *r, const char *id,
+                            const char *content, const char *reasoning,
+                            const tool_calls *calls, const char *finish,
+                            int prompt_tokens, int completion_tokens,
+                            const ds4_runtime_request_metrics *metrics) {
+    bool payload_emitted = false;
+    if (!metrics && !sse_chat_flush_visible(
+            fd, r, id, content, reasoning, calls,
+            &payload_emitted)) return false;
+    buf b = {0};
+    const long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
     buf_puts(&b, "}]}\n\n");
-
     bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens, NULL);
+              sse_done(fd, r, id, prompt_tokens, completion_tokens, metrics);
     buf_free(&b);
     return ok;
 }
@@ -7813,12 +7891,15 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     if (!name) return openai_tool_stream_fail(ts);
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
-    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
-              openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
+    bool ok = sse_chat_tool_call_start_delta(
+        fd, r, id, ts->index, tool_id, name);
     free(name);
     if (!ok) return false;
-
+    /* The start delta already exposes a tool item.  Latch it before the
+     * separate arguments write so a later transport failure cannot erase a
+     * truthful first-payload observation. */
     ts->emitted_any = true;
+    if (!openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1)) return false;
     ts->args_open = true;
     ts->first_param = true;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
@@ -8028,12 +8109,22 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     return true;
 }
 
-static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                   openai_stream *st, const char *raw,
-                                   size_t raw_len, const tool_calls *calls,
-                                   const char *finish, int prompt_tokens,
-                                   int completion_tokens) {
-    if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+static bool openai_sse_flush_live(int fd, server *s, const request *r,
+                                  const char *id, openai_stream *st,
+                                  const char *raw, size_t raw_len,
+                                  const tool_calls *calls,
+                                  bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
+    const bool had_reasoning = st->sent_reasoning;
+    const bool had_content = st->sent_content;
+    const bool had_tool = st->tool.emitted_any;
+    const bool update_ok = openai_sse_stream_update(
+        fd, s, r, id, st, raw, raw_len, true);
+    bool emitted = (!had_reasoning && st->sent_reasoning) ||
+                   (!had_content && st->sent_content) ||
+                   (!had_tool && st->tool.emitted_any);
+    if (payload_emitted) *payload_emitted = emitted;
+    if (!update_ok) return false;
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -8044,6 +8135,30 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
+    const bool had_fallback_payload = b.len > 0;
+    bool ok = send_all(fd, b.ptr, b.len);
+    if (ok && had_fallback_payload) {
+        emitted = true;
+        st->tool.emitted_any = true;
+        st->tool.index = calls ? calls->len : st->tool.index;
+    }
+    if (payload_emitted) *payload_emitted = emitted;
+    buf_free(&b);
+    return ok;
+}
+
+static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
+                                   openai_stream *st, const char *raw,
+                                   size_t raw_len, const tool_calls *calls,
+                                   const char *finish, int prompt_tokens,
+                                   int completion_tokens,
+                                   const ds4_runtime_request_metrics *metrics) {
+    bool payload_emitted = false;
+    if (!metrics && !openai_sse_flush_live(
+            fd, s, r, id, st, raw, raw_len, calls,
+            &payload_emitted)) return false;
+    buf b = {0};
+    const long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
@@ -8051,7 +8166,7 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens, NULL);
+              sse_done(fd, r, id, prompt_tokens, completion_tokens, metrics);
     buf_free(&b);
     return ok;
 }
@@ -8744,15 +8859,25 @@ static bool responses_sse_stream_update(int fd, const request *r,
     return true;
 }
 
-static bool responses_sse_finish_live(int fd, const request *r,
-                                      responses_stream *st,
-                                      const char *raw, size_t raw_len,
-                                      const char *recovered_content,
-                                      const tool_calls *calls,
-                                      const char *finish,
-                                      int prompt_tokens, int completion_tokens,
-                                      long created_at) {
-    if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
+static bool responses_sse_flush_live(int fd, const request *r,
+                                     responses_stream *st,
+                                     const char *raw, size_t raw_len,
+                                     const char *recovered_content,
+                                     const tool_calls *calls,
+                                     const responses_tool_item *items,
+                                     const char *finish,
+                                     bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
+    const bool had_reasoning = st->reasoning_emitted_any;
+    const bool had_message = st->message_emitted_any;
+    const bool update_ok = responses_sse_stream_update(
+        fd, r, st, raw, raw_len, true);
+    if (payload_emitted) {
+        *payload_emitted =
+            (!had_reasoning && st->reasoning_emitted_any) ||
+            (!had_message && st->message_emitted_any);
+    }
+    if (!update_ok) return false;
 
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
@@ -8783,20 +8908,20 @@ static bool responses_sse_finish_live(int fd, const request *r,
         if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
         buf_append(&st->message_text, tail, tail_len);
         st->message_emitted_any = true;
+        if (payload_emitted) *payload_emitted = true;
         st->emit_pos = raw_len;
     }
     if (st->message_item_opened && !st->message_item_closed) {
         if (!responses_sse_message_done(fd, st, finish)) return false;
         st->message_item_closed = true;
     }
-    responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, st->next_output_index);
     if (items && calls) st->next_output_index += calls->len;
     bool ok = true;
     if (items && calls) {
         for (int i = 0; i < calls->len && ok; i++) {
             ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
                                                    &r->tool_orders, finish, false);
+            if (ok && payload_emitted) *payload_emitted = true;
             if (ok) ok = responses_sse_function_call_arguments_done(fd, st, &calls->v[i],
                                                                     &items[i],
                                                                     &r->tool_orders);
@@ -8804,19 +8929,44 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                                            &r->tool_orders, finish, true);
         }
     }
-    if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
-                                         prompt_tokens, completion_tokens,
-                                         created_at, NULL);
-    free(items);
     return ok;
 }
 
-static bool responses_final_response(int fd, bool enable_cors,
+static bool responses_sse_finish_live(
+        int fd, const request *r, responses_stream *st,
+        const char *raw, size_t raw_len, const char *recovered_content,
+        const tool_calls *calls, responses_tool_item *items,
+        const char *finish,
+        int prompt_tokens, int completion_tokens, long created_at,
+        const ds4_runtime_request_metrics *metrics) {
+    responses_tool_item *owned_items = NULL;
+    if (!items) {
+        responses_tool_items_build(&owned_items, calls, st->next_output_index);
+        items = owned_items;
+    }
+    bool payload_emitted = false;
+    if (!metrics && !responses_sse_flush_live(
+            fd, r, st, raw, raw_len, recovered_content, calls, items,
+            finish, &payload_emitted)) {
+        free(owned_items);
+        return false;
+    }
+    bool ok = responses_sse_completed(
+        fd, r, st, calls, items, finish, prompt_tokens, completion_tokens,
+        created_at, metrics);
+    free(owned_items);
+    return ok;
+}
+
+static bool append_responses_final_response_prefix(
+                                     buf *b,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens,
-                                     const ds4_runtime_request_metrics *metrics) {
+                                     size_t *first_payload_end) {
+    if (!b || !r) return false;
+    if (first_payload_end) *first_payload_end = 0u;
     char response_id[40], reasoning_id[40], message_id[40];
     if (id && !strncmp(id, "resp_", 5)) {
         snprintf(response_id, sizeof(response_id), "%s", id);
@@ -8832,19 +8982,18 @@ static bool responses_final_response(int fd, bool enable_cors,
     long now = (long)time(NULL);
     const char *status = responses_status_for_finish(finish);
     const char *item_status = responses_item_status_for_finish(finish);
-    buf b = {0};
-    buf_printf(&b,
+    buf_printf(b,
         "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\","
         "\"model\":",
         response_id, now, status);
-    json_escape(&b, r->model);
+    json_escape(b, r->model);
     if (finish && !strcmp(finish, "error")) {
-        buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
+        buf_puts(b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (finish && !strcmp(finish, "length")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
     }
-    buf_puts(&b, ",\"output\":[");
+    buf_puts(b, ",\"output\":[");
     bool wrote = false;
     if (reasoning && reasoning[0] && r->reasoning_summary_emit) {
         /* Non-streaming path runs after the worker has post-processed the
@@ -8852,46 +9001,116 @@ static bool responses_final_response(int fd, bool enable_cors,
          * where </think> was observed (otherwise the reasoning text would be
          * empty). Tag it with the response-level item_status which still flips
          * to incomplete/failed when finish is length/error. */
-        buf_printf(&b,
+        buf_printf(b,
             "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\","
             "\"summary\":[{\"type\":\"summary_text\",\"text\":",
             reasoning_id, item_status);
-        json_escape(&b, reasoning);
-        buf_puts(&b, "}]}");
+        json_escape(b, reasoning);
+        buf_puts(b, "}]}");
+        if (first_payload_end && *first_payload_end == 0u) {
+            *first_payload_end = b->len;
+        }
         wrote = true;
     }
     if (text && text[0]) {
-        if (wrote) buf_putc(&b, ',');
-        buf_printf(&b,
+        if (wrote) buf_putc(b, ',');
+        buf_printf(b,
             "{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
             "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
             message_id, item_status);
-        json_escape(&b, text);
-        buf_puts(&b, ",\"annotations\":[]}]}");
+        json_escape(b, text);
+        buf_puts(b, ",\"annotations\":[]}]}");
+        if (first_payload_end && *first_payload_end == 0u) {
+            *first_payload_end = b->len;
+        }
         wrote = true;
     }
     if (calls && items) {
         for (int i = 0; i < calls->len; i++) {
-            if (wrote) buf_putc(&b, ',');
-            responses_append_function_call_item(&b, &calls->v[i], &items[i],
+            if (wrote) buf_putc(b, ',');
+            responses_append_function_call_item(b, &calls->v[i], &items[i],
                                                 item_status, true,
                                                 &r->tool_orders);
+            if (first_payload_end && *first_payload_end == 0u) {
+                *first_payload_end = b->len;
+            }
             wrote = true;
         }
     }
-    buf_putc(&b, ']');
-    buf_puts(&b, ",\"usage\":");
-    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
-    if (!append_runtime_request_metrics_member(&b, metrics)) {
-        buf_free(&b);
-        free(items);
-        return false;
-    }
-    buf_putc(&b, '}');
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
-    buf_free(&b);
+    buf_putc(b, ']');
+    buf_puts(b, ",\"usage\":");
+    append_responses_usage_json(b, r, prompt_tokens, completion_tokens);
     free(items);
+    return true;
+}
+
+static bool responses_final_response(int fd, bool enable_cors,
+                                     const request *r, const char *id,
+                                     const char *text, const char *reasoning,
+                                     const tool_calls *calls, const char *finish,
+                                     int prompt_tokens, int completion_tokens,
+                                     const ds4_runtime_request_metrics *metrics) {
+    buf b = {0};
+    bool ok = append_responses_final_response_prefix(
+        &b, r, id, text, reasoning, calls, finish,
+        prompt_tokens, completion_tokens, NULL);
+    if (ok) ok = append_runtime_request_metrics_member(&b, metrics);
+    if (ok) buf_putc(&b, '}');
+    if (ok) ok = http_response(
+        fd, enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
     return ok;
+}
+
+static bool append_openai_final_response_prefix(
+                           buf *b,
+                           const request *r, const char *id, const char *text,
+                           const char *reasoning, const tool_calls *calls,
+                           const char *finish,
+                           int prompt_tokens, int completion_tokens,
+                           size_t *first_payload_end) {
+    if (!b || !r || !id) return false;
+    if (first_payload_end) *first_payload_end = 0u;
+    long now = (long)time(NULL);
+    if (r->kind == REQ_CHAT) {
+        buf_printf(b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(b, r->model);
+        buf_puts(b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+        json_escape(b, text ? text : "");
+        if (first_payload_end && text && text[0]) {
+            *first_payload_end = b->len;
+        }
+        if (reasoning && reasoning[0]) {
+            buf_puts(b, ",\"reasoning_content\":");
+            json_escape(b, reasoning);
+            if (first_payload_end && *first_payload_end == 0u) {
+                *first_payload_end = b->len;
+            }
+        }
+        if (calls && calls->len) {
+            buf_puts(b, ",\"tool_calls\":");
+            append_tool_calls_json(b, calls, id, &r->tool_orders);
+            if (first_payload_end && *first_payload_end == 0u) {
+                *first_payload_end = b->len;
+            }
+        }
+        buf_puts(b, "},\"finish_reason\":");
+        json_escape(b, finish);
+        buf_puts(b, "}],\"usage\":");
+    } else {
+        buf_printf(b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        json_escape(b, r->model);
+        buf_puts(b, ",\"choices\":[{\"text\":");
+        json_escape(b, text);
+        if (first_payload_end && text && text[0]) {
+            *first_payload_end = b->len;
+        }
+        buf_puts(b, ",\"index\":0,\"finish_reason\":");
+        json_escape(b, finish);
+        buf_puts(b, "}],\"usage\":");
+    }
+    append_openai_usage_json(b, r, prompt_tokens, completion_tokens);
+    return true;
 }
 
 static bool final_response(int fd, bool enable_cors,
@@ -8900,39 +9119,13 @@ static bool final_response(int fd, bool enable_cors,
                            int prompt_tokens, int completion_tokens,
                            const ds4_runtime_request_metrics *metrics) {
     buf b = {0};
-    long now = (long)time(NULL);
-    if (r->kind == REQ_CHAT) {
-        buf_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-        json_escape(&b, text ? text : "");
-        if (reasoning && reasoning[0]) {
-            buf_puts(&b, ",\"reasoning_content\":");
-            json_escape(&b, reasoning);
-        }
-        if (calls && calls->len) {
-            buf_puts(&b, ",\"tool_calls\":");
-            append_tool_calls_json(&b, calls, id, &r->tool_orders);
-        }
-        buf_puts(&b, "},\"finish_reason\":");
-        json_escape(&b, finish);
-        buf_puts(&b, "}],\"usage\":");
-    } else {
-        buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"text\":");
-        json_escape(&b, text);
-        buf_puts(&b, ",\"index\":0,\"finish_reason\":");
-        json_escape(&b, finish);
-        buf_puts(&b, "}],\"usage\":");
-    }
-    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
-    if (!append_runtime_request_metrics_member(&b, metrics)) {
-        buf_free(&b);
-        return false;
-    }
-    buf_puts(&b, "}\n");
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = append_openai_final_response_prefix(
+        &b, r, id, text, reasoning, calls, finish,
+        prompt_tokens, completion_tokens, NULL);
+    if (ok) ok = append_runtime_request_metrics_member(&b, metrics);
+    if (ok) buf_puts(&b, "}\n");
+    if (ok) ok = http_response(
+        fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -8967,12 +9160,15 @@ static void append_anthropic_thinking(buf *b, const char *reasoning, const char 
 
 static void append_anthropic_content(buf *b, const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *id_prefix,
-                                     const tool_schema_orders *orders) {
+                                     const tool_schema_orders *orders,
+                                     size_t *first_payload_end) {
+    if (first_payload_end) *first_payload_end = 0u;
     buf_putc(b, '[');
     bool wrote = false;
     bool wrote_after_thinking = false;
     if (reasoning && reasoning[0]) {
         append_anthropic_thinking(b, reasoning, id_prefix);
+        if (first_payload_end) *first_payload_end = b->len;
         wrote = true;
     }
     if (text && text[0]) {
@@ -8980,6 +9176,9 @@ static void append_anthropic_content(buf *b, const char *text, const char *reaso
         buf_puts(b, "{\"type\":\"text\",\"text\":");
         json_escape(b, text);
         buf_putc(b, '}');
+        if (first_payload_end && *first_payload_end == 0u) {
+            *first_payload_end = b->len;
+        }
         wrote = true;
         wrote_after_thinking = true;
     }
@@ -8987,6 +9186,9 @@ static void append_anthropic_content(buf *b, const char *text, const char *reaso
         for (int i = 0; i < calls->len; i++) {
             if (wrote) buf_putc(b, ',');
             append_anthropic_tool_use(b, &calls->v[i], id_prefix, i, orders);
+            if (first_payload_end && *first_payload_end == 0u) {
+                *first_payload_end = b->len;
+            }
             wrote = true;
             wrote_after_thinking = true;
         }
@@ -9012,26 +9214,42 @@ static void append_anthropic_usage_json(buf *b, const request *r,
                input_tokens, completion_tokens, cache_read_tokens, cache_write_tokens);
 }
 
+static bool append_anthropic_final_response_prefix(
+                                     buf *b,
+                                     const request *r, const char *id,
+                                     const char *text,
+                                     const char *reasoning,
+                                     const tool_calls *calls,
+                                     const char *finish,
+                                     int prompt_tokens,
+                                     int completion_tokens,
+                                     size_t *first_payload_end) {
+    if (!b || !r || !id) return false;
+    buf_printf(b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
+    json_escape(b, r->model);
+    buf_puts(b, ",\"content\":");
+    append_anthropic_content(b, text, reasoning, calls, id, &r->tool_orders,
+                             first_payload_end);
+    buf_puts(b, ",\"stop_reason\":");
+    json_escape(b, anthropic_stop_reason(finish));
+    buf_puts(b, ",\"stop_sequence\":null,\"usage\":");
+    append_anthropic_usage_json(b, r, prompt_tokens, completion_tokens);
+    return true;
+}
+
 static bool anthropic_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens,
                                      const ds4_runtime_request_metrics *metrics) {
     buf b = {0};
-    buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
-    json_escape(&b, r->model);
-    buf_puts(&b, ",\"content\":");
-    append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
-    buf_puts(&b, ",\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
-    append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
-    if (!append_runtime_request_metrics_member(&b, metrics)) {
-        buf_free(&b);
-        return false;
-    }
-    buf_puts(&b, "}\n");
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = append_anthropic_final_response_prefix(
+        &b, r, id, text, reasoning, calls, finish,
+        prompt_tokens, completion_tokens, NULL);
+    if (ok) ok = append_runtime_request_metrics_member(&b, metrics);
+    if (ok) buf_puts(&b, "}\n");
+    if (ok) ok = http_response(
+        fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -9365,12 +9583,12 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
      * before tool_memory_remember(), so the next tool_result can continue from
      * the live KV state instead of re-rendering canonical JSON. */
     const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
-    bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
-              anthropic_tool_emit_args_fragment(fd, st, "{", 1);
+    bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name);
     free(name);
     if (!ok) return false;
-
+    /* The block start is already a complete client-visible tool item. */
     ts->emitted_any = true;
+    if (!anthropic_tool_emit_args_fragment(fd, st, "{", 1)) return false;
     ts->args_open = true;
     ts->first_param = true;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
@@ -9641,7 +9859,9 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
 
 static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char *id,
                                            anthropic_stream *st,
-                                           const tool_calls *calls) {
+                                           const tool_calls *calls,
+                                           bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
     (void)r;
     if (!calls) return true;
 
@@ -9667,6 +9887,7 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
         bool ok = sse_event(fd, "content_block_start", b.ptr);
         buf_free(&b);
         if (!ok) return false;
+        if (payload_emitted) *payload_emitted = true;
 
         buf_printf(&b,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
@@ -9683,6 +9904,10 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
         ok = sse_event(fd, "content_block_stop", b.ptr);
         buf_free(&b);
         if (!ok) return false;
+    }
+    if (calls && calls->len > already_streamed) {
+        st->tool.emitted_any = true;
+        st->tool.index = calls->len;
     }
     return true;
 }
@@ -9706,19 +9931,97 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
     return ok;
 }
 
-static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                      anthropic_stream *st, const char *raw,
-                                      size_t raw_len, const tool_calls *calls,
-                                      const char *finish, int completion_tokens) {
-    if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+static bool anthropic_sse_flush_live(int fd, server *s, const request *r,
+                                     const char *id, anthropic_stream *st,
+                                     const char *raw, size_t raw_len,
+                                     const tool_calls *calls,
+                                     bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
+    const bool had_thinking = st->sent_thinking;
+    const bool had_text = st->sent_text;
+    const bool had_tool = st->tool.emitted_any;
+    const bool update_ok = anthropic_sse_stream_update(
+        fd, s, r, id, st, raw, raw_len, true);
+    if (payload_emitted) {
+        *payload_emitted = (!had_thinking && st->sent_thinking) ||
+                           (!had_text && st->sent_text) ||
+                           (!had_tool && st->tool.emitted_any);
+    }
+    if (!update_ok) return false;
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
         if (!anthropic_sse_close_block_live(fd, id, st)) return false;
     }
 
-    if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, completion_tokens, NULL);
+    bool tool_payload = false;
+    const bool tools_ok = anthropic_sse_tool_blocks_live(
+        fd, r, id, st, calls, &tool_payload);
+    if (payload_emitted && tool_payload) *payload_emitted = true;
+    return tools_ok;
+}
+
+static bool anthropic_sse_finish_live(
+        int fd, server *s, const request *r, const char *id,
+        anthropic_stream *st, const char *raw, size_t raw_len,
+        const tool_calls *calls, const char *finish, int completion_tokens,
+        const ds4_runtime_request_metrics *metrics) {
+    bool payload_emitted = false;
+    if (!metrics && !anthropic_sse_flush_live(
+            fd, s, r, id, st, raw, raw_len, calls,
+            &payload_emitted)) return false;
+    return anthropic_sse_stop_live(
+        fd, finish, completion_tokens, metrics);
+}
+
+/* Prepared requests already own a positive canonical prompt and therefore a
+ * real request identity.  Even failures before the first model token publish
+ * that terminal record in the protocol-native error envelope. */
+static bool server_emit_prepared_error_terminal(
+        int fd, bool enable_cors, const request *r, int http_status,
+        const char *message, bool stream_started,
+        const ds4_runtime_request_metrics *metrics) {
+    if (fd < 0 || !r || !message || !metrics) return false;
+    char metrics_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t metrics_json_len = 0;
+    if (!ds4_runtime_request_metrics_json(
+            metrics, metrics_json, sizeof(metrics_json),
+            &metrics_json_len)) return false;
+
+    buf b = {0};
+    if (r->api == API_ANTHROPIC) {
+        buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+        buf_puts(&b, http_status >= 500 ? "api_error" : "invalid_request_error");
+        buf_puts(&b, "\",\"message\":");
+        json_escape(&b, message);
+        buf_putc(&b, '}');
+    } else {
+        buf_puts(&b, "{\"error\":{\"message\":");
+        json_escape(&b, message);
+        buf_puts(&b, ",\"type\":\"");
+        buf_puts(&b, http_status >= 500 ? "server_error" : "invalid_request_error");
+        buf_puts(&b, "\",\"code\":");
+        json_escape(&b, http_status >= 500 ? "server_error" :
+                    "request_rejected");
+        buf_putc(&b, '}');
+    }
+    if (!append_runtime_request_metrics_member(&b, metrics)) {
+        buf_free(&b);
+        return false;
+    }
+    buf_putc(&b, '}');
+    bool ok;
+    if (r->stream && stream_started) {
+        ok = r->api == API_ANTHROPIC ?
+            sse_event(fd, "error", b.ptr) :
+            send_all(fd, "event: error\ndata: ", 19) &&
+            send_all(fd, b.ptr, b.len) && send_all(fd, "\n\n", 2);
+    } else {
+        ok = http_response(fd, enable_cors, http_status,
+                           "application/json", b.ptr);
+    }
+    buf_free(&b);
+    return ok;
 }
 
 /* Emit a complete protocol-native terminal fixture through the production
@@ -9848,6 +10151,13 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+static uint64_t now_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)ts.tv_nsec;
+}
+
 static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void server_log(ds4_log_type type, const char *fmt, ...) {
@@ -9971,6 +10281,10 @@ struct server_slot {
     bool decode_in_flight;
     bool decode_done;
     int decode_token;
+    /* Borrowed only while one synchronous server_eval_token() call is in
+     * flight.  The decode worker copies it into its private batch row and
+     * clears it before waking the slot owner. */
+    ds4_runtime_request_context *decode_request;
     int decode_rc;
     char decode_err[160];
 };
@@ -10037,16 +10351,15 @@ struct job {
 /* A queued job owns request accounting for exactly its stack lifetime.  The
  * client thread prepares it before enqueue; the worker mutates the same
  * context and publishes one immutable terminal value before signalling done. */
-static bool server_job_runtime_accept(
+static bool server_job_runtime_adopt(
         job *j,
-        uint64_t accepted_monotonic_ns) {
-    if (!j || j->runtime_accepted || j->runtime_finished ||
-        j->req.prompt.len <= 0) {
+        ds4_runtime_request_context *accepted_context) {
+    if (!j || !accepted_context || j->runtime_accepted ||
+        j->runtime_finished || j->req.prompt.len <= 0) {
         return false;
     }
-    ds4_runtime_request_context staged;
-    memset(&staged, 0, sizeof(staged));
-    if (!ds4_runtime_request_begin(&staged, accepted_monotonic_ns) ||
+    ds4_runtime_request_context staged = *accepted_context;
+    if (!staged.initialized || staged.prompt_tokens_set || staged.terminal ||
         !ds4_runtime_request_set_prompt_tokens(
             &staged, (uint64_t)j->req.prompt.len)) {
         return false;
@@ -10054,6 +10367,7 @@ static bool server_job_runtime_accept(
     j->runtime_request = staged;
     memset(&j->runtime_terminal, 0, sizeof(j->runtime_terminal));
     j->runtime_accepted = true;
+    memset(accepted_context, 0, sizeof(*accepted_context));
     return true;
 }
 
@@ -10073,7 +10387,18 @@ static bool server_job_runtime_finish(
     if (!ds4_runtime_request_finish(
             &staged_context, status, finished_monotonic_ns,
             &staged_metrics)) {
-        return false;
+        /* A terminal lifecycle/accounting invariant is never retry-safe.  The
+         * runtime API deliberately permits UNSAFE to close an observed but
+         * incomplete advice window, so preserve a terminal record whenever
+         * the context itself is still structurally valid. */
+        if (status == DS4_RUNTIME_REQUEST_UNSAFE_ERROR) return false;
+        staged_context = j->runtime_request;
+        memset(&staged_metrics, 0, sizeof(staged_metrics));
+        if (!ds4_runtime_request_finish(
+                &staged_context, DS4_RUNTIME_REQUEST_UNSAFE_ERROR,
+                finished_monotonic_ns, &staged_metrics)) {
+            return false;
+        }
     }
     j->runtime_request = staged_context;
     j->runtime_terminal = staged_metrics;
@@ -10085,6 +10410,35 @@ static const ds4_runtime_request_metrics *
 server_job_runtime_terminal_metrics(const job *j) {
     return j && j->runtime_accepted && j->runtime_finished
         ? &j->runtime_terminal : NULL;
+}
+
+static bool server_reject_prepared_request(
+        int fd, bool enable_cors, request *prepared,
+        ds4_runtime_request_context *accepted_context,
+        request_admission_code code) {
+    if (!prepared || prepared->prompt.len <= 0 || !accepted_context) {
+        return false;
+    }
+    job rejected = {0};
+    rejected.fd = fd;
+    rejected.req = *prepared;
+    memset(prepared, 0, sizeof(*prepared));
+    if (!server_job_runtime_adopt(&rejected, accepted_context) ||
+        !server_job_runtime_finish(
+            &rejected, DS4_RUNTIME_REQUEST_REJECTED,
+            now_monotonic_ns())) {
+        request_free(&rejected.req);
+        return false;
+    }
+    const char *message =
+        code == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS ?
+            "Requested output tokens must be a positive integer" :
+            "Prompt exceeds the configured context size";
+    const bool ok = server_emit_prepared_error_terminal(
+        fd, enable_cors, &rejected.req, 400, message, false,
+        server_job_runtime_terminal_metrics(&rejected));
+    request_free(&rejected.req);
+    return ok;
 }
 
 /* =========================================================================
@@ -11865,7 +12219,304 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static const char *server_piece_find(const char *p, size_t len,
+                                     const char *needle) {
+    const size_t needle_len = strlen(needle);
+    if (!p || needle_len == 0 || len < needle_len) return NULL;
+    for (size_t i = 0; i + needle_len <= len; i++) {
+        if (!memcmp(p + i, needle, needle_len)) return p + i;
+    }
+    return NULL;
+}
+
+typedef struct {
+    size_t raw_start;
+    size_t raw_end;
+    uint64_t decoded_monotonic_ns;
+} server_decoded_token_span;
+
+typedef struct {
+    server_decoded_token_span *spans;
+    size_t len;
+    size_t cap;
+    bool thinking_initially_inside;
+    bool parse_reasoning_prefix;
+    bool parse_completed_message;
+    bool expose_reasoning;
+    bool published;
+    uint64_t first_payload_emitted_monotonic_ns;
+} server_visible_accounting;
+
+static void server_visible_accounting_free(server_visible_accounting *a) {
+    if (!a) return;
+    free(a->spans);
+    memset(a, 0, sizeof(*a));
+}
+
+/* Each decode_again epoch owns offsets into its own raw buffer.  Retried and
+ * recovery-injected tokens remain part of generated_tokens, but only spans
+ * from the final projected epoch can become client-visible. */
+static void server_visible_accounting_begin_epoch(
+        server_visible_accounting *a,
+        bool thinking_initially_inside,
+        bool parse_reasoning_prefix,
+        bool parse_completed_message,
+        bool expose_reasoning) {
+    if (!a) return;
+    a->len = 0;
+    a->thinking_initially_inside = thinking_initially_inside;
+    a->parse_reasoning_prefix = parse_reasoning_prefix;
+    a->parse_completed_message = parse_completed_message;
+    a->expose_reasoning = expose_reasoning;
+    a->published = false;
+}
+
+/* Decide visibility against the complete accumulated byte stream, rather
+ * than against one tokenizer piece.  That makes markers split across tokens
+ * exact.  Marker bytes themselves are control syntax; DSML outside a hidden
+ * thinking region is visible because native protocols project it into tool
+ * items.  final_raw_len is also the stop-sequence boundary, so held or matched
+ * stop bytes cannot become visible. */
+typedef struct {
+    size_t reasoning_start;
+    size_t reasoning_end;
+    size_t content_start;
+    size_t final_raw_len;
+    size_t suppressed_tool_separator_start;
+    size_t suppressed_tool_separator_end;
+    bool has_reasoning_prefix;
+    bool expose_reasoning;
+} server_visible_projection;
+
+static server_visible_projection server_visible_projection_make(
+        const char *raw,
+        size_t final_raw_len,
+        bool thinking_initially_inside,
+        bool parse_reasoning_prefix,
+        bool parse_completed_message,
+        bool expose_reasoning) {
+    server_visible_projection projection = {
+        .final_raw_len = final_raw_len,
+        .expose_reasoning = expose_reasoning,
+    };
+    if (!raw || final_raw_len == 0u) return projection;
+    const char *open_tag = "<think>";
+    const char *close_tag = "</think>";
+    const size_t open_len = strlen(open_tag);
+    const size_t close_len = strlen(close_tag);
+    if (parse_completed_message) {
+        projection.reasoning_start =
+            final_raw_len >= open_len && !memcmp(raw, open_tag, open_len) ?
+                open_len : 0u;
+        const char *close = server_piece_find(
+            raw + projection.reasoning_start,
+            final_raw_len - projection.reasoning_start, close_tag);
+        if (close) {
+            projection.has_reasoning_prefix = true;
+            projection.reasoning_end = (size_t)(close - raw);
+            projection.content_start =
+                projection.reasoning_end + close_len;
+        }
+    } else {
+        projection.has_reasoning_prefix =
+            parse_reasoning_prefix && thinking_initially_inside;
+        if (parse_reasoning_prefix && final_raw_len >= open_len &&
+            !memcmp(raw, open_tag, open_len)) {
+            projection.has_reasoning_prefix = true;
+            projection.reasoning_start = open_len;
+        }
+    }
+    if (projection.has_reasoning_prefix && !parse_completed_message) {
+        const char *close = server_piece_find(
+            raw + projection.reasoning_start,
+            final_raw_len - projection.reasoning_start, close_tag);
+        projection.reasoning_end = close ?
+            (size_t)(close - raw) : final_raw_len;
+        projection.content_start = close ?
+            projection.reasoning_end + close_len : final_raw_len;
+    }
+    const char *tool = find_any_tool_start(raw + projection.content_start);
+    if (tool) {
+        size_t tool_pos = (size_t)(tool - raw);
+        size_t separator = tool_pos;
+        while (separator > projection.content_start &&
+               isspace((unsigned char)raw[separator - 1])) {
+            separator--;
+        }
+        projection.suppressed_tool_separator_start = separator;
+        projection.suppressed_tool_separator_end = tool_pos;
+    }
+    return projection;
+}
+
+static bool server_projection_span_is_client_visible(
+        const server_visible_projection *projection,
+        size_t span_start,
+        size_t span_end) {
+    if (!projection || span_start >= span_end ||
+        span_start >= projection->final_raw_len) {
+        return false;
+    }
+    if (span_end > projection->final_raw_len) {
+        span_end = projection->final_raw_len;
+    }
+    if (projection->expose_reasoning &&
+        span_start < projection->reasoning_end &&
+        span_end > projection->reasoning_start) {
+        return true;
+    }
+    const bool has_suppressed_separator =
+        projection->suppressed_tool_separator_end >
+            projection->suppressed_tool_separator_start;
+    const size_t content_end = has_suppressed_separator ?
+        projection->suppressed_tool_separator_start :
+        projection->final_raw_len;
+    /* Visibility is intersection with real native projection intervals, not
+     * simply "outside one hidden interval". A tokenizer piece can straddle
+     * the hidden close marker and the suppressed pre-tool whitespace without
+     * containing a single emitted byte. */
+    if (projection->content_start < content_end &&
+        span_start < content_end && span_end > projection->content_start) {
+        return true;
+    }
+    if (has_suppressed_separator &&
+        span_end > projection->suppressed_tool_separator_end) {
+        return true;
+    }
+    return false;
+}
+
+static DS4_SERVER_MAYBE_UNUSED bool server_accumulated_span_is_client_visible(
+        const char *raw,
+        size_t final_raw_len,
+        bool thinking_initially_inside,
+        bool parse_reasoning_prefix,
+        bool parse_completed_message,
+        bool expose_reasoning,
+        size_t span_start,
+        size_t span_end) {
+    const server_visible_projection projection =
+        server_visible_projection_make(
+            raw, final_raw_len, thinking_initially_inside,
+            parse_reasoning_prefix, parse_completed_message,
+            expose_reasoning);
+    return server_projection_span_is_client_visible(
+        &projection, span_start, span_end);
+}
+
+static bool server_execution_failure_is_unsafe(int rc, const char *err) {
+    return rc == DS4_SERVER_EXEC_UNSAFE ||
+        (err && (strstr(err, "invalid attributed") != NULL ||
+                 strstr(err, "accounting failed") != NULL ||
+                 strstr(err, "invalid request context") != NULL));
+}
+
+static ds4_runtime_request_terminal_status server_transport_failure_status(
+        ds4_runtime_request_terminal_status current) {
+    return current == DS4_RUNTIME_REQUEST_UNSAFE_ERROR ? current :
+        DS4_RUNTIME_REQUEST_CANCELLED;
+}
+
+static bool server_visible_accounting_record_sampled(
+        server_visible_accounting *a,
+        ds4_runtime_request_context *runtime,
+        size_t raw_start,
+        size_t raw_end,
+        uint64_t decoded_monotonic_ns) {
+    if (!a || !runtime || decoded_monotonic_ns == 0u || raw_end < raw_start) {
+        return false;
+    }
+    if (raw_end != raw_start && a->len == a->cap) {
+        size_t cap = a->cap ? a->cap * 2u : 64u;
+        if (cap < a->cap || cap > SIZE_MAX / sizeof(a->spans[0])) {
+            return false;
+        }
+        a->spans = xrealloc(a->spans, cap * sizeof(a->spans[0]));
+        a->cap = cap;
+    }
+    if (!ds4_runtime_request_add_generated_tokens(runtime, 1)) return false;
+    if (raw_end == raw_start) return true;
+    a->spans[a->len++] = (server_decoded_token_span) {
+        .raw_start = raw_start,
+        .raw_end = raw_end,
+        .decoded_monotonic_ns = decoded_monotonic_ns,
+    };
+    return true;
+}
+
+static bool server_visible_accounting_publish(
+        server_visible_accounting *a,
+        ds4_runtime_request_context *runtime,
+        const char *raw,
+        size_t final_raw_len,
+        bool force_all_raw_visible) {
+    if (!a || !runtime || a->published) return false;
+    uint64_t visible = 0u;
+    uint64_t first_ns = 0u;
+    uint64_t last_ns = 0u;
+    const server_visible_projection projection =
+        server_visible_projection_make(
+            raw, final_raw_len, a->thinking_initially_inside,
+            a->parse_reasoning_prefix, a->parse_completed_message,
+            a->expose_reasoning);
+    for (size_t i = 0; i < a->len; i++) {
+        const server_decoded_token_span *span = &a->spans[i];
+        const bool visible_span = force_all_raw_visible ?
+            span->raw_start < final_raw_len &&
+                span->raw_end > span->raw_start :
+            server_projection_span_is_client_visible(
+                &projection, span->raw_start, span->raw_end);
+        if (!visible_span) {
+            continue;
+        }
+        if (visible == 0u) first_ns = span->decoded_monotonic_ns;
+        last_ns = span->decoded_monotonic_ns;
+        visible++;
+    }
+    a->published = true;
+    if (visible == 0u) return true;
+    return ds4_runtime_request_publish_visible_decode_window(
+        runtime, visible, first_ns, last_ns);
+}
+
+static bool server_visible_accounting_note_payload_at(
+        server_visible_accounting *a,
+        bool payload_emitted,
+        uint64_t emitted_monotonic_ns) {
+    if (!a || (payload_emitted && emitted_monotonic_ns == 0u)) return false;
+    if (payload_emitted && a->first_payload_emitted_monotonic_ns == 0u) {
+        a->first_payload_emitted_monotonic_ns = emitted_monotonic_ns;
+    }
+    return true;
+}
+
+static bool server_visible_accounting_note_payload(
+        server_visible_accounting *a,
+        bool payload_emitted) {
+    return server_visible_accounting_note_payload_at(
+        a, payload_emitted, payload_emitted ? now_monotonic_ns() : 0u);
+}
+
+static bool server_visible_accounting_publish_emission(
+        const server_visible_accounting *a,
+        ds4_runtime_request_context *runtime) {
+    if (!a || !runtime) return false;
+    if (a->first_payload_emitted_monotonic_ns == 0u) return true;
+    if (!runtime->visible_decode_started) return false;
+    if (runtime->first_visible_emitted) return true;
+    return ds4_runtime_request_mark_first_visible_emitted(
+        runtime, a->first_payload_emitted_monotonic_ns);
+}
+
+static bool server_sse_chunk_incremental(
+        int fd, const request *r, const char *id, const char *text,
+        server_visible_accounting *accounting) {
+    return sse_chunk(fd, r, id, text, NULL) &&
+           server_visible_accounting_note_payload(accounting, true);
+}
+
 static int server_eval_token(server *s, server_slot *slot, int token,
+                             ds4_runtime_request_context *request_runtime,
                              char *err, size_t errlen);
 
 /* Live recovery for a tool call started inside an unclosed <think> block.
@@ -11891,8 +12542,10 @@ static int server_eval_token(server *s, server_slot *slot, int token,
  *
  * Returns 1 when an injection was performed (text extended, thinking closed),
  * 0 when there is nothing to do or no budget, -1 on eval failure. */
-static int chat_think_tool_recovery(server *s,
+static int chat_think_tool_recovery_attributed(
+                                    server *s,
                                     server_slot *slot,
+                                    ds4_runtime_request_context *request_runtime,
                                     buf *text,
                                     thinking_state *thinking,
                                     size_t *scan_from,
@@ -11908,7 +12561,6 @@ static int chat_think_tool_recovery(server *s,
     }
 
     const char *inject = "</think>\n\n";
-    const size_t inject_len = strlen(inject);
     ds4_tokens toks = {0};
     ds4_tokenize_rendered_chat(s->engine, inject, &toks);
 
@@ -11926,20 +12578,46 @@ static int chat_think_tool_recovery(server *s,
     }
 
     for (int i = 0; i < toks.len; i++) {
-        if (server_eval_token(s, slot, toks.v[i], err, errlen) != 0) {
+        const int eval_rc = server_eval_token(
+            s, slot, toks.v[i], request_runtime, err, errlen);
+        if (eval_rc != 0) {
             ds4_tokens_free(&toks);
-            return -1;
+            return -eval_rc;
         }
         if (!request_output_budget_take(budget, 1)) {
             ds4_tokens_free(&toks);
             return -1;
         }
+        if (request_runtime &&
+            !ds4_runtime_request_add_generated_tokens(request_runtime, 1)) {
+            ds4_tokens_free(&toks);
+            if (err && errlen) {
+                snprintf(err, errlen, "request token accounting failed");
+            }
+            return -DS4_SERVER_EXEC_UNSAFE;
+        }
     }
-    buf_append(text, inject, inject_len);
-    thinking_state_feed(thinking, inject, inject_len);
+    /* The forced blank line exists only to steer the live model state.  It is
+     * not sampled assistant output, and exposing it when the model resumes as
+     * ordinary text would create visible bytes with no sampled-token decode
+     * timestamp.  Keep only the control close in the parser buffer; native
+     * projection hides that marker and subsequent sampled text remains exact. */
+    const char *parser_inject = "</think>";
+    buf_append(text, parser_inject, strlen(parser_inject));
+    thinking_state_feed(thinking, parser_inject, strlen(parser_inject));
     *scan_from = text->len;
     ds4_tokens_free(&toks);
     return 1;
+}
+
+static DS4_SERVER_MAYBE_UNUSED int chat_think_tool_recovery(
+                                    server *s, server_slot *slot,
+                                    buf *text, thinking_state *thinking,
+                                    size_t *scan_from,
+                                    request_output_budget *budget,
+                                    char *err, size_t errlen) {
+    return chat_think_tool_recovery_attributed(
+        s, slot, NULL, text, thinking, scan_from, budget, err, errlen);
 }
 
 static char *rendered_chat_system_region(const char *prompt_text) {
@@ -12144,11 +12822,13 @@ static int server_prefill_quantum(server *s) {
  * so compressor alignment is independent of scheduler order. */
 static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
+                               ds4_runtime_request_context *request_runtime,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync(slot->session, prompt, err, errlen);
+        int rc = ds4_session_sync_attributed(slot->session, prompt,
+                                             request_runtime, err, errlen);
         server_prefill_leave(s);
         return rc;
     }
@@ -12169,7 +12849,8 @@ static int server_session_sync(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
+        int rc = ds4_session_sync_attributed(slot->session, &prefix,
+                                             request_runtime, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
         called = true;
@@ -12185,14 +12866,18 @@ static int server_session_sync(server *s, server_slot *slot,
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    const char *suffix,
+                                                   ds4_runtime_request_context *request_runtime,
                                                    request_output_budget *budget,
                                                    int *tokens_appended,
+                                                   int *execution_rc,
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
+    if (execution_rc) *execution_rc = 0;
     if (!s || !slot || !suffix || !suffix[0]) return true;
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live) {
         if (err && errlen) snprintf(err, errlen, "live session is unavailable");
+        if (execution_rc) *execution_rc = DS4_SERVER_EXEC_UNSAFE;
         return false;
     }
 
@@ -12202,16 +12887,25 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     const int delta = target.len - before;
     if (delta <= 0 || delta >= request_output_budget_remaining(budget)) {
         if (err && errlen) snprintf(err, errlen, "output token ceiling exhausted");
+        if (execution_rc) *execution_rc = DS4_SERVER_EXEC_RECOVERABLE;
         ds4_tokens_free(&target);
         return false;
     }
-    bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
+    const int sync_rc = server_session_sync(
+        s, slot, &target, request_runtime, err, errlen);
+    bool ok = sync_rc == 0;
+    if (!ok && execution_rc) *execution_rc = sync_rc;
     if (ok) {
         const int appended = ds4_session_pos(slot->session) - before;
         ok = appended == delta && request_output_budget_take(budget, appended);
+        if (ok && request_runtime) {
+            ok = ds4_runtime_request_add_generated_tokens(
+                request_runtime, (uint64_t)appended);
+        }
         if (ok && tokens_appended) *tokens_appended = appended;
         if (!ok && err && errlen) {
             snprintf(err, errlen, "tool recovery token accounting failed");
+            if (execution_rc) *execution_rc = DS4_SERVER_EXEC_UNSAFE;
         }
     }
     ds4_tokens_free(&target);
@@ -12220,15 +12914,19 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
 
 static bool continue_after_invalid_dsml(server *s, server_slot *slot,
                                         const request *r,
+                                        ds4_runtime_request_context *request_runtime,
                                         const thinking_state *thinking,
                                         const char *detail,
                                         request_output_budget *budget,
                                         int *tokens_appended,
+                                        int *execution_rc,
                                         char *err, size_t errlen) {
     char *suffix = build_invalid_tool_call_error_suffix(r, thinking, detail);
     bool ok = append_rendered_suffix_to_live_session(s, slot, suffix,
+                                                     request_runtime,
                                                      budget,
                                                      tokens_appended,
+                                                     execution_rc,
                                                      err, errlen);
     free(suffix);
     return ok;
@@ -12351,7 +13049,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
 }
 
-static void send_prefill_failure_response(server *s, const job *j,
+static DS4_SERVER_MAYBE_UNUSED void send_prefill_failure_response(
+                                          server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
@@ -12482,11 +13181,13 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * tool id.  If a client sends a tool call without an id we know, the fallback
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
-static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
-                                         const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content,
-                                         const char *reasoning, const tool_calls *calls) {
-    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
+static int canonicalize_tool_checkpoint(server *s, server_slot *slot,
+                                        const job *j, const char *ctx,
+                                        ds4_runtime_request_context *request_runtime,
+                                        uint64_t trace_id, const char *content,
+                                        const char *reasoning, const tool_calls *calls) {
+    if (!calls || calls->len == 0 || !j->req.prompt_text) return 0;
+    int execution_rc = 0;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
@@ -12598,8 +13299,10 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        if (server_session_sync(s, slot, sync_prompt,
-                                sync_err, sizeof(sync_err)) == 0) {
+        const int sync_rc = server_session_sync(
+            s, slot, sync_prompt, request_runtime,
+            sync_err, sizeof(sync_err));
+        if (sync_rc == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
@@ -12619,6 +13322,8 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                             common, live_len, canonical.len, err);
             }
         } else {
+            execution_rc = server_execution_failure_is_unsafe(
+                sync_rc, sync_err) ? DS4_SERVER_EXEC_UNSAFE : sync_rc;
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
@@ -12630,6 +13335,8 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens_free(&effective);
         free(path);
     } else {
+        execution_rc = server_execution_failure_is_unsafe(1, err) ?
+            DS4_SERVER_EXEC_UNSAFE : 1;
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
@@ -12640,6 +13347,7 @@ done:
     ds4_tokens_free(&canonical);
     buf_free(&rendered);
     free(suffix_text);
+    return execution_rc;
 }
 
 static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
@@ -12669,11 +13377,13 @@ static void server_generation_leave(server *s) {
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
+                             ds4_runtime_request_context *request_runtime,
                              char *err, size_t errlen) {
     if (!s || !slot) return 1;
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_session_eval(slot->session, token, err, errlen);
+        int rc = ds4_session_eval_attributed(slot->session, token,
+                                             request_runtime, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
         return rc;
     }
@@ -12685,21 +13395,27 @@ static int server_eval_token(server *s, server_slot *slot, int token,
         return 1;
     }
     slot->decode_token = token;
+    slot->decode_request = request_runtime;
     slot->decode_rc = 1;
     slot->decode_err[0] = '\0';
     slot->decode_done = false;
     slot->decode_pending = true;
     s->decode_pending++;
     pthread_cond_broadcast(&s->model_cv);
-    while (!slot->decode_done && !g_stop_requested) {
+    /* The decode worker borrowed request_runtime from this stack-owned job.
+     * A shutdown request changes the eventual terminal status, but it cannot
+     * release that storage while a pending/in-flight batch still owns the
+     * pointer.  Wait for the worker's acknowledgement unconditionally. */
+    while (!slot->decode_done) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    int rc = slot->decode_done ? slot->decode_rc : 1;
+    int rc = slot->decode_rc;
     if (rc != 0 && err && errlen) {
         snprintf(err, errlen, "%s",
                  slot->decode_err[0] ? slot->decode_err : "decode interrupted");
     }
     slot->decode_done = false;
+    slot->decode_request = NULL;
     pthread_mutex_unlock(&s->model_mu);
     return rc;
 }
@@ -12724,7 +13440,8 @@ static void timespec_add_us(struct timespec *ts, long us) {
 
 static void *decode_worker_main(void *arg) {
     server *s = arg;
-    ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
+    ds4_attributed_decode_item *items =
+        xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
@@ -12766,6 +13483,7 @@ static void *decode_worker_main(void *arg) {
             members[count] = slot;
             items[count].session = slot->session;
             items[count].token = slot->decode_token;
+            items[count].request = slot->decode_request;
             count++;
         }
         if (count == 0) continue;
@@ -12775,8 +13493,8 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_sessions_eval_batch(items, count,
-                                         batch_err, sizeof(batch_err));
+        int rc = ds4_sessions_eval_batch_attributed(
+            items, count, batch_err, sizeof(batch_err));
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
@@ -12790,6 +13508,7 @@ static void *decode_worker_main(void *arg) {
         for (int i = 0; i < count; i++) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
+            slot->decode_request = NULL;
             slot->decode_rc = rc;
             if (rc != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
@@ -12812,6 +13531,262 @@ static uint64_t server_next_sequence(server *s) {
     return seq;
 }
 
+typedef struct {
+    server *srv;
+    job *queued_job;
+    const char *protocol_id;
+    bool structured_stream;
+    bool openai_live_chat;
+    bool responses_live_chat;
+    anthropic_stream *anthropic_live;
+    openai_stream *openai_live;
+    responses_stream *responses_live;
+    const char *raw;
+    size_t raw_len;
+    size_t *plain_stream_pos;
+    const char *content;
+    const char *reasoning;
+    const tool_calls *calls;
+    const char *finish;
+    int prompt_tokens;
+    int completion_tokens;
+    long responses_created_at;
+    bool recovered_tool_parse_failure;
+    responses_tool_item *responses_items;
+} server_native_terminal;
+
+typedef struct {
+    buf prefix;
+    size_t remaining_offset;
+    bool response_started;
+} server_buffered_terminal;
+
+static bool server_native_terminal_valid(
+        const server_native_terminal *terminal) {
+    return terminal && terminal->queued_job && terminal->srv &&
+        terminal->protocol_id && terminal->protocol_id[0] &&
+        terminal->prompt_tokens >= 0 && terminal->completion_tokens >= 0;
+}
+
+static bool server_native_terminal_metrics_match(
+        const server_native_terminal *terminal,
+        const ds4_runtime_request_metrics *metrics) {
+    return server_native_terminal_valid(terminal) && metrics &&
+        metrics->prompt_tokens == (uint64_t)terminal->prompt_tokens &&
+        metrics->generated_tokens == (uint64_t)terminal->completion_tokens;
+}
+
+/* Serialize a buffered native response only up to and including its first
+ * complete model-visible JSON value.  The successful send of that boundary is
+ * the truthful TTFT observation.  Everything after it, including the runtime
+ * metrics member and final outer brace, remains buffered until accounting is
+ * frozen.  Close-delimited HTTP/1.1 is required because that final length does
+ * not exist at header time. */
+static bool server_buffered_terminal_begin(
+        const server_native_terminal *terminal,
+        server_buffered_terminal *buffered,
+        bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
+    if (!server_native_terminal_valid(terminal) || !buffered ||
+        terminal->queued_job->req.stream || buffered->response_started) {
+        return false;
+    }
+    job *j = terminal->queued_job;
+    request *r = &j->req;
+    size_t first_payload_end = 0u;
+    bool ok;
+    if (r->api == API_ANTHROPIC) {
+        ok = append_anthropic_final_response_prefix(
+            &buffered->prefix, r, terminal->protocol_id,
+            terminal->content, terminal->reasoning, terminal->calls,
+            terminal->finish, terminal->prompt_tokens,
+            terminal->completion_tokens, &first_payload_end);
+    } else if (r->api == API_RESPONSES) {
+        ok = append_responses_final_response_prefix(
+            &buffered->prefix, r, terminal->protocol_id,
+            terminal->content, terminal->reasoning, terminal->calls,
+            terminal->finish, terminal->prompt_tokens,
+            terminal->completion_tokens, &first_payload_end);
+    } else {
+        ok = append_openai_final_response_prefix(
+            &buffered->prefix, r, terminal->protocol_id,
+            terminal->content, terminal->reasoning, terminal->calls,
+            terminal->finish, terminal->prompt_tokens,
+            terminal->completion_tokens, &first_payload_end);
+    }
+    if (!ok || first_payload_end > buffered->prefix.len) return false;
+    ok = http_response_close_delimited_begin(
+        j->fd, terminal->srv->enable_cors, 200, "application/json");
+    if (!ok) return false;
+    buffered->response_started = true;
+    if (first_payload_end > 0u) {
+        if (!send_all(j->fd, buffered->prefix.ptr, first_payload_end)) {
+            return false;
+        }
+        buffered->remaining_offset = first_payload_end;
+        if (payload_emitted) *payload_emitted = true;
+    }
+    return true;
+}
+
+static bool server_buffered_terminal_finish(
+        const server_native_terminal *terminal,
+        server_buffered_terminal *buffered,
+        const ds4_runtime_request_metrics *metrics) {
+    if (!server_native_terminal_metrics_match(terminal, metrics) ||
+        !buffered || !buffered->response_started ||
+        buffered->remaining_offset > buffered->prefix.len) {
+        return false;
+    }
+    buf suffix = {0};
+    buf_append(&suffix,
+               buffered->prefix.ptr + buffered->remaining_offset,
+               buffered->prefix.len - buffered->remaining_offset);
+    bool ok = append_runtime_request_metrics_member(&suffix, metrics);
+    if (ok) {
+        buf_putc(&suffix, '}');
+        if (terminal->queued_job->req.api != API_RESPONSES) {
+            buf_putc(&suffix, '\n');
+        }
+        ok = send_all(terminal->queued_job->fd, suffix.ptr, suffix.len);
+    }
+    buf_free(&suffix);
+    return ok;
+}
+
+static void server_buffered_terminal_free(server_buffered_terminal *buffered) {
+    if (!buffered) return;
+    buf_free(&buffered->prefix);
+    memset(buffered, 0, sizeof(*buffered));
+}
+
+/* Emit only client-visible bytes that parsing could not safely project during
+ * decode.  Terminal status, request freezing, and metrics serialization are
+ * deliberately absent: the caller must cross the request barrier first. */
+static bool server_flush_final_visible(
+        server_native_terminal *terminal,
+        bool *payload_emitted) {
+    if (payload_emitted) *payload_emitted = false;
+    if (!terminal || !terminal->queued_job || !terminal->queued_job->req.stream) {
+        return true;
+    }
+    request *r = &terminal->queued_job->req;
+    const int fd = terminal->queued_job->fd;
+    bool emitted = false;
+    bool ok = true;
+    if (r->api == API_ANTHROPIC) {
+        ok = anthropic_sse_flush_live(
+            fd, terminal->srv, r, terminal->protocol_id,
+            terminal->anthropic_live, terminal->raw, terminal->raw_len,
+            terminal->calls, &emitted);
+    } else if (terminal->openai_live_chat) {
+        ok = openai_sse_flush_live(
+            fd, terminal->srv, r, terminal->protocol_id,
+            terminal->openai_live, terminal->raw, terminal->raw_len,
+            terminal->calls, &emitted);
+    } else if (terminal->responses_live_chat) {
+        const char *recover = terminal->recovered_tool_parse_failure ?
+            terminal->content : NULL;
+        ok = responses_sse_flush_live(
+            fd, r, terminal->responses_live, terminal->raw,
+            terminal->raw_len, recover, terminal->calls,
+            terminal->responses_items, terminal->finish, &emitted);
+    } else if (terminal->structured_stream) {
+        ok = sse_chat_flush_visible(
+            fd, r, terminal->protocol_id, terminal->content,
+            terminal->reasoning, terminal->calls, &emitted);
+    } else if (terminal->plain_stream_pos &&
+               terminal->raw_len > *terminal->plain_stream_pos) {
+        char *tail = xstrndup(
+            terminal->raw + *terminal->plain_stream_pos,
+            terminal->raw_len - *terminal->plain_stream_pos);
+        ok = sse_chunk(fd, r, terminal->protocol_id, tail, NULL);
+        free(tail);
+        if (ok) {
+            *terminal->plain_stream_pos = terminal->raw_len;
+            emitted = true;
+        }
+    }
+    if (payload_emitted) *payload_emitted = emitted;
+    return ok;
+}
+
+/* One protocol switch owns every native terminal serializer.  Validate the
+ * immutable runtime object before any terminal bytes leave the process. */
+static bool server_emit_native_terminal(
+        const server_native_terminal *terminal,
+        const ds4_runtime_request_metrics *metrics) {
+    if (!server_native_terminal_metrics_match(terminal, metrics)) {
+        return false;
+    }
+    char metrics_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
+    size_t metrics_json_len = 0;
+    if (!ds4_runtime_request_metrics_json(
+            metrics, metrics_json, sizeof(metrics_json),
+            &metrics_json_len)) return false;
+
+    job *j = terminal->queued_job;
+    request *r = &j->req;
+    if (r->stream) {
+        if (r->api == API_ANTHROPIC) {
+            return anthropic_sse_finish_live(
+                j->fd, terminal->srv, r, terminal->protocol_id,
+                terminal->anthropic_live, terminal->raw, terminal->raw_len,
+                terminal->calls, terminal->finish,
+                terminal->completion_tokens, metrics);
+        }
+        if (terminal->openai_live_chat) {
+            return openai_sse_finish_live(
+                j->fd, terminal->srv, r, terminal->protocol_id,
+                terminal->openai_live, terminal->raw, terminal->raw_len,
+                terminal->calls, terminal->finish, terminal->prompt_tokens,
+                terminal->completion_tokens, metrics);
+        }
+        if (terminal->responses_live_chat) {
+            return responses_sse_finish_live(
+                j->fd, r, terminal->responses_live, terminal->raw,
+                terminal->raw_len,
+                terminal->recovered_tool_parse_failure ?
+                    terminal->content : NULL,
+                terminal->calls, terminal->responses_items,
+                terminal->finish, terminal->prompt_tokens,
+                terminal->completion_tokens, terminal->responses_created_at,
+                metrics);
+        }
+        if (terminal->structured_stream) {
+            return sse_chat_finish(
+                j->fd, r, terminal->protocol_id, terminal->content,
+                terminal->reasoning, terminal->calls, terminal->finish,
+                terminal->prompt_tokens, terminal->completion_tokens,
+                metrics);
+        }
+        return sse_chunk(
+                   j->fd, r, terminal->protocol_id, NULL, terminal->finish) &&
+               sse_done(j->fd, r, terminal->protocol_id,
+                        terminal->prompt_tokens, terminal->completion_tokens,
+                        metrics);
+    }
+    if (r->api == API_ANTHROPIC) {
+        return anthropic_final_response(
+            j->fd, terminal->srv->enable_cors, r, terminal->protocol_id,
+            terminal->content, terminal->reasoning, terminal->calls,
+            terminal->finish, terminal->prompt_tokens,
+            terminal->completion_tokens, metrics);
+    }
+    if (r->api == API_RESPONSES) {
+        return responses_final_response(
+            j->fd, terminal->srv->enable_cors, r, terminal->protocol_id,
+            terminal->content, terminal->reasoning, terminal->calls,
+            terminal->finish, terminal->prompt_tokens,
+            terminal->completion_tokens, metrics);
+    }
+    return final_response(
+        j->fd, terminal->srv->enable_cors, r, terminal->protocol_id,
+        terminal->content, terminal->reasoning, terminal->calls,
+        terminal->finish, terminal->prompt_tokens,
+        terminal->completion_tokens, metrics);
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -12825,21 +13800,61 @@ static uint64_t server_next_sequence(server *s) {
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 static void generate_job(server *s, server_slot *slot, job *j) {
+    ds4_runtime_request_context *runtime = server_job_runtime_context(j);
+    ds4_runtime_request_terminal_status runtime_status =
+        DS4_RUNTIME_REQUEST_REJECTED;
+    bool native_terminal_ready = false;
+    bool response_ok = true;
+    char err[160] = {0};
+    ds4_tokens effective_prompt = {0};
+    ds4_kvstore_text_preview disk_preview = {0};
+    char *disk_cache_path = NULL;
+    anthropic_stream anthropic_live = {0};
+    openai_stream openai_live = {0};
+    responses_stream responses_live = {0};
+    buf text = {0};
+    tool_calls parsed_calls = {0};
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    const char *protocol_content = NULL;
+    const char *protocol_reasoning = NULL;
+    const tool_calls *protocol_calls = NULL;
+    char id[96] = {0};
+    const char *final_finish = "error";
+    const int canonical_prompt_tokens = j->req.prompt.len;
+    int effective_prompt_tokens = 0;
+    int completion = 0;
+    size_t plain_stream_pos = 0;
+    bool structured_stream = false;
+    bool openai_live_chat = false;
+    bool responses_live_chat = false;
+    bool recovered_tool_parse_failure = false;
+    bool runtime_execution_unsafe = false;
+    long responses_created_at = 0;
+    thinking_state thinking = {0};
+    server_visible_accounting visibility = {0};
+    server_native_terminal native_terminal = {0};
+    server_buffered_terminal buffered_terminal = {0};
+    char prepared_error[256] = {0};
+    int prepared_error_status = 500;
+    bool response_stream_started = false;
     const request_admission_code admission =
         request_prepare_token_admission(&j->req, s->ctx_size);
     if (admission != REQUEST_ADMISSION_FITS) {
-        (void)http_reject_token_admission(
-            j->fd, s->enable_cors, &j->req, s->ctx_size, admission);
-        return;
+        prepared_error_status = 400;
+        snprintf(prepared_error, sizeof(prepared_error), "%s",
+                 admission == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS ?
+                    "Requested output tokens must be a positive integer" :
+                 admission == REQUEST_ADMISSION_CONTEXT_OVERFLOW ?
+                    "Prompt exceeds the configured context size" :
+                    "Invalid inference request");
+        goto runtime_terminal_funnel;
     }
-    char err[160];
-    err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
-    ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
@@ -12893,17 +13908,17 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * live frontier no longer matches.  Since the request did not replay
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
-        ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Responses continuation state is not available; retry by replaying the full input history");
-        return;
+        prepared_error_status = 409;
+        snprintf(prepared_error, sizeof(prepared_error), "%s",
+                 "Responses continuation state is not available; retry by replaying the full input history");
+        goto runtime_terminal_funnel;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
-        ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
-        return;
+        prepared_error_status = 409;
+        snprintf(prepared_error, sizeof(prepared_error), "%s",
+                 "Anthropic continuation state is not available; retry by replaying the full messages history");
+        goto runtime_terminal_funnel;
     } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
@@ -12920,9 +13935,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         }
     }
     int disk_cached = 0;
-    char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    ds4_kvstore_text_preview disk_preview = {0};
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
@@ -12944,10 +13957,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                 live_state_required);
         if (action == EFFECTIVE_PROMPT_REJECT) {
             const int rejected_tokens = prompt_for_sync->len;
-            ds4_tokens_free(&effective_prompt);
-            (void)http_error_context_length_exceeded(
-                j->fd, s->enable_cors, &j->req, rejected_tokens, s->ctx_size);
-            return;
+            prepared_error_status = 400;
+            snprintf(prepared_error, sizeof(prepared_error),
+                     "Prompt has %d tokens, but the configured context size is %d tokens",
+                     rejected_tokens, s->ctx_size);
+            goto runtime_terminal_funnel;
         }
         if (action == EFFECTIVE_PROMPT_FALLBACK_CANONICAL) {
             ds4_tokens_free(&effective_prompt);
@@ -12986,11 +14000,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                    s->ctx_size);
     if (effective_admission != REQUEST_ADMISSION_FITS) {
         const int rejected_tokens = prompt_for_sync->len;
-        ds4_kvstore_text_preview_free(&disk_preview);
-        ds4_tokens_free(&effective_prompt);
-        (void)http_error_context_length_exceeded(
-            j->fd, s->enable_cors, &j->req, rejected_tokens, s->ctx_size);
-        return;
+        prepared_error_status = 400;
+        snprintf(prepared_error, sizeof(prepared_error),
+                 "Prompt has %d tokens, but the configured context size is %d tokens",
+                 rejected_tokens, s->ctx_size);
+        goto runtime_terminal_funnel;
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
@@ -13036,23 +14050,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
-    const int prompt_tokens = prompt_for_sync->len;
+    effective_prompt_tokens = prompt_for_sync->len;
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
     j->req.cache_read_tokens = cached;
-    j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    j->req.cache_write_tokens = canonical_prompt_tokens > cached ?
+        canonical_prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
-    uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
+    uint64_t trace_id = trace_begin(s, j, cached, effective_prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
-    request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
+    request_ctx_span(ctx_span, sizeof(ctx_span), cached, effective_prompt_tokens);
     server_prefill_progress progress = {
         .srv = s,
         .slot = slot,
         .kind = j->req.kind,
-        .prompt_tokens = prompt_tokens,
+        .prompt_tokens = effective_prompt_tokens,
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
@@ -13071,18 +14086,18 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
                    cached,
-                   prompt_tokens);
+                   effective_prompt_tokens);
     } else if (anthropic_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
                    anthropic_live_match_ids,
                    cached,
-                   prompt_tokens);
+                   effective_prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
                    cached,
-                   prompt_tokens);
+                   effective_prompt_tokens);
     }
     if (responses_visible_replay_without_reasoning) {
         /* The request replays a prior tool-call turn but omits the hidden
@@ -13096,7 +14111,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    "ds4-server: responses replay RESPPROTO missing reasoning state; continuing from visible history source=%s cached=%d prompt=%d",
                    cache_source,
                    cached,
-                   prompt_tokens);
+                   effective_prompt_tokens);
         trace_event(s, trace_id,
                     "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
                     cache_source, cached);
@@ -13135,24 +14150,39 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
     }
 
+    if (!runtime || !ds4_runtime_request_mark_prefill_started(
+            runtime, now_monotonic_ns())) {
+        runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        snprintf(err, sizeof(err), "request prefill accounting failed");
+        snprintf(prepared_error, sizeof(prepared_error), "%s", err);
+        goto runtime_terminal_funnel;
+    }
+
     if (s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        const int sync_rc = server_session_sync(
+            s, slot, &prefix, runtime, err, sizeof(err));
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
-            ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
-            return;
+            response_stream_started = progress.headers_sent;
+            snprintf(prepared_error, sizeof(prepared_error), "%s", err);
+            runtime_status = server_execution_failure_is_unsafe(sync_rc, err) ?
+                DS4_RUNTIME_REQUEST_UNSAFE_ERROR :
+                (g_stop_requested ||
+                 sync_rc == DS4_SESSION_SYNC_INTERRUPTED) ?
+                    DS4_RUNTIME_REQUEST_CANCELLED :
+                    DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR;
+            goto runtime_terminal_funnel;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -13166,20 +14196,33 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (server_session_sync(s, slot, prompt_for_sync,
-                            err, sizeof(err)) != 0) {
-        ds4_tokens_free(&effective_prompt);
+    const int final_sync_rc = server_session_sync(
+        s, slot, prompt_for_sync, runtime, err, sizeof(err));
+    if (final_sync_rc != 0) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
         kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
-        return;
+        response_stream_started = progress.headers_sent;
+        snprintf(prepared_error, sizeof(prepared_error), "%s", err);
+        runtime_status = server_execution_failure_is_unsafe(
+                final_sync_rc, err) ?
+            DS4_RUNTIME_REQUEST_UNSAFE_ERROR :
+            (g_stop_requested ||
+             final_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) ?
+                DS4_RUNTIME_REQUEST_CANCELLED :
+                DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR;
+        goto runtime_terminal_funnel;
     }
-    free(disk_cache_path);
+    if (!ds4_runtime_request_mark_prefill_complete(
+            runtime, now_monotonic_ns())) {
+        runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        snprintf(err, sizeof(err), "request prefill accounting failed");
+        snprintf(prepared_error, sizeof(prepared_error), "%s", err);
+        goto runtime_terminal_funnel;
+    }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
@@ -13206,18 +14249,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         }
     }
     const uint64_t response_seq = server_next_sequence(s);
-    char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)response_seq);
 
-    bool structured_stream = request_uses_structured_stream(&j->req);
-    anthropic_stream anthropic_live = {0};
-    openai_stream openai_live = {0};
-    responses_stream responses_live = {0};
-    const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
-    const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
-    long responses_created_at = (long)time(NULL);
+    structured_stream = request_uses_structured_stream(&j->req);
+    openai_live_chat = request_uses_openai_live_stream(&j->req);
+    responses_live_chat = request_uses_responses_live_stream(&j->req);
+    responses_created_at = (long)time(NULL);
     if (j->req.stream) {
         if (progress.stream_failed) {
             server_log(DS4_LOG_GENERATION,
@@ -13226,8 +14265,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            ds4_tokens_free(&effective_prompt);
-            return;
+            runtime_status = DS4_RUNTIME_REQUEST_CANCELLED;
+            goto runtime_terminal_funnel;
         }
         /* The prefill progress callback may have already sent the SSE headers
          * to keep the connection alive during a long prefill. Only emit them
@@ -13239,22 +14278,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            ds4_tokens_free(&effective_prompt);
-            return;
+            runtime_status = DS4_RUNTIME_REQUEST_CANCELLED;
+            goto runtime_terminal_funnel;
         }
         progress.headers_sent = true;
+        response_stream_started = true;
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
-                                      prompt_tokens, &anthropic_live)) {
+                                      canonical_prompt_tokens,
+                                      &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            ds4_tokens_free(&effective_prompt);
-            return;
+            runtime_status = DS4_RUNTIME_REQUEST_CANCELLED;
+            goto runtime_terminal_funnel;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
-            ds4_tokens_free(&effective_prompt);
-            return;
+            runtime_status = DS4_RUNTIME_REQUEST_CANCELLED;
+            goto runtime_terminal_funnel;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
         if (responses_live_chat) {
@@ -13266,9 +14307,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags);
-                responses_stream_free(&responses_live);
-                ds4_tokens_free(&effective_prompt);
-                return;
+                runtime_status = DS4_RUNTIME_REQUEST_CANCELLED;
+                goto runtime_terminal_funnel;
             }
         }
     }
@@ -13277,14 +14317,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ (response_seq << 1) ^
          (uint64_t)(uintptr_t)j);
-    int completion = 0;
+    completion = 0;
     const int max_tokens = j->req.max_tokens;
     request_output_budget output_budget =
         request_output_budget_make(max_tokens);
 decode_again:
     ;
-    buf text = {0};
-    size_t plain_stream_pos = 0;
+    buf_free(&text);
+    plain_stream_pos = 0;
     size_t stop_scan_from = 0;
     const char *finish = "length";
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
@@ -13301,7 +14341,12 @@ decode_again:
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
-    thinking_state thinking = thinking_state_from_prompt(&j->req);
+    thinking = thinking_state_from_prompt(&j->req);
+    server_visible_accounting_begin_epoch(
+        &visibility, thinking.inside,
+        ds4_think_mode_enabled(j->req.think_mode),
+        !j->req.stream,
+        j->req.api != API_RESPONSES || j->req.reasoning_summary_emit);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -13348,6 +14393,14 @@ decode_again:
                                              token,
                                              j->req.think_mode)) {
             (void)request_output_budget_take(&output_budget, 1);
+            if (!server_visible_accounting_record_sampled(
+                    &visibility, runtime, text.len, text.len,
+                    now_monotonic_ns())) {
+                finish = "error";
+                snprintf(err, sizeof(err), "request token accounting failed");
+                runtime_execution_unsafe = true;
+                break;
+            }
             completion = output_budget.used;
             finish = "stop";
             break;
@@ -13374,7 +14427,12 @@ decode_again:
                 break;
             }
         } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+            const int eval_rc = server_eval_token(
+                s, slot, token, runtime, err, sizeof(err));
+            if (eval_rc != 0) {
+                if (server_execution_failure_is_unsafe(eval_rc, err)) {
+                    runtime_execution_unsafe = true;
+                }
                 finish = "error";
                 break;
             }
@@ -13389,6 +14447,14 @@ decode_again:
                                                  token,
                                                  j->req.think_mode)) {
                 (void)request_output_budget_take(&output_budget, 1);
+                if (!server_visible_accounting_record_sampled(
+                        &visibility, runtime, text.len, text.len,
+                        now_monotonic_ns())) {
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "request token accounting failed");
+                    runtime_execution_unsafe = true;
+                }
                 completion = output_budget.used;
                 finish = "stop";
                 stop_decode = true;
@@ -13405,9 +14471,19 @@ decode_again:
                 break;
             }
             completion = output_budget.used;
-
             trace_piece(s, trace_id, piece, piece_len);
+            const size_t raw_start = text.len;
             buf_append(&text, piece, piece_len);
+            if (!server_visible_accounting_record_sampled(
+                    &visibility, runtime, raw_start, text.len,
+                    now_monotonic_ns())) {
+                free(piece);
+                finish = "error";
+                snprintf(err, sizeof(err), "request token accounting failed");
+                runtime_execution_unsafe = true;
+                stop_decode = true;
+                break;
+            }
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
@@ -13429,7 +14505,8 @@ decode_again:
 
             if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
                 char *delta = xstrndup(text.ptr + plain_stream_pos, stream_len - plain_stream_pos);
-                bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
+                bool ok = server_sse_chunk_incremental(
+                    j->fd, &j->req, id, delta, &visibility);
                 free(delta);
                 if (!ok) {
                     finish = "error";
@@ -13440,35 +14517,88 @@ decode_again:
                 }
                 plain_stream_pos = stream_len;
             }
-            if (j->req.stream && j->req.api == API_ANTHROPIC &&
-                !anthropic_sse_stream_update(j->fd, s, &j->req, id,
-                                             &anthropic_live, text.ptr, stream_len,
-                                             false)) {
-                finish = "error";
-                snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
+            const bool anthropic_had_visible =
+                anthropic_live.sent_thinking || anthropic_live.sent_text ||
+                anthropic_live.tool.emitted_any;
+            if (j->req.stream && j->req.api == API_ANTHROPIC) {
+                const bool stream_ok = anthropic_sse_stream_update(
+                    j->fd, s, &j->req, id, &anthropic_live,
+                    text.ptr, stream_len, false);
+                const bool payload_emitted = !anthropic_had_visible &&
+                    (anthropic_live.sent_thinking || anthropic_live.sent_text ||
+                     anthropic_live.tool.emitted_any);
+                if (!server_visible_accounting_note_payload(
+                        &visibility, payload_emitted)) {
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "request emission accounting failed");
+                    runtime_execution_unsafe = true;
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+                if (!stream_ok) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
             }
-            if (openai_live_chat &&
-                !openai_sse_stream_update(j->fd, s, &j->req, id,
-                                          &openai_live, text.ptr, stream_len,
-                                          false)) {
-                finish = "error";
-                snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
+            const bool openai_had_visible = openai_live.sent_reasoning ||
+                openai_live.sent_content || openai_live.tool.emitted_any;
+            if (openai_live_chat) {
+                const bool stream_ok = openai_sse_stream_update(
+                    j->fd, s, &j->req, id, &openai_live,
+                    text.ptr, stream_len, false);
+                const bool payload_emitted = !openai_had_visible &&
+                    (openai_live.sent_reasoning || openai_live.sent_content ||
+                     openai_live.tool.emitted_any);
+                if (!server_visible_accounting_note_payload(
+                        &visibility, payload_emitted)) {
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "request emission accounting failed");
+                    runtime_execution_unsafe = true;
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+                if (!stream_ok) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
             }
-            if (responses_live_chat &&
-                !responses_sse_stream_update(j->fd, &j->req,
-                                             &responses_live, text.ptr, stream_len,
-                                             false)) {
-                finish = "error";
-                snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
+            const bool responses_had_visible =
+                responses_live.reasoning_emitted_any ||
+                responses_live.message_emitted_any;
+            if (responses_live_chat) {
+                const bool stream_ok = responses_sse_stream_update(
+                    j->fd, &j->req, &responses_live,
+                    text.ptr, stream_len, false);
+                const bool payload_emitted = !responses_had_visible &&
+                    (responses_live.reasoning_emitted_any ||
+                     responses_live.message_emitted_any);
+                if (!server_visible_accounting_note_payload(
+                        &visibility, payload_emitted)) {
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "request emission accounting failed");
+                    runtime_execution_unsafe = true;
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+                if (!stream_ok) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
             }
             free(piece);
 
@@ -13482,12 +14612,19 @@ decode_again:
                      * close so the model restarts the call on the executable
                      * side. */
                     const int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, slot, &text, &thinking,
+                        chat_think_tool_recovery_attributed(
+                                                 s, slot, runtime,
+                                                 &text, &thinking,
                                                  &think_recovery_scan_from,
                                                  &output_budget,
                                                  err, sizeof(err)) : 0;
                     completion = output_budget.used;
                     if (recovered < 0) {
+                        const int recovery_rc = -recovered;
+                        if (server_execution_failure_is_unsafe(
+                                recovery_rc, err)) {
+                            runtime_execution_unsafe = true;
+                        }
                         finish = "error";
                         stop_decode = true;
                         break;
@@ -13553,7 +14690,7 @@ decode_again:
             }
 
             if (completion >= next_decode_log) {
-                log_decode_progress(j->req.kind, prompt_tokens, completion,
+                log_decode_progress(j->req.kind, effective_prompt_tokens, completion,
                                     responses_protocol,
                                     j->req.has_tools,
                                     thinking.inside,
@@ -13631,6 +14768,7 @@ decode_again:
         if (!completed_truncation) {
             if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
+                int recovery_rc = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
@@ -13639,10 +14777,12 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "unterminated tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
+                if (continue_after_invalid_dsml(s, slot, &j->req, runtime,
+                                                &thinking,
                                                 "unterminated tool call",
                                                 &output_budget,
                                                 &recovery_tokens,
+                                                &recovery_rc,
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
@@ -13662,6 +14802,10 @@ decode_again:
                     goto decode_again;
                 }
                 finish = "error";
+                if (server_execution_failure_is_unsafe(
+                        recovery_rc, recovery_err)) {
+                    runtime_execution_unsafe = true;
+                }
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
             } else {
@@ -13673,7 +14817,7 @@ decode_again:
     }
 
     if (completion > last_decode_log_completion) {
-        log_decode_progress(j->req.kind, prompt_tokens, completion,
+        log_decode_progress(j->req.kind, effective_prompt_tokens, completion,
                             responses_protocol,
                             j->req.has_tools,
                             thinking.inside,
@@ -13684,17 +14828,8 @@ decode_again:
                             &last_decode_log_completion);
     }
 
-    if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
-        char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
-        free(tail);
-    }
-
-    tool_calls parsed_calls = {0};
-    char *parsed_content = NULL;
-    char *parsed_reasoning = NULL;
-    const char *final_finish = finish;
-    bool recovered_tool_parse_failure = false;
+    final_finish = finish;
+    recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response_for_syntax(
             j->req.model_syntax,
@@ -13716,6 +14851,7 @@ decode_again:
              * reminder so it owns the corrected next action. */
             if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
+                int recovery_rc = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
                 server_log(DS4_LOG_WARNING,
@@ -13725,10 +14861,12 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "invalid tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
+                if (continue_after_invalid_dsml(s, slot, &j->req, runtime,
+                                                &thinking,
                                                 detail,
                                                 &output_budget,
                                                 &recovery_tokens,
+                                                &recovery_rc,
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
@@ -13750,6 +14888,10 @@ decode_again:
                     goto decode_again;
                 }
                 final_finish = "error";
+                if (server_execution_failure_is_unsafe(
+                        recovery_rc, recovery_err)) {
+                    runtime_execution_unsafe = true;
+                }
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
             }
@@ -13857,9 +14999,13 @@ decode_again:
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
          * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
+        const int checkpoint_rc = canonicalize_tool_checkpoint(
+            s, slot, j, ctx_span, runtime, trace_id,
+            parsed_content ? parsed_content : "",
+            parsed_reasoning, &parsed_calls);
+        if (server_execution_failure_is_unsafe(checkpoint_rc, NULL)) {
+            runtime_execution_unsafe = true;
+        }
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
@@ -13871,68 +15017,127 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
-    if (j->req.stream) {
-        bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    &parsed_calls, final_finish, completion);
-        } else if (openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
-                                                 text.ptr ? text.ptr : "", text.len,
-                                                 &parsed_calls, final_finish,
-                                                 prompt_tokens, completion);
-        } else if (responses_live_chat) {
-            /* If parse recovered a malformed tool call back to plain text,
-             * pass parsed_content so the streaming tail can be flushed; in
-             * the normal path parsed_content is the assistant text we already
-             * streamed and the diff is empty. */
-            const char *recover =
-                recovered_tool_parse_failure ? parsed_content : NULL;
-            response_ok = responses_sse_finish_live(j->fd, &j->req, &responses_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    recover,
-                                                    &parsed_calls, final_finish,
-                                                    prompt_tokens, completion,
-                                                    responses_created_at);
-        } else if (structured_stream) {
-            response_ok = sse_chat_finish(j->fd, &j->req, id,
-                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                          parsed_reasoning,
-                                          &parsed_calls, final_finish,
-                                          prompt_tokens, completion);
-        } else {
-            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, prompt_tokens,
-                                   completion, NULL);
+    native_terminal = (server_native_terminal) {
+        .srv = s,
+        .queued_job = j,
+        .protocol_id = id,
+        .structured_stream = structured_stream,
+        .openai_live_chat = openai_live_chat,
+        .responses_live_chat = responses_live_chat,
+        .anthropic_live = &anthropic_live,
+        .openai_live = &openai_live,
+        .responses_live = &responses_live,
+        .raw = text.ptr ? text.ptr : "",
+        .raw_len = text.len,
+        .plain_stream_pos = &plain_stream_pos,
+        .content = parsed_content ? parsed_content :
+                   (text.ptr ? text.ptr : ""),
+        .reasoning = parsed_reasoning,
+        .calls = &parsed_calls,
+        .finish = final_finish,
+        .prompt_tokens = canonical_prompt_tokens,
+        .completion_tokens = completion,
+        .responses_created_at = responses_created_at,
+        .recovered_tool_parse_failure = recovered_tool_parse_failure,
+    };
+    if (responses_live_chat) {
+        responses_tool_items_build(
+            &native_terminal.responses_items, &parsed_calls,
+            responses_live.next_output_index);
+    }
+    protocol_content = native_terminal.content;
+    protocol_reasoning = native_terminal.reasoning;
+    protocol_calls = native_terminal.calls;
+    native_terminal_ready = true;
+    runtime_status = runtime_execution_unsafe ?
+        DS4_RUNTIME_REQUEST_UNSAFE_ERROR :
+        !strcmp(final_finish, "error") ?
+        (g_stop_requested || strstr(err, "client stream write failed") ?
+            DS4_RUNTIME_REQUEST_CANCELLED :
+            DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR) :
+        DS4_RUNTIME_REQUEST_COMPLETED;
+
+runtime_terminal_funnel:
+    if (native_terminal_ready) {
+        native_terminal.content = protocol_content;
+        native_terminal.reasoning = protocol_reasoning;
+        native_terminal.calls = protocol_calls;
+        const bool raw_projected_verbatim =
+            j->req.kind == REQ_COMPLETION ||
+            (!j->req.stream && parsed_content && !parsed_reasoning &&
+             text.ptr && strlen(parsed_content) == text.len &&
+             !memcmp(parsed_content, text.ptr, text.len));
+        if (!server_visible_accounting_publish(
+                &visibility, runtime, native_terminal.raw,
+                native_terminal.raw_len, raw_projected_verbatim)) {
+            runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        }
+        bool final_payload_emitted = false;
+        response_ok = server_flush_final_visible(
+            &native_terminal, &final_payload_emitted);
+        if (!server_visible_accounting_note_payload(
+                &visibility, final_payload_emitted)) {
+            runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
         }
         if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
+            runtime_status = server_transport_failure_status(runtime_status);
         }
-    } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion, NULL);
-    } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion, NULL);
-    } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion, NULL);
     }
+    if (runtime && runtime->prefill_started) {
+        if (ds4_session_request_barrier(
+                slot->session, runtime, err, sizeof(err)) != 0) {
+            runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        }
+    }
+    if (runtime && native_terminal_ready) {
+        if (!j->req.stream) {
+            bool buffered_payload_emitted = false;
+            const bool begin_ok = server_buffered_terminal_begin(
+                &native_terminal, &buffered_terminal,
+                &buffered_payload_emitted);
+            if (!server_visible_accounting_note_payload(
+                    &visibility, buffered_payload_emitted)) {
+                runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+            }
+            response_ok = begin_ok && response_ok;
+            if (!begin_ok) {
+                runtime_status = server_transport_failure_status(
+                    runtime_status);
+            }
+        }
+        if (!server_visible_accounting_publish_emission(
+                &visibility, runtime)) {
+            runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        }
+    }
+    if (!server_job_runtime_finish(
+            j, runtime_status, now_monotonic_ns())) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: request terminal accounting failed");
+    }
+    const ds4_runtime_request_metrics *terminal_metrics =
+        server_job_runtime_terminal_metrics(j);
+    if (!native_terminal_ready && prepared_error[0] && terminal_metrics) {
+        response_ok = server_emit_prepared_error_terminal(
+            j->fd, s->enable_cors, &j->req, prepared_error_status,
+            prepared_error, response_stream_started, terminal_metrics);
+    }
+    if (native_terminal_ready && terminal_metrics) {
+        bool terminal_ok = false;
+        if (response_ok) {
+            terminal_ok = j->req.stream ?
+                server_emit_native_terminal(
+                    &native_terminal, terminal_metrics) :
+                server_buffered_terminal_finish(
+                    &native_terminal, &buffered_terminal, terminal_metrics);
+        }
+        response_ok = terminal_ok && response_ok;
+        if (!response_ok) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: final protocol response failed");
+        }
+    }
+    if (!native_terminal_ready) goto runtime_cleanup;
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -13992,12 +15197,20 @@ decode_again:
                        now_sec() - t0);
         }
     }
+runtime_cleanup:
+    ds4_session_set_progress(slot->session, NULL, NULL);
+    ds4_session_set_display_progress(slot->session, NULL, NULL);
+    ds4_kvstore_text_preview_free(&disk_preview);
+    free(disk_cache_path);
     free(parsed_content);
     free(parsed_reasoning);
+    server_buffered_terminal_free(&buffered_terminal);
+    free(native_terminal.responses_items);
     tool_calls_free(&parsed_calls);
     anthropic_stream_free(&anthropic_live);
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
+    server_visible_accounting_free(&visibility);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }
@@ -14455,7 +15668,7 @@ static void *client_main(void *arg) {
         goto done;
     }
 
-    request req;
+    request req = {0};
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
@@ -14482,6 +15695,24 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    const bool inference_post =
+        !strcmp(hr.method, "POST") &&
+        (!strcmp(hr.path, "/v1/chat/completions") ||
+         !strcmp(hr.path, "/v1/messages") ||
+         !strcmp(hr.path, "/v1/responses") ||
+         !strcmp(hr.path, "/v1/completions"));
+    if (!inference_post) {
+        http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        http_request_free(&hr);
+        goto done;
+    }
+    ds4_runtime_request_context accepted_context = {0};
+    if (!ds4_runtime_request_begin(&accepted_context, now_monotonic_ns())) {
+        http_error(fd, s->enable_cors, 500, "request accounting unavailable");
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "POST") &&
         !strcmp(hr.path, "/v1/chat/completions") &&
         ds4_engine_is_laguna(s->engine))
@@ -14498,8 +15729,14 @@ static void *client_main(void *arg) {
             ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                     ctx_size, &req, err, sizeof(err));
         } else if (result.code != REQUEST_ADMISSION_FITS) {
-            (void)http_reject_token_admission(
-                fd, s->enable_cors, NULL, ctx_size, result.code);
+            if (req.prompt.len > 0) {
+                (void)server_reject_prepared_request(
+                    fd, s->enable_cors, &req, &accepted_context,
+                    result.code);
+            } else {
+                (void)http_reject_token_admission(
+                    fd, s->enable_cors, NULL, ctx_size, result.code);
+            }
             http_request_free(&hr);
             goto done;
         } else {
@@ -14532,27 +15769,45 @@ static void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
-    request_apply_model_sampling_defaults(s->engine, &req);
-    const request_admission_code admission =
-        request_prepare_token_admission(&req, ctx_size);
-    if (admission != REQUEST_ADMISSION_FITS) {
-        (void)http_reject_token_admission(
-            fd, s->enable_cors, &req, ctx_size, admission);
-        request_free(&req);
-        goto done;
-    }
-    set_client_socket_nonblocking(fd);
     job j;
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    if (!server_job_runtime_adopt(&j, &accepted_context)) {
+        http_error(fd, s->enable_cors, 500, "request accounting unavailable");
+        request_free(&j.req);
+        goto done;
+    }
+    request_apply_model_sampling_defaults(s->engine, &j.req);
+    const request_admission_code admission =
+        request_prepare_token_admission(&j.req, ctx_size);
+    if (admission != REQUEST_ADMISSION_FITS) {
+        (void)server_job_runtime_finish(
+            &j, DS4_RUNTIME_REQUEST_REJECTED, now_monotonic_ns());
+        const char *message =
+            admission == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS ?
+                "Requested output tokens must be a positive integer" :
+            admission == REQUEST_ADMISSION_CONTEXT_OVERFLOW ?
+                "Prompt exceeds the configured context size" :
+                "Invalid inference request";
+        (void)server_emit_prepared_error_terminal(
+            fd, s->enable_cors, &j.req, 400, message, false,
+            server_job_runtime_terminal_metrics(&j));
+        request_free(&j.req);
+        goto done;
+    }
+    set_client_socket_nonblocking(fd);
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
     pthread_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
         pthread_mutex_unlock(&j.mu);
-        http_error(fd, s->enable_cors, 503, "server shutting down");
+        (void)server_job_runtime_finish(
+            &j, DS4_RUNTIME_REQUEST_CANCELLED, now_monotonic_ns());
+        (void)server_emit_prepared_error_terminal(
+            fd, s->enable_cors, &j.req, 503, "server shutting down", false,
+            server_job_runtime_terminal_metrics(&j));
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -15373,7 +16628,8 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
  * or a process-wide before/after snapshot.  These declarations define the
  * minimal server seam exercised below; production supplies the storage and
  * implementations next to struct job. */
-static bool server_job_runtime_accept(job *j, uint64_t accepted_monotonic_ns);
+static bool server_job_runtime_adopt(
+    job *j, ds4_runtime_request_context *accepted_context);
 static ds4_runtime_request_context *server_job_runtime_context(job *j);
 static bool server_job_runtime_finish(
     job *j,
@@ -15909,8 +17165,12 @@ static void test_server_job_runtime_completed_lifecycle(void) {
     request_init(&accepted.req, REQ_CHAT, 8);
     for (int i = 0; i < 22; i++) ds4_tokens_push(&accepted.req.prompt, i);
 
+    ds4_runtime_request_context early_context = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&early_context, accepted_ns));
+    ds4_runtime_request_context early_snapshot = early_context;
+
     TEST_ASSERT(server_job_runtime_terminal_metrics(&accepted) == NULL);
-    TEST_ASSERT(server_job_runtime_accept(&accepted, accepted_ns));
+    TEST_ASSERT(server_job_runtime_adopt(&accepted, &early_context));
     ds4_runtime_request_context *accepted_context =
         server_job_runtime_context(&accepted);
     TEST_ASSERT(accepted_context != NULL);
@@ -15924,8 +17184,13 @@ static void test_server_job_runtime_completed_lifecycle(void) {
 
     /* Acceptance is single-shot and a rejected reuse cannot replace the
      * canonical UUID, timestamps, or exact prepared prompt count. */
+    TEST_ASSERT(!early_context.initialized);
+    TEST_ASSERT(!memcmp(accepted_context->request_id, early_snapshot.request_id,
+                        sizeof(accepted_context->request_id)));
     ds4_runtime_request_context accepted_snapshot = *accepted_context;
-    TEST_ASSERT(!server_job_runtime_accept(&accepted, accepted_ns + 1));
+    ds4_runtime_request_context second_context = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&second_context, accepted_ns + 1));
+    TEST_ASSERT(!server_job_runtime_adopt(&accepted, &second_context));
     TEST_ASSERT(!memcmp(accepted_context, &accepted_snapshot,
                         sizeof(accepted_snapshot)));
 
@@ -16075,7 +17340,9 @@ static void test_server_job_runtime_pre_token_terminals(void) {
         ds4_tokens_push(&prepared.req.prompt, 102);
         ds4_tokens_push(&prepared.req.prompt, 103);
 
-        TEST_ASSERT(server_job_runtime_accept(&prepared, accepted_ns));
+        ds4_runtime_request_context early_context = {0};
+        TEST_ASSERT(ds4_runtime_request_begin(&early_context, accepted_ns));
+        TEST_ASSERT(server_job_runtime_adopt(&prepared, &early_context));
         ds4_runtime_request_context *runtime =
             server_job_runtime_context(&prepared);
         TEST_ASSERT(runtime != NULL);
@@ -16108,6 +17375,584 @@ static void test_server_job_runtime_pre_token_terminals(void) {
                             sizeof(metrics_snapshot)));
         request_free(&prepared.req);
     }
+
+    job invariant = {0};
+    request_init(&invariant.req, REQ_CHAT, 4);
+    ds4_tokens_push(&invariant.req.prompt, 101);
+    ds4_runtime_request_context invariant_context = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&invariant_context, 100));
+    TEST_ASSERT(server_job_runtime_adopt(&invariant, &invariant_context));
+    ds4_runtime_request_context *invariant_runtime =
+        server_job_runtime_context(&invariant);
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(
+        invariant_runtime, 110));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(
+        invariant_runtime, 120));
+    TEST_ASSERT(ds4_runtime_request_observe_page_advice(
+        invariant_runtime, 130));
+    /* COMPLETED is invalid with an open advice window. The server wrapper
+     * closes that lifecycle as UNSAFE instead of losing the terminal record or
+     * misclassifying it as recoverable. */
+    TEST_ASSERT(server_job_runtime_finish(
+        &invariant, DS4_RUNTIME_REQUEST_COMPLETED, 140));
+    const ds4_runtime_request_metrics *unsafe_metrics =
+        server_job_runtime_terminal_metrics(&invariant);
+    TEST_ASSERT(unsafe_metrics && unsafe_metrics->terminal_status ==
+        DS4_RUNTIME_REQUEST_UNSAFE_ERROR);
+    request_free(&invariant.req);
+}
+
+static void test_server_runtime_separates_hidden_and_visible_tokens(void) {
+    const char split_close[] = "</think>answer";
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        split_close, strlen(split_close), true, true, false, false, 0, 5));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        split_close, strlen(split_close), true, true, false, false, 5,
+        strlen(split_close)));
+
+    const char split_open[] = "<think>";
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        split_open, strlen(split_open), false, true, false, false, 0, 4));
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        split_open, strlen(split_open), false, true, false, false, 4,
+        strlen(split_open)));
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        split_open, strlen(split_open), true, true, false, true, 0,
+        strlen(split_open)));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        split_open, strlen(split_open), false, false, false, false, 0,
+        strlen(split_open)));
+
+    const char no_think_buffered[] = "<think>private</think>public";
+    const size_t no_think_body = strlen("<think>");
+    const size_t no_think_close = no_think_body + strlen("private");
+    const size_t no_think_content = no_think_close + strlen("</think>");
+    /* Buffered native serializers still run the completed-message parser when
+     * thinking controls are disabled.  OpenAI/Anthropic expose the parsed
+     * reasoning body but never its markers; Responses hides the body unless a
+     * reasoning summary was requested. */
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        no_think_buffered, strlen(no_think_buffered), false, true, false, true,
+        0, no_think_body));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        no_think_buffered, strlen(no_think_buffered), false, true, true, true,
+        no_think_body, no_think_close));
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        no_think_buffered, strlen(no_think_buffered), false, true, true, false,
+        no_think_body, no_think_close));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        no_think_buffered, strlen(no_think_buffered), false, true, true, false,
+        no_think_content, strlen(no_think_buffered)));
+    /* Streaming no-think state starts in TEXT, so the exact same literal
+     * marker sequence is ordinary visible assistant content. */
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        no_think_buffered, strlen(no_think_buffered), false, false, false, false,
+        0, no_think_body));
+    const char buffered_bare_close[] = "hello</think>world";
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        buffered_bare_close, strlen(buffered_bare_close),
+        false, false, true, true, 0, strlen("hello")));
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        buffered_bare_close, strlen(buffered_bare_close),
+        false, false, true, false,
+        strlen("hello"), strlen("hello</think>")));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        buffered_bare_close, strlen(buffered_bare_close),
+        false, false, true, false,
+        strlen("hello</think>"), strlen(buffered_bare_close)));
+
+    const char stopped[] = "answerSTOP";
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        stopped, 6, false, false, false, false, 0, 8));
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        stopped, 6, false, false, false, false, 8, strlen(stopped)));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START),
+        false, false, false, false, 0, strlen(DS4_TOOL_CALLS_START)));
+    const char later_literal[] = "</think>answer<think>literal</think>";
+    const char *later_token = strstr(later_literal, "literal");
+    TEST_ASSERT(later_token != NULL);
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        later_literal, strlen(later_literal), true, true, false, false,
+        (size_t)(later_token - later_literal),
+        (size_t)(later_token - later_literal) + strlen("literal")));
+    const char tool_separator[] =
+        "</think>\n\n" DS4_TOOL_CALLS_START;
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        tool_separator, strlen(tool_separator), true, true, false, false,
+        strlen("</think>"), strlen("</think>\n\n")));
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        tool_separator, strlen(tool_separator), true, true, false, false,
+        strlen("</thi"), strlen("</think>\n\n")));
+    TEST_ASSERT(server_accumulated_span_is_client_visible(
+        tool_separator, strlen(tool_separator), true, true, false, false,
+        strlen("</thi"), strlen("</think>\n\n") + 1u));
+    const char no_think_tool_separator[] = "\n\n" DS4_TOOL_CALLS_START;
+    TEST_ASSERT(!server_accumulated_span_is_client_visible(
+        no_think_tool_separator, strlen(no_think_tool_separator),
+        false, false, false, false, 0, 2));
+
+    ds4_runtime_request_context runtime = {0};
+    server_visible_accounting accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&runtime, UINT64_C(100)));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&runtime, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(&runtime, 110));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(&runtime, 120));
+
+    const char raw[] =
+        "private thought</think>" DS4_TOOL_CALLS_START
+        "visible<think>hidden</think>visible";
+    const size_t private_end = strlen("private thought");
+    const size_t close_end = private_end + strlen("</think>");
+    const size_t tool_end = close_end + strlen(DS4_TOOL_CALLS_START);
+    const size_t visible_end = tool_end + strlen("visible");
+    server_visible_accounting_begin_epoch(&accounting, true, true, false, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, 0, private_end, 130));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, private_end, close_end, 140));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, close_end, tool_end, 150));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, tool_end, visible_end, 160));
+    /* A stop/control token and a recovery suffix count as generated work but
+     * own no client-visible raw span. */
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, visible_end, visible_end, 170));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, visible_end, strlen(raw), 180));
+    TEST_ASSERT(ds4_runtime_request_observe_page_advice(&runtime, 190));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &accounting, &runtime, raw, strlen(raw), false));
+    TEST_ASSERT(runtime.generated_tokens == 6);
+    TEST_ASSERT(runtime.visible_generated_tokens == 3);
+    TEST_ASSERT(runtime.first_visible_decode_monotonic_ns == 150);
+    TEST_ASSERT(runtime.last_visible_decode_monotonic_ns == 180);
+    server_visible_accounting_free(&accounting);
+
+    ds4_runtime_request_context retried = {0};
+    server_visible_accounting retry_accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&retried, 200));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&retried, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(&retried, 210));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(&retried, 220));
+    server_visible_accounting_begin_epoch(
+        &retry_accounting, false, true, false, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &retry_accounting, &retried, 0, 7, 230));
+    /* decode_again discards the failed epoch's spans, but not its generated
+     * work.  The model-visible recovery suffix is generated-only too. */
+    server_visible_accounting_begin_epoch(&retry_accounting, true, true, false, false);
+    TEST_ASSERT(ds4_runtime_request_add_generated_tokens(&retried, 2));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &retry_accounting, &retried, 0, 6, 240));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &retry_accounting, &retried, "hidden", 6, false));
+    TEST_ASSERT(retried.generated_tokens == 4);
+    TEST_ASSERT(retried.visible_generated_tokens == 0);
+    server_visible_accounting_free(&retry_accounting);
+
+    ds4_runtime_request_context split_stop_runtime = {0};
+    server_visible_accounting split_stop_accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&split_stop_runtime, 300));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&split_stop_runtime, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(
+        &split_stop_runtime, 310));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(
+        &split_stop_runtime, 320));
+    server_visible_accounting_begin_epoch(
+        &split_stop_accounting, false, false, false, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &split_stop_accounting, &split_stop_runtime, 0, 8, 330));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &split_stop_accounting, &split_stop_runtime, 8, 10, 340));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &split_stop_accounting, &split_stop_runtime, stopped, 6, false));
+    TEST_ASSERT(split_stop_runtime.generated_tokens == 2);
+    TEST_ASSERT(split_stop_runtime.visible_generated_tokens == 1);
+    server_visible_accounting_free(&split_stop_accounting);
+
+    const char unclosed[] = "<think>unfinished";
+    ds4_runtime_request_context responses_nonstream = {0};
+    server_visible_accounting responses_nonstream_accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&responses_nonstream, 400));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&responses_nonstream, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(
+        &responses_nonstream, 410));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(
+        &responses_nonstream, 420));
+    server_visible_accounting_begin_epoch(
+        &responses_nonstream_accounting, false, true, true, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &responses_nonstream_accounting, &responses_nonstream, 0, 7, 430));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &responses_nonstream_accounting, &responses_nonstream,
+        7, strlen(unclosed), 440));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &responses_nonstream_accounting, &responses_nonstream,
+        unclosed, strlen(unclosed), true));
+    TEST_ASSERT(responses_nonstream.visible_generated_tokens == 2);
+    server_visible_accounting_free(&responses_nonstream_accounting);
+
+    ds4_runtime_request_context responses_stream = {0};
+    server_visible_accounting responses_stream_accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&responses_stream, 500));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&responses_stream, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(
+        &responses_stream, 510));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(
+        &responses_stream, 520));
+    server_visible_accounting_begin_epoch(
+        &responses_stream_accounting, false, true, false, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &responses_stream_accounting, &responses_stream, 0, 7, 530));
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &responses_stream_accounting, &responses_stream,
+        7, strlen(unclosed), 540));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &responses_stream_accounting, &responses_stream,
+        unclosed, strlen(unclosed), false));
+    TEST_ASSERT(responses_stream.visible_generated_tokens == 0);
+    server_visible_accounting_free(&responses_stream_accounting);
+}
+
+static void test_server_execution_failure_classification(void) {
+    TEST_ASSERT(server_execution_failure_is_unsafe(
+        DS4_SERVER_EXEC_UNSAFE, "compact graph unsafe"));
+    TEST_ASSERT(server_execution_failure_is_unsafe(
+        1, "invalid attributed request context"));
+    TEST_ASSERT(server_execution_failure_is_unsafe(
+        1, "request token accounting failed"));
+    TEST_ASSERT(!server_execution_failure_is_unsafe(
+        DS4_SESSION_SYNC_INTERRUPTED, "request interrupted"));
+    TEST_ASSERT(!server_execution_failure_is_unsafe(
+        DS4_SERVER_EXEC_RECOVERABLE, "compact read failed"));
+    TEST_ASSERT(server_transport_failure_status(
+        DS4_RUNTIME_REQUEST_UNSAFE_ERROR) ==
+        DS4_RUNTIME_REQUEST_UNSAFE_ERROR);
+    TEST_ASSERT(server_transport_failure_status(
+        DS4_RUNTIME_REQUEST_COMPLETED) ==
+        DS4_RUNTIME_REQUEST_CANCELLED);
+    TEST_ASSERT(server_transport_failure_status(
+        DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR) ==
+        DS4_RUNTIME_REQUEST_CANCELLED);
+}
+
+static void test_server_incremental_payload_marks_first_emission(void) {
+    ds4_runtime_request_context runtime = {0};
+    server_visible_accounting accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&runtime, UINT64_C(100)));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&runtime, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(&runtime, 110));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(&runtime, 120));
+    server_visible_accounting_begin_epoch(
+        &accounting, false, false, false, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, 0, 1, 130));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &accounting, &runtime, "x", 1, false));
+
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(server_sse_chunk_incremental(
+            sv[0], &r, "chatcmpl_incremental", "x", &accounting));
+        TEST_ASSERT(!runtime.first_visible_emitted);
+        TEST_ASSERT(accounting.first_payload_emitted_monotonic_ns >= 130);
+        TEST_ASSERT(server_visible_accounting_publish_emission(
+            &accounting, &runtime));
+        TEST_ASSERT(runtime.first_visible_emitted);
+        TEST_ASSERT(runtime.first_visible_emitted_monotonic_ns >=
+                    runtime.first_visible_decode_monotonic_ns);
+        const uint64_t first = runtime.first_visible_emitted_monotonic_ns;
+        TEST_ASSERT(server_sse_chunk_incremental(
+            sv[0], &r, "chatcmpl_incremental", "y", &accounting));
+        TEST_ASSERT(runtime.first_visible_emitted_monotonic_ns == first);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    server_visible_accounting_free(&accounting);
+    request_free(&r);
+}
+
+static void test_responses_terminal_reuses_stream_tool_item_ids(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    snprintf(st.response_id, sizeof(st.response_id), "resp_id_continuity");
+    st.active = true;
+    tool_calls calls = make_swapped_bash_call();
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, &calls, 0);
+    TEST_ASSERT(items != NULL);
+    char expected[64] = {0};
+    if (items) snprintf(expected, sizeof(expected), "%s", items[0].fc_id);
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0 && items) {
+        ds4_runtime_request_context runtime = {0};
+        ds4_runtime_request_metrics metrics = {0};
+        TEST_ASSERT(ds4_runtime_request_begin(&runtime, UINT64_C(100)));
+        TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&runtime, 3));
+        TEST_ASSERT(ds4_runtime_request_mark_prefill_started(&runtime, 110));
+        TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(&runtime, 120));
+        TEST_ASSERT(ds4_runtime_request_add_generated_tokens(&runtime, 1));
+        TEST_ASSERT(ds4_runtime_request_record_visible_decoded(
+            &runtime, 1, 130));
+        TEST_ASSERT(ds4_runtime_request_mark_first_visible_emitted(
+            &runtime, 140));
+        TEST_ASSERT(ds4_runtime_request_finish(
+            &runtime, DS4_RUNTIME_REQUEST_COMPLETED, 150, &metrics));
+        bool payload_emitted = false;
+        TEST_ASSERT(responses_sse_flush_live(
+            sv[0], &r, &st, "", 0, NULL, &calls, items, "tool_calls",
+            &payload_emitted));
+        TEST_ASSERT(payload_emitted);
+        TEST_ASSERT(responses_sse_finish_live(
+            sv[0], &r, &st, "", 0, NULL, &calls, items, "tool_calls",
+            3, 1, 1234, &metrics));
+        shutdown(sv[0], SHUT_WR);
+        char *wire = read_socket_text(sv[1]);
+        int matches = 0;
+        for (char *p = wire; p && (p = strstr(p, expected)); p++) matches++;
+        TEST_ASSERT(matches == 5);
+        TEST_ASSERT(test_source_count(
+            wire, "\"type\":\"response.output_item.added\"") == 1);
+        TEST_ASSERT(test_source_count(
+            wire, "\"type\":\"response.output_item.done\"") == 1);
+        free(wire);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    free(items);
+    tool_calls_free(&calls);
+    responses_stream_free(&st);
+    request_free(&r);
+}
+
+static void test_server_buffered_terminal_records_actual_payload_boundary(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    r.api = API_RESPONSES;
+    r.model = xstrdup("laguna-test");
+    job j = {.fd = -1};
+    j.req = r;
+    server s = {0};
+    server_native_terminal terminal = {
+        .srv = &s,
+        .queued_job = &j,
+        .protocol_id = "resp_buffered",
+        .content = "visible",
+        .finish = "stop",
+        .prompt_tokens = 3,
+        .completion_tokens = 1,
+    };
+    ds4_runtime_request_context runtime = {0};
+    ds4_runtime_request_metrics metrics = {0};
+    server_visible_accounting accounting = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&runtime, UINT64_C(100)));
+    TEST_ASSERT(ds4_runtime_request_set_prompt_tokens(&runtime, 3));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_started(&runtime, 110));
+    TEST_ASSERT(ds4_runtime_request_mark_prefill_complete(&runtime, 120));
+    server_visible_accounting_begin_epoch(
+        &accounting, false, true, true, false);
+    TEST_ASSERT(server_visible_accounting_record_sampled(
+        &accounting, &runtime, 0, strlen("visible"), 130));
+    TEST_ASSERT(server_visible_accounting_publish(
+        &accounting, &runtime, "visible", strlen("visible"), false));
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        j.fd = sv[0];
+        server_buffered_terminal buffered = {0};
+        bool emitted = false;
+        TEST_ASSERT(server_buffered_terminal_begin(
+            &terminal, &buffered, &emitted));
+        TEST_ASSERT(emitted);
+        TEST_ASSERT(buffered.response_started);
+        TEST_ASSERT(buffered.remaining_offset > 0u);
+        TEST_ASSERT(server_visible_accounting_note_payload_at(
+            &accounting, emitted, 140));
+        TEST_ASSERT(server_visible_accounting_publish_emission(
+            &accounting, &runtime));
+        TEST_ASSERT(ds4_runtime_request_finish(
+            &runtime, DS4_RUNTIME_REQUEST_COMPLETED, 160, &metrics));
+        TEST_ASSERT(metrics.ttft_present && metrics.ttft_ns == 40);
+        TEST_ASSERT(server_buffered_terminal_finish(
+            &terminal, &buffered, &metrics));
+        shutdown(sv[0], SHUT_WR);
+        char *wire = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(wire, "Content-Length:") == NULL);
+        TEST_ASSERT(strstr(wire, "Connection: close") != NULL);
+        TEST_ASSERT(strstr(wire, "\"text\":\"visible\"") != NULL);
+        TEST_ASSERT(strstr(wire, "\"request_metrics\":") != NULL);
+        TEST_ASSERT(test_source_count(wire, "\"request_metrics\":") == 1);
+        free(wire);
+        server_buffered_terminal_free(&buffered);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    server_visible_accounting_free(&accounting);
+    request_free(&j.req);
+}
+
+static void test_server_final_tool_flush_latches_partial_payload(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    st.active = true;
+    tool_calls calls = make_swapped_bash_call();
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, &calls, 0);
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0 && items) {
+        bool emitted = false;
+        server_test_send_all_calls = 0;
+        /* output_item.added succeeds, the following arguments event fails. */
+        server_test_send_all_fail_after = 1;
+        TEST_ASSERT(!responses_sse_flush_live(
+            sv[0], &r, &st, "", 0, NULL, &calls, items,
+            "tool_calls", &emitted));
+        TEST_ASSERT(emitted);
+        server_test_send_all_fail_after = -1;
+        server_test_send_all_calls = 0;
+        close(sv[0]);
+        close(sv[1]);
+    }
+    free(items);
+    tool_calls_free(&calls);
+    responses_stream_free(&st);
+    request_free(&r);
+
+    request ar;
+    request_init(&ar, REQ_CHAT, 4);
+    ar.api = API_ANTHROPIC;
+    ar.stream = true;
+    anthropic_stream ast = {.active = true};
+    ast.mode = ANTH_STREAM_SUPPRESS;
+    tool_calls acalls = make_swapped_bash_call();
+    int av[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, av) == 0);
+    if (av[0] >= 0 && av[1] >= 0) {
+        bool emitted = false;
+        server_test_send_all_calls = 0;
+        server_test_send_all_fail_after = 1;
+        TEST_ASSERT(!anthropic_sse_flush_live(
+            av[0], NULL, &ar, "msg_partial", &ast,
+            "", 0, &acalls, &emitted));
+        TEST_ASSERT(emitted);
+        server_test_send_all_fail_after = -1;
+        server_test_send_all_calls = 0;
+        close(av[0]);
+        close(av[1]);
+    }
+    tool_calls_free(&acalls);
+    anthropic_stream_free(&ast);
+    request_free(&ar);
+
+    request or;
+    request_init(&or, REQ_CHAT, 4);
+    or.api = API_OPENAI;
+    or.stream = true;
+    or.think_mode = DS4_THINK_NONE;
+    or.has_tools = true;
+    openai_stream ost = {0};
+    openai_stream_start(&or, &ost);
+    const char *openai_raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n";
+    int ov[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, ov) == 0);
+    if (ov[0] >= 0 && ov[1] >= 0) {
+        server_test_send_all_calls = 0;
+        server_test_send_all_fail_after = 1;
+        TEST_ASSERT(!openai_sse_stream_update(
+            ov[0], NULL, &or, "chatcmpl_partial", &ost,
+            openai_raw, strlen(openai_raw), false));
+        TEST_ASSERT(ost.tool.emitted_any);
+        server_visible_accounting live_accounting = {0};
+        TEST_ASSERT(server_visible_accounting_note_payload_at(
+            &live_accounting, ost.tool.emitted_any, 42));
+        TEST_ASSERT(live_accounting.first_payload_emitted_monotonic_ns == 42);
+        server_test_send_all_fail_after = -1;
+        server_test_send_all_calls = 0;
+        close(ov[0]);
+        close(ov[1]);
+    }
+    openai_stream_free(&ost);
+    request_free(&or);
+}
+
+static void test_prepared_recoverable_error_emits_request_metrics(void) {
+    job j = {0};
+    request_init(&j.req, REQ_CHAT, 4);
+    ds4_tokens_push(&j.req.prompt, 1);
+    ds4_runtime_request_context accepted = {0};
+    TEST_ASSERT(ds4_runtime_request_begin(&accepted, UINT64_C(100)));
+    TEST_ASSERT(server_job_runtime_adopt(&j, &accepted));
+    TEST_ASSERT(server_job_runtime_finish(
+        &j, DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR, UINT64_C(200)));
+    const ds4_runtime_request_metrics *metrics =
+        server_job_runtime_terminal_metrics(&j);
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(server_emit_prepared_error_terminal(
+            sv[0], false, &j.req, 500, "prefill failed", false, metrics));
+        shutdown(sv[0], SHUT_WR);
+        char *wire = read_socket_text(sv[1]);
+        TEST_ASSERT(wire && strstr(wire, "prefill failed") != NULL);
+        TEST_ASSERT(wire && strstr(wire,
+            "\"terminal_status\":\"recoverable_error\"") != NULL);
+        TEST_ASSERT(wire && strstr(wire, metrics->request_id) != NULL);
+        TEST_ASSERT(wire && strstr(wire, "\"ttft_ns\":null") != NULL);
+        free(wire);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&j.req);
+}
+
+static void test_laguna_prepared_rejection_retains_prompt_for_metrics(void) {
+    const char *body =
+        "{\"model\":\"laguna-s-2.1-chat\",\"messages\":[{\"role\":\"user\","
+        "\"content\":\"hello\"}],\"max_tokens\":99}";
+    const int token_count = 7;
+    request prepared = {0};
+    const laguna_admission_result result = laguna_prepare_chat_request(
+        body, LAGUNA_PREPARE_INFERENCE, 8, 8,
+        test_laguna_fixed_tokenize, (void *)&token_count, &prepared);
+    TEST_ASSERT(result.code == REQUEST_ADMISSION_CONTEXT_OVERFLOW);
+    TEST_ASSERT(prepared.prompt.len == token_count);
+    TEST_ASSERT(prepared.prompt_text != NULL);
+    TEST_ASSERT(prepared.max_tokens == 0);
+    request_free(&prepared);
+
+    const char *wide_body =
+        "{\"model\":\"laguna-s-2.1-chat\",\"messages\":[{\"role\":\"user\","
+        "\"content\":\"hello\"}],\"max_tokens\":4294967296}";
+    request wide = {0};
+    const laguna_admission_result wide_result = laguna_prepare_chat_request(
+        wide_body, LAGUNA_PREPARE_INFERENCE, 8, 8,
+        test_laguna_fixed_tokenize, (void *)&token_count, &wide);
+    TEST_ASSERT(wide_result.code == REQUEST_ADMISSION_CONTEXT_OVERFLOW);
+    TEST_ASSERT(wide_result.requested_output_tokens == UINT64_C(4294967296));
+    TEST_ASSERT(wide.requested_output_tokens == UINT64_C(4294967296));
+    TEST_ASSERT(wide.max_tokens_valid && wide.max_tokens_set);
+    TEST_ASSERT(wide.max_tokens == 0);
+    request_free(&wide);
 }
 
 static void test_live_server_request_lifecycle_call_sites(void) {
@@ -16125,6 +17970,10 @@ static void test_live_server_request_lifecycle_call_sites(void) {
         source, "static bool server_flush_final_visible(");
     char *emit_terminal = test_source_function(
         source, "static bool server_emit_native_terminal(");
+    char *buffered_begin = test_source_function(
+        source, "static bool server_buffered_terminal_begin(");
+    char *buffered_finish = test_source_function(
+        source, "static bool server_buffered_terminal_finish(");
     char *malformed = NULL;
     char *admission_reject = NULL;
     char *enqueue_cancel = NULL;
@@ -16230,18 +18079,16 @@ static void test_live_server_request_lifecycle_call_sites(void) {
                     generate, "server_session_sync(",
                     "ds4_runtime_request_mark_prefill_complete("));
 
-    /* Streaming flushes its final visible tail first.  Both streaming and
-     * buffered responses then cross the attributed request barrier; buffered
-     * responses mark imminent first emission at that point.  Only afterward
-     * may the immutable snapshot enter the native terminal builder. */
+    /* Streaming flushes its final visible tail first. Both forms then cross
+     * the attributed barrier. Buffered JSON sends its prefix through the first
+     * complete visible value after that barrier, publishes the successful send
+     * timestamp, freezes metrics, and only then appends the metrics suffix. */
     TEST_ASSERT(flush_visible != NULL &&
                 strstr(flush_visible, "server_job_runtime_finish(") == NULL &&
                 strstr(flush_visible,
                        "server_job_runtime_terminal_metrics(") == NULL &&
                 strstr(flush_visible, "server_emit_native_terminal(") == NULL &&
-                (strstr(flush_visible,
-                        "ds4_runtime_request_mark_first_visible_emitted(") != NULL ||
-                 strstr(flush_visible, "first_visible") != NULL));
+                strstr(flush_visible, "payload_emitted") != NULL);
     TEST_ASSERT(test_source_count(generate,
                                   "server_flush_final_visible(") == 1 &&
                 test_source_count(generate,
@@ -16253,6 +18100,10 @@ static void test_live_server_request_lifecycle_call_sites(void) {
                                   "server_job_runtime_terminal_metrics(") == 1 &&
                 test_source_count(generate,
                                   "server_emit_native_terminal(") == 1 &&
+                test_source_count(generate,
+                                  "server_buffered_terminal_begin(") == 1 &&
+                test_source_count(generate,
+                                  "server_buffered_terminal_finish(") == 1 &&
                 test_source_before(generate,
                                    "server_flush_final_visible(",
                                    "ds4_session_request_barrier(") &&
@@ -16264,11 +18115,11 @@ static void test_live_server_request_lifecycle_call_sites(void) {
                                    "server_job_runtime_terminal_metrics(") &&
                 test_source_before(generate,
                                    "server_job_runtime_terminal_metrics(",
-                                   "server_emit_native_terminal("));
+                                   "server_buffered_terminal_finish("));
 
-    /* generate_job has one protocol-independent terminal call.  The helper
-     * rejects NULL/invalid snapshots before sending and threads the same
-     * metrics value into every native stream/nonstream terminal builder. */
+    /* generate_job has centralized stream and buffered protocol-independent
+     * terminal seams. Metrics are validated once and threaded into every
+     * stream terminal or the one buffered suffix builder. */
     TEST_ASSERT(strstr(generate, "anthropic_sse_finish_live(") == NULL &&
                 strstr(generate, "openai_sse_finish_live(") == NULL &&
                 strstr(generate, "responses_sse_finish_live(") == NULL &&
@@ -16278,7 +18129,8 @@ static void test_live_server_request_lifecycle_call_sites(void) {
                 strstr(generate, "responses_final_response(") == NULL &&
                 strstr(generate, "final_response(") == NULL);
     TEST_ASSERT(emit_terminal != NULL &&
-                strstr(emit_terminal, "if (!metrics") != NULL &&
+                strstr(emit_terminal,
+                       "server_native_terminal_metrics_match(") != NULL &&
                 strstr(emit_terminal,
                        "ds4_runtime_request_metrics_json(") != NULL &&
                 test_source_call_contains(emit_terminal,
@@ -16293,21 +18145,31 @@ static void test_live_server_request_lifecycle_call_sites(void) {
                 test_source_call_contains(emit_terminal,
                                           "sse_chat_finish(", "metrics") &&
                 test_source_call_contains(emit_terminal,
-                                          "sse_done(", "metrics") &&
-                test_source_call_contains(emit_terminal,
-                                          "anthropic_final_response(",
-                                          "metrics") &&
-                test_source_call_contains(emit_terminal,
-                                          "responses_final_response(",
-                                          "metrics") &&
-                test_source_call_contains(emit_terminal,
-                                          "final_response(", "metrics"));
+                                          "sse_done(", "metrics"));
+    TEST_ASSERT(buffered_begin != NULL && buffered_finish != NULL &&
+                strstr(buffered_begin,
+                       "http_response_close_delimited_begin(") != NULL &&
+                strstr(buffered_begin, "first_payload_end") != NULL &&
+                strstr(buffered_begin, "payload_emitted") != NULL &&
+                strstr(buffered_begin,
+                       "append_anthropic_final_response_prefix(") != NULL &&
+                strstr(buffered_begin,
+                       "append_responses_final_response_prefix(") != NULL &&
+                strstr(buffered_begin,
+                       "append_openai_final_response_prefix(") != NULL &&
+                strstr(buffered_finish,
+                       "server_native_terminal_metrics_match(") != NULL &&
+                test_source_call_contains(buffered_finish,
+                                          "append_runtime_request_metrics_member(",
+                                          "metrics"));
 
 done:
     free(enqueue_cancel);
     free(admission_reject);
     free(malformed);
     free(emit_terminal);
+    free(buffered_finish);
+    free(buffered_begin);
     free(flush_visible);
     free(adopt);
     free(generate);
@@ -16772,7 +18634,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
                                           raw, strlen(raw), &calls,
-                                          "tool_calls", 8));
+                                          "tool_calls", 8, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16848,7 +18710,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
                                           raw_complete, strlen(raw_complete),
-                                          &calls, "tool_calls", 5));
+                                          &calls, "tool_calls", 5, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16968,7 +18830,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
                                        raw, strlen(raw), &calls,
-                                       "tool_calls", 10, 8));
+                                       "tool_calls", 10, 8, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -17111,7 +18973,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
         "We need to generate a title</think>Free disk space check";
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_title", &st,
                                        raw2, strlen(raw2), NULL,
-                                       "stop", 12, 8));
+                                       "stop", 12, 8, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -17184,7 +19046,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     TEST_ASSERT(!strncmp(calls.v[0].id, "call_", 5));
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
                                        raw_complete, strlen(raw_complete), &calls,
-                                       "tool_calls", 10, 4));
+                                       "tool_calls", 10, 4, NULL));
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -17254,7 +19116,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                        raw, strlen(raw), &calls,
-                                       "tool_calls", 10, 4));
+                                       "tool_calls", 10, 4, NULL));
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -17969,7 +19831,8 @@ static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     r.tool_orders = make_bash_order();
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
-    append_anthropic_content(&b, "done", "thinking text", &calls, "msg_1", &r.tool_orders);
+    append_anthropic_content(&b, "done", "thinking text", &calls, "msg_1",
+                             &r.tool_orders, NULL);
     const char *thinking = strstr(b.ptr, "\"type\":\"thinking\"");
     const char *text = strstr(b.ptr, "\"type\":\"text\"");
     const char *tool = strstr(b.ptr, "\"type\":\"tool_use\"");
@@ -20732,6 +22595,14 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_server_job_runtime_completed_lifecycle();
     test_server_job_runtime_pre_token_terminals();
+    test_server_runtime_separates_hidden_and_visible_tokens();
+    test_server_execution_failure_classification();
+    test_server_incremental_payload_marks_first_emission();
+    test_responses_terminal_reuses_stream_tool_item_ids();
+    test_server_buffered_terminal_records_actual_payload_boundary();
+    test_server_final_tool_flush_latches_partial_payload();
+    test_prepared_recoverable_error_emits_request_metrics();
+    test_laguna_prepared_rejection_retains_prompt_for_metrics();
     test_live_server_request_lifecycle_call_sites();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

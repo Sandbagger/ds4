@@ -109,7 +109,7 @@ class Task17OutputCeilingContractTest(unittest.TestCase):
 
     def test_think_tool_recovery_uses_the_worker_slot_session(self) -> None:
         recovery = function_body(
-            "static int chat_think_tool_recovery(server *s"
+            "static int chat_think_tool_recovery_attributed("
         )
         self.assertEqual(
             re.search(r"\bs->session\b", recovery),

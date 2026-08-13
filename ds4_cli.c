@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -1855,6 +1856,15 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.engine.qualification_plan_path = path;
             c.engine.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.engine.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.engine.qualification_control_fd =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -2104,6 +2114,10 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
     char qualification_argv_err[256];
     const int qualification_argv_rc = ds4_qualification_args_preflight(
         argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
@@ -2113,6 +2127,7 @@ int main(int argc, char **argv) {
         return qualification_argv_rc;
     }
     cli_config cfg = parse_options(argc, argv);
+    cfg.engine.runtime_build_info = ds4_build_info_get();
     cfg.engine.inspect_only = cfg.inspect;
     cfg.engine.first_token_test = cfg.gen.first_token_test;
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test ||

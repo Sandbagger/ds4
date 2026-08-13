@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
 
@@ -1198,6 +1199,7 @@ typedef struct {
     const char *regrade_trace_path;
     const char *case_sequence;
     ds4_backend backend;
+    int qualification_control_fd;
     int threads;
     int ctx_size;
     int max_tokens;
@@ -1228,6 +1230,7 @@ typedef struct {
     bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool qualification_plan_path_set;
+    bool qualification_control_fd_set;
     bool self_test_extractors;
 } eval_config;
 
@@ -1570,6 +1573,16 @@ static eval_config parse_options(int argc, char **argv) {
             }
             c.qualification_plan_path = path;
             c.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4-eval: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.qualification_control_fd =
+                parse_nonnegative_int_arg(
+                    need_arg(&i, argc, argv, arg), arg);
+            c.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -4162,6 +4175,10 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
 }
 
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
     char qualification_argv_err[256];
     const int qualification_argv_rc = ds4_qualification_args_preflight(
         argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
@@ -4173,7 +4190,10 @@ int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .runtime_build_info = ds4_build_info_get(),
         .qualification_plan_path = cfg.qualification_plan_path,
+        .qualification_control_fd = cfg.qualification_control_fd,
+        .qualification_control_fd_set = cfg.qualification_control_fd_set,
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,

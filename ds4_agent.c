@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -633,6 +634,15 @@ static agent_config parse_options(int argc, char **argv) {
             }
             c.engine.qualification_plan_path = path;
             c.engine.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.engine.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4-agent: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.engine.qualification_control_fd =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -11210,6 +11220,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
     char qualification_argv_err[256];
     const int qualification_argv_rc = ds4_qualification_args_preflight(
         argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
@@ -11219,6 +11233,7 @@ int main(int argc, char **argv) {
         return qualification_argv_rc;
     }
     agent_config cfg = parse_options(argc, argv);
+    cfg.engine.runtime_build_info = ds4_build_info_get();
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     if (cfg.engine.qualification_plan_path_set) {

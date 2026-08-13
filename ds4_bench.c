@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -36,6 +37,7 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     ds4_backend backend;
+    int qualification_control_fd;
     int threads;
     int ctx_start;
     int ctx_max;
@@ -60,6 +62,7 @@ typedef struct {
     bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool qualification_plan_path_set;
+    bool qualification_control_fd_set;
     bool cuda_tensor_parallel;
     bool show_output;
 } bench_config;
@@ -254,6 +257,15 @@ static bench_config parse_options(int argc, char **argv) {
             }
             c.qualification_plan_path = path;
             c.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.qualification_control_fd =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -599,6 +611,10 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
     char qualification_argv_err[256];
     const int qualification_argv_rc = ds4_qualification_args_preflight(
         argc, argv, DS4_QUALIFICATION_FRONTEND_BENCH,
@@ -617,7 +633,10 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .runtime_build_info = ds4_build_info_get(),
         .qualification_plan_path = cfg.qualification_plan_path,
+        .qualification_control_fd = cfg.qualification_control_fd,
+        .qualification_control_fd_set = cfg.qualification_control_fd_set,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,

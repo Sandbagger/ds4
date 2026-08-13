@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -12956,6 +12957,16 @@ static server_config parse_options(int argc, char **argv) {
             }
             c.engine.qualification_plan_path = path;
             c.engine.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.engine.qualification_control_fd_set) {
+                server_log(
+                    DS4_LOG_DEFAULT,
+                    "ds4-server: --qualification-control-fd may only be specified once");
+                exit(2);
+            }
+            c.engine.qualification_control_fd =
+                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -13194,6 +13205,10 @@ static void server_request_decode_stop(server *s) {
 }
 
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
     char qualification_argv_err[256];
     const int qualification_argv_rc = ds4_qualification_args_preflight(
         argc, argv, DS4_QUALIFICATION_FRONTEND_SERVER,
@@ -13211,6 +13226,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    cfg.engine.runtime_build_info = ds4_build_info_get();
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;

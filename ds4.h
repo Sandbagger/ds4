@@ -188,6 +188,7 @@ typedef struct {
     uint32_t load_layer_start;
     uint32_t load_layer_end;
     bool load_output;
+    const ds4_runtime_build_info *runtime_build_info;
     ds4_distributed_options distributed;
     ds4_tp_options tp;
     /* Qualification harness only: normal frontends never populate this. */

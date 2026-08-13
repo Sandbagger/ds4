@@ -31,7 +31,8 @@
 
 struct ds4_qualification_control {
     int fd;
-    uint32_t timeout_ms;
+    uint32_t barrier_timeout_ms;
+    uint32_t model_timeout_ms;
     uint64_t last_finished_sequence;
     uint64_t active_sequence;
     ds4_runtime_file_identity model_identity;
@@ -169,17 +170,18 @@ static int qualification_control_now_ms(uint64_t *out) {
 
 static int qualification_control_deadline(
         ds4_qualification_control *control,
+        uint32_t timeout_ms,
         uint64_t *deadline,
         char *err,
         size_t errcap) {
     uint64_t now = 0;
     if (!deadline || qualification_control_now_ms(&now) != 0 ||
-        UINT64_MAX - now < control->timeout_ms) {
+        UINT64_MAX - now < timeout_ms) {
         return qualification_control_fail(
             control, err, errcap,
             "cannot establish qualification control deadline");
     }
-    *deadline = now + control->timeout_ms;
+    *deadline = now + timeout_ms;
     return 0;
 }
 
@@ -311,7 +313,8 @@ static int qualification_control_send_message(
         size_t errcap) {
     uint64_t deadline = 0;
     if (qualification_control_deadline(
-            control, &deadline, err, errcap) != 0) {
+            control, control->barrier_timeout_ms,
+            &deadline, err, errcap) != 0) {
         return -1;
     }
 
@@ -407,11 +410,12 @@ static void qualification_control_close_received_rights(
 static int qualification_control_receive_message(
         ds4_qualification_control *control,
         ds4_qualification_control_message *message,
+        uint32_t timeout_ms,
         char *err,
         size_t errcap) {
     uint64_t deadline = 0;
     if (qualification_control_deadline(
-            control, &deadline, err, errcap) != 0) {
+            control, timeout_ms, &deadline, err, errcap) != 0) {
         return -1;
     }
     memset(message, 0, sizeof(*message));
@@ -497,7 +501,8 @@ static int qualification_control_exchange(
 
     ds4_qualification_control_message acknowledgement;
     if (qualification_control_receive_message(
-            control, &acknowledgement, err, errcap) != 0) {
+            control, &acknowledgement, control->barrier_timeout_ms,
+            err, errcap) != 0) {
         return -1;
     }
     if (acknowledgement.protocol_version !=
@@ -511,6 +516,34 @@ static int qualification_control_exchange(
         return qualification_control_fail(
             control, err, errcap,
             "qualification control received a mismatched acknowledgement");
+    }
+    return 0;
+}
+
+static int qualification_control_receive_model_fd_ack(
+        ds4_qualification_control *control,
+        const ds4_runtime_file_identity *expected_identity,
+        char *err,
+        size_t errcap) {
+    ds4_qualification_control_message acknowledgement;
+    if (qualification_control_receive_message(
+            control, &acknowledgement, control->model_timeout_ms,
+            err, errcap) != 0) {
+        return -1;
+    }
+    if (acknowledgement.protocol_version !=
+            DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION ||
+        acknowledgement.message_type !=
+            DS4_QUALIFICATION_CONTROL_MODEL_FD_ACK ||
+        acknowledgement.message_size != sizeof(acknowledgement) ||
+        acknowledgement.reserved != 0 ||
+        acknowledgement.checkpoint_sequence != 0 ||
+        !qualification_control_identity_equal(
+            &acknowledgement.model_identity, expected_identity)) {
+        return qualification_control_fail(
+            control, err, errcap,
+            "qualification control received a mismatched model descriptor "
+            "acknowledgement");
     }
     return 0;
 }
@@ -574,7 +607,8 @@ static int qualification_control_duplicate_cloexec(int fd) {
 int ds4_qualification_control_open(
         ds4_qualification_control **out,
         int inherited_fd,
-        uint32_t timeout_ms,
+        uint32_t barrier_timeout_ms,
+        uint32_t model_timeout_ms,
         char *err,
         size_t errcap) {
     if (err && errcap != 0) err[0] = '\0';
@@ -584,9 +618,12 @@ int ds4_qualification_control_open(
         return -1;
     }
     *out = NULL;
-    if (timeout_ms == 0) {
+    if (barrier_timeout_ms == 0 || model_timeout_ms == 0) {
         qualification_control_error(
-            err, errcap, "qualification control timeout must be nonzero");
+            err, errcap,
+            barrier_timeout_ms == 0
+                ? "qualification control barrier timeout must be nonzero"
+                : "qualification control model timeout must be nonzero");
         return -1;
     }
     if (qualification_control_validate_socket(
@@ -628,7 +665,8 @@ int ds4_qualification_control_open(
         return -1;
     }
     control->fd = duplicate;
-    control->timeout_ms = timeout_ms;
+    control->barrier_timeout_ms = barrier_timeout_ms;
+    control->model_timeout_ms = model_timeout_ms;
     *out = control;
     return 0;
 }
@@ -678,6 +716,10 @@ int ds4_qualification_control_send_model_fd(
     message.model_identity = observed;
     if (qualification_control_send_message(
             control, &message, model_fd, err, errcap) != 0) {
+        return -1;
+    }
+    if (qualification_control_receive_model_fd_ack(
+            control, &observed, err, errcap) != 0) {
         return -1;
     }
 

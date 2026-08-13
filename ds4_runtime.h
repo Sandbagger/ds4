@@ -378,6 +378,7 @@ typedef struct {
 enum {
     DS4_QUALIFICATION_CONTROL_PROTOCOL_VERSION = 1,
     DS4_QUALIFICATION_CONTROL_DEFAULT_TIMEOUT_MS = 30000,
+    DS4_QUALIFICATION_CONTROL_MODEL_TIMEOUT_MS = 900000,
 };
 
 typedef enum {
@@ -386,6 +387,7 @@ typedef enum {
     DS4_QUALIFICATION_CONTROL_SAMPLE_READY_ACK = 3,
     DS4_QUALIFICATION_CONTROL_SAMPLE_RESULT = 4,
     DS4_QUALIFICATION_CONTROL_SAMPLE_RESULT_ACK = 5,
+    DS4_QUALIFICATION_CONTROL_MODEL_FD_ACK = 6,
 } ds4_qualification_control_message_type;
 
 typedef struct {
@@ -400,17 +402,23 @@ typedef struct {
 typedef struct ds4_qualification_control ds4_qualification_control;
 
 /* Open owns a close-on-exec duplicate of inherited_fd and leaves the caller's
- * descriptor untouched.  Zero timeout is invalid.  Every protocol, I/O,
+ * descriptor untouched.  Both timeouts must be nonzero: barrier_timeout_ms
+ * bounds READY/RESULT exchanges, while model_timeout_ms allows descriptor
+ * hashing and cold preparation before MODEL_FD_ACK.  Every protocol, I/O,
  * timeout, or peer-disconnect error latches the control unsafe. */
 int ds4_qualification_control_open(
     ds4_qualification_control **out,
     int inherited_fd,
-    uint32_t timeout_ms,
+    uint32_t barrier_timeout_ms,
+    uint32_t model_timeout_ms,
     char *err,
     size_t errcap);
 
-/* Send exactly one retained opened-model descriptor in one SCM_RIGHTS record.
- * The identity is checked against fstat before it is placed on the wire. */
+/* Send exactly one retained opened-model descriptor in one SCM_RIGHTS record,
+ * then wait for a sequence-zero MODEL_FD_ACK carrying that exact identity.
+ * The descriptor identity is checked before send and again after the ACK;
+ * success therefore means the peer has accepted it before the caller can
+ * continue into model-dependent allocation. */
 int ds4_qualification_control_send_model_fd(
     ds4_qualification_control *control,
     int model_fd,

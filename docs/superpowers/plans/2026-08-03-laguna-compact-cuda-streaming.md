@@ -1033,15 +1033,15 @@ git commit -m "test: gate Laguna warm stability and session pressure"
 - Create: `tests/test_runtime_contract.py`
 - Modify: `Makefile`
 
-- [ ] **Step 1: Write RED schema-boundary tests**
+- [x] **Step 1: Write RED schema-boundary tests**
 
 Load all five schemas with Draft 2020-12 validation and assert their canonical `$id`/`schema` constants. Cover every required field, recursive `additionalProperties: false`, missing/null distinctions, sorted feature arrays, lowercase SHA-256, RFC 3339 timestamps, UUIDs, status enums, and stable rejection/error codes. For every uint64 decimal-string field, accept `0` and `18446744073709551615` and reject leading zeroes, signs, exponent/decimal notation, JSON numbers, and `18446744073709551616`. Token counts remain bounded JSON integers; rates remain finite JSON numbers.
 
-- [ ] **Step 2: Add canonical-JSON dependency and conformance tests**
+- [x] **Step 2: Add canonical-JSON dependency and conformance tests**
 
 Pin `jsonschema` and `rfc8785` versions in the qualification-only requirements file. Test the RFC 8785 implementation against the RFC's number/string/property-order vectors plus duplicate-key, non-finite-number, lone-surrogate, and unsigned UTF-8 path-order cases. DS4's C response serializers need valid JSON, but bundle canonicalization stays in the Python harness.
 
-- [ ] **Step 3: Observe RED**
+- [x] **Step 3: Observe RED**
 
 ```sh
 python3 tests/test_runtime_contract.py -v
@@ -1049,7 +1049,7 @@ python3 tests/test_runtime_contract.py -v
 
 Expected: missing schemas and dependency instructions.
 
-- [ ] **Step 4: Define exact closed schemas**
+- [x] **Step 4: Define exact closed schemas**
 
 Transcribe the approved wire contracts without optional catch-all objects:
 
@@ -1064,7 +1064,7 @@ Use the shared strict-parser/Draft-2020-12 profile for the two `x-ds4-*`
 keywords; raw Draft validation alone does not enforce exact JSON number kinds
 or lexically sorted feature arrays.
 
-- [ ] **Step 5: Make schema tests green and wire the target**
+- [x] **Step 5: Make schema tests green and wire the target**
 
 ```sh
 python3 tests/test_runtime_contract.py -v
@@ -1076,7 +1076,7 @@ make test-laguna-compact-contract
 
 Expected: all valid boundaries pass, all unknown/overflow/noncanonical cases fail, and each schema is independently valid.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```sh
 git add schemas/ds4-version-v1.schema.json schemas/ds4-runtime-v1.schema.json \

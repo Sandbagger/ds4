@@ -3138,6 +3138,9 @@ static void cuda_laguna_compact_pause_creating_if_armed(
 }
 #endif
 
+static void cuda_laguna_compact_counter_add(
+        uint64_t *counter, uint64_t amount);
+
 extern "C" int ds4_gpu_laguna_compact_create(
         ds4_gpu_laguna_compact **out,
         int model_fd,

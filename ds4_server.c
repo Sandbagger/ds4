@@ -16344,7 +16344,11 @@ int main(int argc, char **argv) {
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
-    cfg.engine.share_session_prefill_workspace = slot_count > 1;
+    /* Exact graph-cache accounting prices independent state for each of its
+       supported session slots.  Sharing the legacy prefill workspace would
+       violate that declaration and is rejected by the engine preflight. */
+    cfg.engine.share_session_prefill_workspace =
+        slot_count > 1 && !cfg.engine.ssd_streaming_cache_bytes_set;
     cfg.engine.session_slots = (uint32_t)slot_count;
     if (cfg.engine.qualification_plan_path_set) {
         if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {

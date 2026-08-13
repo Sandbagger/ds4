@@ -60709,8 +60709,8 @@ static int ds4_exact_graph_declaration_preflight(
             snprintf(err,
                      errcap,
                      "--ssd-streaming-cache-bytes does not support a shared "
-                     "prefill workspace on graph backends; exact one-session "
-                     "mode must not retain graph scratch between sessions");
+                     "prefill workspace on graph backends; exact per-session "
+                     "pricing must not alias graph scratch between sessions");
         }
         return 2;
     }

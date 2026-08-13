@@ -243,11 +243,24 @@ assert_reaches_model_open() {
     local name=$1
     local rc=$2
     if [ "$rc" -ne 0 ] &&
-       grep -qE "model file is too small|failed to open model|another ds4 process" "$LOG" &&
+       grep -qE "model file is too small|failed to open model|another ds4 process|working-set limit is unavailable|--ssd-streaming-cache-bytes is unsafe: requested" "$LOG" &&
        ! grep -qE "unknown option|must be canonical|cannot be combined|conflicts with" "$LOG"; then
         ok "$name"
     else
         fail "$name (canonical option did not reach model open, got $rc)"
+        sed -n '1,12p' "$LOG" | sed 's/^/    /'
+    fi
+}
+
+assert_exact_server_slots_reach_runtime() {
+    local name=$1
+    local rc=$2
+    if [ "$rc" -ne 0 ] &&
+       ! grep -qE "shared prefill workspace|requires one or two declared graph session slots" "$LOG" &&
+       grep -qE "model file is too small|failed to open model|another ds4 process|working-set limit is unavailable|--ssd-streaming-cache-bytes is unsafe: requested" "$LOG"; then
+        ok "$name"
+    else
+        fail "$name (exact session declaration was refused, got $rc)"
         sed -n '1,12p' "$LOG" | sed 's/^/    /'
     fi
 }
@@ -322,9 +335,9 @@ if [ -x ./ds4 ]; then
         "--ssd-streaming-cache-bytes is impossible" "$rc"
 fi
 
-# 10: exact graph-cache pricing requires a declared context, and this first
-# qualified compact profile is deliberately single-session until Task 5/14
-# account for concurrent graph/KV state.
+# 10: exact graph-cache pricing requires a declared context. The compact
+# profile prices one or two independent graph/KV sessions; unlike the legacy
+# cache path it must not turn on the server's shared prefill workspace.
 if [ -x ./ds4-eval ]; then
     run_inference_option ds4-eval ./ds4-eval \
         --cuda --ssd-streaming --ssd-streaming-cache-bytes 8589934592
@@ -352,7 +365,7 @@ if [ -x ./ds4-server ]; then
     if [ "$rc" -ne 0 ] &&
        ! grep -q -- "shared prefill workspace" "$LOG" &&
        ! grep -q -- "--session-slots 1" "$LOG" &&
-       grep -qE "model file is too small|failed to open model|another ds4 process|working-set limit is unavailable" "$LOG"; then
+       grep -qE "model file is too small|failed to open model|another ds4 process|working-set limit is unavailable|--ssd-streaming-cache-bytes is unsafe: requested" "$LOG"; then
         ok "ds4-server exact graph cache accepts one declared session"
     else
         fail "ds4-server exact one-session declaration was refused (got $rc)"
@@ -360,20 +373,26 @@ if [ -x ./ds4-server ]; then
     fi
 
     run_inference_option ds4-server ./ds4-server \
-        --cuda --session-slots 2 \
+        --cuda --ctx 32768 --prefill-chunk 4096 --session-slots 2 \
         --ssd-streaming --ssd-streaming-cache-bytes 8589934592
     rc=$?
-    assert_before_model_open \
-        "ds4-server exact graph cache rejects multiple session slots" \
-        "--session-slots" "$rc"
+    assert_exact_server_slots_reach_runtime \
+        "ds4-server exact graph cache accepts two independent session slots" "$rc"
 
     run_inference_option ds4-server ./ds4-server \
-        --cuda --batched-session 2 \
+        --cuda --ctx 32768 --prefill-chunk 4096 --batched-session 2 \
+        --ssd-streaming --ssd-streaming-cache-bytes 8589934592
+    rc=$?
+    assert_exact_server_slots_reach_runtime \
+        "ds4-server exact graph cache accepts legacy two-session alias" "$rc"
+
+    run_inference_option ds4-server ./ds4-server \
+        --cuda --ctx 32768 --prefill-chunk 4096 --session-slots 3 \
         --ssd-streaming --ssd-streaming-cache-bytes 8589934592
     rc=$?
     assert_before_model_open \
-        "ds4-server exact graph cache rejects legacy multi-session alias" \
-        "--session-slots" "$rc"
+        "ds4-server exact graph cache rejects three session slots" \
+        "requires one or two declared graph session slots" "$rc"
 
     run_inference_option ds4-server ./ds4-server \
         --cuda --session-slots 2 \

@@ -26,6 +26,9 @@ LAGUNA_MODEL_TEST = (ROOT / "tests/test_cuda_laguna_model.c").read_text(
 LAGUNA_STREAM_TEST = (ROOT / "tests/test_cuda_laguna_stream.c").read_text(
     encoding="utf-8"
 )
+COMPACT_RUNTIME_REQUIREMENTS = (
+    ROOT / "gguf-tools/quality-testing/requirements-compact-runtime.txt"
+).read_text(encoding="utf-8")
 LAGUNA_KERNEL_TEST = (ROOT / "tests/test_cuda_laguna_kernels.c").read_text(
     encoding="utf-8"
 )
@@ -433,6 +436,50 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_compact_runtime_contract_has_pinned_standalone_target(self) -> None:
+        requirements = [
+            line
+            for raw_line in COMPACT_RUNTIME_REQUIREMENTS.splitlines()
+            if (line := raw_line.strip()) and not line.startswith("#")
+        ]
+        self.assertEqual(
+            requirements,
+            ["jsonschema==4.25.1", "rfc8785==0.1.4"],
+            "wire-schema validation and RFC 8785 canonicalization must use "
+            "the qualification-only pinned runtime",
+        )
+
+        self.assertIn(
+            "test-laguna-compact-contract",
+            rule_prerequisites(".PHONY").split(),
+        )
+        self.assertRegex(
+            MAKEFILE,
+            r"(?m)^test-laguna-compact-contract:$",
+            "the standalone contract target must not acquire build artifacts",
+        )
+        self.assertNotIn(
+            "test-laguna-compact-contract",
+            rule_prerequisites("test").split(),
+            "Task 18 owns aggregate gating for the new contract suite",
+        )
+        self.assertEqual(
+            rule_recipe_lines("test-laguna-compact-contract"),
+            [
+                "\t@command -v uv >/dev/null 2>&1 || { \\",
+                "\t\techo \"error: test-laguna-compact-contract requires uv\" >&2; \\",
+                "\t\texit 127; \\",
+                "\t}",
+                "\t@uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \\",
+                "\t\tpython -c 'from jsonschema import Draft202012Validator; import rfc8785' || { \\",
+                "\t\techo \"error: unable to provision pinned compact-runtime requirements with uv\" >&2; \\",
+                "\t\texit 1; \\",
+                "\t}",
+                "\tuv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \\",
+                "\t\tpython tests/test_runtime_contract.py -v",
+            ],
+        )
+
     def test_score_official_compiles_c_before_cuda_link(self) -> None:
         object_rule = (
             "gguf-tools/quality-testing/score_official.o: "

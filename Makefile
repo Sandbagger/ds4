@@ -51,7 +51,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-metal-session-batch test-session-logits-only-policy test-laguna-stream test-laguna-plan test-runtime test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) -I. -c -o $@ $<
@@ -602,6 +602,19 @@ test-laguna-compact-python:
 	}
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python gguf-tools/quality-testing/test_compact_runtime_qualify.py -v
+
+test-laguna-compact-contract:
+	@command -v uv >/dev/null 2>&1 || { \
+		echo "error: test-laguna-compact-contract requires uv" >&2; \
+		exit 127; \
+	}
+	@uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python -c 'from jsonschema import Draft202012Validator; import rfc8785' || { \
+		echo "error: unable to provision pinned compact-runtime requirements with uv" >&2; \
+		exit 1; \
+	}
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python tests/test_runtime_contract.py -v
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \

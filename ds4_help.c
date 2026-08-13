@@ -146,6 +146,7 @@ static const char *tool_summary(ds4_help_tool tool) {
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
+    opt(fp, c, "--version-json", "Print closed build identity JSON and exit before loading a model.");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");

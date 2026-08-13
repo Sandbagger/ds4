@@ -169,6 +169,11 @@ class VersionJsonSourceContractTest(unittest.TestCase):
             "the recursive ROCm build must select the ROCm-stamped object",
         )
 
+    def test_public_help_names_version_identity_but_not_private_control(self) -> None:
+        help_source = (ROOT / "ds4_help.c").read_text(encoding="utf-8")
+        self.assertIn('"--version-json"', help_source)
+        self.assertNotIn('"--qualification-control-fd"', help_source)
+
     def test_backend_specific_build_info_objects_have_exact_compile_facts(self) -> None:
         expected = {
             "ds4_build_info.o": {"metal", "cuda"},

@@ -3910,6 +3910,24 @@ class CudaBuildContractTest(unittest.TestCase):
             make_sentinel, make_rendered.stdout + make_rendered.stderr
         )
 
+    def test_compact_create_declares_counter_helper_before_first_use(self) -> None:
+        declaration = (
+            "static void cuda_laguna_compact_counter_add(\n"
+            "        uint64_t *counter, uint64_t amount);"
+        )
+        first_use = CUDA_SOURCE.find(
+            "cuda_laguna_compact_counter_add(\n"
+            "            &ctx->host_to_device_ns"
+        )
+        declaration_at = CUDA_SOURCE.find(declaration)
+        definition_at = CUDA_SOURCE.find(
+            "static void cuda_laguna_compact_counter_add(\n"
+            "        uint64_t *counter, uint64_t amount) {"
+        )
+        self.assertGreaterEqual(declaration_at, 0)
+        self.assertLess(declaration_at, first_use)
+        self.assertGreater(definition_at, first_use)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -441,6 +441,12 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Operation-scoped request attribution.  The context is borrowed only for the
+ * synchronous call and is never retained by the session or backend. */
+int ds4_session_sync_attributed(
+        ds4_session *s, const ds4_tokens *prompt,
+        ds4_runtime_request_context *request,
+        char *err, size_t errlen);
 /* Synchronize a prompt for logits inspection. Prompts shorter than the
  * context use ordinary sync. Exact-context success is restricted to local
  * Laguna CUDA and permanently makes the session logits-only terminal. */
@@ -711,23 +717,46 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_attributed(
+        ds4_session *s, int token,
+        ds4_runtime_request_context *request,
+        char *err, size_t errlen);
 
 typedef struct {
     ds4_session *session;
     int token;
 } ds4_decode_item;
 
+typedef struct {
+    ds4_session *session;
+    int token;
+    ds4_runtime_request_context *request;
+} ds4_attributed_decode_item;
+
 /* Advance independent sessions by one token each. Batch size one is exactly
  * ds4_session_eval(). Backends without native batching use a correctness-first
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+int ds4_sessions_eval_batch_attributed(
+        ds4_attributed_decode_item *items, int count,
+        char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */
 int ds4_sessions_eval_batch_with_prefill(
         ds4_decode_item *items, int count,
         ds4_session *prefill_session, const ds4_tokens *prefill_prompt,
+        char *err, size_t errlen);
+int ds4_sessions_eval_batch_with_prefill_attributed(
+        ds4_attributed_decode_item *items, int count,
+        ds4_session *prefill_session, const ds4_tokens *prefill_prompt,
+        ds4_runtime_request_context *prefill_request,
+        char *err, size_t errlen);
+/* Complete any request-owned compact work and publish the request's final
+ * page-advice milestone.  No request pointer survives this call. */
+int ds4_session_request_barrier(
+        ds4_session *s, ds4_runtime_request_context *request,
         char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,

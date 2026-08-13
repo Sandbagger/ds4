@@ -64813,7 +64813,13 @@ static int ds4_session_sync_internal(ds4_session *s,
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
-int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+int ds4_session_sync_attributed(
+        ds4_session *s,
+        const ds4_tokens *prompt,
+        ds4_runtime_request_context *request,
+        char *err,
+        size_t errlen) {
+    (void)request;
     if (ds4_session_is_logits_only_terminal(s)) {
         return ds4_session_terminal_error(err, errlen);
     }
@@ -64872,6 +64878,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
     }
     return rc;
+}
+
+int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt,
+                     char *err, size_t errlen) {
+    return ds4_session_sync_attributed(s, prompt, NULL, err, errlen);
 }
 
 int ds4_session_sync_logits_only(
@@ -66908,7 +66919,13 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
-int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+int ds4_session_eval_attributed(
+        ds4_session *s,
+        int token,
+        ds4_runtime_request_context *request,
+        char *err,
+        size_t errlen) {
+    (void)request;
     if (ds4_session_is_logits_only_terminal(s)) {
         return ds4_session_terminal_error(err, errlen);
     }
@@ -66919,6 +66936,10 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     }
 #endif
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+}
+
+int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    return ds4_session_eval_attributed(s, token, NULL, err, errlen);
 }
 
 #ifndef DS4_NO_GPU
@@ -67765,6 +67786,25 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     return 0;
 }
 
+int ds4_sessions_eval_batch_attributed(
+        ds4_attributed_decode_item *items,
+        int count,
+        char *err,
+        size_t errlen) {
+    if (!items || count <= 0) {
+        if (err && errlen) snprintf(err, errlen, "empty attributed decode batch");
+        return 1;
+    }
+    ds4_decode_item *plain = xmalloc((size_t)count * sizeof(*plain));
+    for (int i = 0; i < count; i++) {
+        plain[i].session = items[i].session;
+        plain[i].token = items[i].token;
+    }
+    const int rc = ds4_sessions_eval_batch(plain, count, err, errlen);
+    free(plain);
+    return rc;
+}
+
 int ds4_sessions_eval_batch_with_prefill(
         ds4_decode_item *items,
         int count,
@@ -67837,6 +67877,52 @@ int ds4_sessions_eval_batch_with_prefill(
     rc = ds4_sessions_eval_batch(items, count, err, errlen);
     if (rc != 0) ds4_session_invalidate(prefill_session);
     return rc;
+}
+
+int ds4_sessions_eval_batch_with_prefill_attributed(
+        ds4_attributed_decode_item *items,
+        int count,
+        ds4_session *prefill_session,
+        const ds4_tokens *prefill_prompt,
+        ds4_runtime_request_context *prefill_request,
+        char *err,
+        size_t errlen) {
+    if (!items || count <= 0) {
+        if (err && errlen) snprintf(err, errlen, "empty attributed mixed batch");
+        return 1;
+    }
+    ds4_decode_item *plain = xmalloc((size_t)count * sizeof(*plain));
+    for (int i = 0; i < count; i++) {
+        plain[i].session = items[i].session;
+        plain[i].token = items[i].token;
+    }
+    (void)prefill_request;
+    const int rc = ds4_sessions_eval_batch_with_prefill(
+        plain, count, prefill_session, prefill_prompt, err, errlen);
+    free(plain);
+    return rc;
+}
+
+int ds4_session_request_barrier(
+        ds4_session *s,
+        ds4_runtime_request_context *request,
+        char *err,
+        size_t errlen) {
+    if (!s || !request) {
+        if (err && errlen) snprintf(err, errlen, "missing session or request context");
+        return 1;
+    }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (s->engine && s->engine->laguna_compact) {
+        const ds4_gpu_laguna_exec_result result =
+            ds4_gpu_laguna_compact_finish_graph(s->engine->laguna_compact);
+        if (result != DS4_GPU_LAGUNA_EXEC_SUCCESS) {
+            if (err && errlen) snprintf(err, errlen, "compact request barrier failed");
+            return 1;
+        }
+    }
+#endif
+    return 0;
 }
 
 #ifndef DS4_NO_GPU

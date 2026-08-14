@@ -99,6 +99,59 @@ def _function_body(source: str, signature: str) -> str:
 
 
 class Task18CudaFaultBuildContract(unittest.TestCase):
+    def test_host_source_contract_is_in_the_model_free_cuda_build_gate(self) -> None:
+        recipe = _recipe("test-cuda-build-contract")
+        self.assertTrue(recipe, "missing normal model-free CUDA build gate")
+        self.assertIn(
+            "test-cuda-build-contract",
+            _rule_prerequisites("test"),
+            "the CUDA build contract is not part of the normal host test gate",
+        )
+        self.assertNotIn(
+            "DS4_TEST_MODEL",
+            recipe,
+            "the normal CUDA build contract must remain model-free",
+        )
+        self.assertIn(
+            "tests/test_task18_cuda_failure_source_contract.py",
+            recipe,
+            "test-cuda-build-contract does not run the Task 18 host source contract",
+        )
+
+    def test_live_fault_contract_has_an_explicit_target_outside_make_test(self) -> None:
+        target = "test-cuda-task18-server-failures"
+        prerequisites = _rule_prerequisites(target)
+        recipe = _recipe(target)
+        self.assertTrue(
+            prerequisites or recipe,
+            f"missing dedicated {target} target",
+        )
+        self.assertIn(
+            "ds4-server-test-hooks",
+            prerequisites,
+            f"{target} does not build the hooked production server",
+        )
+        self.assertIn(
+            "tests/test_task18_cuda_failure_contract.py",
+            recipe,
+            f"{target} does not run the physical CUDA/HTTP fault contract",
+        )
+        self.assertIn(
+            "--server ./ds4-server-test-hooks",
+            recipe,
+            f"{target} does not run against the hooked production server",
+        )
+        self.assertIn(
+            "DS4_TEST_MODEL",
+            recipe,
+            f"{target} does not expose its model-backed input explicitly",
+        )
+        self.assertNotIn(
+            target,
+            " ".join(_rule_prerequisites("test")) + "\n" + _recipe("test"),
+            "the model-backed Task 18 target must not be pulled into make test",
+        )
+
     def test_dedicated_hook_server_links_production_main_and_hooked_cuda(self) -> None:
         target = "ds4-server-test-hooks"
         prerequisites = _rule_prerequisites(target)

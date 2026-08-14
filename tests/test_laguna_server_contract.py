@@ -80,6 +80,22 @@ SNAPSHOT_KEYS = {
     "disk_cache_lru_fingerprint",
 }
 REQUEST_METRICS_SCHEMA = "ds4.runtime.request/v1"
+PROTOCOL_VALIDATION_KEYS = {
+    "http_status",
+    "code",
+    "tools_enabled",
+    "normalized_model",
+    "mutation_fingerprint_before",
+    "mutation_fingerprint_after",
+}
+ACCEPTED_MODEL_ALIASES = (
+    "laguna-s-2.1",
+    "laguna-s-2.1-chat",
+    "laguna-s-2.1-no-think",
+    "laguna-s-2.1-nothink",
+    "laguna-s-2.1-reasoner",
+    "poolside/laguna-s-2.1",
+)
 REQUEST_METRICS_KEYS = {
     "schema",
     "request_id",
@@ -214,6 +230,70 @@ def _chat_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
+def _protocol_body(
+    protocol: str,
+    *,
+    model: str = INPUT_MODEL,
+    tool_choice: str = "auto",
+    stream: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    parameters = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    }
+    if protocol == "openai_chat":
+        return "/v1/chat/completions", _chat_body(
+            model=model,
+            tool_choice=tool_choice,
+            max_tokens=8,
+            stream=stream,
+        )
+    if protocol == "responses":
+        return "/v1/responses", {
+            "model": model,
+            "input": [
+                {"role": "user", "content": "What is the weather in Brussels?"}
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Return the current weather for a city.",
+                    "parameters": parameters,
+                }
+            ],
+            "tool_choice": tool_choice,
+            "max_output_tokens": 8,
+            "stream": stream,
+        }
+    if protocol == "anthropic":
+        anthropic_choice = {
+            "auto": "auto",
+            "none": "none",
+            # Anthropic's `any` is the protocol-native required-tool mode.
+            "required": "any",
+        }[tool_choice]
+        return "/v1/messages", {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "What is the weather in Brussels?"}
+            ],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Return the current weather for a city.",
+                    "input_schema": parameters,
+                }
+            ],
+            "tool_choice": {"type": anthropic_choice},
+            "max_tokens": 8,
+            "stream": stream,
+        }
+    raise AssertionError(f"unknown protocol fixture: {protocol}")
+
+
 class Driver:
     def __init__(self, executable: Path) -> None:
         self.executable = executable
@@ -295,6 +375,48 @@ class Driver:
         if not isinstance(wire, str) or not wire:
             raise AssertionError("protocol metrics wire must be a non-empty string")
         return protocol_request_id, wire
+
+    def protocol_validate(
+        self, path: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = self.rpc(
+            {
+                "op": "protocol_validate",
+                "method": "POST",
+                "path": path,
+                "body": body,
+            }
+        )
+        if set(response) != PROTOCOL_VALIDATION_KEYS:
+            raise AssertionError(
+                "unexpected protocol-validation driver response: "
+                + repr(response)
+            )
+        if type(response["http_status"]) is not int:
+            raise AssertionError("protocol-validation status must be an integer")
+        if response["code"] is not None and not isinstance(
+            response["code"], str
+        ):
+            raise AssertionError("protocol-validation code must be null or a string")
+        if type(response["tools_enabled"]) is not bool:
+            raise AssertionError(
+                "protocol-validation tools_enabled must be a boolean"
+            )
+        if response["normalized_model"] is not None and not isinstance(
+            response["normalized_model"], str
+        ):
+            raise AssertionError(
+                "protocol-validation normalized_model must be null or a string"
+            )
+        for key in (
+            "mutation_fingerprint_before",
+            "mutation_fingerprint_after",
+        ):
+            if not isinstance(response[key], str) or not response[key]:
+                raise AssertionError(
+                    f"protocol-validation {key} must be a non-empty string"
+                )
+        return response
 
     def _raise_missing_seam(self) -> None:
         self.proc.wait(timeout=5)
@@ -1103,6 +1225,131 @@ class AdmissionContract(unittest.TestCase):
                 self.assertEqual(inference, admission)
 
 
+class ProtocolValidationContract(unittest.TestCase):
+    """Freeze protocol validation before any session or replay mutation.
+
+    This is deliberately narrower than stream/non-stream output equivalence.
+    It exercises only the production protocol parsers' semantic validation and
+    normalization boundary through a host-only driver operation.
+    """
+
+    driver: Driver
+    protocols = ("openai_chat", "responses", "anthropic")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if SELECTED_CASES and "protocol" not in SELECTED_CASES:
+            raise unittest.SkipTest("protocol validation contract not selected")
+        cls.driver = Driver(SERVER)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if hasattr(cls, "driver"):
+            cls.driver.close()
+
+    def validate(
+        self,
+        protocol: str,
+        *,
+        model: str = INPUT_MODEL,
+        tool_choice: str = "auto",
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        path, body = _protocol_body(
+            protocol,
+            model=model,
+            tool_choice=tool_choice,
+            stream=stream,
+        )
+        return self.driver.protocol_validate(path, body)
+
+    def assert_accepted(
+        self, result: dict[str, Any], *, tools_enabled: bool
+    ) -> None:
+        self.assertEqual(result["http_status"], 200)
+        self.assertIsNone(result["code"])
+        self.assertIs(result["tools_enabled"], tools_enabled)
+        self.assertEqual(result["normalized_model"], MODEL)
+
+    def assert_rejected(
+        self,
+        result: dict[str, Any],
+        *,
+        code: str,
+        normalized_model: str | None,
+    ) -> None:
+        self.assertEqual(result["http_status"], 400)
+        self.assertEqual(result["code"], code)
+        self.assertIs(result["tools_enabled"], False)
+        self.assertEqual(result["normalized_model"], normalized_model)
+        self.assertEqual(
+            result["mutation_fingerprint_after"],
+            result["mutation_fingerprint_before"],
+            "protocol rejection mutated session, replay, or cache state",
+        )
+
+    def test_auto_and_none_are_supported_for_both_stream_modes(self) -> None:
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                for stream in (False, True):
+                    self.assert_accepted(
+                        self.validate(
+                            protocol, tool_choice="auto", stream=stream
+                        ),
+                        tools_enabled=True,
+                    )
+                    self.assert_accepted(
+                        self.validate(
+                            protocol, tool_choice="none", stream=stream
+                        ),
+                        tools_enabled=False,
+                    )
+
+    def test_required_is_stably_rejected_for_both_stream_modes(self) -> None:
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                for stream in (False, True):
+                    self.assert_rejected(
+                        self.validate(
+                            protocol, tool_choice="required", stream=stream
+                        ),
+                        code="unsupported_tool_choice",
+                        normalized_model=MODEL,
+                    )
+
+    def test_wrong_model_family_is_stably_rejected_for_both_stream_modes(
+        self,
+    ) -> None:
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                for stream in (False, True):
+                    self.assert_rejected(
+                        self.validate(
+                            protocol,
+                            model="deepseek-v4-flash",
+                            tool_choice="auto",
+                            stream=stream,
+                        ),
+                        code="model_mismatch",
+                        normalized_model=None,
+                    )
+
+    def test_laguna_model_aliases_normalize_for_every_protocol(self) -> None:
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                for alias in ACCEPTED_MODEL_ALIASES:
+                    for stream in (False, True):
+                        self.assert_accepted(
+                            self.validate(
+                                protocol,
+                                model=alias,
+                                tool_choice="auto",
+                                stream=stream,
+                            ),
+                            tools_enabled=True,
+                        )
+
+
 class MetricsContract(unittest.TestCase):
     """Freeze request metrics placement without requiring a model or GPU.
 
@@ -1393,7 +1640,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--case",
         action="append",
-        choices=("admission", "metrics"),
+        choices=("admission", "metrics", "protocol"),
         default=[],
         help="contract group to run (default: all)",
     )

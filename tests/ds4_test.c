@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_plan_io.h"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -7015,12 +7016,20 @@ static void test_server_unit_group(void) {
 
 /* Host-only NDJSON seam for the Laguna request-preparation contract.  The
  * actual parse/render/admit operation is supplied by ds4_server.c above; this
- * driver owns only transport plus deliberately inert state fingerprints. */
+ * driver owns transport and a seeded production server-state fixture. */
 typedef struct {
     char *op;
     char *method;
     char *path;
     char *body;
+    char *protocol;
+    char *fixture;
+    char *raw_output;
+    char *metrics_fixture;
+    stop_list tool_call_ids;
+    bool tool_call_ids_set;
+    bool stream;
+    bool stream_set;
     char *call_id;
     char *name;
     char *arguments;
@@ -7036,6 +7045,9 @@ typedef struct {
     buf tool_memory_records;
     buf disk_cache_records;
     FILE *disk_fixture;
+    server parser_server;
+    server_slot parser_slots[1];
+    bool parser_server_initialized;
 } test_server_driver;
 
 typedef enum {
@@ -7064,17 +7076,84 @@ typedef struct {
     bool include_usage;
 } test_metrics_request;
 
+typedef struct {
+    char *fixture_id;
+    char *slot_state;
+    int generation;
+    int pin_count;
+    char *capacity_reserved_bytes;
+    bool published;
+    bool key_present;
+    int key_layer_id;
+    int key_expert_id;
+} test_failure_fixture;
+
+typedef struct {
+    char *typed_outcome;
+    bool headers_sent;
+    char *error_text;
+    char *fixture_fingerprint;
+    test_failure_fixture fixture;
+} test_failure_boundary_request;
+
+#define TEST_PROTOCOL_MUTATION_PROBE_ID \
+    "call_task18_protocol_validation_probe"
+#define TEST_PROTOCOL_CONTINUATION_CALL_ID "call_continuation_fixture"
+#define TEST_PROTOCOL_ANTHROPIC_CONTINUATION_CALL_ID \
+    "toolu_continuation_fixture"
+#define TEST_PROTOCOL_SEEDED_DSML \
+    "<｜DSML｜tool_calls>\n" \
+    "<｜DSML｜invoke name=\"get_weather\">\n" \
+    "<｜DSML｜parameter name=\"city\" string=\"true\">" \
+    "Brussels</｜DSML｜parameter>\n" \
+    "</｜DSML｜invoke>\n" \
+    "</｜DSML｜tool_calls>"
+
 static void test_server_rpc_free(test_server_rpc *rpc) {
     if (!rpc) return;
     free(rpc->op);
     free(rpc->method);
     free(rpc->path);
     free(rpc->body);
+    free(rpc->protocol);
+    free(rpc->fixture);
+    free(rpc->raw_output);
+    free(rpc->metrics_fixture);
+    id_list_free(&rpc->tool_call_ids);
     free(rpc->call_id);
     free(rpc->name);
     free(rpc->arguments);
     free(rpc->sampled_text);
     memset(rpc, 0, sizeof(*rpc));
+}
+
+static bool test_server_rpc_string_array(const char **p, stop_list *values) {
+    if (!p || !*p || !values) return false;
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        char *value = NULL;
+        if (!json_string(p, &value) || !value[0]) {
+            free(value);
+            return false;
+        }
+        stop_list_push(values, value);
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        if (**p != ',') return false;
+        (*p)++;
+        json_ws(p);
+        if (**p == ']') return false;
+    }
 }
 
 static bool test_server_rpc_parse(const char *line, test_server_rpc *rpc) {
@@ -7097,12 +7176,22 @@ static bool test_server_rpc_parse(const char *line, test_server_rpc *rpc) {
 
         char **string_slot = NULL;
         bool raw_value = false;
+        bool stream_value = false;
+        bool tool_call_ids_value = false;
         if (!strcmp(key, "op")) string_slot = &rpc->op;
         else if (!strcmp(key, "method")) string_slot = &rpc->method;
         else if (!strcmp(key, "path")) string_slot = &rpc->path;
         else if (!strcmp(key, "body")) {
             string_slot = &rpc->body;
             raw_value = true;
+        } else if (!strcmp(key, "protocol")) {
+            string_slot = &rpc->protocol;
+        } else if (!strcmp(key, "fixture")) {
+            string_slot = &rpc->fixture;
+        } else if (!strcmp(key, "raw_output")) {
+            string_slot = &rpc->raw_output;
+        } else if (!strcmp(key, "metrics_fixture")) {
+            string_slot = &rpc->metrics_fixture;
         } else if (!strcmp(key, "call_id")) string_slot = &rpc->call_id;
         else if (!strcmp(key, "name")) string_slot = &rpc->name;
         else if (!strcmp(key, "arguments")) {
@@ -7110,7 +7199,8 @@ static bool test_server_rpc_parse(const char *line, test_server_rpc *rpc) {
             raw_value = true;
         } else if (!strcmp(key, "sampled_text")) {
             string_slot = &rpc->sampled_text;
-        }
+        } else if (!strcmp(key, "stream")) stream_value = true;
+        else if (!strcmp(key, "tool_call_ids")) tool_call_ids_value = true;
         free(key);
 
         if (string_slot) {
@@ -7122,6 +7212,15 @@ static bool test_server_rpc_parse(const char *line, test_server_rpc *rpc) {
                 goto fail;
             }
             *string_slot = value;
+        } else if (stream_value) {
+            if (rpc->stream_set || !json_bool(&p, &rpc->stream)) goto fail;
+            rpc->stream_set = true;
+        } else if (tool_call_ids_value) {
+            if (rpc->tool_call_ids_set ||
+                !test_server_rpc_string_array(&p, &rpc->tool_call_ids)) {
+                goto fail;
+            }
+            rpc->tool_call_ids_set = true;
         } else if (!json_skip_value(&p)) {
             goto fail;
         }
@@ -7297,6 +7396,353 @@ static bool test_metrics_request_parse(const char *json,
     return true;
 }
 
+static void test_failure_fixture_free(test_failure_fixture *fixture) {
+    if (!fixture) return;
+    free(fixture->fixture_id);
+    free(fixture->slot_state);
+    free(fixture->capacity_reserved_bytes);
+    memset(fixture, 0, sizeof(*fixture));
+}
+
+static void test_failure_boundary_request_free(
+        test_failure_boundary_request *request) {
+    if (!request) return;
+    free(request->typed_outcome);
+    free(request->error_text);
+    free(request->fixture_fingerprint);
+    test_failure_fixture_free(&request->fixture);
+    memset(request, 0, sizeof(*request));
+}
+
+static bool test_json_nonnegative_int(const char **p, int *out) {
+    uint64_t value = 0;
+    if (!json_exact_u64(p, &value) || value > (uint64_t)INT_MAX) {
+        return false;
+    }
+    *out = (int)value;
+    return true;
+}
+
+static bool test_failure_key_parse(const char **p,
+                                   test_failure_fixture *fixture) {
+    if (!p || !*p || !fixture) return false;
+    json_ws(p);
+    if (*(*p)++ != '{') return false;
+    bool got_layer_id = false;
+    bool got_expert_id = false;
+
+    json_ws(p);
+    if (**p == '}') return false;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (*(*p)++ != ':') {
+            free(key);
+            return false;
+        }
+
+        bool valid = true;
+        if (!strcmp(key, "layer_id") && !got_layer_id) {
+            valid = test_json_nonnegative_int(p, &fixture->key_layer_id);
+            got_layer_id = true;
+        } else if (!strcmp(key, "expert_id") && !got_expert_id) {
+            valid = test_json_nonnegative_int(p, &fixture->key_expert_id);
+            got_expert_id = true;
+        } else {
+            valid = false;
+        }
+        free(key);
+        if (!valid) return false;
+
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            break;
+        }
+        if (*(*p)++ != ',') return false;
+        json_ws(p);
+        if (**p == '}') return false;
+    }
+    fixture->key_present = got_layer_id && got_expert_id;
+    return fixture->key_present;
+}
+
+static bool test_failure_fixture_parse(const char **p,
+                                       test_failure_fixture *fixture) {
+    if (!p || !*p || !fixture) return false;
+    memset(fixture, 0, sizeof(*fixture));
+    bool got_fixture_id = false;
+    bool got_slot_state = false;
+    bool got_generation = false;
+    bool got_pin_count = false;
+    bool got_capacity = false;
+    bool got_published = false;
+    bool got_key = false;
+
+    json_ws(p);
+    if (*(*p)++ != '{') return false;
+    json_ws(p);
+    if (**p == '}') return false;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto fail;
+        json_ws(p);
+        if (*(*p)++ != ':') {
+            free(key);
+            goto fail;
+        }
+
+        bool valid = true;
+        if (!strcmp(key, "fixture_id") && !got_fixture_id) {
+            valid = json_string(p, &fixture->fixture_id);
+            got_fixture_id = true;
+        } else if (!strcmp(key, "slot_state") && !got_slot_state) {
+            valid = json_string(p, &fixture->slot_state);
+            got_slot_state = true;
+        } else if (!strcmp(key, "generation") && !got_generation) {
+            valid = test_json_nonnegative_int(p, &fixture->generation);
+            got_generation = true;
+        } else if (!strcmp(key, "pin_count") && !got_pin_count) {
+            valid = test_json_nonnegative_int(p, &fixture->pin_count);
+            got_pin_count = true;
+        } else if (!strcmp(key, "capacity_reserved_bytes") && !got_capacity) {
+            valid = json_string(p, &fixture->capacity_reserved_bytes);
+            got_capacity = true;
+        } else if (!strcmp(key, "published") && !got_published) {
+            valid = json_bool(p, &fixture->published);
+            got_published = true;
+        } else if (!strcmp(key, "key") && !got_key) {
+            valid = test_failure_key_parse(p, fixture);
+            got_key = true;
+        } else {
+            valid = false;
+        }
+        free(key);
+        if (!valid) goto fail;
+
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            break;
+        }
+        if (*(*p)++ != ',') goto fail;
+        json_ws(p);
+        if (**p == '}') goto fail;
+    }
+
+    if (!got_fixture_id || !got_slot_state || !got_generation ||
+        !got_pin_count || !got_capacity || !got_published || !got_key) {
+        goto fail;
+    }
+    return true;
+
+fail:
+    test_failure_fixture_free(fixture);
+    return false;
+}
+
+static bool test_failure_boundary_request_parse(
+        const char *json, test_failure_boundary_request *request) {
+    if (!json || !request) return false;
+    memset(request, 0, sizeof(*request));
+    bool got_typed_outcome = false;
+    bool got_headers_sent = false;
+    bool got_error_text = false;
+    bool got_fixture = false;
+    bool got_fixture_fingerprint = false;
+
+    const char *p = json;
+    json_ws(&p);
+    if (*p++ != '{') return false;
+    json_ws(&p);
+    if (*p == '}') return false;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto fail;
+        json_ws(&p);
+        if (*p++ != ':') {
+            free(key);
+            goto fail;
+        }
+
+        bool valid = true;
+        if (!strcmp(key, "typed_outcome") && !got_typed_outcome) {
+            valid = json_string(&p, &request->typed_outcome);
+            got_typed_outcome = true;
+        } else if (!strcmp(key, "headers_sent") && !got_headers_sent) {
+            valid = json_bool(&p, &request->headers_sent);
+            got_headers_sent = true;
+        } else if (!strcmp(key, "error_text") && !got_error_text) {
+            valid = json_string(&p, &request->error_text);
+            got_error_text = true;
+        } else if (!strcmp(key, "fixture") && !got_fixture) {
+            valid = test_failure_fixture_parse(&p, &request->fixture);
+            got_fixture = true;
+        } else if (!strcmp(key, "fixture_fingerprint") &&
+                   !got_fixture_fingerprint) {
+            valid = json_string(&p, &request->fixture_fingerprint);
+            got_fixture_fingerprint = true;
+        } else {
+            valid = false;
+        }
+        free(key);
+        if (!valid) goto fail;
+
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p++ != ',') goto fail;
+        json_ws(&p);
+        if (*p == '}') goto fail;
+    }
+    json_ws(&p);
+    if (*p || !got_typed_outcome || !got_headers_sent || !got_error_text ||
+        !got_fixture || !got_fixture_fingerprint) {
+        goto fail;
+    }
+    if (strcmp(request->typed_outcome, "recoverable") &&
+        strcmp(request->typed_outcome, "unsafe")) {
+        goto fail;
+    }
+    return true;
+
+fail:
+    test_failure_boundary_request_free(request);
+    return false;
+}
+
+/* Python's contract hashes json.dumps(sort_keys=True,separators=(",",":"));
+ * keep this exact canonical order so the fingerprint proves that the object
+ * being restored is the object received over the driver boundary. */
+static void test_failure_fixture_append_canonical(
+        const test_failure_fixture *fixture, buf *out) {
+    buf_puts(out, "{\"capacity_reserved_bytes\":");
+    json_escape(out, fixture->capacity_reserved_bytes);
+    buf_puts(out, ",\"fixture_id\":");
+    json_escape(out, fixture->fixture_id);
+    buf_printf(out, ",\"generation\":%d,\"key\":", fixture->generation);
+    if (fixture->key_present) {
+        buf_printf(out, "{\"expert_id\":%d,\"layer_id\":%d}",
+                   fixture->key_expert_id, fixture->key_layer_id);
+    } else {
+        buf_puts(out, "null");
+    }
+    buf_printf(out, ",\"pin_count\":%d,\"published\":%s,\"slot_state\":",
+               fixture->pin_count, fixture->published ? "true" : "false");
+    json_escape(out, fixture->slot_state);
+    buf_putc(out, '}');
+}
+
+static bool test_failure_fixture_fingerprint(
+        const buf *canonical,
+        char digest[DS4_PLAN_IO_SHA256_HEX_SIZE]) {
+    char error[160];
+    return canonical && ds4_plan_io_sha256(
+        canonical->ptr, canonical->len, digest, error, sizeof(error));
+}
+
+static void test_failure_fixture_restore(test_failure_fixture *fixture) {
+    free(fixture->slot_state);
+    fixture->slot_state = xstrdup("empty");
+    fixture->pin_count = 0;
+    free(fixture->capacity_reserved_bytes);
+    fixture->capacity_reserved_bytes = xstrdup("0");
+    fixture->published = false;
+    fixture->key_present = false;
+    fixture->key_layer_id = 0;
+    fixture->key_expert_id = 0;
+}
+
+static bool test_server_append_failure_boundary_response(
+        test_server_driver *driver,
+        const test_server_rpc *rpc,
+        buf *response,
+        bool *process_unsafe) {
+    if (!driver || !rpc || !rpc->body || !response || !process_unsafe) {
+        return false;
+    }
+    *process_unsafe = false;
+    test_failure_boundary_request request;
+    if (!test_failure_boundary_request_parse(rpc->body, &request)) {
+        return false;
+    }
+
+    bool ok = false;
+    buf fixture_before = {0};
+    buf fixture_after = {0};
+    char before_fingerprint[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    char after_fingerprint[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    test_failure_fixture_append_canonical(&request.fixture, &fixture_before);
+    if (!test_failure_fixture_fingerprint(
+            &fixture_before, before_fingerprint) ||
+        strcmp(before_fingerprint, request.fixture_fingerprint)) {
+        goto done;
+    }
+
+    const int execution_result =
+        !strcmp(request.typed_outcome, "unsafe") ?
+            DS4_SERVER_EXEC_UNSAFE : DS4_SERVER_EXEC_RECOVERABLE;
+    const server_failure_boundary boundary =
+        server_failure_boundary_decide(execution_result,
+                                       request.headers_sent);
+
+    /* Model rollback as an actual mutation of the parsed cache slot.  Its
+     * sequence point precedes every terminal response sequence point. */
+    test_failure_fixture_restore(&request.fixture);
+    const uint64_t restore_seq = ++driver->protocol_sequence;
+    test_failure_fixture_append_canonical(&request.fixture, &fixture_after);
+    if (!test_failure_fixture_fingerprint(
+            &fixture_after, after_fingerprint)) {
+        goto done;
+    }
+    const uint64_t response_seq = boundary.abrupt ? 0u :
+        ++driver->protocol_sequence;
+
+    buf_puts(response, "{\"typed_outcome\":");
+    json_escape(response, request.typed_outcome);
+    buf_printf(response,
+        ",\"headers_sent\":%s,\"http_status\":",
+        request.headers_sent ? "true" : "false");
+    if (boundary.http_status) {
+        buf_printf(response, "%d", boundary.http_status);
+    } else {
+        buf_puts(response, "null");
+    }
+    buf_printf(response,
+        ",\"abrupt\":%s,\"terminal_metrics_emitted\":%s,"
+        "\"process_accepting\":%s,\"fallback_calls\":0,"
+        "\"restore_seq\":%" PRIu64 ",\"response_seq\":",
+        boundary.abrupt ? "true" : "false",
+        boundary.emit_terminal_metrics ? "true" : "false",
+        boundary.process_unsafe ? "false" : "true",
+        restore_seq);
+    if (response_seq) {
+        buf_printf(response, "%" PRIu64, response_seq);
+    } else {
+        buf_puts(response, "null");
+    }
+    buf_puts(response, ",\"fixture_before\":");
+    buf_append(response, fixture_before.ptr, fixture_before.len);
+    buf_puts(response, ",\"fixture_before_fingerprint\":");
+    json_escape(response, before_fingerprint);
+    buf_puts(response, ",\"fixture_after\":");
+    buf_append(response, fixture_after.ptr, fixture_after.len);
+    buf_puts(response, ",\"fixture_after_fingerprint\":");
+    json_escape(response, after_fingerprint);
+    buf_putc(response, '}');
+    *process_unsafe = boundary.process_unsafe;
+    ok = true;
+
+done:
+    buf_free(&fixture_before);
+    buf_free(&fixture_after);
+    test_failure_boundary_request_free(&request);
+    return ok;
+}
+
 static void test_server_fingerprint(const void *data, size_t len,
                                     char out[41]) {
     const char empty = '\0';
@@ -7383,6 +7829,95 @@ static void test_server_snapshot_json(const test_server_driver *driver,
         empty_hash, empty_hash,
         driver->disk_cache_entries, driver->disk_cache_bytes,
         disk_hash, disk_hash);
+}
+
+static bool test_server_parser_state_init(test_server_driver *driver) {
+    if (!driver || driver->parser_server_initialized) return false;
+    server *parser = &driver->parser_server;
+    memset(parser, 0, sizeof(*parser));
+    memset(driver->parser_slots, 0, sizeof(driver->parser_slots));
+    if (pthread_mutex_init(&parser->tool_mu, NULL) != 0) return false;
+    parser->slots = driver->parser_slots;
+    parser->slot_count = 1;
+    parser->ctx_size = driver->context_tokens;
+    parser->default_tokens = 8;
+    driver->parser_slots[0].srv = parser;
+    driver->parser_slots[0].id = 0;
+    driver->parser_server_initialized = true;
+
+    /* These are real production tool-memory entries.  Invalid validation and
+     * malformed-history requests carry one of these IDs, so moving validation
+     * below tool_memory_attach_to_messages() changes the real LRU clock/order
+     * captured by the mutation fingerprint. */
+    tool_memory_put(
+        parser, TEST_PROTOCOL_MUTATION_PROBE_ID, TEST_PROTOCOL_SEEDED_DSML);
+    tool_memory_put(
+        parser, TEST_PROTOCOL_CONTINUATION_CALL_ID,
+        TEST_PROTOCOL_SEEDED_DSML);
+    tool_memory_put(
+        parser, TEST_PROTOCOL_ANTHROPIC_CONTINUATION_CALL_ID,
+        TEST_PROTOCOL_SEEDED_DSML);
+    return true;
+}
+
+static void test_server_parser_state_free(test_server_driver *driver) {
+    if (!driver || !driver->parser_server_initialized) return;
+    server *parser = &driver->parser_server;
+    tool_memory_free(&parser->tool_mem);
+    for (int i = 0; i < parser->slot_count; i++) {
+        live_tool_state_free(&parser->slots[i].responses_live);
+        live_tool_state_free(&parser->slots[i].anthropic_live);
+        visible_live_free(&parser->slots[i].thinking_live);
+    }
+    pthread_mutex_destroy(&parser->tool_mu);
+    memset(parser, 0, sizeof(*parser));
+    memset(driver->parser_slots, 0, sizeof(driver->parser_slots));
+    driver->parser_server_initialized = false;
+}
+
+static void test_server_append_parser_state(
+        const test_server_driver *driver,
+        buf *out) {
+    if (!driver || !out || !driver->parser_server_initialized) return;
+    server *parser = (server *)&driver->parser_server;
+    pthread_mutex_lock(&parser->tool_mu);
+    buf_printf(out,
+        "parser_tool_memory:%d:%zu:%" PRIu64 ":%" PRIu64 ";",
+        parser->tool_mem.entries, parser->tool_mem.bytes,
+        parser->tool_mem.clock, parser->tool_mem.scan_clock);
+    for (const tool_memory_entry *entry = parser->tool_mem.head;
+         entry;
+         entry = entry->next) {
+        test_server_append_record_field(out, entry->id);
+        test_server_append_record_field(
+            out, entry->block ? entry->block->dsml : "");
+        buf_printf(out, "%d:%" PRIu64 ";",
+                   (int)entry->source, entry->stamp);
+    }
+    for (int i = 0; i < parser->slot_count; i++) {
+        const server_slot *slot = &parser->slots[i];
+        const live_tool_state *states[] = {
+            &slot->responses_live,
+            &slot->anthropic_live,
+        };
+        for (size_t j = 0; j < sizeof(states) / sizeof(states[0]); j++) {
+            const live_tool_state *state = states[j];
+            buf_printf(out, "live:%d:%zu:%d;",
+                       state->valid ? 1 : 0,
+                       state->visible_len,
+                       state->live_tokens);
+            test_server_append_record_field(out, state->visible_text);
+            for (int k = 0; k < state->call_ids.len; k++) {
+                test_server_append_record_field(out, state->call_ids.v[k]);
+            }
+        }
+    }
+    pthread_mutex_unlock(&parser->tool_mu);
+    buf_printf(out, "parser_kv:%d:%d:%d:%" PRIu64 ";",
+               parser->kv.enabled ? 1 : 0,
+               parser->kv.len,
+               parser->kv.continued_last_store_tokens,
+               parser->kv.budget_bytes);
 }
 
 static void test_server_write_json(const buf *response) {
@@ -7612,6 +8147,2185 @@ static bool test_server_append_metrics_response(
     return true;
 }
 
+static bool test_protocol_kind_for_path(const char *path,
+                                        test_metrics_protocol *protocol) {
+    if (!path || !protocol) return false;
+    if (!strcmp(path, "/v1/chat/completions")) {
+        *protocol = TEST_METRICS_OPENAI_CHAT;
+    } else if (!strcmp(path, "/v1/responses")) {
+        *protocol = TEST_METRICS_RESPONSES;
+    } else if (!strcmp(path, "/v1/messages")) {
+        *protocol = TEST_METRICS_ANTHROPIC;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static const char *test_protocol_name(test_metrics_protocol protocol) {
+    switch (protocol) {
+    case TEST_METRICS_OPENAI_CHAT: return "openai_chat";
+    case TEST_METRICS_RESPONSES: return "responses";
+    case TEST_METRICS_ANTHROPIC: return "anthropic";
+    }
+    return "";
+}
+
+static bool test_protocol_parse_history(const char *body,
+                                        test_metrics_protocol protocol,
+                                        chat_msgs *messages) {
+    if (!body || !messages) return false;
+    memset(messages, 0, sizeof(*messages));
+    const char *wanted = protocol == TEST_METRICS_RESPONSES ?
+        "input" : "messages";
+    bool found = false;
+    bool valid = false;
+    buf loaded_tool_schemas = {0};
+    tool_schema_orders orders = {0};
+    const char *p = body;
+    json_ws(&p);
+    if (*p++ != '{') goto done;
+    json_ws(&p);
+    if (*p == '}') goto done;
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p++ != ':') {
+            free(key);
+            goto done;
+        }
+        if (!strcmp(key, wanted)) {
+            free(key);
+            if (found) goto done;
+            found = true;
+            if (protocol == TEST_METRICS_OPENAI_CHAT) {
+                if (!parse_messages(&p, messages)) goto done;
+            } else if (protocol == TEST_METRICS_RESPONSES) {
+                if (!parse_responses_input(
+                        &p, messages, &loaded_tool_schemas, &orders)) {
+                    goto done;
+                }
+            } else if (!parse_anthropic_messages(&p, messages)) {
+                goto done;
+            }
+        } else {
+            free(key);
+            if (!json_skip_value(&p)) goto done;
+        }
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p++ != ',') goto done;
+        json_ws(&p);
+        if (*p == '}') goto done;
+    }
+    json_ws(&p);
+    valid = found && *p == '\0';
+
+done:
+    buf_free(&loaded_tool_schemas);
+    tool_schema_orders_free(&orders);
+    if (!valid) chat_msgs_free(messages);
+    return valid;
+}
+
+static const char *test_protocol_message_result_id(const chat_msg *message) {
+    if (!message) return NULL;
+    if (message->tool_call_id && message->tool_call_id[0]) {
+        return message->tool_call_id;
+    }
+    if (message->tool_call_ids_len > 0 && message->tool_call_ids[0] &&
+        message->tool_call_ids[0][0]) {
+        return message->tool_call_ids[0];
+    }
+    return NULL;
+}
+
+static bool test_protocol_history_evidence(
+        const char *body,
+        test_metrics_protocol protocol,
+        const char *rendered_prompt,
+        char **continuation_call_id,
+        bool *tool_result_in_prompt) {
+    if (!continuation_call_id || !tool_result_in_prompt) return false;
+    *continuation_call_id = NULL;
+    *tool_result_in_prompt = false;
+    chat_msgs messages = {0};
+    if (!test_protocol_parse_history(body, protocol, &messages)) return false;
+
+    bool valid = true;
+    if (protocol == TEST_METRICS_OPENAI_CHAT) {
+        bool live_tool = false;
+        bool live_reasoning = false;
+        char err[256] = {0};
+        valid = responses_validate_tool_outputs(
+            NULL, &messages, DS4_THINK_NONE, &live_tool, &live_reasoning,
+            err, sizeof(err));
+    }
+    if (valid) {
+        for (int i = 0; i < messages.len; i++) {
+            const chat_msg *message = &messages.v[i];
+            const bool is_result =
+                protocol == TEST_METRICS_ANTHROPIC ?
+                    anthropic_msg_is_tool_result_tail(message) :
+                    (!strcmp(message->role, "tool") ||
+                     !strcmp(message->role, "function"));
+            if (!is_result) continue;
+            const char *id = test_protocol_message_result_id(message);
+            if (id) {
+                free(*continuation_call_id);
+                *continuation_call_id = xstrdup(id);
+            }
+            if (message->content && message->content[0] && rendered_prompt &&
+                strstr(rendered_prompt, message->content)) {
+                *tool_result_in_prompt = true;
+            }
+        }
+    }
+    chat_msgs_free(&messages);
+    if (!valid) {
+        free(*continuation_call_id);
+        *continuation_call_id = NULL;
+        *tool_result_in_prompt = false;
+    }
+    return valid;
+}
+
+static request_admission_code test_protocol_parse_request(
+        const test_server_rpc *rpc,
+        server *parser_server,
+        test_metrics_protocol *protocol,
+        request *prepared,
+        char **continuation_call_id,
+        bool *tool_result_in_prompt) {
+    if (!rpc || !rpc->body || !rpc->path || !protocol || !prepared) {
+        return REQUEST_ADMISSION_INVALID_REQUEST;
+    }
+    memset(prepared, 0, sizeof(*prepared));
+    if (!test_protocol_kind_for_path(rpc->path, protocol)) {
+        return REQUEST_ADMISSION_INVALID_REQUEST;
+    }
+
+    char err[512] = {0};
+    bool parsed = false;
+    switch (*protocol) {
+    case TEST_METRICS_OPENAI_CHAT:
+        parsed = parse_chat_request(
+            NULL, parser_server, rpc->body, 8, 2048,
+            prepared, err, sizeof(err));
+        break;
+    case TEST_METRICS_RESPONSES:
+        parsed = parse_responses_request(
+            NULL, parser_server, rpc->body, 8, 2048,
+            prepared, err, sizeof(err));
+        break;
+    case TEST_METRICS_ANTHROPIC:
+        parsed = parse_anthropic_request(
+            NULL, parser_server, rpc->body, 8, 2048,
+            prepared, err, sizeof(err));
+        break;
+    }
+    if (!parsed) {
+        if (!strcmp(err, "model_mismatch")) {
+            return REQUEST_ADMISSION_MODEL_MISMATCH;
+        }
+        if (!strcmp(err, "unsupported_tool_choice")) {
+            return REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE;
+        }
+        return REQUEST_ADMISSION_INVALID_REQUEST;
+    }
+
+    char *history_call_id = NULL;
+    bool result_in_prompt = false;
+    if (!test_protocol_history_evidence(
+            rpc->body, *protocol, prepared->prompt_text,
+            &history_call_id, &result_in_prompt)) {
+        request_free(prepared);
+        return REQUEST_ADMISSION_INVALID_REQUEST;
+    }
+    if (continuation_call_id) *continuation_call_id = history_call_id;
+    else free(history_call_id);
+    if (tool_result_in_prompt) *tool_result_in_prompt = result_in_prompt;
+    return REQUEST_ADMISSION_FITS;
+}
+
+static void test_server_state_fingerprint(const test_server_driver *driver,
+                                          char out[41]) {
+    buf snapshot = {0};
+    test_server_snapshot_json(driver, &snapshot);
+    test_server_append_parser_state(driver, &snapshot);
+    test_server_fingerprint(snapshot.ptr, snapshot.len, out);
+    buf_free(&snapshot);
+}
+
+static void test_protocol_append_validation_response(
+        buf *response,
+        request_admission_code code,
+        const request *prepared,
+        const char before[41],
+        const char after[41]) {
+    buf_printf(response, "{\"http_status\":%d,\"code\":",
+               code == REQUEST_ADMISSION_FITS ? 200 : 400);
+    const char *name = request_admission_code_name(code);
+    if (name) json_escape(response, name);
+    else buf_puts(response, "null");
+    buf_printf(response, ",\"tools_enabled\":%s,\"normalized_model\":",
+               code == REQUEST_ADMISSION_FITS && prepared &&
+               prepared->has_tools ? "true" : "false");
+    if (code != REQUEST_ADMISSION_MODEL_MISMATCH) {
+        json_escape(response, LAGUNA_ADMISSION_MODEL);
+    } else {
+        buf_puts(response, "null");
+    }
+    buf_puts(response, ",\"mutation_fingerprint_before\":");
+    json_escape(response, before);
+    buf_puts(response, ",\"mutation_fingerprint_after\":");
+    json_escape(response, after);
+    buf_putc(response, '}');
+}
+
+static bool test_server_append_protocol_validate_response(
+        test_server_driver *driver,
+        const test_server_rpc *rpc,
+        buf *response) {
+    if (!driver || !rpc || !response || !rpc->method ||
+        strcmp(rpc->method, "POST") || !rpc->path || !rpc->body) {
+        return false;
+    }
+    char before[41];
+    char after[41];
+    test_server_state_fingerprint(driver, before);
+    request prepared = {0};
+    test_metrics_protocol protocol = TEST_METRICS_OPENAI_CHAT;
+    const request_admission_code code = test_protocol_parse_request(
+        rpc, &driver->parser_server, &protocol, &prepared, NULL, NULL);
+    test_server_state_fingerprint(driver, after);
+    test_protocol_append_validation_response(
+        response, code, &prepared, before, after);
+    request_free(&prepared);
+    return true;
+}
+
+static bool test_protocol_fixture_known(const char *fixture) {
+    return fixture &&
+        (!strcmp(fixture, "reasoning_text") ||
+         !strcmp(fixture, "two_tools") ||
+         !strcmp(fixture, "tool_choice_none_dsml") ||
+         !strcmp(fixture, "continuation") ||
+         !strcmp(fixture, "malformed_client_history"));
+}
+
+static bool test_protocol_assign_call_ids(tool_calls *calls,
+                                          const stop_list *ids) {
+    if (!calls || !ids || calls->len != ids->len) return false;
+    for (int i = 0; i < calls->len; i++) {
+        free(calls->v[i].id);
+        calls->v[i].id = xstrdup(ids->v[i]);
+    }
+    return true;
+}
+
+static bool test_protocol_parse_output(
+        const request *prepared,
+        const test_server_rpc *rpc,
+        char **content,
+        char **reasoning,
+        tool_calls *calls,
+        const char **finish) {
+    if (!prepared || !rpc || !rpc->raw_output || !content || !reasoning ||
+        !calls || !finish) return false;
+    *content = NULL;
+    *reasoning = NULL;
+    memset(calls, 0, sizeof(*calls));
+    const bool saw_tool_start = prepared->has_tools &&
+        find_any_tool_start(rpc->raw_output) != NULL;
+    *finish = saw_tool_start ? "tool_calls" : "stop";
+    char err[256] = {0};
+    bool recovered = false;
+    if (!parse_generated_message_for_response_for_syntax(
+            prepared->model_syntax, rpc->raw_output,
+            prepared->has_tools, saw_tool_start,
+            ds4_think_mode_enabled(prepared->think_mode), finish,
+            err, sizeof(err), content, reasoning, calls, &recovered)) {
+        free(*content);
+        free(*reasoning);
+        *content = NULL;
+        *reasoning = NULL;
+        tool_calls_free(calls);
+        return false;
+    }
+    *finish = calls->len > 0 ? "tool_calls" : "stop";
+    return test_protocol_assign_call_ids(calls, &rpc->tool_call_ids);
+}
+
+static void test_protocol_projected_raw(buf *raw,
+                                        const char *content,
+                                        const char *reasoning) {
+    if (reasoning && reasoning[0]) {
+        buf_puts(raw, "<think>");
+        buf_puts(raw, reasoning);
+        buf_puts(raw, "</think>");
+    }
+    if (content) buf_puts(raw, content);
+}
+
+static bool test_protocol_emit_fixture_wire(
+        test_metrics_protocol protocol,
+        const request *prepared,
+        const char *protocol_request_id,
+        const char *content,
+        const char *reasoning,
+        const tool_calls *calls,
+        const char *finish,
+        const ds4_runtime_request_metrics *metrics,
+        buf *wire) {
+    if (!prepared || !protocol_request_id || !finish || !metrics || !wire ||
+        metrics->prompt_tokens > (uint64_t)INT_MAX ||
+        metrics->generated_tokens > (uint64_t)INT_MAX) return false;
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return false;
+    bool emitted = false;
+    const int prompt_tokens = (int)metrics->prompt_tokens;
+    const int completion_tokens = (int)metrics->generated_tokens;
+
+    if (!prepared->stream) {
+        if (protocol == TEST_METRICS_OPENAI_CHAT) {
+            emitted = final_response(
+                sockets[0], false, prepared, protocol_request_id,
+                content, reasoning, calls, finish, prompt_tokens,
+                completion_tokens, metrics);
+        } else if (protocol == TEST_METRICS_RESPONSES) {
+            emitted = responses_final_response(
+                sockets[0], false, prepared, protocol_request_id,
+                content, reasoning, calls, finish, prompt_tokens,
+                completion_tokens, metrics);
+        } else {
+            emitted = anthropic_final_response(
+                sockets[0], false, prepared, protocol_request_id,
+                content, reasoning, calls, finish, prompt_tokens,
+                completion_tokens, metrics);
+        }
+    } else if (sse_headers(sockets[0], false)) {
+        if (protocol == TEST_METRICS_OPENAI_CHAT) {
+            bool payload_emitted = false;
+            emitted = sse_chat_flush_visible(
+                    sockets[0], prepared, protocol_request_id,
+                    content, reasoning, calls, &payload_emitted) &&
+                sse_chat_finish(
+                    sockets[0], prepared, protocol_request_id,
+                    content, reasoning, calls, finish, prompt_tokens,
+                    completion_tokens, metrics);
+        } else if (protocol == TEST_METRICS_RESPONSES) {
+            responses_stream stream;
+            responses_stream_init(prepared, &stream);
+            snprintf(stream.response_id, sizeof(stream.response_id), "%s",
+                     protocol_request_id);
+            stream.active = true;
+            const long created_at = (long)time(NULL);
+            buf raw = {0};
+            test_protocol_projected_raw(&raw, content, reasoning);
+            responses_tool_item *items = NULL;
+            bool payload_emitted = false;
+            emitted = responses_sse_created(
+                    sockets[0], prepared, &stream, created_at) &&
+                responses_sse_stream_update(
+                    sockets[0], prepared, &stream,
+                    raw.ptr ? raw.ptr : "", raw.len, true);
+            if (emitted) {
+                responses_tool_items_build(
+                    &items, calls, stream.next_output_index);
+                emitted = responses_sse_flush_live(
+                        sockets[0], prepared, &stream,
+                        raw.ptr ? raw.ptr : "", raw.len, NULL, calls, items,
+                        finish, &payload_emitted) &&
+                    responses_sse_finish_live(
+                        sockets[0], prepared, &stream,
+                        raw.ptr ? raw.ptr : "", raw.len, NULL, calls, items,
+                        finish, prompt_tokens, completion_tokens, created_at,
+                        metrics);
+            }
+            free(items);
+            buf_free(&raw);
+            responses_stream_free(&stream);
+        } else {
+            anthropic_stream stream;
+            buf raw = {0};
+            test_protocol_projected_raw(&raw, content, reasoning);
+            bool payload_emitted = false;
+            emitted = anthropic_sse_start_live(
+                    sockets[0], prepared, protocol_request_id,
+                    prompt_tokens, &stream) &&
+                anthropic_sse_flush_live(
+                    sockets[0], NULL, prepared, protocol_request_id, &stream,
+                    raw.ptr ? raw.ptr : "", raw.len, calls,
+                    &payload_emitted) &&
+                anthropic_sse_finish_live(
+                    sockets[0], NULL, prepared, protocol_request_id, &stream,
+                    raw.ptr ? raw.ptr : "", raw.len, calls, finish,
+                    completion_tokens, metrics);
+            anthropic_stream_free(&stream);
+            buf_free(&raw);
+        }
+    }
+
+    (void)shutdown(sockets[0], SHUT_WR);
+    close(sockets[0]);
+    const bool captured = test_server_read_socket(sockets[1], wire);
+    close(sockets[1]);
+    if (!emitted || !captured || wire->len == 0) return false;
+    return test_server_strip_http_headers(wire);
+}
+
+typedef struct {
+    buf visible_text;
+    buf reasoning_text;
+    tool_calls calls;
+    stop_list protocol_ids;
+    char *finish;
+    char *finish_reason;
+    char *stop_reason;
+    char *response_status;
+    stop_list output_item_types;
+    stop_list output_item_statuses;
+    char *request_metrics;
+    int request_metrics_occurrences;
+    bool request_metrics_at_terminal;
+    uint64_t native_prompt_tokens;
+    uint64_t native_completion_tokens;
+    bool native_prompt_tokens_set;
+    bool native_completion_tokens_set;
+} test_protocol_wire_semantic;
+
+static void test_protocol_wire_semantic_free(
+        test_protocol_wire_semantic *semantic) {
+    if (!semantic) return;
+    buf_free(&semantic->visible_text);
+    buf_free(&semantic->reasoning_text);
+    tool_calls_free(&semantic->calls);
+    id_list_free(&semantic->protocol_ids);
+    free(semantic->finish);
+    free(semantic->finish_reason);
+    free(semantic->stop_reason);
+    free(semantic->response_status);
+    id_list_free(&semantic->output_item_types);
+    id_list_free(&semantic->output_item_statuses);
+    free(semantic->request_metrics);
+    memset(semantic, 0, sizeof(*semantic));
+}
+
+/* Return one raw top-level member while still validating the complete JSON
+ * object.  Callers inspect the occurrence count so duplicate wire members
+ * cannot be normalized away. */
+static bool test_json_object_member_raw(const char *json,
+                                        const char *wanted,
+                                        char **out,
+                                        int *occurrences) {
+    if (!json || !wanted || !occurrences) return false;
+    if (out) *out = NULL;
+    *occurrences = 0;
+    const char *p = json;
+    json_ws(&p);
+    if (*p++ != '{') return false;
+    json_ws(&p);
+    if (*p == '}') {
+        p++;
+        json_ws(&p);
+        return *p == '\0';
+    }
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p++ != ':') {
+            free(key);
+            return false;
+        }
+        if (!strcmp(key, wanted)) {
+            char *raw = NULL;
+            if (!json_raw_value(&p, &raw)) {
+                free(key);
+                return false;
+            }
+            (*occurrences)++;
+            if (out && !*out) *out = raw;
+            else free(raw);
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p++ != ',') return false;
+        json_ws(&p);
+        if (*p == '}') return false;
+    }
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool test_json_member_optional(const char *json,
+                                      const char *key,
+                                      char **raw,
+                                      bool *present) {
+    int occurrences = 0;
+    if (!test_json_object_member_raw(json, key, raw, &occurrences) ||
+        occurrences > 1) return false;
+    if (present) *present = occurrences == 1;
+    return true;
+}
+
+static bool test_json_member_required(const char *json,
+                                      const char *key,
+                                      char **raw) {
+    bool present = false;
+    return test_json_member_optional(json, key, raw, &present) && present;
+}
+
+static bool test_json_raw_string(const char *raw, char **out) {
+    if (!raw || !out) return false;
+    const char *p = raw;
+    if (!json_string(&p, out)) return false;
+    json_ws(&p);
+    if (*p == '\0') return true;
+    free(*out);
+    *out = NULL;
+    return false;
+}
+
+static bool test_json_raw_u64(const char *raw, uint64_t *out) {
+    if (!raw || !out) return false;
+    const char *p = raw;
+    if (!json_exact_u64(&p, out)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool test_protocol_wire_set_u64(uint64_t *slot,
+                                      bool *slot_set,
+                                      uint64_t value) {
+    if (!slot || !slot_set) return false;
+    if (*slot_set) return *slot == value;
+    *slot = value;
+    *slot_set = true;
+    return true;
+}
+
+static bool test_protocol_wire_parse_usage(
+        const char *usage,
+        const char *prompt_key,
+        const char *completion_key,
+        bool parse_prompt,
+        bool parse_completion,
+        test_protocol_wire_semantic *semantic) {
+    if (!usage || !prompt_key || !completion_key || !semantic) return false;
+    char *raw = NULL;
+    uint64_t value = 0;
+    if (parse_prompt) {
+        if (!test_json_member_required(usage, prompt_key, &raw) ||
+            !test_json_raw_u64(raw, &value) ||
+            !test_protocol_wire_set_u64(
+                &semantic->native_prompt_tokens,
+                &semantic->native_prompt_tokens_set, value)) {
+            free(raw);
+            return false;
+        }
+        free(raw);
+        raw = NULL;
+    }
+    if (parse_completion) {
+        if (!test_json_member_required(usage, completion_key, &raw) ||
+            !test_json_raw_u64(raw, &value) ||
+            !test_protocol_wire_set_u64(
+                &semantic->native_completion_tokens,
+                &semantic->native_completion_tokens_set, value)) {
+            free(raw);
+            return false;
+        }
+        free(raw);
+    }
+    return true;
+}
+
+typedef bool (*test_json_array_item_fn)(const char *raw, int index, void *ctx);
+
+static bool test_json_array_each(const char *json,
+                                 test_json_array_item_fn visit,
+                                 void *ctx,
+                                 int *count_out) {
+    if (!json) return false;
+    const char *p = json;
+    int count = 0;
+    json_ws(&p);
+    if (*p++ != '[') return false;
+    json_ws(&p);
+    if (*p == ']') {
+        p++;
+        json_ws(&p);
+        if (count_out) *count_out = 0;
+        return *p == '\0';
+    }
+    for (;;) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return false;
+        const bool ok = !visit || visit(raw, count, ctx);
+        free(raw);
+        if (!ok) return false;
+        count++;
+        json_ws(&p);
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (*p++ != ',') return false;
+        json_ws(&p);
+        if (*p == ']') return false;
+    }
+    json_ws(&p);
+    if (*p != '\0') return false;
+    if (count_out) *count_out = count;
+    return true;
+}
+
+static bool test_protocol_wire_append_string(buf *out, const char *raw) {
+    char *value = NULL;
+    if (!test_json_raw_string(raw, &value)) return false;
+    buf_puts(out, value);
+    free(value);
+    return true;
+}
+
+static bool test_protocol_wire_set_string(char **slot, const char *raw) {
+    char *value = NULL;
+    if (!test_json_raw_string(raw, &value)) return false;
+    free(*slot);
+    *slot = value;
+    return true;
+}
+
+static bool test_protocol_wire_add_id(test_protocol_wire_semantic *semantic,
+                                      const char *raw) {
+    char *id = NULL;
+    if (!test_json_raw_string(raw, &id) || !id[0]) {
+        free(id);
+        return false;
+    }
+    id_list_push_unique(&semantic->protocol_ids, id);
+    free(id);
+    return true;
+}
+
+static tool_call *test_protocol_wire_call_at(tool_calls *calls, int index) {
+    if (!calls || index < 0 || index > 1024) return NULL;
+    while (calls->len <= index) {
+        tool_call empty = {0};
+        tool_calls_push(calls, empty);
+    }
+    return &calls->v[index];
+}
+
+static bool test_protocol_wire_append_call_fragment(char **slot,
+                                                    const char *fragment) {
+    if (!slot || !fragment) return false;
+    const size_t old_len = *slot ? strlen(*slot) : 0;
+    const size_t add_len = strlen(fragment);
+    *slot = xrealloc(*slot, old_len + add_len + 1);
+    memcpy(*slot + old_len, fragment, add_len + 1);
+    return true;
+}
+
+static bool test_protocol_wire_call_arguments_valid(const char *arguments) {
+    if (!arguments) return false;
+    const char *p = arguments;
+    json_ws(&p);
+    if (*p != '{' || !json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool test_protocol_wire_calls_valid(const tool_calls *calls) {
+    if (!calls) return false;
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *call = &calls->v[i];
+        if (!call->id || !call->id[0] || !call->name || !call->name[0] ||
+            !test_protocol_wire_call_arguments_valid(call->arguments)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_protocol_wire_calls_equal(const tool_calls *a,
+                                           const tool_calls *b) {
+    if (!a || !b || a->len != b->len) return false;
+    for (int i = 0; i < a->len; i++) {
+        const tool_call *left = &a->v[i];
+        const tool_call *right = &b->v[i];
+        if (!left->id || !right->id || strcmp(left->id, right->id) ||
+            !left->name || !right->name || strcmp(left->name, right->name) ||
+            !left->arguments || !right->arguments ||
+            strcmp(left->arguments, right->arguments)) return false;
+    }
+    return true;
+}
+
+static bool test_protocol_wire_lists_equal(const stop_list *a,
+                                           const stop_list *b) {
+    if (!a || !b || a->len != b->len) return false;
+    for (int i = 0; i < a->len; i++) {
+        if (strcmp(a->v[i], b->v[i])) return false;
+    }
+    return true;
+}
+
+static bool test_protocol_wire_record_metrics(
+        test_protocol_wire_semantic *semantic,
+        const char *metrics_raw) {
+    if (!semantic || !metrics_raw) return false;
+    semantic->request_metrics_occurrences++;
+    if (!semantic->request_metrics) {
+        const char *p = metrics_raw;
+        json_ws(&p);
+        if (*p != '{' || !json_skip_value(&p)) return false;
+        json_ws(&p);
+        if (*p != '\0') return false;
+        semantic->request_metrics = xstrdup(metrics_raw);
+    }
+    return true;
+}
+
+static bool test_protocol_append_calls_json(buf *out,
+                                            const tool_calls *calls) {
+    buf_putc(out, '[');
+    for (int i = 0; calls && i < calls->len; i++) {
+        if (i) buf_putc(out, ',');
+        const tool_call *call = &calls->v[i];
+        const char *arguments = call->arguments ? call->arguments : "{}";
+        const char *p = arguments;
+        json_ws(&p);
+        if (*p != '{' || !json_skip_value(&p)) return false;
+        json_ws(&p);
+        if (*p) return false;
+        buf_puts(out, "{\"id\":");
+        json_escape(out, call->id ? call->id : "");
+        buf_puts(out, ",\"name\":");
+        json_escape(out, call->name ? call->name : "");
+        buf_puts(out, ",\"arguments\":");
+        buf_puts(out, arguments);
+        buf_putc(out, '}');
+    }
+    buf_putc(out, ']');
+    return true;
+}
+
+static void test_protocol_append_string_list(buf *out,
+                                             const stop_list *values) {
+    buf_putc(out, '[');
+    for (int i = 0; values && i < values->len; i++) {
+        if (i) buf_putc(out, ',');
+        json_escape(out, values->v[i]);
+    }
+    buf_putc(out, ']');
+}
+
+static void test_protocol_append_native_terminal(
+        buf *out,
+        const test_protocol_wire_semantic *semantic) {
+    buf_puts(out, "{\"finish_reason\":");
+    if (semantic->finish_reason) json_escape(out, semantic->finish_reason);
+    else buf_puts(out, "null");
+    buf_puts(out, ",\"stop_reason\":");
+    if (semantic->stop_reason) json_escape(out, semantic->stop_reason);
+    else buf_puts(out, "null");
+    buf_puts(out, ",\"response_status\":");
+    if (semantic->response_status) json_escape(out, semantic->response_status);
+    else buf_puts(out, "null");
+    buf_puts(out, ",\"output_item_types\":");
+    test_protocol_append_string_list(out, &semantic->output_item_types);
+    buf_puts(out, ",\"output_item_statuses\":");
+    test_protocol_append_string_list(out, &semantic->output_item_statuses);
+    buf_putc(out, '}');
+}
+
+static bool test_json_optional_string_member(const char *json,
+                                             const char *key,
+                                             char **value,
+                                             bool *present) {
+    char *raw = NULL;
+    bool found = false;
+    if (!test_json_member_optional(json, key, &raw, &found)) return false;
+    if (!found) {
+        if (present) *present = false;
+        return true;
+    }
+    const bool ok = test_json_raw_string(raw, value);
+    free(raw);
+    if (present) *present = true;
+    return ok;
+}
+
+static bool test_protocol_wire_set_same_string(char **slot,
+                                               const char *value) {
+    if (!slot || !value) return false;
+    if (*slot) return !strcmp(*slot, value);
+    *slot = xstrdup(value);
+    return true;
+}
+
+typedef struct {
+    char *first;
+} test_json_first_item;
+
+static bool test_json_capture_first(const char *raw, int index, void *ctx) {
+    test_json_first_item *first = ctx;
+    if (!first || index != 0 || first->first) return false;
+    first->first = xstrdup(raw);
+    return true;
+}
+
+static bool test_json_array_first_raw(const char *json,
+                                      char **first,
+                                      int *count) {
+    test_json_first_item capture = {0};
+    int found = 0;
+    const bool ok = test_json_array_each(
+        json, test_json_capture_first, &capture, &found);
+    if (!ok) free(capture.first);
+    else if (first) *first = capture.first;
+    else free(capture.first);
+    if (count) *count = found;
+    return ok;
+}
+
+static bool test_protocol_wire_extract_metrics(
+        const char *json,
+        test_protocol_wire_semantic *semantic,
+        bool *present) {
+    char *raw = NULL;
+    int occurrences = 0;
+    if (!test_json_object_member_raw(
+            json, "request_metrics", &raw, &occurrences)) return false;
+    if (present) *present = occurrences > 0;
+    semantic->request_metrics_occurrences += occurrences;
+    if (occurrences == 0) return true;
+    if (occurrences != 1 || semantic->request_metrics) {
+        free(raw);
+        return false;
+    }
+    const char *p = raw;
+    json_ws(&p);
+    const bool valid = *p == '{' && json_skip_value(&p);
+    json_ws(&p);
+    if (!valid || *p != '\0') {
+        free(raw);
+        return false;
+    }
+    semantic->request_metrics = raw;
+    return true;
+}
+
+typedef bool (*test_protocol_sse_visit_fn)(const char *event,
+                                           const char *data,
+                                           int record_index,
+                                           void *ctx);
+
+static bool test_protocol_sse_each(const char *wire,
+                                   test_protocol_sse_visit_fn visit,
+                                   void *ctx,
+                                   int *record_count) {
+    if (!wire || !visit) return false;
+    const char *p = wire;
+    int index = 0;
+    while (*p) {
+        const char *end = strstr(p, "\n\n");
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == 0) {
+            p = end ? end + 2 : p + len;
+            continue;
+        }
+        char *record = xstrndup(p, len);
+        char *event = NULL;
+        char *data = NULL;
+        char *save = NULL;
+        bool valid = true;
+        for (char *line = strtok_r(record, "\n", &save);
+             line;
+             line = strtok_r(NULL, "\n", &save)) {
+            if (!strncmp(line, "event: ", 7) && !event) {
+                event = xstrdup(line + 7);
+            } else if (!strncmp(line, "data: ", 6) && !data) {
+                data = xstrdup(line + 6);
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if (!data || !valid || !visit(event, data, index, ctx)) valid = false;
+        free(event);
+        free(data);
+        free(record);
+        if (!valid) return false;
+        index++;
+        if (!end) {
+            p += len;
+            break;
+        }
+        p = end + 2;
+    }
+    if (record_count) *record_count = index;
+    return index > 0;
+}
+
+typedef struct {
+    test_protocol_wire_semantic *semantic;
+    bool delta;
+} test_openai_tools_ctx;
+
+static bool test_protocol_parse_openai_tool(const char *raw,
+                                            int array_index,
+                                            void *opaque) {
+    test_openai_tools_ctx *ctx = opaque;
+    if (!ctx || !ctx->semantic) return false;
+    int call_index = array_index;
+    if (ctx->delta) {
+        char *index_raw = NULL;
+        uint64_t index = 0;
+        if (!test_json_member_required(raw, "index", &index_raw) ||
+            !test_json_raw_u64(index_raw, &index) || index > 1024u) {
+            free(index_raw);
+            return false;
+        }
+        free(index_raw);
+        call_index = (int)index;
+    }
+    tool_call *call = test_protocol_wire_call_at(
+        &ctx->semantic->calls, call_index);
+    if (!call) return false;
+
+    char *id = NULL;
+    bool has_id = false;
+    if (!test_json_optional_string_member(raw, "id", &id, &has_id)) {
+        return false;
+    }
+    if (has_id) {
+        if (!id[0] || (call->id && strcmp(call->id, id))) {
+            free(id);
+            return false;
+        }
+        if (!call->id) call->id = id;
+        else free(id);
+    }
+
+    char *function_raw = NULL;
+    bool has_function = false;
+    if (!test_json_member_optional(
+            raw, "function", &function_raw, &has_function)) return false;
+    if (!has_function) return ctx->delta;
+
+    char *name = NULL;
+    bool has_name = false;
+    if (!test_json_optional_string_member(
+            function_raw, "name", &name, &has_name)) {
+        free(function_raw);
+        return false;
+    }
+    if (has_name) {
+        if (!name[0] || (call->name && strcmp(call->name, name))) {
+            free(name);
+            free(function_raw);
+            return false;
+        }
+        if (!call->name) call->name = name;
+        else free(name);
+    }
+
+    char *arguments = NULL;
+    bool has_arguments = false;
+    const bool arguments_ok = test_json_optional_string_member(
+        function_raw, "arguments", &arguments, &has_arguments);
+    free(function_raw);
+    if (!arguments_ok) return false;
+    if (has_arguments) {
+        if (ctx->delta) {
+            const bool ok = test_protocol_wire_append_call_fragment(
+                &call->arguments, arguments);
+            free(arguments);
+            return ok;
+        }
+        if (call->arguments) {
+            free(arguments);
+            return false;
+        }
+        call->arguments = arguments;
+    }
+    return true;
+}
+
+static bool test_protocol_parse_openai_payload(
+        const char *payload,
+        bool delta,
+        test_protocol_wire_semantic *semantic) {
+    char *raw = NULL;
+    bool present = false;
+    if (!test_json_member_optional(payload, "content", &raw, &present)) {
+        return false;
+    }
+    if (present) {
+        const bool ok = test_protocol_wire_append_string(
+            &semantic->visible_text, raw);
+        free(raw);
+        if (!ok) return false;
+    }
+    raw = NULL;
+    present = false;
+    if (!test_json_member_optional(
+            payload, "reasoning_content", &raw, &present)) return false;
+    if (present) {
+        const bool ok = test_protocol_wire_append_string(
+            &semantic->reasoning_text, raw);
+        free(raw);
+        if (!ok) return false;
+    }
+    raw = NULL;
+    present = false;
+    if (!test_json_member_optional(payload, "tool_calls", &raw, &present)) {
+        return false;
+    }
+    if (present) {
+        test_openai_tools_ctx ctx = {
+            .semantic = semantic,
+            .delta = delta,
+        };
+        const bool ok = test_json_array_each(
+            raw, test_protocol_parse_openai_tool, &ctx, NULL);
+        free(raw);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+typedef struct {
+    test_protocol_wire_semantic *semantic;
+    int finish_index;
+    int metrics_index;
+    int done_index;
+    int last_json_index;
+} test_openai_sse_ctx;
+
+static bool test_protocol_parse_openai_record(
+        const char *json,
+        int record_index,
+        bool streaming,
+        test_protocol_wire_semantic *semantic,
+        bool *has_finish,
+        bool *has_metrics) {
+    char *raw = NULL;
+    bool present = false;
+    if (!test_json_member_optional(json, "id", &raw, &present)) return false;
+    if (present) {
+        const bool ok = test_protocol_wire_add_id(semantic, raw);
+        free(raw);
+        if (!ok) return false;
+    }
+
+    raw = NULL;
+    present = false;
+    if (!test_json_member_optional(json, "choices", &raw, &present)) {
+        return false;
+    }
+    bool finish_seen = false;
+    if (present) {
+        char *choice = NULL;
+        int choice_count = 0;
+        const bool array_ok = test_json_array_first_raw(
+            raw, &choice, &choice_count);
+        free(raw);
+        if (!array_ok || choice_count > 1) {
+            free(choice);
+            return false;
+        }
+        if (choice_count == 1) {
+            char *finish_raw = NULL;
+            bool finish_present = false;
+            if (!test_json_member_optional(
+                    choice, "finish_reason", &finish_raw,
+                    &finish_present)) {
+                free(choice);
+                return false;
+            }
+            if (finish_present && strcmp(finish_raw, "null")) {
+                char *finish = NULL;
+                if (!test_json_raw_string(finish_raw, &finish) ||
+                    !test_protocol_wire_set_same_string(
+                        &semantic->finish_reason, finish)) {
+                    free(finish);
+                    free(finish_raw);
+                    free(choice);
+                    return false;
+                }
+                free(finish);
+                finish_seen = true;
+            }
+            free(finish_raw);
+
+            char *payload = NULL;
+            bool payload_present = false;
+            const char *payload_key = streaming ? "delta" : "message";
+            if (!test_json_member_optional(
+                    choice, payload_key, &payload, &payload_present)) {
+                free(choice);
+                return false;
+            }
+            if (payload_present) {
+                const bool payload_ok = test_protocol_parse_openai_payload(
+                    payload, streaming, semantic);
+                free(payload);
+                if (!payload_ok) {
+                    free(choice);
+                    return false;
+                }
+            }
+        }
+        free(choice);
+    }
+
+    raw = NULL;
+    present = false;
+    if (!test_json_member_optional(json, "usage", &raw, &present)) {
+        return false;
+    }
+    if (present) {
+        const bool usage_ok = test_protocol_wire_parse_usage(
+            raw, "prompt_tokens", "completion_tokens",
+            true, true, semantic);
+        free(raw);
+        if (!usage_ok) return false;
+    }
+
+    bool metrics_seen = false;
+    if (!test_protocol_wire_extract_metrics(
+            json, semantic, &metrics_seen)) return false;
+    if (has_finish) *has_finish = finish_seen;
+    if (has_metrics) *has_metrics = metrics_seen;
+    (void)record_index;
+    return true;
+}
+
+static bool test_protocol_openai_sse_visit(const char *event,
+                                           const char *data,
+                                           int record_index,
+                                           void *opaque) {
+    test_openai_sse_ctx *ctx = opaque;
+    if (!ctx || !ctx->semantic || event) return false;
+    if (!strcmp(data, "[DONE]")) {
+        if (ctx->done_index >= 0) return false;
+        ctx->done_index = record_index;
+        return true;
+    }
+    if (ctx->done_index >= 0) return false;
+    bool has_finish = false;
+    bool has_metrics = false;
+    if (!test_protocol_parse_openai_record(
+            data, record_index, true, ctx->semantic,
+            &has_finish, &has_metrics)) return false;
+    if (has_finish) ctx->finish_index = record_index;
+    if (has_metrics) ctx->metrics_index = record_index;
+    ctx->last_json_index = record_index;
+    return true;
+}
+
+static bool test_protocol_normalize_openai(
+        const buf *wire,
+        bool stream,
+        test_protocol_wire_semantic *semantic) {
+    if (!wire || !wire->ptr || !semantic) return false;
+    if (!stream) {
+        bool has_finish = false;
+        bool has_metrics = false;
+        if (!test_protocol_parse_openai_record(
+                wire->ptr, 0, false, semantic,
+                &has_finish, &has_metrics)) return false;
+        semantic->request_metrics_at_terminal = has_finish && has_metrics;
+    } else {
+        test_openai_sse_ctx ctx = {
+            .semantic = semantic,
+            .finish_index = -1,
+            .metrics_index = -1,
+            .done_index = -1,
+            .last_json_index = -1,
+        };
+        int records = 0;
+        if (!test_protocol_sse_each(
+                wire->ptr, test_protocol_openai_sse_visit,
+                &ctx, &records)) return false;
+        semantic->request_metrics_at_terminal =
+            ctx.finish_index >= 0 &&
+            ctx.metrics_index > ctx.finish_index &&
+            ctx.metrics_index == ctx.last_json_index &&
+            ctx.done_index == records - 1 &&
+            ctx.done_index > ctx.metrics_index;
+    }
+    return semantic->finish_reason &&
+        semantic->protocol_ids.len > 0 &&
+        semantic->request_metrics_occurrences == 1 &&
+        semantic->request_metrics_at_terminal &&
+        test_protocol_wire_calls_valid(&semantic->calls) &&
+        test_protocol_wire_set_same_string(
+            &semantic->finish, semantic->finish_reason);
+}
+
+static bool test_protocol_parse_responses_call(
+        const char *item,
+        test_protocol_wire_semantic *semantic) {
+    if (!item || !semantic) return false;
+    tool_call call = {0};
+    char *arguments = NULL;
+    if (!test_json_optional_string_member(
+            item, "call_id", &call.id, NULL) ||
+        !test_json_optional_string_member(
+            item, "name", &call.name, NULL) ||
+        !test_json_optional_string_member(
+            item, "arguments", &arguments, NULL) ||
+        !call.id || !call.name || !arguments) {
+        tool_call_free(&call);
+        free(arguments);
+        return false;
+    }
+    call.arguments = arguments;
+    if (!test_protocol_wire_call_arguments_valid(call.arguments)) {
+        tool_call_free(&call);
+        return false;
+    }
+    tool_calls_push(&semantic->calls, call);
+    return true;
+}
+
+typedef struct {
+    buf *text;
+    const char *text_key;
+} test_responses_text_ctx;
+
+static bool test_protocol_parse_responses_text_part(
+        const char *part,
+        int index,
+        void *opaque) {
+    (void)index;
+    test_responses_text_ctx *ctx = opaque;
+    if (!ctx || !ctx->text || !ctx->text_key) return false;
+    char *raw = NULL;
+    if (!test_json_member_required(part, ctx->text_key, &raw)) return false;
+    const bool ok = test_protocol_wire_append_string(ctx->text, raw);
+    free(raw);
+    return ok;
+}
+
+typedef struct {
+    test_protocol_wire_semantic *semantic;
+    bool append_payload;
+    bool collect_native;
+} test_responses_items_ctx;
+
+static bool test_protocol_parse_responses_item(
+        const char *item,
+        int index,
+        void *opaque) {
+    (void)index;
+    test_responses_items_ctx *ctx = opaque;
+    if (!ctx || !ctx->semantic) return false;
+    char *type = NULL;
+    char *status = NULL;
+    if (!test_json_optional_string_member(item, "type", &type, NULL) ||
+        !type || !test_json_optional_string_member(
+            item, "status", &status, NULL) || !status) {
+        free(type);
+        free(status);
+        return false;
+    }
+    if (ctx->collect_native) {
+        stop_list_push(&ctx->semantic->output_item_types, xstrdup(type));
+        stop_list_push(&ctx->semantic->output_item_statuses, xstrdup(status));
+    }
+
+    bool ok = true;
+    if (ctx->append_payload && !strcmp(type, "reasoning")) {
+        char *summary = NULL;
+        if (!test_json_member_required(item, "summary", &summary)) {
+            ok = false;
+        } else {
+            test_responses_text_ctx text_ctx = {
+                .text = &ctx->semantic->reasoning_text,
+                .text_key = "text",
+            };
+            ok = test_json_array_each(
+                summary, test_protocol_parse_responses_text_part,
+                &text_ctx, NULL);
+            free(summary);
+        }
+    } else if (ctx->append_payload && !strcmp(type, "message")) {
+        char *content = NULL;
+        if (!test_json_member_required(item, "content", &content)) {
+            ok = false;
+        } else {
+            test_responses_text_ctx text_ctx = {
+                .text = &ctx->semantic->visible_text,
+                .text_key = "text",
+            };
+            ok = test_json_array_each(
+                content, test_protocol_parse_responses_text_part,
+                &text_ctx, NULL);
+            free(content);
+        }
+    } else if (ctx->append_payload && !strcmp(type, "function_call")) {
+        ok = test_protocol_parse_responses_call(item, ctx->semantic);
+    }
+    free(type);
+    free(status);
+    return ok;
+}
+
+static bool test_protocol_parse_responses_response(
+        const char *json,
+        test_protocol_wire_semantic *semantic,
+        bool append_payload,
+        bool collect_native,
+        bool *has_metrics) {
+    char *raw = NULL;
+    if (!test_json_member_required(json, "id", &raw)) return false;
+    bool ok = test_protocol_wire_add_id(semantic, raw);
+    free(raw);
+    if (!ok) return false;
+
+    char *status = NULL;
+    if (!test_json_optional_string_member(
+            json, "status", &status, NULL) || !status ||
+        !test_protocol_wire_set_same_string(
+            &semantic->response_status, status)) {
+        free(status);
+        return false;
+    }
+    free(status);
+
+    raw = NULL;
+    if (!test_json_member_required(json, "output", &raw)) return false;
+    test_responses_items_ctx items_ctx = {
+        .semantic = semantic,
+        .append_payload = append_payload,
+        .collect_native = collect_native,
+    };
+    ok = test_json_array_each(
+        raw, test_protocol_parse_responses_item, &items_ctx, NULL);
+    free(raw);
+    if (!ok) return false;
+    raw = NULL;
+    if (!test_json_member_required(json, "usage", &raw)) return false;
+    ok = test_protocol_wire_parse_usage(
+        raw, "input_tokens", "output_tokens", true, true, semantic);
+    free(raw);
+    if (!ok) return false;
+    return test_protocol_wire_extract_metrics(json, semantic, has_metrics);
+}
+
+static const char *test_protocol_buf_text(const buf *value) {
+    return value && value->ptr ? value->ptr : "";
+}
+
+typedef struct {
+    test_protocol_wire_semantic *semantic;
+    stop_list event_item_types;
+    stop_list event_item_statuses;
+    int terminal_index;
+    int last_index;
+} test_responses_sse_ctx;
+
+static bool test_protocol_responses_record_item_done(
+        const char *json,
+        test_responses_sse_ctx *ctx) {
+    char *item = NULL;
+    if (!test_json_member_required(json, "item", &item)) return false;
+    char *type = NULL;
+    char *status = NULL;
+    bool ok = test_json_optional_string_member(
+            item, "type", &type, NULL) && type &&
+        test_json_optional_string_member(
+            item, "status", &status, NULL) && status;
+    if (ok) {
+        stop_list_push(&ctx->event_item_types, xstrdup(type));
+        stop_list_push(&ctx->event_item_statuses, xstrdup(status));
+        if (!strcmp(type, "function_call")) {
+            ok = test_protocol_parse_responses_call(item, ctx->semantic);
+        }
+    }
+    free(type);
+    free(status);
+    free(item);
+    return ok;
+}
+
+static bool test_protocol_responses_merge_terminal(
+        test_responses_sse_ctx *ctx,
+        const char *response_json) {
+    test_protocol_wire_semantic terminal = {0};
+    bool has_metrics = false;
+    bool ok = test_protocol_parse_responses_response(
+        response_json, &terminal, true, true, &has_metrics);
+    if (ok) {
+        ok = has_metrics &&
+            !strcmp(test_protocol_buf_text(&ctx->semantic->visible_text),
+                    test_protocol_buf_text(&terminal.visible_text)) &&
+            !strcmp(test_protocol_buf_text(&ctx->semantic->reasoning_text),
+                    test_protocol_buf_text(&terminal.reasoning_text)) &&
+            test_protocol_wire_calls_equal(
+                &ctx->semantic->calls, &terminal.calls) &&
+            test_protocol_wire_lists_equal(
+                &ctx->event_item_types, &terminal.output_item_types) &&
+            test_protocol_wire_lists_equal(
+                &ctx->event_item_statuses, &terminal.output_item_statuses);
+    }
+    if (ok) {
+        for (int i = 0; i < terminal.protocol_ids.len; i++) {
+            id_list_push_unique(
+                &ctx->semantic->protocol_ids, terminal.protocol_ids.v[i]);
+        }
+        ctx->semantic->response_status = terminal.response_status;
+        terminal.response_status = NULL;
+        ctx->semantic->output_item_types = terminal.output_item_types;
+        memset(&terminal.output_item_types, 0,
+               sizeof(terminal.output_item_types));
+        ctx->semantic->output_item_statuses = terminal.output_item_statuses;
+        memset(&terminal.output_item_statuses, 0,
+               sizeof(terminal.output_item_statuses));
+        ctx->semantic->request_metrics = terminal.request_metrics;
+        terminal.request_metrics = NULL;
+        ctx->semantic->request_metrics_occurrences =
+            terminal.request_metrics_occurrences;
+        ctx->semantic->native_prompt_tokens = terminal.native_prompt_tokens;
+        ctx->semantic->native_completion_tokens =
+            terminal.native_completion_tokens;
+        ctx->semantic->native_prompt_tokens_set =
+            terminal.native_prompt_tokens_set;
+        ctx->semantic->native_completion_tokens_set =
+            terminal.native_completion_tokens_set;
+    }
+    test_protocol_wire_semantic_free(&terminal);
+    return ok;
+}
+
+static bool test_protocol_responses_sse_visit(const char *event,
+                                              const char *data,
+                                              int record_index,
+                                              void *opaque) {
+    test_responses_sse_ctx *ctx = opaque;
+    if (!ctx || !ctx->semantic || event || ctx->terminal_index >= 0) {
+        return false;
+    }
+    char *type = NULL;
+    if (!test_json_optional_string_member(data, "type", &type, NULL) ||
+        !type) return false;
+    bool ok = true;
+    if (!strcmp(type, "response.created")) {
+        char *response = NULL;
+        char *id = NULL;
+        ok = test_json_member_required(data, "response", &response) &&
+            test_json_member_required(response, "id", &id) &&
+            test_protocol_wire_add_id(ctx->semantic, id);
+        free(id);
+        free(response);
+    } else if (!strcmp(type, "response.output_text.delta")) {
+        char *delta = NULL;
+        ok = test_json_member_required(data, "delta", &delta) &&
+            test_protocol_wire_append_string(
+                &ctx->semantic->visible_text, delta);
+        free(delta);
+    } else if (!strcmp(type, "response.reasoning_summary_text.delta")) {
+        char *delta = NULL;
+        ok = test_json_member_required(data, "delta", &delta) &&
+            test_protocol_wire_append_string(
+                &ctx->semantic->reasoning_text, delta);
+        free(delta);
+    } else if (!strcmp(type, "response.output_item.done")) {
+        ok = test_protocol_responses_record_item_done(data, ctx);
+    } else if (!strcmp(type, "response.completed") ||
+               !strcmp(type, "response.incomplete") ||
+               !strcmp(type, "response.failed")) {
+        char *response = NULL;
+        ok = test_json_member_required(data, "response", &response) &&
+            test_protocol_responses_merge_terminal(ctx, response);
+        free(response);
+        if (ok) ctx->terminal_index = record_index;
+    }
+    free(type);
+    if (ok) ctx->last_index = record_index;
+    return ok;
+}
+
+static bool test_protocol_normalize_responses(
+        const buf *wire,
+        bool stream,
+        test_protocol_wire_semantic *semantic) {
+    if (!wire || !wire->ptr || !semantic) return false;
+    if (!stream) {
+        bool has_metrics = false;
+        if (!test_protocol_parse_responses_response(
+                wire->ptr, semantic, true, true,
+                &has_metrics)) return false;
+        semantic->request_metrics_at_terminal = has_metrics &&
+            semantic->response_status != NULL;
+    } else {
+        test_responses_sse_ctx ctx = {
+            .semantic = semantic,
+            .terminal_index = -1,
+            .last_index = -1,
+        };
+        int records = 0;
+        const bool ok = test_protocol_sse_each(
+            wire->ptr, test_protocol_responses_sse_visit,
+            &ctx, &records);
+        semantic->request_metrics_at_terminal = ok &&
+            ctx.terminal_index == records - 1 &&
+            ctx.terminal_index == ctx.last_index;
+        id_list_free(&ctx.event_item_types);
+        id_list_free(&ctx.event_item_statuses);
+        if (!ok) return false;
+    }
+    const char *finish = semantic->calls.len > 0 ? "tool_calls" : "stop";
+    return semantic->response_status &&
+        semantic->protocol_ids.len > 0 &&
+        semantic->request_metrics_occurrences == 1 &&
+        semantic->request_metrics_at_terminal &&
+        semantic->output_item_types.len ==
+            semantic->output_item_statuses.len &&
+        test_protocol_wire_calls_valid(&semantic->calls) &&
+        test_protocol_wire_set_same_string(&semantic->finish, finish);
+}
+
+typedef struct {
+    test_protocol_wire_semantic *semantic;
+} test_anthropic_content_ctx;
+
+static bool test_protocol_parse_anthropic_content(
+        const char *item,
+        int index,
+        void *opaque) {
+    (void)index;
+    test_anthropic_content_ctx *ctx = opaque;
+    if (!ctx || !ctx->semantic) return false;
+    char *type = NULL;
+    if (!test_json_optional_string_member(item, "type", &type, NULL) ||
+        !type) return false;
+    bool ok = true;
+    if (!strcmp(type, "text")) {
+        char *raw = NULL;
+        ok = test_json_member_required(item, "text", &raw) &&
+            test_protocol_wire_append_string(
+                &ctx->semantic->visible_text, raw);
+        free(raw);
+    } else if (!strcmp(type, "thinking")) {
+        char *raw = NULL;
+        ok = test_json_member_required(item, "thinking", &raw) &&
+            test_protocol_wire_append_string(
+                &ctx->semantic->reasoning_text, raw);
+        free(raw);
+    } else if (!strcmp(type, "tool_use")) {
+        tool_call call = {0};
+        char *input = NULL;
+        ok = test_json_optional_string_member(
+                item, "id", &call.id, NULL) && call.id &&
+            test_json_optional_string_member(
+                item, "name", &call.name, NULL) && call.name &&
+            test_json_member_required(item, "input", &input) &&
+            test_protocol_wire_call_arguments_valid(input);
+        if (ok) {
+            call.arguments = input;
+            input = NULL;
+            tool_calls_push(&ctx->semantic->calls, call);
+        } else {
+            tool_call_free(&call);
+        }
+        free(input);
+    } else {
+        ok = false;
+    }
+    free(type);
+    return ok;
+}
+
+static bool test_protocol_parse_anthropic_message(
+        const char *json,
+        test_protocol_wire_semantic *semantic,
+        bool *has_metrics) {
+    char *raw = NULL;
+    if (!test_json_member_required(json, "id", &raw)) return false;
+    bool ok = test_protocol_wire_add_id(semantic, raw);
+    free(raw);
+    if (!ok) return false;
+
+    raw = NULL;
+    if (!test_json_member_required(json, "content", &raw)) return false;
+    test_anthropic_content_ctx content_ctx = {.semantic = semantic};
+    ok = test_json_array_each(
+        raw, test_protocol_parse_anthropic_content, &content_ctx, NULL);
+    free(raw);
+    if (!ok) return false;
+
+    char *stop = NULL;
+    if (!test_json_optional_string_member(
+            json, "stop_reason", &stop, NULL) || !stop ||
+        !test_protocol_wire_set_same_string(&semantic->stop_reason, stop)) {
+        free(stop);
+        return false;
+    }
+    free(stop);
+    raw = NULL;
+    if (!test_json_member_required(json, "usage", &raw)) return false;
+    ok = test_protocol_wire_parse_usage(
+        raw, "input_tokens", "output_tokens", true, true, semantic);
+    free(raw);
+    if (!ok) return false;
+    return test_protocol_wire_extract_metrics(json, semantic, has_metrics);
+}
+
+typedef struct {
+    int index;
+    char *type;
+    int call_index;
+    bool stopped;
+} test_anthropic_block;
+
+typedef struct {
+    test_protocol_wire_semantic *semantic;
+    test_anthropic_block *blocks;
+    int blocks_len;
+    int blocks_cap;
+    int metrics_index;
+    int message_stop_index;
+    int last_index;
+} test_anthropic_sse_ctx;
+
+static void test_protocol_anthropic_sse_ctx_free(
+        test_anthropic_sse_ctx *ctx) {
+    if (!ctx) return;
+    for (int i = 0; i < ctx->blocks_len; i++) free(ctx->blocks[i].type);
+    free(ctx->blocks);
+    ctx->blocks = NULL;
+    ctx->blocks_len = 0;
+    ctx->blocks_cap = 0;
+}
+
+static test_anthropic_block *test_protocol_anthropic_block_find(
+        test_anthropic_sse_ctx *ctx,
+        int index) {
+    if (!ctx) return NULL;
+    for (int i = 0; i < ctx->blocks_len; i++) {
+        if (ctx->blocks[i].index == index) return &ctx->blocks[i];
+    }
+    return NULL;
+}
+
+static test_anthropic_block *test_protocol_anthropic_block_add(
+        test_anthropic_sse_ctx *ctx,
+        int index,
+        char *type) {
+    if (!ctx || index < 0 || !type || !type[0] ||
+        test_protocol_anthropic_block_find(ctx, index)) {
+        free(type);
+        return NULL;
+    }
+    if (ctx->blocks_len == ctx->blocks_cap) {
+        ctx->blocks_cap = ctx->blocks_cap ? ctx->blocks_cap * 2 : 4;
+        ctx->blocks = xrealloc(
+            ctx->blocks,
+            (size_t)ctx->blocks_cap * sizeof(ctx->blocks[0]));
+    }
+    test_anthropic_block *block = &ctx->blocks[ctx->blocks_len++];
+    *block = (test_anthropic_block){
+        .index = index,
+        .type = type,
+        .call_index = -1,
+    };
+    return block;
+}
+
+static bool test_protocol_anthropic_event_index(const char *data,
+                                                int *index) {
+    char *raw = NULL;
+    uint64_t value = 0;
+    if (!test_json_member_required(data, "index", &raw) ||
+        !test_json_raw_u64(raw, &value) || value > 1024u) {
+        free(raw);
+        return false;
+    }
+    free(raw);
+    *index = (int)value;
+    return true;
+}
+
+static bool test_protocol_anthropic_block_start(
+        const char *data,
+        test_anthropic_sse_ctx *ctx) {
+    int index = 0;
+    char *content = NULL;
+    char *type = NULL;
+    if (!test_protocol_anthropic_event_index(data, &index) ||
+        !test_json_member_required(data, "content_block", &content) ||
+        !test_json_optional_string_member(
+            content, "type", &type, NULL) || !type) {
+        free(content);
+        free(type);
+        return false;
+    }
+    test_anthropic_block *block = test_protocol_anthropic_block_add(
+        ctx, index, type);
+    if (!block) {
+        free(content);
+        return false;
+    }
+    bool ok = true;
+    if (!strcmp(block->type, "tool_use")) {
+        tool_call call = {0};
+        ok = test_json_optional_string_member(
+                content, "id", &call.id, NULL) && call.id &&
+            test_json_optional_string_member(
+                content, "name", &call.name, NULL) && call.name;
+        if (ok) {
+            call.arguments = xstrdup("");
+            block->call_index = ctx->semantic->calls.len;
+            tool_calls_push(&ctx->semantic->calls, call);
+        } else {
+            tool_call_free(&call);
+        }
+    } else if (strcmp(block->type, "text") &&
+               strcmp(block->type, "thinking")) {
+        ok = false;
+    }
+    free(content);
+    return ok;
+}
+
+static bool test_protocol_anthropic_block_delta(
+        const char *data,
+        test_anthropic_sse_ctx *ctx) {
+    int index = 0;
+    char *delta = NULL;
+    char *type = NULL;
+    if (!test_protocol_anthropic_event_index(data, &index) ||
+        !test_json_member_required(data, "delta", &delta) ||
+        !test_json_optional_string_member(
+            delta, "type", &type, NULL) || !type) {
+        free(delta);
+        free(type);
+        return false;
+    }
+    test_anthropic_block *block = test_protocol_anthropic_block_find(
+        ctx, index);
+    if (!block || block->stopped) {
+        free(delta);
+        free(type);
+        return false;
+    }
+    bool ok = true;
+    if (!strcmp(type, "text_delta")) {
+        char *raw = NULL;
+        ok = !strcmp(block->type, "text") &&
+            test_json_member_required(delta, "text", &raw) &&
+            test_protocol_wire_append_string(
+                &ctx->semantic->visible_text, raw);
+        free(raw);
+    } else if (!strcmp(type, "thinking_delta")) {
+        char *raw = NULL;
+        ok = !strcmp(block->type, "thinking") &&
+            test_json_member_required(delta, "thinking", &raw) &&
+            test_protocol_wire_append_string(
+                &ctx->semantic->reasoning_text, raw);
+        free(raw);
+    } else if (!strcmp(type, "input_json_delta")) {
+        char *fragment = NULL;
+        tool_call *call = block->call_index >= 0 ?
+            test_protocol_wire_call_at(
+                &ctx->semantic->calls, block->call_index) : NULL;
+        ok = !strcmp(block->type, "tool_use") && call &&
+            test_json_optional_string_member(
+                delta, "partial_json", &fragment, NULL) && fragment &&
+            test_protocol_wire_append_call_fragment(
+                &call->arguments, fragment);
+        free(fragment);
+    } else if (!strcmp(type, "signature_delta")) {
+        ok = !strcmp(block->type, "thinking");
+    } else {
+        ok = false;
+    }
+    free(delta);
+    free(type);
+    return ok;
+}
+
+static bool test_protocol_anthropic_message_delta(
+        const char *data,
+        int record_index,
+        test_anthropic_sse_ctx *ctx) {
+    char *delta = NULL;
+    char *stop = NULL;
+    if (!test_json_member_required(data, "delta", &delta) ||
+        !test_json_optional_string_member(
+            delta, "stop_reason", &stop, NULL) || !stop ||
+        !test_protocol_wire_set_same_string(
+            &ctx->semantic->stop_reason, stop)) {
+        free(delta);
+        free(stop);
+        return false;
+    }
+    free(delta);
+    free(stop);
+    char *usage = NULL;
+    if (!test_json_member_required(data, "usage", &usage) ||
+        !test_protocol_wire_parse_usage(
+            usage, "input_tokens", "output_tokens",
+            false, true, ctx->semantic)) {
+        free(usage);
+        return false;
+    }
+    free(usage);
+    bool has_metrics = false;
+    if (!test_protocol_wire_extract_metrics(
+            data, ctx->semantic, &has_metrics) || !has_metrics) return false;
+    ctx->metrics_index = record_index;
+    return true;
+}
+
+static bool test_protocol_anthropic_sse_visit(const char *event,
+                                              const char *data,
+                                              int record_index,
+                                              void *opaque) {
+    test_anthropic_sse_ctx *ctx = opaque;
+    if (!ctx || !ctx->semantic || !event ||
+        ctx->message_stop_index >= 0) return false;
+    bool ok = true;
+    if (!strcmp(event, "message_start")) {
+        char *message = NULL;
+        char *id = NULL;
+        char *usage = NULL;
+        char *initial_output = NULL;
+        uint64_t initial_output_tokens = 0;
+        ok = test_json_member_required(data, "message", &message) &&
+            test_json_member_required(message, "id", &id) &&
+            test_protocol_wire_add_id(ctx->semantic, id) &&
+            test_json_member_required(message, "usage", &usage) &&
+            test_protocol_wire_parse_usage(
+                usage, "input_tokens", "output_tokens",
+                true, false, ctx->semantic) &&
+            test_json_member_required(
+                usage, "output_tokens", &initial_output) &&
+            test_json_raw_u64(initial_output, &initial_output_tokens) &&
+            initial_output_tokens == 0;
+        free(initial_output);
+        free(usage);
+        free(id);
+        free(message);
+    } else if (!strcmp(event, "content_block_start")) {
+        ok = test_protocol_anthropic_block_start(data, ctx);
+    } else if (!strcmp(event, "content_block_delta")) {
+        ok = test_protocol_anthropic_block_delta(data, ctx);
+    } else if (!strcmp(event, "content_block_stop")) {
+        int index = 0;
+        ok = test_protocol_anthropic_event_index(data, &index);
+        test_anthropic_block *block = ok ?
+            test_protocol_anthropic_block_find(ctx, index) : NULL;
+        if (!block || block->stopped) ok = false;
+        else block->stopped = true;
+    } else if (!strcmp(event, "message_delta")) {
+        ok = test_protocol_anthropic_message_delta(
+            data, record_index, ctx);
+    } else if (!strcmp(event, "message_stop")) {
+        ctx->message_stop_index = record_index;
+    } else {
+        ok = false;
+    }
+    if (ok) ctx->last_index = record_index;
+    return ok;
+}
+
+static bool test_protocol_normalize_anthropic(
+        const buf *wire,
+        bool stream,
+        test_protocol_wire_semantic *semantic) {
+    if (!wire || !wire->ptr || !semantic) return false;
+    if (!stream) {
+        bool has_metrics = false;
+        if (!test_protocol_parse_anthropic_message(
+                wire->ptr, semantic, &has_metrics)) return false;
+        semantic->request_metrics_at_terminal = has_metrics &&
+            semantic->stop_reason != NULL;
+    } else {
+        test_anthropic_sse_ctx ctx = {
+            .semantic = semantic,
+            .metrics_index = -1,
+            .message_stop_index = -1,
+            .last_index = -1,
+        };
+        int records = 0;
+        bool ok = test_protocol_sse_each(
+            wire->ptr, test_protocol_anthropic_sse_visit,
+            &ctx, &records);
+        for (int i = 0; ok && i < ctx.blocks_len; i++) {
+            if (!ctx.blocks[i].stopped) ok = false;
+        }
+        semantic->request_metrics_at_terminal = ok &&
+            ctx.metrics_index >= 0 &&
+            ctx.message_stop_index == ctx.metrics_index + 1 &&
+            ctx.message_stop_index == records - 1 &&
+            ctx.message_stop_index == ctx.last_index;
+        test_protocol_anthropic_sse_ctx_free(&ctx);
+        if (!ok) return false;
+    }
+    const char *finish = semantic->stop_reason &&
+        !strcmp(semantic->stop_reason, "tool_use") ? "tool_calls" : "stop";
+    return semantic->stop_reason &&
+        semantic->protocol_ids.len > 0 &&
+        semantic->request_metrics_occurrences == 1 &&
+        semantic->request_metrics_at_terminal &&
+        test_protocol_wire_calls_valid(&semantic->calls) &&
+        test_protocol_wire_set_same_string(&semantic->finish, finish);
+}
+
+static bool test_protocol_normalize_wire(
+        const buf *wire,
+        test_metrics_protocol protocol,
+        bool stream,
+        test_protocol_wire_semantic *semantic) {
+    if (!semantic) return false;
+    memset(semantic, 0, sizeof(*semantic));
+    bool normalized = false;
+    switch (protocol) {
+    case TEST_METRICS_OPENAI_CHAT:
+        normalized = test_protocol_normalize_openai(wire, stream, semantic);
+        break;
+    case TEST_METRICS_RESPONSES:
+        normalized = test_protocol_normalize_responses(
+            wire, stream, semantic);
+        break;
+    case TEST_METRICS_ANTHROPIC:
+        normalized = test_protocol_normalize_anthropic(
+            wire, stream, semantic);
+        break;
+    }
+    if (!normalized || !semantic->request_metrics ||
+        !semantic->native_prompt_tokens_set ||
+        !semantic->native_completion_tokens_set) return false;
+
+    char *prompt_raw = NULL;
+    char *generated_raw = NULL;
+    uint64_t metric_prompt_tokens = 0;
+    uint64_t metric_completion_tokens = 0;
+    const bool metrics_match = test_json_member_required(
+            semantic->request_metrics, "prompt_tokens", &prompt_raw) &&
+        test_json_raw_u64(prompt_raw, &metric_prompt_tokens) &&
+        test_json_member_required(
+            semantic->request_metrics, "generated_tokens", &generated_raw) &&
+        test_json_raw_u64(generated_raw, &metric_completion_tokens) &&
+        semantic->native_prompt_tokens == metric_prompt_tokens &&
+        semantic->native_completion_tokens == metric_completion_tokens;
+    free(prompt_raw);
+    free(generated_raw);
+    return metrics_match;
+}
+
+static bool test_protocol_append_semantic(
+        buf *out,
+        const test_protocol_wire_semantic *semantic) {
+    if (!out || !semantic || !semantic->request_metrics ||
+        !semantic->finish || semantic->protocol_ids.len == 0 ||
+        !semantic->native_prompt_tokens_set ||
+        !semantic->native_completion_tokens_set) return false;
+
+    buf_puts(out, "{\"visible_text\":");
+    json_escape(out, test_protocol_buf_text(&semantic->visible_text));
+    buf_puts(out, ",\"reasoning_text\":");
+    json_escape(out, test_protocol_buf_text(&semantic->reasoning_text));
+    buf_puts(out, ",\"tool_calls\":");
+    if (!test_protocol_append_calls_json(out, &semantic->calls)) return false;
+    buf_puts(out, ",\"finish\":");
+    json_escape(out, semantic->finish);
+    buf_printf(out,
+        ",\"prompt_tokens\":%" PRIu64
+        ",\"completion_tokens\":%" PRIu64
+        ",\"protocol_id\":",
+        semantic->native_prompt_tokens,
+        semantic->native_completion_tokens);
+    json_escape(out, semantic->protocol_ids.v[0]);
+    buf_puts(out, ",\"protocol_ids_seen\":");
+    test_protocol_append_string_list(out, &semantic->protocol_ids);
+    buf_puts(out, ",\"request_metrics\":");
+    buf_puts(out, semantic->request_metrics);
+    buf_printf(out,
+        ",\"request_metrics_occurrences\":%d,"
+        "\"request_metrics_at_terminal\":%s,\"native_terminal\":",
+        semantic->request_metrics_occurrences,
+        semantic->request_metrics_at_terminal ? "true" : "false");
+    test_protocol_append_native_terminal(out, semantic);
+    buf_putc(out, '}');
+    return true;
+}
+
+static bool test_protocol_append_input_evidence(
+        buf *out,
+        const test_server_rpc *rpc,
+        const request *prepared,
+        const char *continuation_call_id,
+        bool tool_result_in_prompt) {
+    if (!out || !rpc || !prepared || !rpc->raw_output ||
+        !rpc->metrics_fixture) return false;
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    char error[160];
+    if (!ds4_plan_io_sha256(
+            rpc->raw_output, strlen(rpc->raw_output), digest,
+            error, sizeof(error))) return false;
+    bool prompt_contains_tool_schema = false;
+    if (prepared->has_tools && prepared->prompt_text) {
+        for (int i = 0; i < prepared->tool_orders.len; i++) {
+            const char *name = prepared->tool_orders.v[i].name;
+            if (name && name[0] && strstr(prepared->prompt_text, name)) {
+                prompt_contains_tool_schema = true;
+                break;
+            }
+        }
+    }
+    buf_puts(out, "{\"reasoning_summary\":");
+    if (prepared->reasoning_summary_emit) json_escape(out, "auto");
+    else buf_puts(out, "null");
+    buf_puts(out, ",\"tool_choice\":");
+    json_escape(out, prepared->has_tools ? "auto" : "none");
+    buf_printf(out, ",\"prompt_contains_tool_schema\":%s,",
+               prompt_contains_tool_schema ? "true" : "false");
+    buf_puts(out, "\"raw_output_fingerprint\":");
+    json_escape(out, digest);
+    buf_puts(out, ",\"continuation_call_id\":");
+    if (continuation_call_id) json_escape(out, continuation_call_id);
+    else buf_puts(out, "null");
+    buf_printf(out, ",\"tool_result_in_prompt\":%s,\"metrics_fixture\":",
+               tool_result_in_prompt ? "true" : "false");
+    json_escape(out, rpc->metrics_fixture);
+    buf_putc(out, '}');
+    return true;
+}
+
+static bool test_server_append_protocol_fixture_response(
+        test_server_driver *driver,
+        const test_server_rpc *rpc,
+        buf *response) {
+    if (!driver || !rpc || !response || !rpc->method ||
+        strcmp(rpc->method, "POST") || !rpc->path || !rpc->body ||
+        !rpc->protocol || !rpc->fixture || !rpc->stream_set ||
+        !rpc->raw_output || !rpc->tool_call_ids_set ||
+        !rpc->metrics_fixture || !test_protocol_fixture_known(rpc->fixture)) {
+        return false;
+    }
+    char before[41];
+    char after[41];
+    test_server_state_fingerprint(driver, before);
+    request prepared = {0};
+    test_metrics_protocol protocol = TEST_METRICS_OPENAI_CHAT;
+    char *continuation_call_id = NULL;
+    bool tool_result_in_prompt = false;
+    request_admission_code code = test_protocol_parse_request(
+        rpc, &driver->parser_server, &protocol, &prepared,
+        &continuation_call_id,
+        &tool_result_in_prompt);
+    if (strcmp(rpc->protocol, test_protocol_name(protocol)) ||
+        (code == REQUEST_ADMISSION_FITS && prepared.stream != rpc->stream)) {
+        request_free(&prepared);
+        free(continuation_call_id);
+        return false;
+    }
+    test_server_state_fingerprint(driver, after);
+
+    buf_printf(response, "{\"http_status\":%d,\"code\":",
+               code == REQUEST_ADMISSION_FITS ? 200 : 400);
+    if (code == REQUEST_ADMISSION_FITS) buf_puts(response, "null");
+    else json_escape(response, request_admission_code_name(code));
+    buf_puts(response, ",\"input_evidence\":");
+    if (code != REQUEST_ADMISSION_FITS) {
+        buf_puts(response, "null,\"semantic\":null");
+    } else {
+        if (!test_protocol_append_input_evidence(
+                response, rpc, &prepared, continuation_call_id,
+                tool_result_in_prompt)) {
+            request_free(&prepared);
+            free(continuation_call_id);
+            return false;
+        }
+
+        char *content = NULL;
+        char *reasoning = NULL;
+        tool_calls calls = {0};
+        const char *finish = "stop";
+        if (!test_protocol_parse_output(
+                &prepared, rpc, &content, &reasoning, &calls, &finish)) {
+            request_free(&prepared);
+            free(continuation_call_id);
+            free(content);
+            free(reasoning);
+            tool_calls_free(&calls);
+            return false;
+        }
+        test_metrics_request metrics_request = {
+            .protocol = protocol,
+            .fixture = TEST_METRICS_VISIBLE,
+            .responses_terminal = TEST_RESPONSES_COMPLETED,
+            .terminal_status = DS4_RUNTIME_REQUEST_COMPLETED,
+            .stream = rpc->stream,
+        };
+        ds4_runtime_request_metrics metrics;
+        buf wire = {0};
+        driver->protocol_sequence++;
+        char protocol_request_id[96];
+        const char *prefix = protocol == TEST_METRICS_OPENAI_CHAT ?
+            "chatcmpl_protocol_" :
+            protocol == TEST_METRICS_RESPONSES ?
+                "resp_protocol_" : "msg_protocol_";
+        snprintf(protocol_request_id, sizeof(protocol_request_id),
+                 "%s%" PRIu64, prefix, driver->protocol_sequence);
+        const bool wire_ok =
+            test_metrics_build_lifecycle(&metrics_request, &metrics) &&
+            test_protocol_emit_fixture_wire(
+                protocol, &prepared, protocol_request_id,
+                content, reasoning, &calls, finish, &metrics, &wire);
+        test_protocol_wire_semantic semantic = {0};
+        const bool semantic_ok = wire_ok && test_protocol_normalize_wire(
+            &wire, protocol, rpc->stream, &semantic);
+        buf_puts(response, ",\"semantic\":");
+        if (!semantic_ok ||
+            !test_protocol_append_semantic(response, &semantic)) {
+            test_protocol_wire_semantic_free(&semantic);
+            buf_free(&wire);
+            free(content);
+            free(reasoning);
+            tool_calls_free(&calls);
+            request_free(&prepared);
+            free(continuation_call_id);
+            return false;
+        }
+        test_protocol_wire_semantic_free(&semantic);
+        buf_free(&wire);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+    buf_puts(response, ",\"mutation_fingerprint_before\":");
+    json_escape(response, before);
+    buf_puts(response, ",\"mutation_fingerprint_after\":");
+    json_escape(response, after);
+    buf_putc(response, '}');
+
+    request_free(&prepared);
+    free(continuation_call_id);
+    return true;
+}
+
 static bool test_server_append_prepare_response(
         const test_server_driver *driver,
         const test_server_rpc *rpc,
@@ -7648,6 +10362,10 @@ static int test_server_token_admission_stdio(int context_tokens) {
     size_t line_cap = 0;
     int rc = 0;
     bool done = false;
+    if (!test_server_parser_state_init(&driver)) {
+        fprintf(stderr, "ds4-test: parser-state fixture setup failed\n");
+        return 1;
+    }
 
     while (!done) {
         errno = 0;
@@ -7667,10 +10385,21 @@ static int test_server_token_admission_stdio(int context_tokens) {
         }
 
         buf response = {0};
+        bool process_unsafe = false;
         if (!strcmp(rpc.op, "ping")) {
             buf_puts(&response, "{\"ok\":true}");
         } else if (!strcmp(rpc.op, "snapshot")) {
             test_server_snapshot_json(&driver, &response);
+        } else if (!strcmp(rpc.op, "failure_boundary")) {
+            if (!rpc.body || rpc.method || rpc.path || rpc.call_id ||
+                rpc.name || rpc.arguments || rpc.sampled_text) {
+                buf_puts(&response,
+                         "{\"error\":\"invalid failure_boundary operation\"}");
+            } else if (!test_server_append_failure_boundary_response(
+                           &driver, &rpc, &response, &process_unsafe)) {
+                buf_puts(&response,
+                         "{\"error\":\"failure boundary evaluation failed\"}");
+            }
         } else if (!strcmp(rpc.op, "metrics")) {
             if (!rpc.body || rpc.method || rpc.path || rpc.call_id ||
                 rpc.name || rpc.arguments || rpc.sampled_text) {
@@ -7680,6 +10409,27 @@ static int test_server_token_admission_stdio(int context_tokens) {
                            &driver, &rpc, &response)) {
                 buf_puts(&response,
                          "{\"error\":\"metrics emission failed\"}");
+            }
+        } else if (!strcmp(rpc.op, "protocol_validate")) {
+            if (rpc.protocol || rpc.fixture || rpc.raw_output ||
+                rpc.metrics_fixture || rpc.stream_set ||
+                rpc.tool_call_ids_set || rpc.call_id || rpc.name ||
+                rpc.arguments || rpc.sampled_text) {
+                buf_puts(&response,
+                    "{\"error\":\"invalid protocol_validate operation\"}");
+            } else if (!test_server_append_protocol_validate_response(
+                           &driver, &rpc, &response)) {
+                buf_puts(&response,
+                    "{\"error\":\"protocol validation failed\"}");
+            }
+        } else if (!strcmp(rpc.op, "protocol_fixture")) {
+            if (rpc.call_id || rpc.name || rpc.arguments || rpc.sampled_text) {
+                buf_puts(&response,
+                    "{\"error\":\"invalid protocol_fixture operation\"}");
+            } else if (!test_server_append_protocol_fixture_response(
+                           &driver, &rpc, &response)) {
+                buf_puts(&response,
+                    "{\"error\":\"protocol fixture evaluation failed\"}");
             }
         } else if (!strcmp(rpc.op, "seed_tool_replay") ||
                    !strcmp(rpc.op, "seed_disk_tool_replay")) {
@@ -7709,6 +10459,10 @@ static int test_server_token_admission_stdio(int context_tokens) {
         test_server_write_json(&response);
         buf_free(&response);
         test_server_rpc_free(&rpc);
+        if (process_unsafe) {
+            done = true;
+            rc = 1;
+        }
     }
 
     free(line);
@@ -7717,6 +10471,7 @@ static int test_server_token_admission_stdio(int context_tokens) {
     }
     buf_free(&driver.tool_memory_records);
     buf_free(&driver.disk_cache_records);
+    test_server_parser_state_free(&driver);
     return rc;
 }
 
@@ -7803,6 +10558,30 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--server-lifecycle-stdio")) {
+        if ((argc != 4 && argc != 6) || strcmp(argv[2], "--scenario") ||
+            (argc == 6 && strcmp(argv[4], "--port"))) {
+            fprintf(stderr,
+                    "ds4-test: --server-lifecycle-stdio requires "
+                    "--scenario NAME [--port N]\n");
+            return 2;
+        }
+        int requested_port = 0;
+        if (argc == 6) {
+            errno = 0;
+            char *end = NULL;
+            const long parsed = strtol(argv[5], &end, 10);
+            if (errno || end == argv[5] || *end || parsed <= 0 ||
+                parsed > UINT16_MAX) {
+                fprintf(stderr, "ds4-test: invalid --port value: %s\n",
+                        argv[5]);
+                return 2;
+            }
+            requested_port = (int)parsed;
+        }
+        return test_server_lifecycle_stdio_on_port(
+            argv[3], requested_port);
+    }
     if (argc >= 2 && !strcmp(argv[1], "--server-token-admission-stdio")) {
         if (argc != 4 || strcmp(argv[2], "--context-tokens")) {
             fprintf(stderr,

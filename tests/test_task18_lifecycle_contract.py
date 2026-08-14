@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -139,6 +140,19 @@ class Task18LifecycleContract(unittest.TestCase):
         child.signal(signal.SIGTERM)
         child.wait(143)
 
+    def test_second_signal_uses_the_actual_forcing_signal(self) -> None:
+        term_then_int = self.child("forced")
+        term_then_int.signal(signal.SIGTERM)
+        time.sleep(0.1)
+        term_then_int.signal(signal.SIGINT)
+        term_then_int.wait(130)
+
+        int_then_term = self.child("forced")
+        int_then_term.signal(signal.SIGINT)
+        time.sleep(0.1)
+        int_then_term.signal(signal.SIGTERM)
+        int_then_term.wait(143)
+
     def test_internal_unsafe_wakes_blocked_accept_and_exits_one(self) -> None:
         child = self.child("unsafe")
         child.command("unsafe")
@@ -166,6 +180,50 @@ class Task18LifecycleContract(unittest.TestCase):
             response += chunk
         self.assertTrue(response.startswith(b"HTTP/1.1 503 "), response)
         child.wait(0)
+
+
+class Task18LifecycleSourceContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (Path(__file__).resolve().parents[1] / "ds4_server.c").read_text()
+
+    def function_body(self, name: str, next_name: str) -> str:
+        start = self.source.index(name)
+        end = self.source.index(next_name, start)
+        return self.source[start:end]
+
+    def test_prefill_rechecks_shutdown_after_inference_lock(self) -> None:
+        body = self.function_body(
+            "static bool server_prefill_enter(",
+            "static void server_prefill_leave(",
+        )
+        model_owned = body.index("s->model_busy = true")
+        inference_lock = body.index(
+            "pthread_mutex_lock(&s->inference_mu);", model_owned
+        )
+        return_true = body.index("return true;", inference_lock)
+        handoff = body[inference_lock:return_true]
+        self.assertIn("if (g_stop_requested)", handoff)
+        self.assertIn("s->model_busy = false", handoff)
+
+    def test_decode_rechecks_shutdown_after_model_wait(self) -> None:
+        body = self.function_body(
+            "static void *decode_worker_main(",
+            "static uint64_t server_next_sequence(",
+        )
+        wait = body.index("while (s->model_busy")
+        collect = body.index("int count = 0", wait)
+        self.assertIn("if (g_stop_requested)", body[wait:collect])
+
+    def test_decode_rechecks_shutdown_at_inference_dispatch(self) -> None:
+        body = self.function_body(
+            "static void *decode_worker_main(",
+            "static uint64_t server_next_sequence(",
+        )
+        busy = body.index("s->model_busy = true")
+        inference_lock = body.index("pthread_mutex_lock(&s->inference_mu);", busy)
+        dispatch = body.index("ds4_sessions_eval_batch_attributed(", inference_lock)
+        self.assertIn("g_stop_requested", body[inference_lock:dispatch])
 
 
 def main() -> None:

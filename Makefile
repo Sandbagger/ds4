@@ -374,8 +374,11 @@ test-runtime: tests/test_runtime
 test-runtime-request: tests/test_runtime
 	./tests/test_runtime --case request-metrics
 
-test-laguna-server-contract: ds4_test
-	python3 tests/test_laguna_server_contract.py --server ./ds4_test --case admission --case metrics -v
+test-laguna-server-contract: ds4_test ds4-server
+	python3 tests/test_laguna_server_contract.py --server ./ds4_test --case admission --case metrics --case protocol -v
+	python3 tests/test_task18_failure_contract.py --server ./ds4_test -v
+	python3 tests/test_task18_lifecycle_contract.py --server ./ds4_test -v
+	python3 tests/test_task18_cli_contract.py --live-server ./ds4-server --test-server ./ds4_test -v
 	python3 tests/test_laguna_server_live_contract.py -v
 
 tests/test_qualification_control.o: tests/test_qualification_control.c ds4.h ds4_runtime.h

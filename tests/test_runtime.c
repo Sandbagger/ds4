@@ -2311,6 +2311,61 @@ static void test_request_metrics_saturation_and_validation(void) {
           "decoded buffered output can be cancelled before any client emission");
 }
 
+static void test_request_metrics_recoverable_prefill_barrier(void) {
+    ds4_runtime_request_context request;
+    ds4_runtime_request_metrics metrics;
+    memset(&request, 0, sizeof(request));
+    memset(&metrics, 0xa5, sizeof(metrics));
+
+    CHECK(ds4_runtime_request_begin(&request, 100u) &&
+              ds4_runtime_request_set_prompt_tokens(&request, 8u),
+          "recoverable prefill fixture prepares one accepted request");
+    const ds4_runtime_request_context before_prefill = request;
+    CHECK(!ds4_runtime_request_record_page_advice_complete(
+              &request, 101u) &&
+              memcmp(&request, &before_prefill, sizeof(request)) == 0,
+          "final advice cannot precede the start of physical prefill work");
+
+    CHECK(ds4_runtime_request_mark_prefill_started(&request, 110u),
+          "recoverable prefill fixture starts physical work");
+    const ds4_runtime_request_context after_prefill_started = request;
+    CHECK(!ds4_runtime_request_record_page_advice_complete(
+              &request, 109u) &&
+              memcmp(&request, &after_prefill_started, sizeof(request)) == 0,
+          "failed-prefill barrier cannot predate the prefill start");
+    CHECK(ds4_runtime_request_observe_page_advice(&request, 120u),
+          "recoverable prefill fixture observes physical page advice");
+
+    CHECK(ds4_runtime_request_record_page_advice_complete(
+              &request, 130u) &&
+              request.prefill_started && !request.prefill_complete &&
+              request.page_advice_observed &&
+              request.page_advice_complete &&
+              request.page_advice_complete_monotonic_ns == 130u,
+          "recoverable failed prefill seals its final advice barrier without fabricating completion");
+    const ds4_runtime_request_context after_barrier = request;
+    CHECK(!ds4_runtime_request_mark_prefill_complete(&request, 131u) &&
+              !ds4_runtime_request_add_counters(
+                  &request, &(ds4_runtime_wire_counters){
+                      .page_advice_attempts = 1u,
+                  }) &&
+              memcmp(&request, &after_barrier, sizeof(request)) == 0,
+          "failed-prefill barrier freezes later prefill and counter mutation");
+
+    CHECK(ds4_runtime_request_finish(
+              &request, DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR,
+              140u, &metrics) &&
+              metrics.prompt_tokens == 8u &&
+              metrics.generated_tokens == 0u &&
+              !metrics.ttft_present &&
+              metrics.prefill_tokens_per_second == 0.0 &&
+              metrics.page_advice_complete_present &&
+              metrics.page_advice_complete_monotonic_ns == 130u &&
+              metrics.terminal_status ==
+                  DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR,
+          "recoverable failed prefill publishes truthful terminal metrics");
+}
+
 static int run_external_attribution(void) {
     test_valid_external_attribution();
     test_partial_vma_credit_and_managed_deduplication();
@@ -2337,6 +2392,7 @@ static int run_external_attribution(void) {
 static int run_request_metrics(void) {
     test_request_metrics_lifecycle();
     test_request_metrics_saturation_and_validation();
+    test_request_metrics_recoverable_prefill_barrier();
     if (g_failures != 0) {
         fprintf(stderr, "request-metrics: %d/%d assertions failed\n",
                 g_failures, g_assertions);

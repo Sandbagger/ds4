@@ -660,8 +660,37 @@ class Task18CudaFailureContract(unittest.TestCase):
             - _u64(before["event_completion_failures"], "event_completion_failures"),
             1,
         )
-        self.assertEqual(_u64(after["cache_slot_loading_count"], "loading"), 1)
-        self.assertGreater(_u64(after["cache_slot_total_refs"], "refs"), 0)
+        self.assertEqual(
+            _u64(after["cache_load_failures"], "cache_load_failures")
+            - _u64(before["cache_load_failures"], "cache_load_failures"),
+            1,
+        )
+        self.assertEqual(
+            _u64(before["cache_slot_loading_count"], "before.loading"), 0
+        )
+        self.assertEqual(
+            _u64(after["cache_slot_loading_count"], "after.loading"), 1
+        )
+        self.assertEqual(
+            _u64(before["cache_slot_in_use_count"], "before.in_use"), 0
+        )
+        self.assertEqual(
+            _u64(after["cache_slot_in_use_count"], "after.in_use"), 0
+        )
+        # A load owner remains unreferenced until publish changes LOADING to
+        # IN_USE.  Completion uncertainty must retain that unpublished owner
+        # and poison the cache; a positive refcount would falsely claim that
+        # the uncertain payload became execution-visible.
+        self.assertEqual(_u64(before["cache_slot_total_refs"], "before.refs"), 0)
+        self.assertEqual(_u64(after["cache_slot_total_refs"], "after.refs"), 0)
+        self.assertEqual(
+            _u64(after["cache_slot_empty_count"], "after.empty") + 1,
+            _u64(before["cache_slot_empty_count"], "before.empty"),
+        )
+        self.assertEqual(
+            _u64(after["cache_slot_ready_count"], "after.ready"),
+            _u64(before["cache_slot_ready_count"], "before.ready"),
+        )
         server.wait(1)
 
     def test_request_barrier_unsafe_abrupts_after_visible_frame(self) -> None:

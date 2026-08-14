@@ -6,6 +6,10 @@
 #include "ds4_kvstore.h"
 #include "rax.h"
 
+#ifdef DS4_TEST_HOOKS
+#include "ds4_gpu.h"
+#endif
+
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
@@ -10628,6 +10632,17 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+#ifdef DS4_TEST_HOOKS
+    bool test_compact_fault_enabled;
+    unsigned test_compact_fault_evidence_count;
+    ds4_gpu_laguna_cache_test_fault test_compact_fault;
+    const char *test_compact_fault_name;
+    int test_evidence_fd;
+    ds4_gpu_laguna_compact_test_snapshot test_compact_before;
+    ds4_gpu_laguna_routed_origin_test_snapshot test_routed_origin_before;
+    ds4_gpu_laguna_routed_origin_test_snapshot test_routed_origin_fault;
+    ds4_runtime_wire_snapshot test_runtime_identity;
+#endif
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -12986,6 +13001,305 @@ static server_failure_boundary server_failure_boundary_decide(
         .process_unsafe = false,
     };
 }
+
+#ifdef DS4_TEST_HOOKS
+static const char *server_test_compact_lifecycle_name(
+        ds4_gpu_laguna_lifecycle lifecycle) {
+    switch (lifecycle) {
+    case DS4_GPU_LAGUNA_LIFECYCLE_IDLE: return "idle";
+    case DS4_GPU_LAGUNA_LIFECYCLE_CREATING: return "creating";
+    case DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE: return "active";
+    case DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING: return "destroying";
+    case DS4_GPU_LAGUNA_LIFECYCLE_RELEASING: return "releasing";
+    }
+    return "unknown";
+}
+
+static void server_test_append_u64_string(buf *b, uint64_t value) {
+    buf_printf(b, "\"%" PRIu64 "\"", value);
+}
+
+static void server_test_append_file_identity(
+        buf *b, const ds4_runtime_file_identity *identity) {
+    buf_puts(b, "{\"device\":");
+    server_test_append_u64_string(b, identity ? identity->device : 0u);
+    buf_puts(b, ",\"inode\":");
+    server_test_append_u64_string(b, identity ? identity->inode : 0u);
+    buf_puts(b, ",\"size_bytes\":");
+    server_test_append_u64_string(b, identity ? identity->size_bytes : 0u);
+    buf_puts(b, ",\"mtime_ns\":");
+    server_test_append_u64_string(b, identity ? identity->mtime_ns : 0u);
+    buf_putc(b, '}');
+}
+
+static void server_test_append_compact_snapshot(
+        buf *b, const ds4_gpu_laguna_compact_test_snapshot *snapshot) {
+    buf_puts(b, "{\"lifecycle\":");
+    json_escape(b, server_test_compact_lifecycle_name(snapshot->lifecycle));
+    buf_printf(b, ",\"model_fd_live\":%s,\"cache_unsafe\":%s",
+               snapshot->model_fd_live ? "true" : "false",
+               snapshot->cache_unsafe ? "true" : "false");
+#define SERVER_TEST_APPEND_SNAPSHOT_U64(name) do {                          \
+        buf_puts(b, ",\"" #name "\":");                                  \
+        server_test_append_u64_string(b, snapshot->name);                   \
+    } while (0)
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_slot_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_slot_empty_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_slot_ready_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_slot_loading_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_slot_in_use_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_slot_total_refs);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_payload_id);
+    buf_puts(b, ",\"pinned_staging_ids\":[");
+    for (size_t i = 0; i < 4; i++) {
+        if (i) buf_putc(b, ',');
+        server_test_append_u64_string(b, snapshot->pinned_staging_ids[i]);
+    }
+    buf_putc(b, ']');
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_payload_bytes);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(pinned_staging_live_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(pinned_staging_bytes);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_payload_allocation_attempts);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(pinned_staging_allocation_attempts);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cache_load_failures);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(pread_error_failures);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(cuda_copy_failures);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(event_completion_failures);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(request_barrier_unsafe_failures);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(model_mapping_registered_bytes);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(whole_model_copied_bytes);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(opportunistic_range_allocated_bytes);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(legacy_model_range_count);
+    SERVER_TEST_APPEND_SNAPSHOT_U64(legacy_model_arena_count);
+#undef SERVER_TEST_APPEND_SNAPSHOT_U64
+    buf_putc(b, '}');
+}
+
+static void server_test_append_routed_origin(
+        buf *b,
+        const ds4_gpu_laguna_routed_origin_test_snapshot *origin) {
+    buf_putc(b, '{');
+#define SERVER_TEST_APPEND_ORIGIN_U64(name, comma) do {                     \
+        if (comma) buf_putc(b, ',');                                       \
+        buf_puts(b, "\"" #name "\":");                                  \
+        server_test_append_u64_string(b, origin->name);                     \
+    } while (0)
+    SERVER_TEST_APPEND_ORIGIN_U64(routed_projection_requests, false);
+    SERVER_TEST_APPEND_ORIGIN_U64(engine_slot_resolutions, true);
+    SERVER_TEST_APPEND_ORIGIN_U64(static_slab_resolutions, true);
+    SERVER_TEST_APPEND_ORIGIN_U64(model_mapping_resolutions, true);
+    SERVER_TEST_APPEND_ORIGIN_U64(managed_resolutions, true);
+    SERVER_TEST_APPEND_ORIGIN_U64(per_request_resolutions, true);
+    SERVER_TEST_APPEND_ORIGIN_U64(unknown_resolutions, true);
+#undef SERVER_TEST_APPEND_ORIGIN_U64
+    buf_putc(b, '}');
+}
+
+static uint64_t server_test_compact_fault_consumed_count(
+        ds4_gpu_laguna_cache_test_fault fault,
+        const ds4_gpu_laguna_compact_test_snapshot *before,
+        const ds4_gpu_laguna_compact_test_snapshot *after) {
+    uint64_t old_count = 0u;
+    uint64_t new_count = 0u;
+    switch (fault) {
+    case DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_ERROR:
+        old_count = before->pread_error_failures;
+        new_count = after->pread_error_failures;
+        break;
+    case DS4_GPU_LAGUNA_CACHE_FAULT_CUDA_COPY:
+        old_count = before->cuda_copy_failures;
+        new_count = after->cuda_copy_failures;
+        break;
+    case DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION:
+        old_count = before->event_completion_failures;
+        new_count = after->event_completion_failures;
+        break;
+    case DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE:
+        old_count = before->request_barrier_unsafe_failures;
+        new_count = after->request_barrier_unsafe_failures;
+        break;
+    default:
+        return 0u;
+    }
+    return new_count >= old_count ? new_count - old_count : 0u;
+}
+
+static bool server_test_cuda_fault_prepare(
+        server *s,
+        ds4_gpu_laguna_cache_test_fault fault,
+        const char *fault_name,
+        int evidence_fd) {
+    if (!s || !fault_name || evidence_fd < 3 ||
+        !ds4_gpu_test_laguna_compact_active_snapshot(
+            &s->test_compact_before) ||
+        !ds4_gpu_test_laguna_compact_routed_origin_snapshot(
+            &s->test_routed_origin_before) ||
+        !ds4_engine_runtime_snapshot(s->engine, &s->test_runtime_identity) ||
+        !s->test_runtime_identity.instance_id[0]) {
+        return false;
+    }
+    s->test_compact_fault_enabled = true;
+    s->test_compact_fault = fault;
+    s->test_compact_fault_name = fault_name;
+    s->test_evidence_fd = evidence_fd;
+    ds4_gpu_test_laguna_compact_cache_fault_once(fault);
+    return true;
+}
+
+static bool server_test_cuda_fault_evidence_emit(
+        server *s,
+        const job *j,
+        int execution_result,
+        bool headers_sent,
+        const server_failure_boundary *boundary) {
+    if (!s || !j || !boundary || !s->test_compact_fault_enabled ||
+        s->test_evidence_fd < 3 || !j->runtime_request.request_id[0]) {
+        return !s || !s->test_compact_fault_enabled;
+    }
+    if (s->test_compact_fault_evidence_count >= 2u) return true;
+    const bool first_evidence =
+        s->test_compact_fault_evidence_count == 0u;
+    const bool followup_evidence =
+        s->test_compact_fault_evidence_count == 1u && execution_result == 0;
+    ds4_gpu_laguna_compact_test_snapshot after;
+    ds4_gpu_laguna_routed_origin_test_snapshot routed_origin;
+    memset(&after, 0, sizeof(after));
+    memset(&routed_origin, 0, sizeof(routed_origin));
+    if (!ds4_gpu_test_laguna_compact_active_snapshot(&after) ||
+        !ds4_gpu_test_laguna_compact_routed_origin_snapshot(
+            &routed_origin)) {
+        return false;
+    }
+
+    const ds4_gpu_laguna_compact_test_snapshot *before =
+        &s->test_compact_before;
+    const uint64_t consumed = server_test_compact_fault_consumed_count(
+        s->test_compact_fault, before, &after);
+    const bool fixed_allocations_unchanged =
+        before->cache_payload_id != 0u &&
+        before->cache_payload_id == after.cache_payload_id &&
+        before->cache_payload_bytes == after.cache_payload_bytes &&
+        before->cache_payload_allocation_attempts ==
+            after.cache_payload_allocation_attempts &&
+        before->pinned_staging_allocation_attempts ==
+            after.pinned_staging_allocation_attempts &&
+        before->pinned_staging_live_count == 4u &&
+        after.pinned_staging_live_count == 4u &&
+        before->pinned_staging_bytes == after.pinned_staging_bytes &&
+        memcmp(before->pinned_staging_ids, after.pinned_staging_ids,
+               sizeof(before->pinned_staging_ids)) == 0;
+    const bool fault_counters_monotonic =
+        after.cache_load_failures >= before->cache_load_failures &&
+        after.pread_error_failures >= before->pread_error_failures &&
+        after.cuda_copy_failures >= before->cuda_copy_failures &&
+        after.event_completion_failures >=
+            before->event_completion_failures &&
+        after.request_barrier_unsafe_failures >=
+            before->request_barrier_unsafe_failures;
+    const bool no_fallback =
+        after.model_mapping_registered_bytes == 0u &&
+        after.whole_model_copied_bytes == 0u &&
+        after.opportunistic_range_allocated_bytes == 0u &&
+        after.legacy_model_range_count == 0u &&
+        after.legacy_model_arena_count == 0u &&
+        routed_origin.model_mapping_resolutions == 0u &&
+        routed_origin.managed_resolutions == 0u &&
+        routed_origin.per_request_resolutions == 0u &&
+        routed_origin.unknown_resolutions == 0u;
+    const bool restored =
+        execution_result == DS4_SERVER_EXEC_RECOVERABLE &&
+        !after.cache_unsafe && after.cache_slot_loading_count == 0u &&
+        after.cache_slot_in_use_count == 0u &&
+        after.cache_slot_total_refs == 0u &&
+        after.cache_slot_empty_count + after.cache_slot_ready_count ==
+            after.cache_slot_count;
+    const bool followup_safe =
+        followup_evidence && !after.cache_unsafe &&
+        after.cache_slot_loading_count == 0u &&
+        after.cache_slot_in_use_count == 0u &&
+        after.cache_slot_total_refs == 0u &&
+        after.cache_slot_empty_count + after.cache_slot_ready_count ==
+            after.cache_slot_count &&
+        routed_origin.routed_projection_requests >
+            s->test_routed_origin_fault.routed_projection_requests &&
+        routed_origin.routed_projection_requests ==
+            routed_origin.engine_slot_resolutions;
+    const uint64_t evidence_sequence = restored ? 2u : 1u;
+    const uint64_t response_sequence = headers_sent ? 0u :
+        evidence_sequence + 1u;
+    const char *execution_result_name =
+        execution_result == 0 ? "completed" :
+        execution_result == DS4_SERVER_EXEC_RECOVERABLE ? "recoverable" :
+        execution_result == DS4_SERVER_EXEC_UNSAFE ? "unsafe" :
+        execution_result == DS4_SERVER_EXEC_INTERRUPTED ? "cancelled" :
+        "unknown";
+
+    buf record = {0};
+    buf_puts(&record, "{\"schema\":\"ds4.test.cuda-fault/v1\",\"fault\":");
+    json_escape(&record, s->test_compact_fault_name);
+    buf_printf(&record, ",\"pid\":%ld,\"request_id\":", (long)getpid());
+    json_escape(&record, j->runtime_request.request_id);
+    buf_puts(&record, ",\"execution_result\":");
+    json_escape(&record, execution_result_name);
+    buf_printf(&record,
+               ",\"headers_sent\":%s,"
+               "\"fault_armed_count\":\"1\","
+               "\"fault_consumed_count\":",
+               headers_sent ? "true" : "false");
+    server_test_append_u64_string(&record, consumed);
+    buf_puts(&record, ",\"restore_sequence\":");
+    if (restored) server_test_append_u64_string(&record, 1u);
+    else buf_puts(&record, "null");
+    buf_puts(&record, ",\"evidence_sequence\":");
+    server_test_append_u64_string(&record, evidence_sequence);
+    buf_puts(&record, ",\"response_sequence\":");
+    if (response_sequence) {
+        server_test_append_u64_string(&record, response_sequence);
+    } else {
+        buf_puts(&record, "null");
+    }
+    buf_puts(&record, ",\"executable\":");
+    server_test_append_file_identity(
+        &record, &s->test_runtime_identity.executable);
+    buf_puts(&record, ",\"model\":");
+    server_test_append_file_identity(&record, &s->test_runtime_identity.model);
+    buf_printf(&record, ",\"model_fd\":%d,\"compact_before\":",
+               after.model_fd);
+    server_test_append_compact_snapshot(&record, before);
+    buf_puts(&record, ",\"compact_after\":");
+    server_test_append_compact_snapshot(&record, &after);
+    buf_puts(&record, ",\"routed_origin\":");
+    server_test_append_routed_origin(&record, &routed_origin);
+    buf_puts(&record, "}\n");
+
+    bool write_ok = true;
+    size_t offset = 0u;
+    while (offset < record.len) {
+        const ssize_t written = write(
+            s->test_evidence_fd, record.ptr + offset,
+            record.len - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            write_ok = false;
+            break;
+        }
+        offset += (size_t)written;
+    }
+    buf_free(&record);
+    if (write_ok) {
+        if (first_evidence) {
+            s->test_routed_origin_fault = routed_origin;
+        }
+        s->test_compact_fault_evidence_count++;
+    }
+    const bool first_valid = first_evidence && consumed == 1u &&
+        execution_result != 0 &&
+        (execution_result != DS4_SERVER_EXEC_RECOVERABLE || restored);
+    return write_ok && fixed_allocations_unchanged &&
+        fault_counters_monotonic && no_fallback &&
+        (first_valid || (followup_safe && consumed == 1u));
+}
+#endif
 
 static ds4_runtime_request_terminal_status server_transport_failure_status(
         ds4_runtime_request_terminal_status current) {
@@ -15851,6 +16165,22 @@ runtime_terminal_funnel:
             execution_result, response_stream_started);
         runtime_status = failure_boundary.terminal_status;
     }
+#ifdef DS4_TEST_HOOKS
+    if (s->test_compact_fault_enabled &&
+        s->test_compact_fault_evidence_count < 2u &&
+        !server_test_cuda_fault_evidence_emit(
+            s, j, execution_result, response_stream_started,
+            &failure_boundary)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: physical CUDA fault evidence failed closed");
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+        runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        execution_failure_active = true;
+        failure_boundary = server_failure_boundary_decide(
+            execution_result, response_stream_started);
+    }
+#endif
     if (runtime && native_terminal_ready && !execution_failure_active) {
         if (!j->req.stream) {
             bool buffered_payload_emitted = false;
@@ -17093,6 +17423,13 @@ typedef struct {
     int batched_sessions;
     bool batched_sessions_set;
     bool session_slots_set;
+#ifdef DS4_TEST_HOOKS
+    bool test_compact_fault_set;
+    ds4_gpu_laguna_cache_test_fault test_compact_fault;
+    const char *test_compact_fault_name;
+    bool test_evidence_fd_set;
+    int test_evidence_fd;
+#endif
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -17219,6 +17556,26 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+#ifdef DS4_TEST_HOOKS
+static bool server_test_compact_fault_parse(
+        const char *name,
+        ds4_gpu_laguna_cache_test_fault *fault) {
+    if (!name || !fault) return false;
+    if (!strcmp(name, "pread-error")) {
+        *fault = DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_ERROR;
+    } else if (!strcmp(name, "cuda-copy")) {
+        *fault = DS4_GPU_LAGUNA_CACHE_FAULT_CUDA_COPY;
+    } else if (!strcmp(name, "event-completion")) {
+        *fault = DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION;
+    } else if (!strcmp(name, "request-barrier-unsafe")) {
+        *fault = DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE;
+    } else {
+        return false;
+    }
+    return true;
+}
+#endif
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -17232,6 +17589,9 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+#ifdef DS4_TEST_HOOKS
+        .test_evidence_fd = -1,
+#endif
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -17380,6 +17740,39 @@ static server_config parse_options(int argc, char **argv) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+#ifdef DS4_TEST_HOOKS
+        } else if (!strcmp(arg, "--test-compact-fault")) {
+            if (c.test_compact_fault_set) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --test-compact-fault may only be specified once");
+                exit(2);
+            }
+            const char *name = need_arg(&i, argc, argv, arg);
+            if (!server_test_compact_fault_parse(
+                    name, &c.test_compact_fault)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: invalid --test-compact-fault value: %s",
+                           name);
+                exit(2);
+            }
+            c.test_compact_fault_name = name;
+            c.test_compact_fault_set = true;
+        } else if (!strcmp(arg, "--test-evidence-fd")) {
+            if (c.test_evidence_fd_set) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --test-evidence-fd may only be specified once");
+                exit(2);
+            }
+            c.test_evidence_fd =
+                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.test_evidence_fd < 3 ||
+                fcntl(c.test_evidence_fd, F_GETFD) < 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --test-evidence-fd requires an open descriptor >= 3");
+                exit(2);
+            }
+            c.test_evidence_fd_set = true;
+#endif
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -17510,6 +17903,13 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
         exit(2);
     }
+#ifdef DS4_TEST_HOOKS
+    if (c.test_compact_fault_set != c.test_evidence_fd_set) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --test-compact-fault and --test-evidence-fd must be specified together");
+        exit(2);
+    }
+#endif
     return c;
 }
 
@@ -17687,6 +18087,18 @@ int main(int argc, char **argv) {
         ds4_session_set_cancel(
             slot->session, server_session_cancel_requested, &s);
     }
+#ifdef DS4_TEST_HOOKS
+    if (cfg.test_compact_fault_set &&
+        (!s.runtime_snapshot_required ||
+         !server_test_cuda_fault_prepare(
+             &s, cfg.test_compact_fault, cfg.test_compact_fault_name,
+             cfg.test_evidence_fd))) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: compact CUDA fault qualification setup failed");
+        server_close_resources(&s);
+        return 1;
+    }
+#endif
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);

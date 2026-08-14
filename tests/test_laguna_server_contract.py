@@ -167,6 +167,7 @@ ACCEPTED_MODEL_ALIASES = (
     "laguna-s-2.1-reasoner",
     "poolside/laguna-s-2.1",
 )
+PROTOCOL_MUTATION_PROBE_CALL_ID = "call_task18_protocol_validation_probe"
 REQUEST_METRICS_KEYS = {
     "schema",
     "request_id",
@@ -315,12 +316,15 @@ def _protocol_body(
         "required": ["city"],
     }
     if protocol == "openai_chat":
-        return "/v1/chat/completions", _chat_body(
+        body = _chat_body(
             model=model,
             tool_choice=tool_choice,
             max_tokens=8,
             stream=stream,
         )
+        if stream:
+            body["stream_options"] = {"include_usage": True}
+        return "/v1/chat/completions", body
     if protocol == "responses":
         return "/v1/responses", {
             "model": model,
@@ -1635,6 +1639,17 @@ class ProtocolValidationContract(unittest.TestCase):
             tool_choice=tool_choice,
             stream=stream,
         )
+        if tool_choice == "required" or model not in ACCEPTED_MODEL_ALIASES:
+            # The driver seeds this exact call ID in production tool memory.
+            # Early validation remains read-only; moving either rejection
+            # below replay attachment would touch the real LRU state and make
+            # the before/after mutation fingerprints diverge.
+            _set_native_continuation_history(
+                protocol,
+                body,
+                call_id=PROTOCOL_MUTATION_PROBE_CALL_ID,
+                result_call_id=PROTOCOL_MUTATION_PROBE_CALL_ID,
+            )
         return self.driver.protocol_validate(path, body)
 
     def assert_accepted(

@@ -549,6 +549,13 @@ typedef struct {
     uint64_t cache_payload_bytes;
     uint64_t cache_slot_count;
     uint64_t cache_slot_stride_bytes;
+    uint64_t cache_slot_empty_count;
+    uint64_t cache_slot_ready_count;
+    uint64_t cache_slot_loading_count;
+    uint64_t cache_slot_in_use_count;
+    uint64_t cache_slot_total_refs;
+    uint64_t cache_payload_id;
+    uint64_t pinned_staging_ids[4];
     uint64_t pinned_staging_live_count;
     uint64_t pinned_staging_bytes;
     uint64_t cache_payload_allocation_attempts;

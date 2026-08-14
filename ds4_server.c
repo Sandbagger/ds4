@@ -13233,6 +13233,12 @@ static bool server_test_cuda_fault_evidence_emit(
         execution_result == DS4_SERVER_EXEC_UNSAFE ? "unsafe" :
         execution_result == DS4_SERVER_EXEC_INTERRUPTED ? "cancelled" :
         "unknown";
+    const bool first_valid = first_evidence && execution_result != 0 &&
+        (execution_result != DS4_SERVER_EXEC_RECOVERABLE || restored);
+    const bool evidence_valid = consumed == 1u &&
+        fixed_allocations_unchanged && fault_counters_monotonic &&
+        no_fallback && (first_valid || followup_safe);
+    if (!evidence_valid) return false;
 
     buf record = {0};
     buf_puts(&record, "{\"schema\":\"ds4.test.cuda-fault/v1\",\"fault\":");
@@ -13292,12 +13298,7 @@ static bool server_test_cuda_fault_evidence_emit(
         }
         s->test_compact_fault_evidence_count++;
     }
-    const bool first_valid = first_evidence && consumed == 1u &&
-        execution_result != 0 &&
-        (execution_result != DS4_SERVER_EXEC_RECOVERABLE || restored);
-    return write_ok && fixed_allocations_unchanged &&
-        fault_counters_monotonic && no_fallback &&
-        (first_valid || (followup_safe && consumed == 1u));
+    return write_ok;
 }
 #endif
 

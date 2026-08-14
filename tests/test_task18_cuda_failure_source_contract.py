@@ -98,6 +98,21 @@ def _function_body(source: str, signature: str) -> str:
     return ""
 
 
+def _typedef_struct_body(source: str, name: str) -> str:
+    end = re.search(rf"\}}\s*{re.escape(name)}\s*;", source)
+    if end is None:
+        return ""
+    start = source.rfind("typedef struct {", 0, end.start())
+    if start < 0:
+        return ""
+    return source[start + len("typedef struct {") : end.start()]
+
+
+def _normalized_c_tokens(source: str) -> str:
+    without_comments = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.DOTALL)
+    return re.sub(r"\s+", "", without_comments)
+
+
 class Task18CudaFaultBuildContract(unittest.TestCase):
     def test_host_source_contract_is_in_the_model_free_cuda_build_gate(self) -> None:
         recipe = _recipe("test-cuda-build-contract")
@@ -182,6 +197,18 @@ class Task18CudaFaultBuildContract(unittest.TestCase):
 
 
 class Task18CudaFaultSourceContract(unittest.TestCase):
+    def test_cuda_snapshot_duplicate_matches_the_public_abi(self) -> None:
+        name = "ds4_gpu_laguna_compact_test_snapshot"
+        public = _typedef_struct_body(GPU_HEADER, name)
+        cuda = _typedef_struct_body(CUDA, name)
+        self.assertTrue(public, f"public header lacks {name}")
+        self.assertTrue(cuda, f"CUDA translation unit lacks {name}")
+        self.assertEqual(
+            _normalized_c_tokens(cuda),
+            _normalized_c_tokens(public),
+            "CUDA's duplicated compact snapshot ABI diverges from ds4_gpu.h",
+        )
+
     def test_request_barrier_has_a_one_shot_post_quiescence_unsafe_hook(self) -> None:
         symbol = "DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE"
         self.assertTrue(

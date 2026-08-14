@@ -144,6 +144,13 @@ class Task18LifecycleContract(unittest.TestCase):
         child.command("unsafe")
         child.wait(1)
 
+    def test_term_received_before_unsafe_completion_retains_143(self) -> None:
+        child = self.child("unsafe")
+        child.signal(signal.SIGTERM)
+        time.sleep(0.05)
+        child.command("unsafe")
+        child.wait(143)
+
     def test_partial_pre_admission_client_cannot_hold_drain_open(self) -> None:
         child = self.child("idle")
         conn = child.connect()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 def _listener_pids(port: int) -> set[int]:
@@ -127,6 +129,19 @@ class Task18CliContract(unittest.TestCase):
             timeout=10,
             check=False,
         )
+
+    def test_live_cli_does_not_inherit_an_occupied_ambient_lock(self) -> None:
+        missing_model = "/definitely/missing/task18-model.gguf"
+        with tempfile.NamedTemporaryFile() as ambient_lock:
+            fcntl.flock(ambient_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.dict(
+                os.environ, {"DS4_LOCK_FILE": ambient_lock.name}
+            ):
+                result = self.run_live("--model", missing_model, "--cpu")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot open model", result.stderr)
+        self.assertNotIn("another ds4 process", result.stderr)
 
     def test_invalid_invocation_exits_two_before_model_open(self) -> None:
         missing_model = "/definitely/missing/task18-model.gguf"

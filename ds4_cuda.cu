@@ -721,6 +721,7 @@ struct ds4_gpu_laguna_compact {
     uint64_t event_record_failures;
     uint64_t event_completion_failures;
     uint64_t cache_cancellations;
+    uint64_t request_barrier_unsafe_failures;
     ds4_laguna_page_advice_counters page_advice_counters;
     ds4_laguna_page_advice_counters page_advice_fadvise_counters;
     ds4_laguna_page_advice_counters page_advice_madvise_counters;

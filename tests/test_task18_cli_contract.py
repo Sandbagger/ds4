@@ -121,13 +121,25 @@ class Task18CliContract(unittest.TestCase):
     live_server = "./ds4-server"
     test_server = "./ds4_test"
 
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="task18-cli-"
+        )
+        self.addCleanup(self._temporary_directory.cleanup)
+        self._live_lock_file = (
+            Path(self._temporary_directory.name) / "ds4.lock"
+        )
+
     def run_live(self, *args: str) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["DS4_LOCK_FILE"] = str(self._live_lock_file)
         return subprocess.run(
             [self.live_server, *args],
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
+            env=environment,
         )
 
     def test_live_cli_does_not_inherit_an_occupied_ambient_lock(self) -> None:

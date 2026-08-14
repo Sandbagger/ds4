@@ -325,6 +325,16 @@ class Task18CudaFaultSourceContract(unittest.TestCase):
             re.search(r"\b(?:write|dprintf)\s*\(", body),
             "physical evidence emitter does not write its evidence FD",
         )
+        validation = body.find("const bool evidence_valid")
+        validation_guard = body.find("if (!evidence_valid)")
+        write = body.find("write(", validation_guard)
+        self.assertGreaterEqual(validation, 0, "evidence has no semantic validity gate")
+        self.assertGreater(validation_guard, validation)
+        self.assertGreater(
+            write,
+            validation_guard,
+            "invalid compact evidence must be rejected before any record is written",
+        )
 
     def test_physical_evidence_precedes_the_http_failure_action(self) -> None:
         generate = _function_body(SERVER, "static void generate_job(")

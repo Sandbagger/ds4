@@ -2245,9 +2245,12 @@ static bool runtime_request_context_mutable(
           context->latest_page_advice_monotonic_ns >=
               context->prefill_started_monotonic_ns)) &&
         (!context->page_advice_complete ||
-         (context->page_advice_observed && context->prefill_complete &&
+         (context->page_advice_observed && context->prefill_started &&
           context->page_advice_complete_monotonic_ns >=
-              context->prefill_complete_monotonic_ns &&
+              context->prefill_started_monotonic_ns &&
+          (!context->prefill_complete ||
+           context->page_advice_complete_monotonic_ns >=
+               context->prefill_complete_monotonic_ns) &&
           context->page_advice_complete_monotonic_ns >=
               context->latest_page_advice_monotonic_ns &&
           (!context->visible_decode_started ||
@@ -2302,7 +2305,7 @@ bool ds4_runtime_request_mark_prefill_complete(
         uint64_t complete_monotonic_ns) {
     if (!runtime_request_context_mutable(context) ||
         !context->prompt_tokens_set || !context->prefill_started ||
-        context->prefill_complete ||
+        context->prefill_complete || context->page_advice_complete ||
         complete_monotonic_ns == 0u ||
         complete_monotonic_ns < context->prefill_started_monotonic_ns ||
         (context->page_advice_observed &&
@@ -2488,10 +2491,13 @@ bool ds4_runtime_request_record_page_advice_complete(
         ds4_runtime_request_context *context,
         uint64_t complete_monotonic_ns) {
     if (!runtime_request_context_mutable(context) ||
-        !context->prompt_tokens_set || !context->prefill_complete ||
+        !context->prompt_tokens_set || !context->prefill_started ||
         context->page_advice_complete ||
         complete_monotonic_ns == 0u ||
-        complete_monotonic_ns < context->prefill_complete_monotonic_ns ||
+        complete_monotonic_ns < context->prefill_started_monotonic_ns ||
+        (context->prefill_complete &&
+         complete_monotonic_ns <
+             context->prefill_complete_monotonic_ns) ||
         (context->page_advice_observed &&
          complete_monotonic_ns <
              context->latest_page_advice_monotonic_ns) ||

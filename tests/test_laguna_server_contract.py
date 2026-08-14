@@ -38,6 +38,7 @@ later verify exact Laguna vocabulary counts on DGX.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -91,9 +92,26 @@ PROTOCOL_VALIDATION_KEYS = {
 PROTOCOL_FIXTURE_RESPONSE_KEYS = {
     "http_status",
     "code",
+    "input_evidence",
     "semantic",
     "mutation_fingerprint_before",
     "mutation_fingerprint_after",
+}
+PROTOCOL_FIXTURE_EVIDENCE_KEYS = {
+    "reasoning_summary",
+    "tool_choice",
+    "prompt_contains_tool_schema",
+    "raw_output_fingerprint",
+    "continuation_call_id",
+    "tool_result_in_prompt",
+    "metrics_fixture",
+}
+PROTOCOL_NATIVE_TERMINAL_KEYS = {
+    "finish_reason",
+    "stop_reason",
+    "response_status",
+    "output_item_types",
+    "output_item_statuses",
 }
 PROTOCOL_FIXTURE_SEMANTIC_KEYS = {
     "visible_text",
@@ -107,12 +125,39 @@ PROTOCOL_FIXTURE_SEMANTIC_KEYS = {
     "request_metrics",
     "request_metrics_occurrences",
     "request_metrics_at_terminal",
+    "native_terminal",
 }
 PROTOCOL_FIXTURES = (
     "reasoning_text",
     "two_tools",
+    "tool_choice_none_dsml",
     "continuation",
     "malformed_client_history",
+)
+FROZEN_PROTOCOL_METRICS_FIXTURE = "task18-protocol-serializer-v1"
+CONTINUATION_TOOL_RESULT = "fixture-result: 12 C and cloudy"
+REASONING_RAW_OUTPUT = "<think>private</think>visible"
+NONE_VISIBLE_TEXT = "I cannot call tools."
+NONE_DSML_RAW_OUTPUT = (
+    NONE_VISIBLE_TEXT
+    + "\n<｜DSML｜tool_calls>\n"
+    '<｜DSML｜invoke name="get_weather">\n'
+    '<｜DSML｜parameter name="city" string="true">'
+    "Brussels</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>"
+)
+TWO_TOOLS_RAW_OUTPUT = (
+    "<｜DSML｜tool_calls>\n"
+    '<｜DSML｜invoke name="get_weather">\n'
+    '<｜DSML｜parameter name="city" string="true">'
+    "Brussels</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    '<｜DSML｜invoke name="get_time">\n'
+    '<｜DSML｜parameter name="timezone" string="true">'
+    "Europe/Brussels</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>"
 )
 ACCEPTED_MODEL_ALIASES = (
     "laguna-s-2.1",
@@ -320,6 +365,197 @@ def _protocol_body(
     raise AssertionError(f"unknown protocol fixture: {protocol}")
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _protocol_fixture_call_id(protocol: str, purpose: str) -> str:
+    prefix = "toolu_" if protocol == "anthropic" else "call_"
+    return f"{prefix}{purpose}_fixture"
+
+
+def _append_time_tool(protocol: str, body: dict[str, Any]) -> None:
+    parameters = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"timezone": {"type": "string"}},
+        "required": ["timezone"],
+    }
+    if protocol == "openai_chat":
+        body["tools"].append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "description": "Return the current time for a timezone.",
+                    "parameters": parameters,
+                },
+            }
+        )
+    elif protocol == "responses":
+        body["tools"].append(
+            {
+                "type": "function",
+                "name": "get_time",
+                "description": "Return the current time for a timezone.",
+                "parameters": parameters,
+            }
+        )
+    elif protocol == "anthropic":
+        body["tools"].append(
+            {
+                "name": "get_time",
+                "description": "Return the current time for a timezone.",
+                "input_schema": parameters,
+            }
+        )
+    else:
+        raise AssertionError(f"unknown protocol fixture target: {protocol!r}")
+
+
+def _set_native_continuation_history(
+    protocol: str,
+    body: dict[str, Any],
+    *,
+    call_id: str,
+    result_call_id: str,
+) -> None:
+    arguments = {"city": "Brussels"}
+    if protocol == "openai_chat":
+        body["messages"] = [
+            {"role": "user", "content": "Check Brussels weather."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": json.dumps(
+                                arguments, separators=(",", ":")
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": result_call_id,
+                "content": CONTINUATION_TOOL_RESULT,
+            },
+        ]
+    elif protocol == "responses":
+        body["input"] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Check Brussels weather."}
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "get_weather",
+                "arguments": json.dumps(arguments, separators=(",", ":")),
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": result_call_id,
+                "output": CONTINUATION_TOOL_RESULT,
+            },
+        ]
+    elif protocol == "anthropic":
+        body["messages"] = [
+            {"role": "user", "content": "Check Brussels weather."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": "get_weather",
+                        "input": arguments,
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": result_call_id,
+                        "content": CONTINUATION_TOOL_RESULT,
+                    }
+                ],
+            },
+        ]
+    else:
+        raise AssertionError(f"unknown protocol fixture target: {protocol!r}")
+
+
+def _protocol_fixture_input(
+    protocol: str, *, stream: bool, fixture: str
+) -> dict[str, Any]:
+    if fixture not in PROTOCOL_FIXTURES:
+        raise AssertionError(f"unknown protocol fixture: {fixture!r}")
+    tool_choice = "none" if fixture == "tool_choice_none_dsml" else "auto"
+    model = (
+        "laguna-s-2.1-reasoner"
+        if fixture == "reasoning_text"
+        else INPUT_MODEL
+    )
+    path, body = _protocol_body(
+        protocol,
+        model=model,
+        tool_choice=tool_choice,
+        stream=stream,
+    )
+
+    raw_output = "continued"
+    tool_call_ids: list[str] = []
+    if fixture == "reasoning_text":
+        raw_output = REASONING_RAW_OUTPUT
+        if protocol == "responses":
+            body["reasoning"] = {"summary": "auto"}
+    elif fixture == "two_tools":
+        raw_output = TWO_TOOLS_RAW_OUTPUT
+        _append_time_tool(protocol, body)
+        tool_call_ids = [
+            _protocol_fixture_call_id(protocol, "weather"),
+            _protocol_fixture_call_id(protocol, "time"),
+        ]
+    elif fixture == "tool_choice_none_dsml":
+        raw_output = NONE_DSML_RAW_OUTPUT
+    elif fixture in ("continuation", "malformed_client_history"):
+        call_id = _protocol_fixture_call_id(protocol, "continuation")
+        result_call_id = (
+            call_id
+            if fixture == "continuation"
+            else _protocol_fixture_call_id(protocol, "mismatched_result")
+        )
+        _set_native_continuation_history(
+            protocol,
+            body,
+            call_id=call_id,
+            result_call_id=result_call_id,
+        )
+        if fixture == "malformed_client_history":
+            raw_output = ""
+
+    return {
+        "method": "POST",
+        "path": path,
+        "body": body,
+        "raw_output": raw_output,
+        "tool_call_ids": tool_call_ids,
+        "metrics_fixture": FROZEN_PROTOCOL_METRICS_FIXTURE,
+    }
+
+
 class Driver:
     def __init__(self, executable: Path) -> None:
         self.executable = executable
@@ -451,12 +687,16 @@ class Driver:
             raise AssertionError(f"unknown protocol fixture target: {protocol!r}")
         if fixture not in PROTOCOL_FIXTURES:
             raise AssertionError(f"unknown protocol fixture: {fixture!r}")
+        fixture_input = _protocol_fixture_input(
+            protocol, stream=stream, fixture=fixture
+        )
         response = self.rpc(
             {
                 "op": "protocol_fixture",
                 "protocol": protocol,
                 "stream": stream,
                 "fixture": fixture,
+                **fixture_input,
             }
         )
         if set(response) != PROTOCOL_FIXTURE_RESPONSE_KEYS:
@@ -473,6 +713,53 @@ class Driver:
                 raise AssertionError(
                     f"protocol-fixture {key} must be a non-empty string"
                 )
+        evidence = response["input_evidence"]
+        if evidence is not None and (
+            not isinstance(evidence, dict)
+            or set(evidence) != PROTOCOL_FIXTURE_EVIDENCE_KEYS
+        ):
+            raise AssertionError(
+                "unexpected protocol-fixture input evidence: "
+                + repr(evidence)
+            )
+        if evidence is not None:
+            if evidence["reasoning_summary"] is not None and not isinstance(
+                evidence["reasoning_summary"], str
+            ):
+                raise AssertionError(
+                    "protocol-fixture reasoning_summary must be null or a string"
+                )
+            if not isinstance(evidence["tool_choice"], str):
+                raise AssertionError(
+                    "protocol-fixture tool_choice must be a string"
+                )
+            if type(evidence["prompt_contains_tool_schema"]) is not bool:
+                raise AssertionError(
+                    "protocol-fixture prompt schema evidence must be a boolean"
+                )
+            fingerprint = evidence["raw_output_fingerprint"]
+            if (
+                not isinstance(fingerprint, str)
+                or len(fingerprint) != 64
+                or any(c not in "0123456789abcdef" for c in fingerprint)
+            ):
+                raise AssertionError(
+                    "protocol-fixture raw output fingerprint must be SHA-256"
+                )
+            if evidence["continuation_call_id"] is not None and not isinstance(
+                evidence["continuation_call_id"], str
+            ):
+                raise AssertionError(
+                    "protocol-fixture continuation call ID must be null or a string"
+                )
+            if type(evidence["tool_result_in_prompt"]) is not bool:
+                raise AssertionError(
+                    "protocol-fixture tool-result evidence must be a boolean"
+                )
+            if not isinstance(evidence["metrics_fixture"], str):
+                raise AssertionError(
+                    "protocol-fixture metrics fixture must be a string"
+                )
         semantic = response["semantic"]
         if semantic is not None and (
             not isinstance(semantic, dict)
@@ -482,6 +769,27 @@ class Driver:
                 "unexpected protocol-fixture semantic result: "
                 + repr(semantic)
             )
+        if semantic is not None:
+            native = semantic["native_terminal"]
+            if not isinstance(native, dict) or set(native) != (
+                PROTOCOL_NATIVE_TERMINAL_KEYS
+            ):
+                raise AssertionError(
+                    "unexpected protocol-fixture native terminal: "
+                    + repr(native)
+                )
+            for key in ("finish_reason", "stop_reason", "response_status"):
+                if native[key] is not None and not isinstance(native[key], str):
+                    raise AssertionError(
+                        f"protocol-fixture native {key} must be null or a string"
+                    )
+            for key in ("output_item_types", "output_item_statuses"):
+                if not isinstance(native[key], list) or not all(
+                    isinstance(value, str) for value in native[key]
+                ):
+                    raise AssertionError(
+                        f"protocol-fixture native {key} must be a string list"
+                    )
         return response
 
     def _raise_missing_seam(self) -> None:
@@ -1336,6 +1644,11 @@ class ProtocolValidationContract(unittest.TestCase):
         self.assertIsNone(result["code"])
         self.assertIs(result["tools_enabled"], tools_enabled)
         self.assertEqual(result["normalized_model"], MODEL)
+        self.assertEqual(
+            result["mutation_fingerprint_after"],
+            result["mutation_fingerprint_before"],
+            "protocol validation mutated session, replay, or cache state",
+        )
 
     def assert_rejected(
         self,
@@ -1419,17 +1732,23 @@ class ProtocolValidationContract(unittest.TestCase):
 class ProtocolOutputContract(unittest.TestCase):
     """Freeze native wire output after production parsing/serialization.
 
-    ``protocol_fixture`` is a test-driver fixture table, not a second parser.
-    The driver must feed raw generated chunks through the production Laguna
-    output parser and each protocol's production serializer, then normalize
-    that wire back to this semantic result.  In particular, ``reasoning_text``
-    uses the raw text ``<think>private</think>visible``.  ``two_tools`` uses
-    canonical Laguna DSML for ``get_weather(city=Brussels)`` followed by
-    ``get_time(timezone=Europe/Brussels)``; its streamed chunks split inside
-    the opening marker, ``get_weather``, ``Europe/Brussels``, and the closing
-    marker.  ``continuation`` uses each protocol's native assistant tool-call
-    history plus a real result with the same call ID.  The malformed history
-    fixture changes that result ID and must be rejected before state mutation.
+    ``protocol_fixture`` receives an explicit native request body and raw model
+    output; it is not a second parser.  The driver must feed those inputs through
+    the production Laguna request/output parsers and native serializer, then
+    normalize the captured wire back to this semantic result.  Responses
+    reasoning explicitly opts into ``reasoning.summary=auto``.  ``two_tools``
+    uses canonical Laguna DSML for two calls and supplies deterministic call
+    IDs to the serializer so the wire IDs are compared rather than normalized
+    away.  In stream mode the fixture still splits inside the opening marker,
+    both tool values, and the closing marker.  ``tool_choice_none_dsml`` proves
+    the same syntax cannot become a structured call when tools are disabled.
+    ``continuation`` supplies full native history and a real result with the
+    same call ID; the malformed variant changes only that result ID.
+
+    Stream/non-stream metric equality is deliberately serializer-only.  Both
+    forms receive fresh request identities but the exact same immutable
+    ``task18-protocol-serializer-v1`` physical-counter fixture.  This contract
+    does not claim that two independent cache executions have equal counters.
     """
 
     driver: Driver
@@ -1495,6 +1814,95 @@ class ProtocolOutputContract(unittest.TestCase):
         for marker in ("<think>", "</think>", "DSML"):
             self.assertNotIn(marker, normalized)
 
+    def assert_input_evidence(
+        self,
+        evidence: dict[str, Any] | None,
+        protocol: str,
+        fixture: str,
+        *,
+        stream: bool,
+    ) -> None:
+        self.assertIsInstance(evidence, dict)
+        fixture_input = _protocol_fixture_input(
+            protocol, stream=stream, fixture=fixture
+        )
+        body = fixture_input["body"]
+        reasoning_summary = None
+        if protocol == "responses" and fixture == "reasoning_text":
+            reasoning_summary = body["reasoning"]["summary"]
+        continuation_call_id = (
+            _protocol_fixture_call_id(protocol, "continuation")
+            if fixture == "continuation"
+            else None
+        )
+        expected = {
+            "reasoning_summary": reasoning_summary,
+            "tool_choice": (
+                "none" if fixture == "tool_choice_none_dsml" else "auto"
+            ),
+            "prompt_contains_tool_schema": (
+                fixture != "tool_choice_none_dsml"
+            ),
+            "raw_output_fingerprint": _sha256_text(
+                fixture_input["raw_output"]
+            ),
+            "continuation_call_id": continuation_call_id,
+            "tool_result_in_prompt": fixture == "continuation",
+            "metrics_fixture": FROZEN_PROTOCOL_METRICS_FIXTURE,
+        }
+        self.assertEqual(
+            evidence,
+            expected,
+            "fixture did not prove the request/rendered-prompt inputs used",
+        )
+
+    def assert_native_terminal(
+        self,
+        semantic: dict[str, Any],
+        protocol: str,
+        fixture: str,
+    ) -> None:
+        canonical_finish = "tool_calls" if fixture == "two_tools" else "stop"
+        if protocol == "openai_chat":
+            expected = {
+                "finish_reason": canonical_finish,
+                "stop_reason": None,
+                "response_status": None,
+                "output_item_types": [],
+                "output_item_statuses": [],
+            }
+        elif protocol == "anthropic":
+            expected = {
+                "finish_reason": None,
+                "stop_reason": (
+                    "tool_use" if fixture == "two_tools" else "end_turn"
+                ),
+                "response_status": None,
+                "output_item_types": [],
+                "output_item_statuses": [],
+            }
+        elif protocol == "responses":
+            output_types = {
+                "reasoning_text": ["reasoning", "message"],
+                "two_tools": ["function_call", "function_call"],
+                "tool_choice_none_dsml": ["message"],
+                "continuation": ["message"],
+            }[fixture]
+            expected = {
+                "finish_reason": None,
+                "stop_reason": None,
+                "response_status": "completed",
+                "output_item_types": output_types,
+                "output_item_statuses": ["completed"] * len(output_types),
+            }
+        else:
+            raise AssertionError(f"unknown protocol fixture target: {protocol!r}")
+        self.assertEqual(
+            semantic["native_terminal"],
+            expected,
+            "normalized finish hid an invalid native terminal shape",
+        )
+
     def stable_semantics(self, semantic: dict[str, Any]) -> dict[str, Any]:
         metric = semantic["request_metrics"]
         stable_metric = {
@@ -1518,6 +1926,7 @@ class ProtocolOutputContract(unittest.TestCase):
             "request_metrics_at_terminal": semantic[
                 "request_metrics_at_terminal"
             ],
+            "native_terminal": semantic["native_terminal"],
         }
 
     def accepted_pair(
@@ -1534,14 +1943,21 @@ class ProtocolOutputContract(unittest.TestCase):
             self.assertEqual(result["http_status"], 200)
             self.assertIsNone(result["code"])
             self.assertIsInstance(result["semantic"], dict)
+            self.assert_input_evidence(
+                result["input_evidence"],
+                protocol,
+                fixture,
+                stream=stream,
+            )
             semantic = result["semantic"]
             self.assert_metric_and_id_contract(semantic, identities)
             self.assert_no_raw_tag_leakage(semantic)
+            self.assert_native_terminal(semantic, protocol, fixture)
             semantics.append(semantic)
         self.assertEqual(
             self.stable_semantics(semantics[0]),
             self.stable_semantics(semantics[1]),
-            "streaming changed normalized semantics or stable runtime metrics",
+            "streaming changed semantics or the frozen serializer metrics fixture",
         )
         return semantics[0], semantics[1]
 
@@ -1559,15 +1975,20 @@ class ProtocolOutputContract(unittest.TestCase):
 
     def test_two_chunked_dsml_calls_preserve_order_and_arguments(self) -> None:
         identities = {"protocol": set(), "runtime": set(), "instance": set()}
-        expected_calls = [
-            {"name": "get_weather", "arguments": {"city": "Brussels"}},
-            {
-                "name": "get_time",
-                "arguments": {"timezone": "Europe/Brussels"},
-            },
-        ]
         for protocol in self.protocols:
             with self.subTest(protocol=protocol):
+                expected_calls = [
+                    {
+                        "id": _protocol_fixture_call_id(protocol, "weather"),
+                        "name": "get_weather",
+                        "arguments": {"city": "Brussels"},
+                    },
+                    {
+                        "id": _protocol_fixture_call_id(protocol, "time"),
+                        "name": "get_time",
+                        "arguments": {"timezone": "Europe/Brussels"},
+                    },
+                ]
                 buffered, _streamed = self.accepted_pair(
                     protocol, "two_tools", identities
                 )
@@ -1575,6 +1996,18 @@ class ProtocolOutputContract(unittest.TestCase):
                 self.assertEqual(buffered["reasoning_text"], "")
                 self.assertEqual(buffered["tool_calls"], expected_calls)
                 self.assertEqual(buffered["finish"], "tool_calls")
+
+    def test_tool_choice_none_omits_schema_and_suppresses_raw_dsml(self) -> None:
+        identities = {"protocol": set(), "runtime": set(), "instance": set()}
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                buffered, _streamed = self.accepted_pair(
+                    protocol, "tool_choice_none_dsml", identities
+                )
+                self.assertEqual(buffered["visible_text"].strip(), NONE_VISIBLE_TEXT)
+                self.assertEqual(buffered["reasoning_text"], "")
+                self.assertEqual(buffered["tool_calls"], [])
+                self.assertEqual(buffered["finish"], "stop")
 
     def test_matching_native_tool_results_allow_continuation(self) -> None:
         identities = {"protocol": set(), "runtime": set(), "instance": set()}
@@ -1601,6 +2034,7 @@ class ProtocolOutputContract(unittest.TestCase):
                     )
                     self.assertEqual(result["http_status"], 400)
                     self.assertEqual(result["code"], "invalid_request")
+                    self.assertIsNone(result["input_evidence"])
                     self.assertIsNone(result["semantic"])
                     self.assertEqual(
                         result["mutation_fingerprint_after"],

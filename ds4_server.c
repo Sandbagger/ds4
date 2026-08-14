@@ -42,11 +42,75 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_signal_received = 0;
+static volatile sig_atomic_t g_originating_signal = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
+static volatile sig_atomic_t g_accept_wake_fd = -1;
+
+typedef enum {
+    SERVER_LIFECYCLE_ACCEPTING = 0,
+    SERVER_LIFECYCLE_DRAINING,
+    SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING,
+    SERVER_LIFECYCLE_UNSAFE_DRAINING,
+    SERVER_LIFECYCLE_FORCED_EXIT,
+} server_lifecycle_state;
+
+typedef enum {
+    SERVER_LIFECYCLE_EVENT_TERM = 0,
+    SERVER_LIFECYCLE_EVENT_INT,
+    SERVER_LIFECYCLE_EVENT_UNSAFE,
+} server_lifecycle_event;
+
+static server_lifecycle_state server_lifecycle_transition(
+        server_lifecycle_state state, server_lifecycle_event event) {
+    if (state == SERVER_LIFECYCLE_UNSAFE_DRAINING ||
+        state == SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING) {
+        return state;
+    }
+    if (event == SERVER_LIFECYCLE_EVENT_UNSAFE) {
+        return state == SERVER_LIFECYCLE_DRAINING ?
+            SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING :
+            SERVER_LIFECYCLE_UNSAFE_DRAINING;
+    }
+    if (state == SERVER_LIFECYCLE_FORCED_EXIT) return state;
+    if (state == SERVER_LIFECYCLE_ACCEPTING) {
+        return SERVER_LIFECYCLE_DRAINING;
+    }
+    return SERVER_LIFECYCLE_FORCED_EXIT;
+}
+
+static bool server_lifecycle_allows_admission(server_lifecycle_state state) {
+    return state == SERVER_LIFECYCLE_ACCEPTING;
+}
+
+static bool server_lifecycle_is_unsafe_state(server_lifecycle_state state) {
+    return state == SERVER_LIFECYCLE_UNSAFE_DRAINING ||
+        state == SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING;
+}
+
+static int server_lifecycle_resolve_exit_status(
+        server_lifecycle_state state,
+        int originating_signal,
+        bool drain_reached_safe_point) {
+    if (state == SERVER_LIFECYCLE_UNSAFE_DRAINING) return 1;
+    if (state == SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING) {
+        return originating_signal > 0 ? 128 + originating_signal : 1;
+    }
+    if (originating_signal <= 0) {
+        return drain_reached_safe_point ? 0 : 1;
+    }
+    if (state == SERVER_LIFECYCLE_FORCED_EXIT ||
+        originating_signal == SIGINT ||
+        !drain_reached_safe_point) {
+        return 128 + originating_signal;
+    }
+    return 0;
+}
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
-#define DS4_SERVER_EXEC_RECOVERABLE 2
+#define DS4_SERVER_EXEC_RECOVERABLE 1
+#define DS4_SERVER_EXEC_INTERRUPTED 2
 #define DS4_SERVER_EXEC_UNSAFE 3
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -56,13 +120,18 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #endif
 
 static void stop_signal_handler(int sig) {
-    (void)sig;
-    if (g_stop_requested) _exit(130);
+    /* Unsafe runtime shutdown also closes admission through
+     * g_stop_requested, but it must not consume the process's first real
+     * signal.  Only a second signal is the forced-exit path. */
+    if (g_signal_received) _exit(128 + sig);
+    g_signal_received = 1;
+    g_originating_signal = sig;
     g_stop_requested = 1;
-    if (g_listen_fd >= 0) {
-        int fd = (int)g_listen_fd;
-        g_listen_fd = -1;
-        close(fd);
+    if (g_accept_wake_fd >= 0) {
+        const unsigned char wake = 1;
+        const int saved_errno = errno;
+        (void)write((int)g_accept_wake_fd, &wake, sizeof(wake));
+        errno = saved_errno;
     }
 }
 
@@ -1059,6 +1128,70 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "zai/glm-5.2") ||
             !strcmp(id, "zai/glm-5.2-chat") ||
             !strcmp(id, "zai/glm-5.2-reasoner"));
+}
+
+static bool server_model_alias_matches_engine(ds4_engine *engine,
+                                              const char *model) {
+    if (!model || !model[0]) return false;
+#ifdef DS4_SERVER_TEST
+    if (!engine) {
+        return !strcmp(model, "laguna-s-2.1") ||
+            !strcmp(model, "laguna-s-2.1-chat") ||
+            !strcmp(model, "laguna-s-2.1-no-think") ||
+            !strcmp(model, "laguna-s-2.1-nothink") ||
+            !strcmp(model, "laguna-s-2.1-reasoner") ||
+            !strcmp(model, "poolside/laguna-s-2.1");
+    }
+#endif
+    if (ds4_engine_is_laguna(engine)) {
+        return !strcmp(model, "laguna-s-2.1") ||
+            !strcmp(model, "laguna-s-2.1-chat") ||
+            !strcmp(model, "laguna-s-2.1-no-think") ||
+            !strcmp(model, "laguna-s-2.1-nothink") ||
+            !strcmp(model, "laguna-s-2.1-reasoner") ||
+            !strcmp(model, "poolside/laguna-s-2.1");
+    }
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return !strcmp(model, "glm-5.2") ||
+            !strcmp(model, "glm-5.2-chat") ||
+            !strcmp(model, "glm-5.2-no-think") ||
+            !strcmp(model, "glm-5.2-nothink") ||
+            !strcmp(model, "glm-5.2-reasoner") ||
+            !strcmp(model, "zai/glm-5.2") ||
+            !strcmp(model, "zai/glm-5.2-chat") ||
+            !strcmp(model, "zai/glm-5.2-reasoner");
+    }
+    return !strcmp(model, "deepseek-v4-flash") ||
+        !strcmp(model, "deepseek-v4-pro") ||
+        !strcmp(model, "deepseek-chat") ||
+        !strcmp(model, "deepseek-reasoner");
+}
+
+static void server_normalize_request_model(ds4_engine *engine, request *r) {
+    if (!r || !r->model_from_request) return;
+    free(r->model);
+#ifdef DS4_SERVER_TEST
+    if (!engine) {
+        r->model = xstrdup("laguna-s-2.1");
+        return;
+    }
+#endif
+    r->model = xstrdup(server_model_id_from_engine(engine));
+}
+
+static void server_tokenize_rendered_request(ds4_engine *engine,
+                                             const char *text,
+                                             ds4_tokens *tokens) {
+#ifdef DS4_SERVER_TEST
+    if (!engine) {
+        const unsigned char *p = (const unsigned char *)(text ? text : "");
+        do {
+            ds4_tokens_push(tokens, (int)*p);
+        } while (*p++ != '\0');
+        return;
+    }
+#endif
+    ds4_tokenize_rendered_chat(engine, text ? text : "", tokens);
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -3219,6 +3352,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
+    bool tool_choice_unsupported = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -3260,11 +3394,18 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                     free(key);
                     goto bad;
                 }
-                tool_choice_none = !strcmp(choice, "none");
+                if (!strcmp(choice, "none")) {
+                    tool_choice_none = true;
+                } else if (strcmp(choice, "auto")) {
+                    tool_choice_unsupported = true;
+                }
                 free(choice);
-            } else if (!json_skip_value(&p)) {
-                free(key);
-                goto bad;
+            } else {
+                if (!json_skip_value(&p)) {
+                    free(key);
+                    goto bad;
+                }
+                tool_choice_unsupported = true;
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
@@ -3364,11 +3505,34 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (tool_choice_unsupported) {
+        snprintf(err, errlen, "unsupported_tool_choice");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (r->model_from_request &&
+        !server_model_alias_matches_engine(e, r->model)) {
+        snprintf(err, errlen, "model_mismatch");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    server_normalize_request_model(e, r);
+    if (!responses_validate_tool_outputs(
+            s, &msgs, r->think_mode, NULL, NULL, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -3377,7 +3541,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    server_tokenize_rendered_request(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -3397,6 +3561,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
+    bool tool_choice_unsupported = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -3441,6 +3606,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             json_ws(&p);
             if (*p == '{') {
                 p++;
+                bool got_choice_type = false;
                 json_ws(&p);
                 while (*p && *p != '}') {
                     char *ckey = NULL;
@@ -3462,7 +3628,15 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                             free(key);
                             goto bad;
                         }
-                        tool_choice_none = !strcmp(choice, "none");
+                        if (got_choice_type) {
+                            tool_choice_unsupported = true;
+                        } else if (!strcmp(choice, "none")) {
+                            tool_choice_none = true;
+                        } else if (strcmp(choice, "auto")) {
+                            /* Anthropic `any` is required-tool mode. */
+                            tool_choice_unsupported = true;
+                        }
+                        got_choice_type = true;
                         free(choice);
                     } else if (!json_skip_value(&p)) {
                         free(ckey);
@@ -3479,9 +3653,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                     goto bad;
                 }
                 p++;
-            } else if (!json_skip_value(&p)) {
-                free(key);
-                goto bad;
+                if (!got_choice_type) tool_choice_unsupported = true;
+            } else {
+                if (!json_skip_value(&p)) {
+                    free(key);
+                    goto bad;
+                }
+                tool_choice_unsupported = true;
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
@@ -3561,6 +3739,23 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
+    if (tool_choice_unsupported) {
+        snprintf(err, errlen, "unsupported_tool_choice");
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (r->model_from_request &&
+        !server_model_alias_matches_engine(e, r->model)) {
+        snprintf(err, errlen, "model_mismatch");
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     if (system && system[0]) {
         chat_msg msg = {0};
         msg.role = xstrdup("system");
@@ -3573,6 +3768,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    server_normalize_request_model(e, r);
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -3592,7 +3788,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    server_tokenize_rendered_request(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -4366,7 +4562,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 if (!strcmp(choice, "none")) {
                     tool_choice_none = true;
                 } else if (strcmp(choice, "auto") != 0) {
-                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    snprintf(err, errlen, "unsupported_tool_choice");
                     free(choice);
                     free(key);
                     chat_msgs_free(&msgs);
@@ -4378,7 +4574,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 }
                 free(choice);
             } else if (*p == '{') {
-                snprintf(err, errlen, "forced tool_choice not supported");
+                snprintf(err, errlen, "unsupported_tool_choice");
                 free(key);
                 chat_msgs_free(&msgs);
                 buf_free(&loaded_tool_schemas);
@@ -4485,6 +4681,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
+    if (r->model_from_request &&
+        !server_model_alias_matches_engine(e, r->model)) {
+        snprintf(err, errlen, "model_mismatch");
+        chat_msgs_free(&msgs);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     /* instructions in the Responses API replaces any system message — for Codex
      * it carries the full agent system prompt. Prepend it so render produces a
      * standard system+chat layout. */
@@ -4516,6 +4722,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    server_normalize_request_model(e, r);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -4536,7 +4743,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    server_tokenize_rendered_request(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -4757,7 +4964,6 @@ static bool send_all(int fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
-        if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -5498,19 +5704,41 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                             bool *recovered_out) {
     if (recovered_out) *recovered_out = false;
 
+    /* `tool_choice=none` is a semantic constraint, not merely the absence of
+     * schemas in the prompt.  If the model nevertheless samples DSML, return
+     * only the preceding assistant text and never promote it to executable
+     * protocol tool calls. */
+    char *tools_disabled_text = NULL;
+    const char *parse_text = text ? text : "";
+    if (!has_tools) {
+        const char *tool_start = find_any_tool_start(parse_text);
+        if (tool_start) {
+            const size_t limit = trim_tool_separator_ws(
+                parse_text, 0, (size_t)(tool_start - parse_text));
+            tools_disabled_text = xmalloc(limit + 1);
+            memcpy(tools_disabled_text, parse_text, limit);
+            tools_disabled_text[limit] = '\0';
+            parse_text = tools_disabled_text;
+        }
+    }
+
     bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
-                                                           text ? text : "",
+                                                           parse_text,
                                                            require_thinking_closed,
                                                            content_out,
                                                            reasoning_out,
                                                            calls);
-    if (parsed_ok) return true;
+    if (parsed_ok) {
+        free(tools_disabled_text);
+        return true;
+    }
 
     free(*content_out);
     free(*reasoning_out);
-    *content_out = xstrdup(text ? text : "");
+    *content_out = xstrdup(parse_text);
     *reasoning_out = NULL;
     tool_calls_free(calls);
+    free(tools_disabled_text);
 
     /* A malformed tool block is model output, not a server failure.  The
      * generation worker may hide this turn from the client, append a tool error
@@ -5606,6 +5834,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
+                         code == 503 ? "Service Unavailable" :
                          code == 500 ? "Internal Server Error" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
@@ -5636,6 +5865,7 @@ static bool http_response_close_delimited_begin(
         int fd, bool enable_cors, int code, const char *type) {
     const char *reason = code == 200 ? "OK" :
                          code == 400 ? "Bad Request" :
+                         code == 503 ? "Service Unavailable" :
                          code == 500 ? "Internal Server Error" : "Error";
     buf h = {0};
     buf_printf(&h, "HTTP/1.1 %d %s\r\n", code, reason);
@@ -5659,6 +5889,54 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+static bool http_protocol_request_error(
+        int fd, bool enable_cors, api_style api,
+        const char *code, const char *message) {
+    const char *stable_code = code && code[0] ? code : "invalid_request";
+    const char *stable_message =
+        message && message[0] ? message : "Invalid inference request";
+    buf b = {0};
+    if (api == API_ANTHROPIC) {
+        buf_puts(&b,
+                 "{\"type\":\"error\",\"error\":{"
+                 "\"type\":\"invalid_request_error\",\"message\":");
+        json_escape(&b, stable_message);
+        buf_puts(&b, ",\"code\":");
+        json_escape(&b, stable_code);
+        buf_puts(&b, "}}\n");
+    } else {
+        buf_puts(&b, "{\"error\":{\"message\":");
+        json_escape(&b, stable_message);
+        buf_puts(&b, ",\"type\":\"invalid_request_error\",\"code\":");
+        json_escape(&b, stable_code);
+        buf_puts(&b, "}}\n");
+    }
+    const bool ok = http_response(
+        fd, enable_cors, 400, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static const char *server_request_parse_error_code(const char *error) {
+    if (error && !strcmp(error, "model_mismatch")) {
+        return "model_mismatch";
+    }
+    if (error && !strcmp(error, "unsupported_tool_choice")) {
+        return "unsupported_tool_choice";
+    }
+    return "invalid_request";
+}
+
+static const char *server_request_parse_error_message(const char *error) {
+    if (error && !strcmp(error, "model_mismatch")) {
+        return "Requested model does not match the loaded model family";
+    }
+    if (error && !strcmp(error, "unsupported_tool_choice")) {
+        return "tool_choice=required is not supported";
+    }
+    return error && error[0] ? error : "Invalid inference request";
 }
 
 static const char *context_length_error_param(const request *r) {
@@ -6975,15 +7253,24 @@ static bool http_reject_token_admission(
         int ctx_size,
         request_admission_code code) {
     if (code == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS) {
-        return http_error(
-            fd, enable_cors, 400,
+        return http_protocol_request_error(
+            fd, enable_cors, r ? r->api : API_OPENAI,
+            "invalid_output_tokens",
             "Requested output tokens must be a positive integer");
     }
     if (code == REQUEST_ADMISSION_CONTEXT_OVERFLOW) {
         return http_error_context_length_exceeded(
             fd, enable_cors, r, r ? r->prompt.len : 0, ctx_size);
     }
-    return http_error(fd, enable_cors, 400, "Invalid inference request");
+    const char *name = request_admission_code_name(code);
+    return http_protocol_request_error(
+        fd, enable_cors, r ? r->api : API_OPENAI,
+        name ? name : "invalid_request",
+        code == REQUEST_ADMISSION_MODEL_MISMATCH ?
+            "Requested model does not match the loaded model family" :
+        code == REQUEST_ADMISSION_UNSUPPORTED_TOOL_CHOICE ?
+            "tool_choice=required is not supported" :
+            "Invalid inference request");
 }
 
 /* Streaming is a translation state machine over the raw DS4 text.  The model
@@ -9981,12 +10268,7 @@ static bool server_emit_prepared_error_terminal(
         int fd, bool enable_cors, const request *r, int http_status,
         const char *message, bool stream_started,
         const ds4_runtime_request_metrics *metrics) {
-    if (fd < 0 || !r || !message || !metrics) return false;
-    char metrics_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
-    size_t metrics_json_len = 0;
-    if (!ds4_runtime_request_metrics_json(
-            metrics, metrics_json, sizeof(metrics_json),
-            &metrics_json_len)) return false;
+    if (fd < 0 || !r || !message) return false;
 
     buf b = {0};
     if (r->api == API_ANTHROPIC) {
@@ -10005,9 +10287,11 @@ static bool server_emit_prepared_error_terminal(
                     "request_rejected");
         buf_putc(&b, '}');
     }
-    if (!append_runtime_request_metrics_member(&b, metrics)) {
-        buf_free(&b);
-        return false;
+    if (metrics) {
+        if (!append_runtime_request_metrics_member(&b, metrics)) {
+            buf_free(&b);
+            return false;
+        }
     }
     buf_putc(&b, '}');
     bool ok;
@@ -10191,6 +10475,12 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
 
 typedef struct job job;
 typedef struct server_slot server_slot;
+typedef struct {
+    int fd;
+    bool admitted;
+    bool reading_request;
+    bool drain_rejected;
+} server_client_connection;
 
 typedef ds4_kvstore_entry kv_entry;
 typedef ds4_kvstore_options kv_cache_options;
@@ -10322,7 +10612,18 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
+    /* Protected by mu.  Signal handlers publish only the async-safe globals;
+     * server threads fold those facts into this explicit lifecycle. */
+    server_lifecycle_state lifecycle;
+    int originating_signal;
+    int admitted_requests;
+    int preparing_requests;
+    bool drain_reached_safe_point;
+    bool drain_failed;
     int clients;
+    server_client_connection *client_connections;
+    size_t client_connection_count;
+    size_t client_connection_cap;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -10339,11 +10640,199 @@ struct job {
     ds4_runtime_request_metrics runtime_terminal;
     bool runtime_accepted;
     bool runtime_finished;
+    bool lifecycle_admitted;
+    bool lifecycle_safe;
+    bool lifecycle_unsafe;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static server_lifecycle_event server_lifecycle_event_for_signal(int sig) {
+    return sig == SIGINT ? SERVER_LIFECYCLE_EVENT_INT :
+                           SERVER_LIFECYCLE_EVENT_TERM;
+}
+
+/* Fold the signal handler's async-safe publication into server-owned state.
+ * Callers hold s->mu. */
+static void server_lifecycle_observe_stop_locked(server *s) {
+    if (!s || !g_stop_requested || s->originating_signal != 0) return;
+    const int sig = (int)g_originating_signal;
+    if (sig != SIGINT && sig != SIGTERM) return;
+    s->originating_signal = sig;
+    s->lifecycle = server_lifecycle_transition(
+        s->lifecycle, server_lifecycle_event_for_signal(sig));
+}
+
+static bool server_lifecycle_accepting_locked(server *s) {
+    if (!s) return false;
+    server_lifecycle_observe_stop_locked(s);
+    return !g_stop_requested && !s->stopping &&
+        server_lifecycle_allows_admission(s->lifecycle);
+}
+
+static bool server_lifecycle_accepting(server *s) {
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    const bool accepting = server_lifecycle_accepting_locked(s);
+    pthread_mutex_unlock(&s->mu);
+    return accepting;
+}
+
+static bool server_lifecycle_allows_engine_start(server *s) {
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    server_lifecycle_observe_stop_locked(s);
+    const bool allowed = !server_lifecycle_is_unsafe_state(s->lifecycle) &&
+        s->lifecycle != SERVER_LIFECYCLE_FORCED_EXIT;
+    pthread_mutex_unlock(&s->mu);
+    return allowed;
+}
+
+static void server_lifecycle_observe_stop(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mu);
+    server_lifecycle_observe_stop_locked(s);
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void server_lifecycle_wake_accept(void) {
+    if (g_accept_wake_fd < 0) return;
+    const unsigned char wake = 1;
+    (void)write((int)g_accept_wake_fd, &wake, sizeof(wake));
+}
+
+static bool server_session_cancel_requested(void *opaque) {
+    (void)opaque;
+    /* Both a real signal and an internal unsafe latch publish this flag before
+     * waking the accept owner.  Compact execution observes it only at its
+     * existing safe boundaries through ds4_session_set_cancel(). */
+    return g_stop_requested != 0;
+}
+
+/* Publish an integrity failure as soon as its typed result is known.  Waiting
+ * until the worker returns would leave a window where admission and sibling
+ * slots could start new engine work against state we already know is unsafe. */
+static void server_lifecycle_latch_unsafe(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mu);
+    server_lifecycle_observe_stop_locked(s);
+    s->lifecycle = server_lifecycle_transition(
+        s->lifecycle, SERVER_LIFECYCLE_EVENT_UNSAFE);
+    s->drain_failed = true;
+    s->drain_reached_safe_point = false;
+    g_stop_requested = 1;
+    pthread_cond_broadcast(&s->cv);
+    pthread_cond_broadcast(&s->clients_cv);
+    pthread_mutex_unlock(&s->mu);
+    server_lifecycle_wake_accept();
+}
+
+/* Reserve an inference request before any parser can consult or mutate replay
+ * state.  A signal that arrives after this point drains the reserved request;
+ * a signal that wins this mutex is rejected before parser-side effects. */
+static bool server_lifecycle_reserve_request(server *s, int client_fd) {
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    const bool accepted = server_lifecycle_accepting_locked(s);
+    if (accepted) {
+        s->admitted_requests++;
+        s->preparing_requests++;
+        s->drain_reached_safe_point = false;
+        for (size_t i = 0; i < s->client_connection_count; i++) {
+            if (s->client_connections[i].fd == client_fd) {
+                s->client_connections[i].admitted = true;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s->mu);
+    return accepted;
+}
+
+/* Callers hold s->mu and have already decremented the request-specific owner
+ * (preparing or queued).  Return true when the accept loop must be woken. */
+static bool server_lifecycle_finish_request_locked(
+        server *s, bool safe, bool unsafe) {
+    bool stop_for_unsafe = false;
+    server_lifecycle_observe_stop_locked(s);
+    if (s->admitted_requests > 0) s->admitted_requests--;
+
+    if (unsafe) {
+        s->lifecycle = server_lifecycle_transition(
+            s->lifecycle, SERVER_LIFECYCLE_EVENT_UNSAFE);
+        s->drain_failed = true;
+        s->drain_reached_safe_point = false;
+        g_stop_requested = 1;
+        stop_for_unsafe = true;
+    } else if (s->lifecycle != SERVER_LIFECYCLE_ACCEPTING && !safe) {
+        s->drain_failed = true;
+    }
+
+    if (s->admitted_requests == 0) {
+        if (s->lifecycle == SERVER_LIFECYCLE_ACCEPTING) {
+            /* A transport failure completed before shutdown began and does
+             * not poison a later idle graceful drain. */
+            s->drain_failed = false;
+            s->drain_reached_safe_point = true;
+        } else if (s->lifecycle == SERVER_LIFECYCLE_DRAINING) {
+            s->drain_reached_safe_point = !s->drain_failed;
+        }
+    }
+    pthread_cond_broadcast(&s->clients_cv);
+    return stop_for_unsafe;
+}
+
+static void server_lifecycle_release_preparing(
+        server *s, bool safe, bool unsafe) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mu);
+    if (s->preparing_requests > 0) s->preparing_requests--;
+    const bool wake = server_lifecycle_finish_request_locked(s, safe, unsafe);
+    pthread_mutex_unlock(&s->mu);
+    if (wake) {
+        g_stop_requested = 1;
+        server_lifecycle_wake_accept();
+    }
+}
+
+/* A worker calls this only after the Task 17 terminal/barrier funnel has
+ * released request-owned engine state and made its final response attempt. */
+static void server_lifecycle_complete_admitted(server *s, job *j) {
+    if (!s || !j || !j->lifecycle_admitted) return;
+    bool stop_for_unsafe = false;
+    pthread_mutex_lock(&s->mu);
+    j->lifecycle_admitted = false;
+    stop_for_unsafe = server_lifecycle_finish_request_locked(
+        s, j->lifecycle_safe, j->lifecycle_unsafe);
+    pthread_mutex_unlock(&s->mu);
+
+    if (stop_for_unsafe) {
+        g_stop_requested = 1;
+        server_lifecycle_wake_accept();
+    }
+}
+
+static int server_lifecycle_process_exit_status(server *s) {
+    if (!s) return 1;
+    pthread_mutex_lock(&s->mu);
+    server_lifecycle_observe_stop_locked(s);
+    const server_lifecycle_state state = s->lifecycle;
+    const int sig = s->originating_signal;
+    const bool safe = s->admitted_requests == 0 &&
+        s->drain_reached_safe_point && !s->drain_failed;
+    pthread_mutex_unlock(&s->mu);
+    return server_lifecycle_resolve_exit_status(state, sig, safe);
+}
+
+static bool server_lifecycle_process_is_unsafe(server *s) {
+    if (!s) return true;
+    pthread_mutex_lock(&s->mu);
+    const bool unsafe = server_lifecycle_is_unsafe_state(s->lifecycle);
+    pthread_mutex_unlock(&s->mu);
+    return unsafe;
+}
 
 /* A queued job owns request accounting for exactly its stack lifetime.  The
  * client thread prepares it before enqueue; the worker mutates the same
@@ -10409,10 +10898,29 @@ server_job_runtime_terminal_metrics(const job *j) {
         ? &j->runtime_terminal : NULL;
 }
 
+static ds4_runtime_request_terminal_status
+server_job_runtime_effective_status(
+        const job *j, ds4_runtime_request_terminal_status requested) {
+    const ds4_runtime_request_metrics *metrics =
+        server_job_runtime_terminal_metrics(j);
+    return metrics ? metrics->terminal_status : requested;
+}
+
+static bool server_job_runtime_effective_unsafe(
+        const job *j,
+        ds4_runtime_request_terminal_status requested,
+        bool finish_ok) {
+    return !finish_ok ||
+        server_job_runtime_effective_status(j, requested) ==
+            DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+}
+
 static bool server_reject_prepared_request(
-        int fd, bool enable_cors, request *prepared,
+        server *s, int fd, bool enable_cors, request *prepared,
         ds4_runtime_request_context *accepted_context,
-        request_admission_code code) {
+        request_admission_code code,
+        bool *unsafe_out) {
+    if (unsafe_out) *unsafe_out = false;
     if (!prepared || prepared->prompt.len <= 0 || !accepted_context) {
         return false;
     }
@@ -10420,12 +10928,19 @@ static bool server_reject_prepared_request(
     rejected.fd = fd;
     rejected.req = *prepared;
     memset(prepared, 0, sizeof(*prepared));
-    if (!server_job_runtime_adopt(&rejected, accepted_context) ||
-        !server_job_runtime_finish(
-            &rejected, DS4_RUNTIME_REQUEST_REJECTED,
-            now_monotonic_ns())) {
+    const bool adopted = server_job_runtime_adopt(&rejected, accepted_context);
+    const bool finished = adopted && server_job_runtime_finish(
+        &rejected, DS4_RUNTIME_REQUEST_REJECTED, now_monotonic_ns());
+    const bool unsafe = server_job_runtime_effective_unsafe(
+        &rejected, DS4_RUNTIME_REQUEST_UNSAFE_ERROR, finished);
+    if (unsafe_out) *unsafe_out = unsafe;
+    if (unsafe) server_lifecycle_latch_unsafe(s);
+    if (!adopted || !finished) {
+        const bool emitted = server_emit_prepared_error_terminal(
+            fd, enable_cors, &rejected.req, 500,
+            "request accounting unavailable", false, NULL);
         request_free(&rejected.req);
-        return false;
+        return emitted;
     }
     const char *message =
         code == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS ?
@@ -12401,11 +12916,75 @@ static DS4_SERVER_MAYBE_UNUSED bool server_accumulated_span_is_client_visible(
         &projection, span_start, span_end);
 }
 
-static bool server_execution_failure_is_unsafe(int rc, const char *err) {
-    return rc == DS4_SERVER_EXEC_UNSAFE ||
-        (err && (strstr(err, "invalid attributed") != NULL ||
-                 strstr(err, "accounting failed") != NULL ||
-                 strstr(err, "invalid request context") != NULL));
+static bool server_execution_failure_is_unsafe(int rc) {
+    return rc == DS4_SERVER_EXEC_UNSAFE;
+}
+
+static int server_execution_result_merge(int current, int next) {
+    if (current == DS4_SERVER_EXEC_UNSAFE ||
+        next == DS4_SERVER_EXEC_UNSAFE) {
+        return DS4_SERVER_EXEC_UNSAFE;
+    }
+    if (current == DS4_SERVER_EXEC_INTERRUPTED ||
+        next == DS4_SERVER_EXEC_INTERRUPTED) {
+        return DS4_SERVER_EXEC_INTERRUPTED;
+    }
+    return current != 0 || next != 0 ? DS4_SERVER_EXEC_RECOVERABLE : 0;
+}
+
+static void server_execution_result_observe(
+        server *s, int *current, int next) {
+    if (!current) return;
+    *current = server_execution_result_merge(*current, next);
+    if (*current == DS4_SERVER_EXEC_UNSAFE) {
+        server_lifecycle_latch_unsafe(s);
+    }
+}
+
+static void server_execution_mark_unsafe(
+        server *s, bool *runtime_unsafe, int *execution_result) {
+    if (runtime_unsafe) *runtime_unsafe = true;
+    server_execution_result_observe(
+        s, execution_result, DS4_SERVER_EXEC_UNSAFE);
+}
+
+typedef struct {
+    ds4_runtime_request_terminal_status terminal_status;
+    int http_status;
+    bool abrupt;
+    bool emit_terminal_metrics;
+    bool process_unsafe;
+} server_failure_boundary;
+
+/* Interpret the engine's typed outcome exactly once at the HTTP boundary.
+ * Error text remains diagnostic and cannot promote or demote the result. */
+static server_failure_boundary server_failure_boundary_decide(
+        int execution_result, bool headers_sent) {
+    if (execution_result == DS4_SERVER_EXEC_UNSAFE) {
+        return (server_failure_boundary) {
+            .terminal_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR,
+            .http_status = headers_sent ? 0 : 500,
+            .abrupt = headers_sent,
+            .emit_terminal_metrics = !headers_sent,
+            .process_unsafe = true,
+        };
+    }
+    if (execution_result == DS4_SERVER_EXEC_INTERRUPTED) {
+        return (server_failure_boundary) {
+            .terminal_status = DS4_RUNTIME_REQUEST_CANCELLED,
+            .http_status = headers_sent ? 0 : 503,
+            .abrupt = headers_sent,
+            .emit_terminal_metrics = !headers_sent,
+            .process_unsafe = false,
+        };
+    }
+    return (server_failure_boundary) {
+        .terminal_status = DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR,
+        .http_status = headers_sent ? 0 : 503,
+        .abrupt = headers_sent,
+        .emit_terminal_metrics = !headers_sent,
+        .process_unsafe = false,
+    };
 }
 
 static ds4_runtime_request_terminal_status server_transport_failure_status(
@@ -12757,6 +13336,10 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     if (!s || !slot) return false;
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
+        if (g_stop_requested) {
+            pthread_mutex_unlock(&s->inference_mu);
+            return false;
+        }
         return true;
     }
 
@@ -12778,6 +13361,14 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     s->model_busy = true;
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
+    if (g_stop_requested) {
+        pthread_mutex_unlock(&s->inference_mu);
+        pthread_mutex_lock(&s->model_mu);
+        s->model_busy = false;
+        pthread_cond_broadcast(&s->model_cv);
+        pthread_mutex_unlock(&s->model_mu);
+        return false;
+    }
     return true;
 }
 
@@ -12822,15 +13413,23 @@ static int server_session_sync(server *s, server_slot *slot,
                                ds4_runtime_request_context *request_runtime,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt) return 1;
+    if (g_stop_requested) return DS4_SESSION_SYNC_INTERRUPTED;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_attributed(slot->session, prompt,
                                              request_runtime, err, errlen);
+        if (server_execution_failure_is_unsafe(rc)) {
+            server_lifecycle_latch_unsafe(s);
+        }
         server_prefill_leave(s);
         return rc;
     }
 
     pthread_mutex_lock(&s->inference_mu);
+    if (g_stop_requested) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
@@ -12849,6 +13448,12 @@ static int server_session_sync(server *s, server_slot *slot,
         int rc = ds4_session_sync_attributed(slot->session, &prefix,
                                              request_runtime, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
+        if (server_execution_failure_is_unsafe(rc)) {
+            /* Publish while this prefill still owns model_busy/inference_mu so
+             * a waiting slot cannot begin another quantum after integrity is
+             * already known unsafe. */
+            server_lifecycle_latch_unsafe(s);
+        }
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
@@ -13319,8 +13924,8 @@ static int canonicalize_tool_checkpoint(server *s, server_slot *slot,
                             common, live_len, canonical.len, err);
             }
         } else {
-            execution_rc = server_execution_failure_is_unsafe(
-                sync_rc, sync_err) ? DS4_SERVER_EXEC_UNSAFE : sync_rc;
+            execution_rc = server_execution_failure_is_unsafe(sync_rc) ?
+                DS4_SERVER_EXEC_UNSAFE : sync_rc;
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
@@ -13332,8 +13937,7 @@ static int canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens_free(&effective);
         free(path);
     } else {
-        execution_rc = server_execution_failure_is_unsafe(1, err) ?
-            DS4_SERVER_EXEC_UNSAFE : 1;
+        execution_rc = DS4_SERVER_EXEC_UNSAFE;
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
@@ -13377,6 +13981,10 @@ static int server_eval_token(server *s, server_slot *slot, int token,
                              ds4_runtime_request_context *request_runtime,
                              char *err, size_t errlen) {
     if (!s || !slot) return 1;
+    if (g_stop_requested) {
+        if (err && errlen) snprintf(err, errlen, "shutdown requested");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
         int rc = ds4_session_eval_attributed(slot->session, token,
@@ -13386,6 +13994,11 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     }
 
     pthread_mutex_lock(&s->model_mu);
+    if (s->model_stopping || g_stop_requested) {
+        pthread_mutex_unlock(&s->model_mu);
+        if (err && errlen) snprintf(err, errlen, "shutdown requested");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
     if (slot->decode_pending || slot->decode_in_flight) {
         pthread_mutex_unlock(&s->model_mu);
         if (err && errlen) snprintf(err, errlen, "session already has a decode in flight");
@@ -13435,6 +14048,25 @@ static void timespec_add_us(struct timespec *ts, long us) {
     ts->tv_nsec %= 1000000000L;
 }
 
+/* Callers hold model_mu.  Acknowledge every borrowed request context before
+ * the owning slot/job can return, but never send a pending row to CUDA after
+ * shutdown or an unsafe batch result. */
+static void server_decode_cancel_pending_locked(server *s, const char *reason) {
+    if (!s) return;
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (!slot->decode_pending) continue;
+        slot->decode_pending = false;
+        if (s->decode_pending > 0) s->decode_pending--;
+        slot->decode_request = NULL;
+        slot->decode_rc = DS4_SESSION_SYNC_INTERRUPTED;
+        snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
+                 reason && reason[0] ? reason : "shutdown requested");
+        slot->decode_done = true;
+    }
+    pthread_cond_broadcast(&s->model_cv);
+}
+
 static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_attributed_decode_item *items =
@@ -13445,8 +14077,13 @@ static void *decode_worker_main(void *arg) {
 
     pthread_mutex_lock(&s->model_mu);
     for (;;) {
-        while (s->decode_pending == 0 && !s->model_stopping) {
+        while (s->decode_pending == 0 && !s->model_stopping &&
+               !g_stop_requested) {
             pthread_cond_wait(&s->model_cv, &s->model_mu);
+        }
+        if (g_stop_requested) {
+            server_decode_cancel_pending_locked(s, "shutdown requested");
+            break;
         }
         if (s->decode_pending == 0 && s->model_stopping) break;
 
@@ -13465,8 +14102,17 @@ static void *decode_worker_main(void *arg) {
             }
         }
 
-        while (s->model_busy) {
+        if (g_stop_requested) {
+            server_decode_cancel_pending_locked(s, "shutdown requested");
+            break;
+        }
+
+        while (s->model_busy && !g_stop_requested) {
             pthread_cond_wait(&s->model_cv, &s->model_mu);
+        }
+        if (g_stop_requested) {
+            server_decode_cancel_pending_locked(s, "shutdown requested");
+            break;
         }
         if (s->model_stopping && s->decode_pending == 0) break;
 
@@ -13490,9 +14136,20 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_sessions_eval_batch_attributed(
-            items, count, batch_err, sizeof(batch_err));
+        int rc;
+        if (g_stop_requested) {
+            rc = DS4_SESSION_SYNC_INTERRUPTED;
+            snprintf(batch_err, sizeof(batch_err), "shutdown requested");
+        } else {
+            rc = ds4_sessions_eval_batch_attributed(
+                items, count, batch_err, sizeof(batch_err));
+        }
         pthread_mutex_unlock(&s->inference_mu);
+        if (server_execution_failure_is_unsafe(rc)) {
+            /* Latch before model_busy is cleared so no successor batch can
+             * win the coordinator between the unsafe result and publication. */
+            server_lifecycle_latch_unsafe(s);
+        }
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s",
@@ -13512,6 +14169,9 @@ static void *decode_worker_main(void *arg) {
                          batch_err[0] ? batch_err : "batched decode failed");
             }
             slot->decode_done = true;
+        }
+        if (g_stop_requested) {
+            server_decode_cancel_pending_locked(s, "shutdown requested");
         }
         pthread_cond_broadcast(&s->model_cv);
     }
@@ -13797,11 +14457,15 @@ static bool server_emit_native_terminal(
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 static void generate_job(server *s, server_slot *slot, job *j) {
+    j->lifecycle_safe = false;
+    j->lifecycle_unsafe = false;
     ds4_runtime_request_context *runtime = server_job_runtime_context(j);
     ds4_runtime_request_terminal_status runtime_status =
         DS4_RUNTIME_REQUEST_REJECTED;
     bool native_terminal_ready = false;
     bool response_ok = true;
+    bool request_barrier_safe = true;
+    bool terminal_response_complete = false;
     char err[160] = {0};
     ds4_tokens effective_prompt = {0};
     ds4_kvstore_text_preview disk_preview = {0};
@@ -13827,6 +14491,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     bool responses_live_chat = false;
     bool recovered_tool_parse_failure = false;
     bool runtime_execution_unsafe = false;
+    int execution_result = 0;
     long responses_created_at = 0;
     thinking_state thinking = {0};
     server_visible_accounting visibility = {0};
@@ -13835,6 +14500,13 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     char prepared_error[256] = {0};
     int prepared_error_status = 500;
     bool response_stream_started = false;
+    if (!server_lifecycle_allows_engine_start(s)) {
+        runtime_status = DS4_RUNTIME_REQUEST_CANCELLED;
+        prepared_error_status = 503;
+        snprintf(prepared_error, sizeof(prepared_error), "%s",
+                 "server shutting down");
+        goto runtime_terminal_funnel;
+    }
     const request_admission_code admission =
         request_prepare_token_admission(&j->req, s->ctx_size);
     if (admission != REQUEST_ADMISSION_FITS) {
@@ -14070,7 +14742,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         .responses_protocol = responses_protocol,
         .t0 = t0,
         .fd = j->fd,
-        .stream = j->req.stream,
+        /* Keep HTTP status mutable until prefill has crossed the compact
+         * restore/barrier boundary.  A typed recoverable load failure must be
+         * able to return a real 503, not a 200 SSE stream with an error event. */
+        .stream = false,
         .enable_cors = s->enable_cors,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
@@ -14170,15 +14845,19 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            if (!err[0] && (g_stop_requested ||
+                            sync_rc == DS4_SESSION_SYNC_INTERRUPTED)) {
+                snprintf(err, sizeof(err), "shutdown requested");
+            }
             trace_event(s, trace_id, "prefill failed: %s", err);
             response_stream_started = progress.headers_sent;
             snprintf(prepared_error, sizeof(prepared_error), "%s", err);
-            runtime_status = server_execution_failure_is_unsafe(sync_rc, err) ?
-                DS4_RUNTIME_REQUEST_UNSAFE_ERROR :
-                (g_stop_requested ||
-                 sync_rc == DS4_SESSION_SYNC_INTERRUPTED) ?
-                    DS4_RUNTIME_REQUEST_CANCELLED :
-                    DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR;
+            server_execution_result_observe(s, &execution_result, sync_rc);
+            const server_failure_boundary boundary =
+                server_failure_boundary_decide(
+                    execution_result, response_stream_started);
+            prepared_error_status = boundary.http_status;
+            runtime_status = boundary.terminal_status;
             goto runtime_terminal_funnel;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
@@ -14201,16 +14880,20 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
         kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        if (!err[0] && (g_stop_requested ||
+                        final_sync_rc == DS4_SESSION_SYNC_INTERRUPTED)) {
+            snprintf(err, sizeof(err), "shutdown requested");
+        }
         trace_event(s, trace_id, "prefill failed: %s", err);
         response_stream_started = progress.headers_sent;
         snprintf(prepared_error, sizeof(prepared_error), "%s", err);
-        runtime_status = server_execution_failure_is_unsafe(
-                final_sync_rc, err) ?
-            DS4_RUNTIME_REQUEST_UNSAFE_ERROR :
-            (g_stop_requested ||
-             final_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) ?
-                DS4_RUNTIME_REQUEST_CANCELLED :
-                DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR;
+        server_execution_result_observe(
+            s, &execution_result, final_sync_rc);
+        const server_failure_boundary boundary =
+            server_failure_boundary_decide(
+                execution_result, response_stream_started);
+        prepared_error_status = boundary.http_status;
+        runtime_status = boundary.terminal_status;
         goto runtime_terminal_funnel;
     }
     if (!ds4_runtime_request_mark_prefill_complete(
@@ -14395,7 +15078,8 @@ decode_again:
                     now_monotonic_ns())) {
                 finish = "error";
                 snprintf(err, sizeof(err), "request token accounting failed");
-                runtime_execution_unsafe = true;
+                server_execution_mark_unsafe(
+                    s, &runtime_execution_unsafe, &execution_result);
                 break;
             }
             completion = output_budget.used;
@@ -14420,6 +15104,8 @@ decode_again:
                                                        err,
                                                        sizeof(err));
             if (ntok < 0) {
+                server_execution_result_observe(
+                    s, &execution_result, DS4_SERVER_EXEC_RECOVERABLE);
                 finish = "error";
                 break;
             }
@@ -14427,7 +15113,8 @@ decode_again:
             const int eval_rc = server_eval_token(
                 s, slot, token, runtime, err, sizeof(err));
             if (eval_rc != 0) {
-                if (server_execution_failure_is_unsafe(eval_rc, err)) {
+                server_execution_result_observe(s, &execution_result, eval_rc);
+                if (server_execution_failure_is_unsafe(eval_rc)) {
                     runtime_execution_unsafe = true;
                 }
                 finish = "error";
@@ -14450,7 +15137,8 @@ decode_again:
                     finish = "error";
                     snprintf(err, sizeof(err),
                              "request token accounting failed");
-                    runtime_execution_unsafe = true;
+                    server_execution_mark_unsafe(
+                        s, &runtime_execution_unsafe, &execution_result);
                 }
                 completion = output_budget.used;
                 finish = "stop";
@@ -14477,7 +15165,8 @@ decode_again:
                 free(piece);
                 finish = "error";
                 snprintf(err, sizeof(err), "request token accounting failed");
-                runtime_execution_unsafe = true;
+                server_execution_mark_unsafe(
+                    s, &runtime_execution_unsafe, &execution_result);
                 stop_decode = true;
                 break;
             }
@@ -14529,7 +15218,8 @@ decode_again:
                     finish = "error";
                     snprintf(err, sizeof(err),
                              "request emission accounting failed");
-                    runtime_execution_unsafe = true;
+                    server_execution_mark_unsafe(
+                        s, &runtime_execution_unsafe, &execution_result);
                     free(piece);
                     stop_decode = true;
                     break;
@@ -14556,7 +15246,8 @@ decode_again:
                     finish = "error";
                     snprintf(err, sizeof(err),
                              "request emission accounting failed");
-                    runtime_execution_unsafe = true;
+                    server_execution_mark_unsafe(
+                        s, &runtime_execution_unsafe, &execution_result);
                     free(piece);
                     stop_decode = true;
                     break;
@@ -14584,7 +15275,8 @@ decode_again:
                     finish = "error";
                     snprintf(err, sizeof(err),
                              "request emission accounting failed");
-                    runtime_execution_unsafe = true;
+                    server_execution_mark_unsafe(
+                        s, &runtime_execution_unsafe, &execution_result);
                     free(piece);
                     stop_decode = true;
                     break;
@@ -14618,8 +15310,9 @@ decode_again:
                     completion = output_budget.used;
                     if (recovered < 0) {
                         const int recovery_rc = -recovered;
-                        if (server_execution_failure_is_unsafe(
-                                recovery_rc, err)) {
+                        server_execution_result_observe(
+                            s, &execution_result, recovery_rc);
+                        if (server_execution_failure_is_unsafe(recovery_rc)) {
                             runtime_execution_unsafe = true;
                         }
                         finish = "error";
@@ -14724,6 +15417,24 @@ decode_again:
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_INTERRUPTED);
+    }
+
+    /* A typed execution failure owns the HTTP result.  Do not parse sampled
+     * bytes, update tool/live replay state, or canonicalize a checkpoint after
+     * the engine has reported that the request did not complete safely. */
+    if (!strcmp(finish, "error") && execution_result == 0) {
+        server_execution_result_observe(
+            s, &execution_result,
+            (g_stop_requested ||
+             strstr(err, "client stream write failed") != NULL) ?
+                DS4_SERVER_EXEC_INTERRUPTED :
+                DS4_SERVER_EXEC_RECOVERABLE);
+    }
+    if (execution_result != 0) {
+        final_finish = "error";
+        goto runtime_terminal_funnel;
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
@@ -14799,12 +15510,18 @@ decode_again:
                     goto decode_again;
                 }
                 finish = "error";
-                if (server_execution_failure_is_unsafe(
-                        recovery_rc, recovery_err)) {
+                server_execution_result_observe(
+                    s, &execution_result,
+                    recovery_rc != 0 ? recovery_rc :
+                        DS4_SERVER_EXEC_RECOVERABLE);
+                if (server_execution_failure_is_unsafe(recovery_rc)) {
                     runtime_execution_unsafe = true;
                 }
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
+                buf_free(&repaired);
+                final_finish = "error";
+                goto runtime_terminal_funnel;
             } else {
                 finish = "error";
                 snprintf(err, sizeof(err), "unterminated tool call");
@@ -14885,12 +15602,17 @@ decode_again:
                     goto decode_again;
                 }
                 final_finish = "error";
-                if (server_execution_failure_is_unsafe(
-                        recovery_rc, recovery_err)) {
+                server_execution_result_observe(
+                    s, &execution_result,
+                    recovery_rc != 0 ? recovery_rc :
+                        DS4_SERVER_EXEC_RECOVERABLE);
+                if (server_execution_failure_is_unsafe(recovery_rc)) {
                     runtime_execution_unsafe = true;
                 }
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
+                final_finish = "error";
+                goto runtime_terminal_funnel;
             }
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */
@@ -15000,7 +15722,9 @@ decode_again:
             s, slot, j, ctx_span, runtime, trace_id,
             parsed_content ? parsed_content : "",
             parsed_reasoning, &parsed_calls);
-        if (server_execution_failure_is_unsafe(checkpoint_rc, NULL)) {
+        server_execution_result_observe(
+            s, &execution_result, checkpoint_rc);
+        if (server_execution_failure_is_unsafe(checkpoint_rc)) {
             runtime_execution_unsafe = true;
         }
         thinking_live_clear(s, slot);
@@ -15012,6 +15736,11 @@ decode_again:
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
+    }
+
+    if (execution_result != 0) {
+        final_finish = "error";
+        goto runtime_terminal_funnel;
     }
 
     native_terminal = (server_native_terminal) {
@@ -15046,8 +15775,16 @@ decode_again:
     protocol_reasoning = native_terminal.reasoning;
     protocol_calls = native_terminal.calls;
     native_terminal_ready = true;
-    runtime_status = runtime_execution_unsafe ?
+    if (runtime_execution_unsafe) {
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+    }
+    runtime_status = execution_result == DS4_SERVER_EXEC_UNSAFE ?
         DS4_RUNTIME_REQUEST_UNSAFE_ERROR :
+        execution_result == DS4_SERVER_EXEC_INTERRUPTED ?
+        DS4_RUNTIME_REQUEST_CANCELLED :
+        execution_result == DS4_SERVER_EXEC_RECOVERABLE ?
+        DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR :
         !strcmp(final_finish, "error") ?
         (g_stop_requested || strstr(err, "client stream write failed") ?
             DS4_RUNTIME_REQUEST_CANCELLED :
@@ -15055,7 +15792,14 @@ decode_again:
         DS4_RUNTIME_REQUEST_COMPLETED;
 
 runtime_terminal_funnel:
-    if (native_terminal_ready) {
+    if (runtime_status == DS4_RUNTIME_REQUEST_UNSAFE_ERROR) {
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+    } else if (runtime_status == DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR) {
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_RECOVERABLE);
+    }
+    if (native_terminal_ready && execution_result == 0) {
         native_terminal.content = protocol_content;
         native_terminal.reasoning = protocol_reasoning;
         native_terminal.calls = protocol_calls;
@@ -15068,33 +15812,57 @@ runtime_terminal_funnel:
                 &visibility, runtime, native_terminal.raw,
                 native_terminal.raw_len, raw_projected_verbatim)) {
             runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+            server_execution_result_observe(
+                s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
         }
-        bool final_payload_emitted = false;
-        response_ok = server_flush_final_visible(
-            &native_terminal, &final_payload_emitted);
-        if (!server_visible_accounting_note_payload(
-                &visibility, final_payload_emitted)) {
-            runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
-        }
-        if (!response_ok) {
-            runtime_status = server_transport_failure_status(runtime_status);
+        if (execution_result != DS4_SERVER_EXEC_UNSAFE) {
+            bool final_payload_emitted = false;
+            response_ok = server_flush_final_visible(
+                &native_terminal, &final_payload_emitted);
+            if (!server_visible_accounting_note_payload(
+                    &visibility, final_payload_emitted)) {
+                runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+                server_execution_result_observe(
+                    s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+            }
+            if (!response_ok) {
+                runtime_status = server_transport_failure_status(
+                    runtime_status);
+            }
         }
     }
     if (runtime && runtime->prefill_started) {
         if (ds4_session_request_barrier(
                 slot->session, runtime, err, sizeof(err)) != 0) {
+            request_barrier_safe = false;
             runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+            server_execution_result_observe(
+                s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
         }
     }
-    if (runtime && native_terminal_ready) {
+    if (runtime_status == DS4_RUNTIME_REQUEST_UNSAFE_ERROR) {
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+    }
+    bool execution_failure_active = execution_result != 0;
+    server_failure_boundary failure_boundary = {0};
+    if (execution_failure_active) {
+        failure_boundary = server_failure_boundary_decide(
+            execution_result, response_stream_started);
+        runtime_status = failure_boundary.terminal_status;
+    }
+    if (runtime && native_terminal_ready && !execution_failure_active) {
         if (!j->req.stream) {
             bool buffered_payload_emitted = false;
             const bool begin_ok = server_buffered_terminal_begin(
                 &native_terminal, &buffered_terminal,
                 &buffered_payload_emitted);
+            response_stream_started = buffered_terminal.response_started;
             if (!server_visible_accounting_note_payload(
                     &visibility, buffered_payload_emitted)) {
                 runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+                server_execution_result_observe(
+                    s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
             }
             response_ok = begin_ok && response_ok;
             if (!begin_ok) {
@@ -15105,21 +15873,61 @@ runtime_terminal_funnel:
         if (!server_visible_accounting_publish_emission(
                 &visibility, runtime)) {
             runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+            server_execution_result_observe(
+                s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
         }
     }
-    if (!server_job_runtime_finish(
-            j, runtime_status, now_monotonic_ns())) {
+    execution_failure_active = execution_result != 0;
+    if (execution_failure_active) {
+        failure_boundary = server_failure_boundary_decide(
+            execution_result, response_stream_started);
+        runtime_status = failure_boundary.terminal_status;
+    }
+    const bool terminal_accounting_ok = server_job_runtime_finish(
+        j, runtime_status, now_monotonic_ns());
+    if (!terminal_accounting_ok) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: request terminal accounting failed");
+        runtime_status = DS4_RUNTIME_REQUEST_UNSAFE_ERROR;
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+        execution_failure_active = true;
+        failure_boundary = server_failure_boundary_decide(
+            execution_result, response_stream_started);
     }
     const ds4_runtime_request_metrics *terminal_metrics =
         server_job_runtime_terminal_metrics(j);
-    if (!native_terminal_ready && prepared_error[0] && terminal_metrics) {
+    const ds4_runtime_request_terminal_status effective_status =
+        server_job_runtime_effective_status(j, runtime_status);
+    if (effective_status == DS4_RUNTIME_REQUEST_UNSAFE_ERROR) {
+        server_execution_result_observe(
+            s, &execution_result, DS4_SERVER_EXEC_UNSAFE);
+        execution_failure_active = true;
+        failure_boundary = server_failure_boundary_decide(
+            execution_result, response_stream_started);
+    }
+    if (execution_failure_active && failure_boundary.emit_terminal_metrics &&
+        failure_boundary.http_status > 0) {
+        const char *failure_message = prepared_error[0] ? prepared_error :
+            err[0] ? err : failure_boundary.process_unsafe ?
+                "unsafe runtime failure" : "request execution failed";
+        response_ok = server_emit_prepared_error_terminal(
+            j->fd, s->enable_cors, &j->req,
+            failure_boundary.http_status, failure_message, false,
+            terminal_metrics);
+        terminal_response_complete = response_ok;
+    } else if (execution_failure_active) {
+        /* Once headers or payload bytes escaped, a typed failure cannot be
+         * rewritten as a successful native terminal.  Closing the client fd
+         * after this worker returns is the only truthful wire result. */
+        response_ok = false;
+        terminal_response_complete = false;
+    } else if (!native_terminal_ready && prepared_error[0] && terminal_metrics) {
         response_ok = server_emit_prepared_error_terminal(
             j->fd, s->enable_cors, &j->req, prepared_error_status,
             prepared_error, response_stream_started, terminal_metrics);
-    }
-    if (native_terminal_ready && terminal_metrics) {
+        terminal_response_complete = response_ok;
+    } else if (native_terminal_ready && terminal_metrics) {
         bool terminal_ok = false;
         if (response_ok) {
             terminal_ok = j->req.stream ?
@@ -15133,7 +15941,13 @@ runtime_terminal_funnel:
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: final protocol response failed");
         }
+        terminal_response_complete = response_ok;
     }
+    j->lifecycle_unsafe = server_job_runtime_effective_unsafe(
+        j, runtime_status, terminal_accounting_ok);
+    j->lifecycle_safe = !j->lifecycle_unsafe && request_barrier_safe &&
+        terminal_accounting_ok && terminal_response_complete &&
+        strstr(err, "client stream write failed") == NULL;
     if (!native_terminal_ready) goto runtime_cleanup;
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -15260,28 +16074,44 @@ static void dispatch_jobs_locked(server *s) {
         server_slot *chosen_slot = NULL;
         int chosen_score = INT_MIN;
 
-        pthread_mutex_lock(&s->tool_mu);
-        job *prev = NULL;
-        for (job *j = s->head; j; prev = j, j = j->next) {
-            int required = job_required_slot_locked(s, j);
-            server_slot *best = NULL;
-            int best_score = INT_MIN;
-            for (int i = 0; i < s->slot_count; i++) {
-                int score = job_slot_score(s, &s->slots[i], j, required);
-                if (score > best_score) {
-                    best_score = score;
-                    best = &s->slots[i];
+        const bool engine_forbidden =
+            server_lifecycle_is_unsafe_state(s->lifecycle) ||
+            s->lifecycle == SERVER_LIFECYCLE_FORCED_EXIT;
+        if (engine_forbidden) {
+            /* Drain stack-owned jobs through generate_job's cancellation
+             * funnel, but do not inspect session prefixes or tool/live state
+             * after an integrity failure has forbidden more engine work. */
+            chosen = s->head;
+            for (int i = 0; chosen && i < s->slot_count; i++) {
+                if (!s->slots[i].busy && !s->slots[i].assigned) {
+                    chosen_slot = &s->slots[i];
+                    break;
                 }
             }
-            if (best) {
-                chosen = j;
-                chosen_prev = prev;
-                chosen_slot = best;
-                chosen_score = best_score;
-                break; /* FIFO among jobs that can run now. */
+        } else {
+            pthread_mutex_lock(&s->tool_mu);
+            job *prev = NULL;
+            for (job *j = s->head; j; prev = j, j = j->next) {
+                int required = job_required_slot_locked(s, j);
+                server_slot *best = NULL;
+                int best_score = INT_MIN;
+                for (int i = 0; i < s->slot_count; i++) {
+                    int score = job_slot_score(s, &s->slots[i], j, required);
+                    if (score > best_score) {
+                        best_score = score;
+                        best = &s->slots[i];
+                    }
+                }
+                if (best) {
+                    chosen = j;
+                    chosen_prev = prev;
+                    chosen_slot = best;
+                    chosen_score = best_score;
+                    break; /* FIFO among jobs that can run now. */
+                }
             }
+            pthread_mutex_unlock(&s->tool_mu);
         }
-        pthread_mutex_unlock(&s->tool_mu);
         (void)chosen_score;
         if (!chosen || !chosen_slot) break;
 
@@ -15297,9 +16127,27 @@ static void dispatch_jobs_locked(server *s) {
 
 static bool enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
-    if (s->stopping) {
-        pthread_mutex_unlock(&s->mu);
-        return false;
+    if (j->lifecycle_admitted) {
+        /* A pre-parser reservation may cross the first TERM.  It remains an
+         * admitted request and is allowed to reach the worker, but an unsafe
+         * or forced shutdown never starts more engine work. */
+        server_lifecycle_observe_stop_locked(s);
+        if (s->stopping || s->preparing_requests <= 0 ||
+            server_lifecycle_is_unsafe_state(s->lifecycle) ||
+            s->lifecycle == SERVER_LIFECYCLE_FORCED_EXIT) {
+            pthread_mutex_unlock(&s->mu);
+            return false;
+        }
+        s->preparing_requests--;
+        pthread_cond_broadcast(&s->clients_cv);
+    } else {
+        if (!server_lifecycle_accepting_locked(s)) {
+            pthread_mutex_unlock(&s->mu);
+            return false;
+        }
+        j->lifecycle_admitted = true;
+        s->admitted_requests++;
+        s->drain_reached_safe_point = false;
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
@@ -15334,6 +16182,7 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, &s->slots[0], j);
+        server_lifecycle_complete_admitted(s, j);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -15359,6 +16208,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
+        server_lifecycle_complete_admitted(s, j);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -15418,6 +16268,7 @@ static bool read_http_request(int fd, http_request *r) {
     const size_t max_body = 64 * 1024 * 1024;
 
     while (hend < 0 && b.len < max_header) {
+        if (g_stop_requested) goto fail;
         char tmp[4096];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
@@ -15441,6 +16292,7 @@ static bool read_http_request(int fd, http_request *r) {
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
+        if (g_stop_requested) goto fail;
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
@@ -15616,10 +16468,72 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
-static void client_done(server *s) {
-    pthread_mutex_lock(&s->mu);
+static bool server_client_register_locked(server *s, int fd) {
+    if (!s || fd < 0) return false;
+    if (s->client_connection_count == s->client_connection_cap) {
+        size_t next = s->client_connection_cap ?
+            s->client_connection_cap * 2 : 16;
+        s->client_connections = xrealloc(
+            s->client_connections, next * sizeof(s->client_connections[0]));
+        s->client_connection_cap = next;
+    }
+    s->client_connections[s->client_connection_count++] =
+        (server_client_connection){
+            .fd = fd,
+            .admitted = false,
+            .reading_request = true,
+            .drain_rejected = false,
+        };
+    s->clients++;
+    return true;
+}
+
+static void server_client_remove_locked(server *s, int fd) {
+    if (!s) return;
+    for (size_t i = 0; i < s->client_connection_count; i++) {
+        if (s->client_connections[i].fd != fd) continue;
+        s->client_connections[i] =
+            s->client_connections[s->client_connection_count - 1];
+        s->client_connection_count--;
+        break;
+    }
     if (s->clients > 0) s->clients--;
     pthread_cond_broadcast(&s->clients_cv);
+}
+
+static bool server_client_finish_request_read(server *s, int fd) {
+    bool drain_rejected = false;
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->client_connection_count; i++) {
+        if (s->client_connections[i].fd != fd) continue;
+        s->client_connections[i].reading_request = false;
+        drain_rejected = s->client_connections[i].drain_rejected;
+        break;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return drain_rejected;
+}
+
+static void server_lifecycle_reject_unadmitted_readers(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->client_connection_count; i++) {
+        server_client_connection *client = &s->client_connections[i];
+        if (client->admitted || !client->reading_request) continue;
+        client->drain_rejected = true;
+        /* Holding mu pins the fd against client_done()/close and descriptor
+         * reuse while the owner thread is still blocked in recv(). */
+        (void)http_error(client->fd, s->enable_cors, 503,
+                         "server shutting down");
+        (void)shutdown(client->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void client_done(server *s, int fd) {
+    pthread_mutex_lock(&s->mu);
+    server_client_remove_locked(s, fd);
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -15630,10 +16544,24 @@ static void *client_main(void *arg) {
     server *s = ca->srv;
     int fd = ca->fd;
     free(ca);
+    bool lifecycle_reserved = false;
+    bool lifecycle_response_complete = false;
+    bool lifecycle_unsafe = false;
 
     http_request hr = {0};
-    if (!read_http_request(fd, &hr)) {
-        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+    const bool request_read = read_http_request(fd, &hr);
+    const bool drain_rejected = server_client_finish_request_read(s, fd);
+    if (drain_rejected) {
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!request_read) {
+        if (g_stop_requested) {
+            (void)http_error(fd, s->enable_cors, 503,
+                             "server shutting down");
+        } else {
+            (void)http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        }
         goto done;
     }
 
@@ -15672,6 +16600,11 @@ static void *client_main(void *arg) {
     if (!strcmp(hr.method, "POST") &&
         !strcmp(hr.path, "/v1/token-admission"))
     {
+        if (!server_lifecycle_accepting(s)) {
+            http_error(fd, s->enable_cors, 503, "server shutting down");
+            http_request_free(&hr);
+            goto done;
+        }
         laguna_admission_result result = {
             .context_tokens = ctx_size,
             .code = REQUEST_ADMISSION_MODEL_MISMATCH,
@@ -15703,9 +16636,21 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    const api_style request_api = !strcmp(hr.path, "/v1/messages") ?
+        API_ANTHROPIC : !strcmp(hr.path, "/v1/responses") ?
+        API_RESPONSES : API_OPENAI;
+    if (!server_lifecycle_reserve_request(s, fd)) {
+        http_error(fd, s->enable_cors, 503, "server shutting down");
+        http_request_free(&hr);
+        goto done;
+    }
+    lifecycle_reserved = true;
     ds4_runtime_request_context accepted_context = {0};
     if (!ds4_runtime_request_begin(&accepted_context, now_monotonic_ns())) {
-        http_error(fd, s->enable_cors, 500, "request accounting unavailable");
+        lifecycle_unsafe = true;
+        server_lifecycle_latch_unsafe(s);
+        lifecycle_response_complete = http_error(
+            fd, s->enable_cors, 500, "request accounting unavailable");
         http_request_free(&hr);
         goto done;
     }
@@ -15727,11 +16672,11 @@ static void *client_main(void *arg) {
                                     ctx_size, &req, err, sizeof(err));
         } else if (result.code != REQUEST_ADMISSION_FITS) {
             if (req.prompt.len > 0) {
-                (void)server_reject_prepared_request(
-                    fd, s->enable_cors, &req, &accepted_context,
-                    result.code);
+                lifecycle_response_complete = server_reject_prepared_request(
+                    s, fd, s->enable_cors, &req, &accepted_context,
+                    result.code, &lifecycle_unsafe);
             } else {
-                (void)http_reject_token_admission(
+                lifecycle_response_complete = http_reject_token_admission(
                     fd, s->enable_cors, NULL, ctx_size, result.code);
             }
             http_request_free(&hr);
@@ -15759,7 +16704,10 @@ static void *client_main(void *arg) {
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        lifecycle_response_complete = http_protocol_request_error(
+            fd, s->enable_cors, request_api,
+            server_request_parse_error_code(err),
+            server_request_parse_error_message(err));
         goto done;
     }
     if (!req.model_from_request) {
@@ -15770,8 +16718,13 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    j.lifecycle_admitted = lifecycle_reserved;
     if (!server_job_runtime_adopt(&j, &accepted_context)) {
-        http_error(fd, s->enable_cors, 500, "request accounting unavailable");
+        lifecycle_unsafe = true;
+        server_lifecycle_latch_unsafe(s);
+        lifecycle_response_complete = server_emit_prepared_error_terminal(
+            fd, s->enable_cors, &j.req, 500,
+            "request accounting unavailable", false, NULL);
         request_free(&j.req);
         goto done;
     }
@@ -15779,7 +16732,7 @@ static void *client_main(void *arg) {
     const request_admission_code admission =
         request_prepare_token_admission(&j.req, ctx_size);
     if (admission != REQUEST_ADMISSION_FITS) {
-        (void)server_job_runtime_finish(
+        const bool finished = server_job_runtime_finish(
             &j, DS4_RUNTIME_REQUEST_REJECTED, now_monotonic_ns());
         const char *message =
             admission == REQUEST_ADMISSION_INVALID_OUTPUT_TOKENS ?
@@ -15787,9 +16740,16 @@ static void *client_main(void *arg) {
             admission == REQUEST_ADMISSION_CONTEXT_OVERFLOW ?
                 "Prompt exceeds the configured context size" :
                 "Invalid inference request";
-        (void)server_emit_prepared_error_terminal(
-            fd, s->enable_cors, &j.req, 400, message, false,
-            server_job_runtime_terminal_metrics(&j));
+        const ds4_runtime_request_metrics *metrics =
+            server_job_runtime_terminal_metrics(&j);
+        lifecycle_unsafe = !metrics || server_job_runtime_effective_unsafe(
+            &j, DS4_RUNTIME_REQUEST_REJECTED, finished);
+        if (lifecycle_unsafe) server_lifecycle_latch_unsafe(s);
+        lifecycle_response_complete = server_emit_prepared_error_terminal(
+            fd, s->enable_cors, &j.req,
+            lifecycle_unsafe ? 500 : 400,
+            lifecycle_unsafe ? "request accounting unavailable" : message,
+            false, metrics);
         request_free(&j.req);
         goto done;
     }
@@ -15800,16 +16760,25 @@ static void *client_main(void *arg) {
     pthread_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
         pthread_mutex_unlock(&j.mu);
-        (void)server_job_runtime_finish(
+        const bool finished = server_job_runtime_finish(
             &j, DS4_RUNTIME_REQUEST_CANCELLED, now_monotonic_ns());
-        (void)server_emit_prepared_error_terminal(
-            fd, s->enable_cors, &j.req, 503, "server shutting down", false,
-            server_job_runtime_terminal_metrics(&j));
+        const ds4_runtime_request_metrics *metrics =
+            server_job_runtime_terminal_metrics(&j);
+        lifecycle_unsafe = !metrics || server_job_runtime_effective_unsafe(
+            &j, DS4_RUNTIME_REQUEST_CANCELLED, finished);
+        if (lifecycle_unsafe) server_lifecycle_latch_unsafe(s);
+        lifecycle_response_complete = server_emit_prepared_error_terminal(
+            fd, s->enable_cors, &j.req,
+            lifecycle_unsafe ? 500 : 503,
+            lifecycle_unsafe ? "request accounting unavailable" :
+                "server shutting down",
+            false, metrics);
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
         goto done;
     }
+    lifecycle_reserved = false;
     while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
     pthread_mutex_unlock(&j.mu);
 
@@ -15817,8 +16786,12 @@ static void *client_main(void *arg) {
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);
 done:
+    if (lifecycle_reserved) {
+        server_lifecycle_release_preparing(
+            s, lifecycle_response_complete, lifecycle_unsafe);
+    }
+    client_done(s, fd);
     close(fd);
-    client_done(s);
     return NULL;
 }
 
@@ -15846,6 +16819,13 @@ static int listen_on(const char *host, int port) {
         close(fd);
         return -1;
     }
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
     return fd;
 }
 
@@ -15864,6 +16844,234 @@ static void set_client_socket_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+
+static bool server_accept_wake_open(int wake_fds[2]) {
+    if (!wake_fds) return false;
+    wake_fds[0] = -1;
+    wake_fds[1] = -1;
+    if (pipe(wake_fds) != 0) return false;
+    for (int i = 0; i < 2; i++) {
+        const int status_flags = fcntl(wake_fds[i], F_GETFL, 0);
+        const int descriptor_flags = fcntl(wake_fds[i], F_GETFD, 0);
+        if (status_flags < 0 || descriptor_flags < 0 ||
+            fcntl(wake_fds[i], F_SETFL,
+                  status_flags | O_NONBLOCK) != 0 ||
+            fcntl(wake_fds[i], F_SETFD,
+                  descriptor_flags | FD_CLOEXEC) != 0) {
+            const int saved_errno = errno;
+            close(wake_fds[0]);
+            close(wake_fds[1]);
+            wake_fds[0] = -1;
+            wake_fds[1] = -1;
+            errno = saved_errno;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Production and the host lifecycle child share this exact accept/wakeup and
+ * client-registration loop.  Model-free lifecycle tests therefore exercise
+ * the same blocked-poll wake and pre-parser HTTP boundary as ds4-server. */
+static void server_accept_loop(server *s, int listen_fd, int wake_read_fd) {
+    while (!g_stop_requested) {
+        struct pollfd ready[2] = {
+            {.fd = listen_fd, .events = POLLIN},
+            {.fd = wake_read_fd, .events = POLLIN},
+        };
+        int ready_count;
+        do {
+            ready_count = poll(ready, 2, -1);
+        } while (ready_count < 0 && errno == EINTR && !g_stop_requested);
+        if (g_stop_requested) break;
+        if (ready_count < 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: listener poll failed: %s",
+                       strerror(errno));
+            continue;
+        }
+        if (ready[1].revents) {
+            unsigned char discard[64];
+            while (read(wake_read_fd, discard, sizeof(discard)) > 0) {}
+            if (g_stop_requested) break;
+        }
+        if (!(ready[0].revents & POLLIN)) continue;
+        int fd = accept(listen_fd, NULL, NULL);
+        if (fd < 0) {
+            if (g_stop_requested) break;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s",
+                       strerror(errno));
+            continue;
+        }
+        if (g_stop_requested) {
+            close(fd);
+            break;
+        }
+
+        /* Accepted sockets must retain the server's historical blocking read
+         * semantics even on platforms that inherit O_NONBLOCK from the
+         * listener.  Inference responses switch explicitly after enqueue. */
+        const int accepted_flags = fcntl(fd, F_GETFL, 0);
+        if (accepted_flags >= 0) {
+            (void)fcntl(fd, F_SETFL, accepted_flags & ~O_NONBLOCK);
+        }
+
+        configure_client_socket(fd);
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = s;
+        ca->fd = fd;
+        pthread_mutex_lock(&s->mu);
+        (void)server_client_register_locked(s, fd);
+        pthread_mutex_unlock(&s->mu);
+        pthread_t th;
+        if (pthread_create(&th, NULL, client_main, ca) != 0) {
+            pthread_mutex_lock(&s->mu);
+            server_client_remove_locked(s, fd);
+            pthread_mutex_unlock(&s->mu);
+            free(ca);
+            close(fd);
+            continue;
+        }
+        pthread_detach(th);
+    }
+}
+
+#ifdef DS4_SERVER_TEST
+typedef struct {
+    server *srv;
+} test_lifecycle_command_arg;
+
+static void *test_lifecycle_unsafe_command(void *opaque) {
+    test_lifecycle_command_arg *arg = opaque;
+    char command[32] = {0};
+    if (fgets(command, sizeof(command), stdin) &&
+        !strcmp(command, "unsafe\n")) {
+        server_lifecycle_release_preparing(arg->srv, false, true);
+    }
+    return NULL;
+}
+
+/* Model-free real-process seam for Task 18.  It deliberately reuses the
+ * production signal handler, lifecycle accounting, accept wake channel,
+ * accept loop, HTTP reader, and client admission gate. */
+static int test_server_lifecycle_stdio_on_port(const char *scenario,
+                                               int requested_port) {
+    const bool idle = scenario && !strcmp(scenario, "idle");
+    const bool active_safe = scenario && !strcmp(scenario, "active-safe");
+    const bool active_incomplete =
+        scenario && !strcmp(scenario, "active-incomplete");
+    const bool forced = scenario && !strcmp(scenario, "forced");
+    const bool unsafe = scenario && !strcmp(scenario, "unsafe");
+    if (!idle && !active_safe && !active_incomplete && !forced && !unsafe) {
+        fprintf(stderr, "ds4-test: invalid lifecycle scenario\n");
+        return 2;
+    }
+
+    g_stop_requested = 0;
+    g_signal_received = 0;
+    g_originating_signal = 0;
+    g_listen_fd = -1;
+    g_accept_wake_fd = -1;
+    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = stop_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    server s = {
+        .lifecycle = SERVER_LIFECYCLE_ACCEPTING,
+        .drain_reached_safe_point = true,
+        .ctx_size = 128,
+    };
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    pthread_cond_init(&s.clients_cv, NULL);
+
+    if (!idle && !server_lifecycle_reserve_request(&s, -1)) {
+        pthread_cond_destroy(&s.clients_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
+        return 1;
+    }
+
+    int listen_fd = listen_on("127.0.0.1", requested_port);
+    int wake_fds[2] = {-1, -1};
+    if (listen_fd < 0 || !server_accept_wake_open(wake_fds)) {
+        fprintf(stderr, "ds4-test: lifecycle listener setup failed: %s\n",
+                strerror(errno));
+        if (listen_fd >= 0) close(listen_fd);
+        pthread_cond_destroy(&s.clients_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
+        return 1;
+    }
+    struct sockaddr_in bound;
+    socklen_t bound_len = sizeof(bound);
+    memset(&bound, 0, sizeof(bound));
+    if (getsockname(listen_fd, (struct sockaddr *)&bound, &bound_len) != 0) {
+        fprintf(stderr, "ds4-test: lifecycle listener identity failed: %s\n",
+                strerror(errno));
+        close(wake_fds[0]);
+        close(wake_fds[1]);
+        close(listen_fd);
+        pthread_cond_destroy(&s.clients_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
+        return 1;
+    }
+
+    pthread_t unsafe_thread = (pthread_t){0};
+    test_lifecycle_command_arg command_arg = {.srv = &s};
+    if (unsafe && pthread_create(&unsafe_thread, NULL,
+                                 test_lifecycle_unsafe_command,
+                                 &command_arg) != 0) {
+        close(wake_fds[0]);
+        close(wake_fds[1]);
+        close(listen_fd);
+        pthread_cond_destroy(&s.clients_cv);
+        pthread_cond_destroy(&s.cv);
+        pthread_mutex_destroy(&s.mu);
+        return 1;
+    }
+
+    g_listen_fd = listen_fd;
+    g_accept_wake_fd = wake_fds[1];
+    printf("{\"state\":\"accepting\",\"port\":%u}\n",
+           (unsigned)ntohs(bound.sin_port));
+    fflush(stdout);
+    server_accept_loop(&s, listen_fd, wake_fds[0]);
+    server_lifecycle_observe_stop(&s);
+    server_lifecycle_reject_unadmitted_readers(&s);
+
+    if (forced) {
+        for (;;) pause();
+    }
+    if (active_safe) {
+        server_lifecycle_release_preparing(&s, true, false);
+    } else if (active_incomplete) {
+        server_lifecycle_release_preparing(&s, false, false);
+    }
+    if (unsafe) pthread_join(unsafe_thread, NULL);
+
+    pthread_mutex_lock(&s.mu);
+    while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
+    pthread_mutex_unlock(&s.mu);
+    const int exit_status = server_lifecycle_process_exit_status(&s);
+
+    g_listen_fd = -1;
+    close(listen_fd);
+    free(s.client_connections);
+    pthread_cond_destroy(&s.clients_cv);
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.mu);
+    return exit_status;
+}
+
+#endif
 
 typedef struct {
     ds4_engine_options engine;
@@ -15966,6 +17174,7 @@ static void server_close_resources(server *s) {
     }
     free(s->slot_threads);
     free(s->slots);
+    free(s->client_connections);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->kv_mu);
     pthread_mutex_destroy(&s->inference_mu);
@@ -16111,6 +17320,12 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.port > UINT16_MAX) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: invalid value for --port: %d",
+                           c.port);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
@@ -16328,6 +17543,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4-server: %s\n", qualification_argv_err);
         return qualification_argv_rc;
     }
+    g_stop_requested = 0;
+    g_signal_received = 0;
+    g_originating_signal = 0;
+    g_listen_fd = -1;
+    g_accept_wake_fd = -1;
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -16418,6 +17638,8 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    s.lifecycle = SERVER_LIFECYCLE_ACCEPTING;
+    s.drain_reached_safe_point = true;
     s.runtime_snapshot_required =
         ds4_engine_is_laguna(engine) &&
         cfg.engine.ssd_streaming &&
@@ -16462,6 +17684,8 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        ds4_session_set_cancel(
+            slot->session, server_session_cancel_requested, &s);
     }
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -16544,53 +17768,55 @@ int main(int argc, char **argv) {
         server_close_resources(&s);
         return 1;
     }
+    int accept_wake[2] = {-1, -1};
+    if (!server_accept_wake_open(accept_wake)) {
+        const int wake_errno = errno;
+        if (accept_wake[0] >= 0) close(accept_wake[0]);
+        if (accept_wake[1] >= 0) close(accept_wake[1]);
+        close(lfd);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: failed to create accept wake channel: %s",
+                   strerror(wake_errno));
+        server_request_worker_stop(&s);
+        if (s.batched_mode) {
+            for (int i = 0; i < slot_threads_started; i++) {
+                pthread_join(s.slot_threads[i], NULL);
+            }
+            server_request_decode_stop(&s);
+            if (decode_thread_started) pthread_join(s.decode_thread, NULL);
+        } else {
+            pthread_join(worker, NULL);
+        }
+        server_close_resources(&s);
+        return 1;
+    }
     g_listen_fd = lfd;
+    g_accept_wake_fd = accept_wake[1];
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
-    while (!g_stop_requested) {
-        int fd = accept(lfd, NULL, NULL);
-        if (fd < 0) {
-            if (g_stop_requested) break;
-            if (errno == EINTR) continue;
-            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
-            continue;
-        }
-        if (g_stop_requested) {
-            close(fd);
-            break;
-        }
-
-        configure_client_socket(fd);
-        client_arg *ca = xmalloc(sizeof(*ca));
-        ca->srv = &s;
-        ca->fd = fd;
-        pthread_mutex_lock(&s.mu);
-        s.clients++;
-        pthread_mutex_unlock(&s.mu);
-        pthread_t th;
-        if (pthread_create(&th, NULL, client_main, ca) != 0) {
-            pthread_mutex_lock(&s.mu);
-            s.clients--;
-            pthread_cond_broadcast(&s.clients_cv);
-            pthread_mutex_unlock(&s.mu);
-            free(ca);
-            close(fd);
-            continue;
-        }
-        pthread_detach(th);
-    }
-    if (g_listen_fd >= 0) {
-        close(lfd);
-        g_listen_fd = -1;
-    }
+    server_accept_loop(&s, lfd, accept_wake[0]);
+    server_lifecycle_observe_stop(&s);
+    server_lifecycle_reject_unadmitted_readers(&s);
+    g_listen_fd = -1;
+    close(lfd);
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
+    /* Parsing requests reserved before the drain owns admission already.  Let
+     * each one either transfer atomically to the queue or release its
+     * reservation before workers are stopped. */
+    pthread_mutex_lock(&s.mu);
+    while (s.preparing_requests > 0) {
+        pthread_cond_wait(&s.clients_cv, &s.mu);
+    }
+    pthread_mutex_unlock(&s.mu);
     server_request_worker_stop(&s);
     if (s.batched_mode) {
+        /* Wake prefill waiters immediately.  The decode coordinator still
+         * drains every pending/in-flight borrow before it observes stop. */
+        server_request_decode_stop(&s);
         for (int i = 0; i < slot_threads_started; i++) {
             pthread_join(s.slot_threads[i], NULL);
         }
-        server_request_decode_stop(&s);
         if (decode_thread_started) pthread_join(s.decode_thread, NULL);
     } else {
         pthread_join(worker, NULL);
@@ -16599,7 +17825,13 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
+    const int exit_status = server_lifecycle_process_exit_status(&s);
+
+    const bool unsafe_shutdown = server_lifecycle_process_is_unsafe(&s);
+    for (int i = 0;
+         !unsafe_shutdown && exit_status != 1 && s.kv.enabled &&
+         i < s.slot_count;
+         i++) {
         server_slot *slot = &s.slots[i];
         const ds4_tokens *tokens = ds4_session_tokens(slot->session);
         if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
@@ -16609,7 +17841,7 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
-    return 0;
+    return exit_status;
 }
 #else
 
@@ -16622,30 +17854,6 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
-
-/* Process lifecycle is an explicit state machine.  These declarations are the
- * minimal production seam exercised by the lifecycle contract tests below;
- * the implementation belongs with signal handling and server admission. */
-typedef enum {
-    SERVER_LIFECYCLE_ACCEPTING = 0,
-    SERVER_LIFECYCLE_DRAINING,
-    SERVER_LIFECYCLE_UNSAFE_DRAINING,
-    SERVER_LIFECYCLE_FORCED_EXIT,
-} server_lifecycle_state;
-
-typedef enum {
-    SERVER_LIFECYCLE_EVENT_TERM = 0,
-    SERVER_LIFECYCLE_EVENT_INT,
-    SERVER_LIFECYCLE_EVENT_UNSAFE,
-} server_lifecycle_event;
-
-static server_lifecycle_state server_lifecycle_transition(
-    server_lifecycle_state state, server_lifecycle_event event);
-static bool server_lifecycle_allows_admission(server_lifecycle_state state);
-static int server_lifecycle_resolve_exit_status(
-    server_lifecycle_state state,
-    int originating_signal,
-    bool drain_reached_safe_point);
 
 /* Live request accounting is owned by the queued job, not by a test adapter
  * or a process-wide before/after snapshot.  These declarations define the
@@ -17209,23 +18417,151 @@ static void test_server_lifecycle_preserves_signal_derived_exits(void) {
                     incomplete, SIGTERM, false) == 143);
 }
 
-static void test_server_lifecycle_unsafe_exit_latches_and_dominates(void) {
-    server_lifecycle_state state = server_lifecycle_transition(
-        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_INT);
-    state = server_lifecycle_transition(
-        state, SERVER_LIFECYCLE_EVENT_UNSAFE);
-    TEST_ASSERT(state == SERVER_LIFECYCLE_UNSAFE_DRAINING);
-    TEST_ASSERT(!server_lifecycle_allows_admission(state));
+static void test_server_lifecycle_preserves_first_shutdown_cause(void) {
+    server_lifecycle_state term_first = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_TERM);
+    term_first = server_lifecycle_transition(
+        term_first, SERVER_LIFECYCLE_EVENT_UNSAFE);
+    TEST_ASSERT(term_first == SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING);
+    TEST_ASSERT(!server_lifecycle_allows_admission(term_first));
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    term_first, SIGTERM, false) == 143);
 
-    /* Unsafe is sticky and wins over the status of the signal/cancellation
-     * that interrupted an admitted response. */
-    state = server_lifecycle_transition(
-        state, SERVER_LIFECYCLE_EVENT_UNSAFE);
-    TEST_ASSERT(state == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    server_lifecycle_state int_first = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_INT);
+    int_first = server_lifecycle_transition(
+        int_first, SERVER_LIFECYCLE_EVENT_UNSAFE);
+    TEST_ASSERT(int_first == SERVER_LIFECYCLE_SIGNAL_UNSAFE_DRAINING);
     TEST_ASSERT(server_lifecycle_resolve_exit_status(
-                    state, SIGTERM, false) == 1);
+                    int_first, SIGINT, false) == 130);
+
+    server_lifecycle_state unsafe_first = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_UNSAFE);
+    TEST_ASSERT(unsafe_first == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    unsafe_first = server_lifecycle_transition(
+        unsafe_first, SERVER_LIFECYCLE_EVENT_TERM);
+    TEST_ASSERT(unsafe_first == SERVER_LIFECYCLE_UNSAFE_DRAINING);
     TEST_ASSERT(server_lifecycle_resolve_exit_status(
-                    state, SIGINT, false) == 1);
+                    unsafe_first, SIGTERM, false) == 1);
+}
+
+static void test_server_lifecycle_admitted_drain_bookkeeping(void) {
+    const sig_atomic_t saved_stop = g_stop_requested;
+    const sig_atomic_t saved_signal_received = g_signal_received;
+    const sig_atomic_t saved_signal = g_originating_signal;
+    const sig_atomic_t saved_listener = g_listen_fd;
+    g_stop_requested = 0;
+    g_signal_received = 0;
+    g_originating_signal = 0;
+    g_listen_fd = -1;
+
+    server s = {
+        .lifecycle = SERVER_LIFECYCLE_ACCEPTING,
+        .drain_reached_safe_point = true,
+    };
+    TEST_ASSERT(pthread_mutex_init(&s.mu, NULL) == 0);
+    TEST_ASSERT(pthread_cond_init(&s.cv, NULL) == 0);
+    TEST_ASSERT(pthread_cond_init(&s.clients_cv, NULL) == 0);
+
+    job safe = {0};
+    TEST_ASSERT(server_lifecycle_reserve_request(&s, -1));
+    safe.lifecycle_admitted = true;
+    TEST_ASSERT(safe.lifecycle_admitted);
+    TEST_ASSERT(s.admitted_requests == 1);
+    TEST_ASSERT(s.preparing_requests == 1);
+    TEST_ASSERT(!s.drain_reached_safe_point);
+
+    g_originating_signal = SIGTERM;
+    g_stop_requested = 1;
+    server_lifecycle_observe_stop(&s);
+    TEST_ASSERT(s.lifecycle == SERVER_LIFECYCLE_DRAINING);
+    /* The reservation won before TERM, so enqueue transfers it without
+     * admitting new work after the drain boundary. */
+    TEST_ASSERT(enqueue(&s, &safe));
+    TEST_ASSERT(s.preparing_requests == 0);
+    TEST_ASSERT(dequeue(&s) == &safe);
+    job rejected = {0};
+    TEST_ASSERT(!enqueue(&s, &rejected));
+    safe.lifecycle_safe = true;
+    server_lifecycle_complete_admitted(&s, &safe);
+    TEST_ASSERT(s.admitted_requests == 0);
+    TEST_ASSERT(s.drain_reached_safe_point);
+    TEST_ASSERT(server_lifecycle_process_exit_status(&s) == 0);
+
+    g_stop_requested = 0;
+    g_originating_signal = 0;
+    s.lifecycle = SERVER_LIFECYCLE_ACCEPTING;
+    s.originating_signal = 0;
+    s.drain_reached_safe_point = true;
+    s.drain_failed = false;
+    job incomplete = {0};
+    TEST_ASSERT(enqueue(&s, &incomplete));
+    TEST_ASSERT(dequeue(&s) == &incomplete);
+    g_originating_signal = SIGTERM;
+    g_stop_requested = 1;
+    server_lifecycle_observe_stop(&s);
+    incomplete.lifecycle_safe = false;
+    server_lifecycle_complete_admitted(&s, &incomplete);
+    TEST_ASSERT(!s.drain_reached_safe_point);
+    TEST_ASSERT(server_lifecycle_process_exit_status(&s) == 143);
+
+    g_stop_requested = 0;
+    g_originating_signal = 0;
+    s.lifecycle = SERVER_LIFECYCLE_ACCEPTING;
+    s.originating_signal = 0;
+    s.drain_reached_safe_point = true;
+    s.drain_failed = false;
+    job unsafe = {0};
+    TEST_ASSERT(enqueue(&s, &unsafe));
+    TEST_ASSERT(dequeue(&s) == &unsafe);
+    server_lifecycle_latch_unsafe(&s);
+    TEST_ASSERT(s.lifecycle == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    TEST_ASSERT(!server_lifecycle_accepting(&s));
+    TEST_ASSERT(!server_lifecycle_allows_engine_start(&s));
+    unsafe.lifecycle_unsafe = true;
+    server_lifecycle_complete_admitted(&s, &unsafe);
+    TEST_ASSERT(s.lifecycle == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    TEST_ASSERT(server_lifecycle_process_is_unsafe(&s));
+    TEST_ASSERT(server_lifecycle_process_exit_status(&s) == 1);
+    /* Queued peers are assigned only so their stack owners can receive a
+     * cancellation terminal.  A NULL session here makes any prefix/tool-state
+     * inspection after the unsafe latch an immediate test failure. */
+    server_slot cancel_slot = {.srv = &s};
+    job cancelled = {0};
+    s.batched_mode = true;
+    s.slot_count = 1;
+    s.slots = &cancel_slot;
+    s.head = &cancelled;
+    s.tail = &cancelled;
+    pthread_mutex_lock(&s.mu);
+    dispatch_jobs_locked(&s);
+    pthread_mutex_unlock(&s.mu);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(cancel_slot.assigned == &cancelled);
+    cancel_slot.assigned = NULL;
+    cancel_slot.busy = false;
+    s.batched_mode = false;
+    s.slot_count = 0;
+    s.slots = NULL;
+    /* Runtime-unsafe shutdown closes admission without consuming a process
+     * signal.  A later first TERM must leave unsafe exit status at 1; only a
+     * second real signal is forced. */
+    g_signal_received = 0;
+    g_originating_signal = 0;
+    stop_signal_handler(SIGTERM);
+    TEST_ASSERT(g_signal_received == 1);
+    TEST_ASSERT(g_originating_signal == SIGTERM);
+    server_lifecycle_observe_stop(&s);
+    TEST_ASSERT(s.lifecycle == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    TEST_ASSERT(server_lifecycle_process_exit_status(&s) == 1);
+
+    pthread_cond_destroy(&s.clients_cv);
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.mu);
+    g_stop_requested = saved_stop;
+    g_signal_received = saved_signal_received;
+    g_originating_signal = saved_signal;
+    g_listen_fd = saved_listener;
 }
 
 static void test_server_job_runtime_completed_lifecycle(void) {
@@ -17476,6 +18812,30 @@ static void test_server_job_runtime_pre_token_terminals(void) {
         server_job_runtime_terminal_metrics(&invariant);
     TEST_ASSERT(unsafe_metrics && unsafe_metrics->terminal_status ==
         DS4_RUNTIME_REQUEST_UNSAFE_ERROR);
+    TEST_ASSERT(server_job_runtime_effective_unsafe(
+        &invariant, DS4_RUNTIME_REQUEST_COMPLETED, true));
+
+    /* The wrapper's successful fallback is still process-unsafe.  Exercise
+     * the same admitted-job completion boundary used by worker threads so a
+     * terminal record can never hide the required exit-1 latch. */
+    const sig_atomic_t saved_stop = g_stop_requested;
+    g_stop_requested = 0;
+    server lifecycle = {
+        .lifecycle = SERVER_LIFECYCLE_ACCEPTING,
+        .admitted_requests = 1,
+        .drain_reached_safe_point = false,
+    };
+    TEST_ASSERT(pthread_mutex_init(&lifecycle.mu, NULL) == 0);
+    TEST_ASSERT(pthread_cond_init(&lifecycle.clients_cv, NULL) == 0);
+    invariant.lifecycle_admitted = true;
+    invariant.lifecycle_unsafe = server_job_runtime_effective_unsafe(
+        &invariant, DS4_RUNTIME_REQUEST_COMPLETED, true);
+    server_lifecycle_complete_admitted(&lifecycle, &invariant);
+    TEST_ASSERT(lifecycle.lifecycle == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    TEST_ASSERT(server_lifecycle_process_exit_status(&lifecycle) == 1);
+    pthread_cond_destroy(&lifecycle.clients_cv);
+    pthread_mutex_destroy(&lifecycle.mu);
+    g_stop_requested = saved_stop;
     request_free(&invariant.req);
 }
 
@@ -17694,16 +19054,37 @@ static void test_server_runtime_separates_hidden_and_visible_tokens(void) {
 }
 
 static void test_server_execution_failure_classification(void) {
-    TEST_ASSERT(server_execution_failure_is_unsafe(
-        DS4_SERVER_EXEC_UNSAFE, "compact graph unsafe"));
-    TEST_ASSERT(server_execution_failure_is_unsafe(
-        1, "invalid attributed request context"));
-    TEST_ASSERT(server_execution_failure_is_unsafe(
-        1, "request token accounting failed"));
+    TEST_ASSERT(server_execution_failure_is_unsafe(DS4_SERVER_EXEC_UNSAFE));
     TEST_ASSERT(!server_execution_failure_is_unsafe(
-        DS4_SESSION_SYNC_INTERRUPTED, "request interrupted"));
+        DS4_SERVER_EXEC_RECOVERABLE));
     TEST_ASSERT(!server_execution_failure_is_unsafe(
-        DS4_SERVER_EXEC_RECOVERABLE, "compact read failed"));
+        DS4_SERVER_EXEC_INTERRUPTED));
+    /* Classification is typed: adversarial diagnostic text is irrelevant. */
+    const char *adversarial =
+        "unsafe invariant accounting failed; compact read may be retried";
+    (void)adversarial;
+    const server_failure_boundary recoverable =
+        server_failure_boundary_decide(DS4_SERVER_EXEC_RECOVERABLE, false);
+    TEST_ASSERT(recoverable.terminal_status ==
+                DS4_RUNTIME_REQUEST_RECOVERABLE_ERROR);
+    TEST_ASSERT(recoverable.http_status == 503);
+    TEST_ASSERT(!recoverable.abrupt);
+    TEST_ASSERT(recoverable.emit_terminal_metrics);
+    TEST_ASSERT(!recoverable.process_unsafe);
+    const server_failure_boundary unsafe_before =
+        server_failure_boundary_decide(DS4_SERVER_EXEC_UNSAFE, false);
+    TEST_ASSERT(unsafe_before.terminal_status ==
+                DS4_RUNTIME_REQUEST_UNSAFE_ERROR);
+    TEST_ASSERT(unsafe_before.http_status == 500);
+    TEST_ASSERT(!unsafe_before.abrupt);
+    TEST_ASSERT(unsafe_before.emit_terminal_metrics);
+    TEST_ASSERT(unsafe_before.process_unsafe);
+    const server_failure_boundary unsafe_after =
+        server_failure_boundary_decide(DS4_SERVER_EXEC_UNSAFE, true);
+    TEST_ASSERT(unsafe_after.http_status == 0);
+    TEST_ASSERT(unsafe_after.abrupt);
+    TEST_ASSERT(!unsafe_after.emit_terminal_metrics);
+    TEST_ASSERT(unsafe_after.process_unsafe);
     TEST_ASSERT(server_transport_failure_status(
         DS4_RUNTIME_REQUEST_UNSAFE_ERROR) ==
         DS4_RUNTIME_REQUEST_UNSAFE_ERROR);
@@ -18617,6 +19998,42 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         close(sv[1]);
     }
     request_free(&a);
+}
+
+static void test_request_parse_error_uses_protocol_native_shape(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_protocol_request_error(
+            sv[0], false, API_OPENAI, "model_mismatch",
+            "Requested model does not match the loaded model family"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 400 Bad Request") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"code\":\"model_mismatch\"") != NULL);
+        TEST_ASSERT(strstr(out, "event:") == NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_protocol_request_error(
+            sv[0], false, API_ANTHROPIC, "unsupported_tool_choice",
+            "tool_choice=required is not supported"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 400 Bad Request") != NULL);
+        TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\":") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"code\":\"unsupported_tool_choice\"") != NULL);
+        TEST_ASSERT(strstr(out, "event:") == NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
 }
 
 static void test_cors_headers_are_opt_in(void) {
@@ -20261,6 +21678,33 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) != NULL);
     TEST_ASSERT(reasoning == NULL);
     TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_tool_choice_none_suppresses_sampled_dsml(void) {
+    const char *generated =
+        "I cannot call tools.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"get_weather\">\n"
+        DS4_PARAM_START " name=\"city\" string=\"true\">Brussels"
+        DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "stop";
+    bool recovered = false;
+
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, generated, false, true, false,
+        &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered));
+    TEST_ASSERT(content && !strcmp(content, "I cannot call tools."));
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(!recovered);
 
     free(content);
     free(reasoning);
@@ -22672,7 +24116,8 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_server_lifecycle_first_term_drains_and_closes_admission();
     test_server_lifecycle_preserves_signal_derived_exits();
-    test_server_lifecycle_unsafe_exit_latches_and_dominates();
+    test_server_lifecycle_preserves_first_shutdown_cause();
+    test_server_lifecycle_admitted_drain_bookkeeping();
     test_server_job_runtime_completed_lifecycle();
     test_server_job_runtime_pre_token_terminals();
     test_server_runtime_separates_hidden_and_visible_tokens();
@@ -22723,6 +24168,7 @@ static void ds4_server_unit_tests_run(void) {
     test_requests_disable_speculative_decode();
     test_request_output_count_requires_exact_json_integer();
     test_context_length_error_uses_protocol_standard_shape();
+    test_request_parse_error_uses_protocol_native_shape();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
@@ -22746,6 +24192,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_tool_choice_none_suppresses_sampled_dsml();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
     test_thinking_dsml_is_not_executable_before_think_close();

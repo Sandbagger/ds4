@@ -516,6 +516,77 @@ class Task18CudaFailureContract(unittest.TestCase):
         self.assertEqual(metrics[0].get("terminal_status"), terminal_status)
         return payload, metrics[0]
 
+    def _assert_followup_evidence(
+        self,
+        server: FaultServer,
+        first: dict[str, Any],
+        metrics: dict[str, Any],
+    ) -> None:
+        records = server.records()
+        self.assertEqual(
+            len(records), 2,
+            "same-process follow-up must emit a second physical snapshot",
+        )
+        record = records[1]
+        self.assertEqual(set(record), EVIDENCE_FIELDS)
+        self.assertEqual(record["schema"], EVIDENCE_SCHEMA)
+        self.assertEqual(record["fault"], server.fault)
+        self.assertEqual(record["pid"], server.proc.pid)
+        self.assertEqual(record["execution_result"], "completed")
+        self.assertEqual(record["request_id"], metrics["request_id"])
+        self.assertNotEqual(record["request_id"], first["request_id"])
+        self.assertEqual(str(uuid.UUID(record["request_id"])), record["request_id"])
+        self.assertEqual(_u64(record["fault_armed_count"], "fault_armed_count"), 1)
+        self.assertEqual(
+            _u64(record["fault_consumed_count"], "fault_consumed_count"), 1
+        )
+        self.assertEqual(
+            _wire_identity(record["executable"]), server.candidate_identity
+        )
+        self.assertEqual(_wire_identity(record["model"]), server.model_identity)
+
+        after = self._assert_compact_snapshot(
+            record["compact_after"], "followup.after"
+        )
+        self.assertIs(after["cache_unsafe"], False)
+        self.assertEqual(_u64(after["cache_slot_loading_count"], "loading"), 0)
+        self.assertEqual(_u64(after["cache_slot_in_use_count"], "in_use"), 0)
+        self.assertEqual(_u64(after["cache_slot_total_refs"], "refs"), 0)
+        baseline = first["compact_before"]
+        for name in (
+            "cache_payload_id",
+            "pinned_staging_ids",
+            "cache_payload_allocation_attempts",
+            "pinned_staging_allocation_attempts",
+        ):
+            self.assertEqual(
+                after[name], baseline[name], f"follow-up changed fixed owner: {name}"
+            )
+
+        first_routed = {
+            name: _u64(first["routed_origin"][name], f"first.routed.{name}")
+            for name in ROUTED_ORIGIN_FIELDS
+        }
+        routed = record["routed_origin"]
+        self.assertIsInstance(routed, dict)
+        self.assertEqual(set(routed), ROUTED_ORIGIN_FIELDS)
+        routed_counts = {
+            name: _u64(routed[name], f"followup.routed.{name}") for name in routed
+        }
+        self.assertGreater(
+            routed_counts["routed_projection_requests"],
+            first_routed["routed_projection_requests"],
+            "follow-up did not traverse the compact routed projection",
+        )
+        self.assertEqual(
+            routed_counts["routed_projection_requests"],
+            routed_counts["engine_slot_resolutions"],
+        )
+        for name in ROUTED_ORIGIN_FIELDS - {
+            "routed_projection_requests", "engine_slot_resolutions"
+        }:
+            self.assertEqual(routed_counts[name], 0, f"follow-up fallback: {name}")
+
     def _recoverable(self, fault: str, counter: str) -> None:
         server = self._server(fault)
         pid = server.proc.pid
@@ -557,6 +628,7 @@ class Task18CudaFailureContract(unittest.TestCase):
         followup_metrics = _schema_objects(followup, REQUEST_METRICS_SCHEMA)
         self.assertEqual(len(followup_metrics), 1)
         self.assertEqual(followup_metrics[0].get("terminal_status"), "completed")
+        self._assert_followup_evidence(server, record, followup_metrics[0])
         self.assertEqual(server.proc.pid, pid)
         self.assertIsNone(server.proc.poll())
         server.stop_clean()

@@ -303,8 +303,17 @@ class Task18CudaFaultSourceContract(unittest.TestCase):
         generate = _function_body(SERVER, "static void generate_job(")
         self.assertTrue(generate, "missing production generate_job")
         evidence = generate.find("server_test_cuda_fault_evidence_emit(")
+        finish = generate.find("server_job_runtime_finish(")
         response = generate.find("server_emit_prepared_error_terminal(", evidence)
         self.assertGreaterEqual(evidence, 0, "failure funnel emits no CUDA evidence")
+        self.assertGreater(
+            finish,
+            evidence,
+            "evidence validation must fail closed before terminal metrics are frozen",
+        )
+        fail_closed = generate[evidence:finish]
+        self.assertIn("DS4_RUNTIME_REQUEST_UNSAFE_ERROR", fail_closed)
+        self.assertIn("server_execution_result_observe", fail_closed)
         self.assertGreater(
             response,
             evidence,

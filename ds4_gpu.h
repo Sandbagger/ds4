@@ -363,6 +363,7 @@ typedef enum {
     DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_RECORD = 6,
     DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION = 7,
     DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION = 8,
+    DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE = 9,
 } ds4_gpu_laguna_cache_test_fault;
 
 typedef struct {
@@ -396,6 +397,13 @@ typedef struct {
     uint64_t cache_payload_bytes;
     uint64_t cache_slot_count;
     uint64_t cache_slot_stride_bytes;
+    uint64_t cache_slot_empty_count;
+    uint64_t cache_slot_ready_count;
+    uint64_t cache_slot_loading_count;
+    uint64_t cache_slot_in_use_count;
+    uint64_t cache_slot_total_refs;
+    uint64_t cache_payload_id;
+    uint64_t pinned_staging_ids[4];
     uint64_t pinned_staging_live_count;
     uint64_t pinned_staging_bytes;
     uint64_t cache_payload_allocation_attempts;
@@ -415,6 +423,7 @@ typedef struct {
     uint64_t event_record_failures;
     uint64_t event_completion_failures;
     uint64_t cache_cancellations;
+    uint64_t request_barrier_unsafe_failures;
     bool cache_unsafe;
     uint64_t model_mapping_registered_bytes;
     uint64_t whole_model_copied_bytes;

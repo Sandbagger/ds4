@@ -1427,21 +1427,26 @@ wires the identity required to make the snapshot observable.
 
 ### Task 18: Lock compact server protocol and lifecycle semantics
 
-**Files:**
-- Modify: `ds4_server.c:54-63,957-990,5664-7700,12524-12695,13125-13370`
-- Modify: `ds4.c:59019-59080,60043-60091`
-- Modify: `tests/test_laguna_server_contract.py`
-- Modify: `Makefile`
+**Files (implemented):**
+- Modify: `Makefile`, `ds4.c`, `ds4_cuda.cu`, `ds4_gpu.h`,
+  `ds4_runtime.c`, `ds4_server.c`
+- Modify: `tests/ds4_test.c`, `tests/test_laguna_server_contract.py`,
+  `tests/test_runtime.c`
+- Create: `tests/test_task18_cli_contract.py`,
+  `tests/test_task18_cuda_failure_contract.py`,
+  `tests/test_task18_cuda_failure_source_contract.py`,
+  `tests/test_task18_failure_contract.py`,
+  `tests/test_task18_lifecycle_contract.py`
 
-- [ ] **Step 1: Add RED protocol matrix tests**
+- [x] **Step 1: Add RED protocol matrix tests**
 
 For Chat Completions, Responses, and Anthropic messages, cover streaming/non-streaming equivalence, `tool_choice=auto`, `tool_choice=none`, stable unsupported `required`, chunked/multiple tool calls, malformed-call rejection, continuation after real tool results, and a request naming the wrong model family. Compare visible text, reasoning separation, tagged tool calls, finish status, token counts, request ID, and final runtime metrics between streaming and non-streaming forms.
 
-- [ ] **Step 2: Add RED HTTP/fault classification tests**
+- [x] **Step 2: Add RED HTTP/fault classification tests**
 
-Require invalid input, overflow, protocol errors, and unsupported values to return stable structured 4xx bodies before session mutation while the process remains healthy. Inject a recoverable compact read/upload failure and require 503 only after every slot/pin is restored. Inject an invariant violation and require a structured 500 if headers are unsent, otherwise an abruptly terminated stream, followed by process exit `1`. None may fall back to resident execution.
+Require invalid input, overflow, protocol errors, and unsupported values to return stable structured 4xx bodies before session mutation while the process remains healthy. Inject recoverable compact read/upload failures and require 503 only after every slot/pin is restored. Inject invariant violations and require a structured 500 if headers are unsent, otherwise an abruptly terminated stream, followed by process exit `1`. None may fall back to resident execution. The model-free boundary fixtures are paired with a dedicated four-process real-CUDA/HTTP fault target whose evidence is derived from live compact snapshots before the response action.
 
-- [ ] **Step 3: Add RED foreground/signal tests**
+- [x] **Step 3: Add RED foreground/signal tests**
 
 Launch the server as a child process and verify:
 
@@ -1452,41 +1457,174 @@ Launch the server as a child process and verify:
 - a second/forced `SIGTERM`, or a first `SIGTERM` before a safe response can complete, retains `143`; and
 - after first `TERM`, new requests are rejected while admitted CUDA work drains to a safe point and releases pins.
 
-Also assert DS4 remains foreground and never forks a daemon, restarts itself, signals peers, changes global page cache state, or chooses a deployment port.
+Also assert DS4 remains foreground and never forks a daemon, restarts itself, signals peers, changes global page-cache state, or chooses an alternate deployment port.
 
-- [ ] **Step 4: Observe RED**
-
-```sh
-DS4_TEST_MODEL="$LAGUNA_MODEL" \
-  python3 tests/test_laguna_server_contract.py \
-    --server ./ds4-server --case protocol --case failures --case lifecycle
-```
-
-Expected: at least unsupported-required, typed cache-error, or signal-derived exit semantics fail.
-
-- [ ] **Step 5: Implement explicit server and process state transitions**
-
-Separate accepting, draining, unsafe-draining, and forced-exit states. First `TERM` closes admission and requests cooperative cancellation/safe completion; it does not free cache state referenced by CUDA. Preserve the originating signal only when a safe response/drain cannot complete or a second signal forces exit. Map the compact execution result from Task 9 to 503 versus unsafe termination exactly once at the HTTP boundary.
-
-- [ ] **Step 6: Make the full matrix green and reach checkpoint E**
+- [x] **Step 4: Observe RED**
 
 ```sh
-DS4_TEST_MODEL="$LAGUNA_MODEL" \
-  python3 tests/test_laguna_server_contract.py \
-    --server ./ds4-server --case all
-make test-laguna-compact-contract
-make test-cuda-laguna-streaming
-make test
+make ds4_test ds4-server
+python3 tests/test_laguna_server_contract.py \
+  --server ./ds4_test --case protocol -v
+python3 tests/test_task18_failure_contract.py --server ./ds4_test -v
+python3 tests/test_task18_lifecycle_contract.py --server ./ds4_test -v
+python3 tests/test_task18_cli_contract.py \
+  --live-server ./ds4-server --test-server ./ds4_test -v
+python3 tests/test_task18_cuda_failure_source_contract.py -v
 ```
 
-Expected: all protocol, admission, runtime, lifecycle, and compact CUDA tests pass without service-control behavior.
+Expected: the protocol, typed failure, lifecycle, CLI, and physical-evidence seams fail independently before their corresponding implementation commits. The real-CUDA failure target remains outside ordinary `make test` and requires the pinned retained model descriptor.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 5: Implement explicit server and process state transitions**
+
+Separate accepting, draining, signal-unsafe-draining, unsafe-draining, and forced-exit states. First `TERM` closes admission and requests cooperative cancellation/safe completion; it does not free cache state referenced by CUDA. Preserve the originating signal when a safe response/drain cannot complete or a second signal forces exit. Map compact execution results to restored 503 versus unsafe 500/abrupt termination exactly once at the HTTP boundary. Final request page advice remains sealable after a recoverable prefill failure, while event-completion uncertainty retains one unpublished `LOADING` owner with zero execution-visible references and poisons the cache.
+
+- [x] **Step 6: Make the Task 18 matrix green and prove its stable-handoff slice**
 
 ```sh
-git add ds4_server.c ds4.c tests/test_laguna_server_contract.py Makefile
-git commit -m "feat: lock compact server protocol and lifecycle semantics"
+make test-laguna-runtime-identity
+make test-laguna-server-contract
+make test-laguna-plan test-runtime-request test-cuda-build-contract
+./ds4_test --server
+./tests/test_laguna_stream --case options
+./tests/test_laguna_stream --case allocation
+python3 tests/test_task17_output_ceiling_contract.py -v
 ```
+
+On the guarded DGX maintenance run, additionally execute the three low-level cache-fault cases, the two-session request-counter target, the four-process physical CUDA/HTTP failure target, and the standard 12-case live server contract against the retained pinned model descriptor.
+
+Expected: protocol, admission, runtime, lifecycle, CLI, source/build, physical CUDA fault, and live HTTP contracts pass without service-control behavior. This closes Task 18's protocol/lifecycle portion of stable handoff; Task 19 still owns the benchmark/eval portion of checkpoint E, so checkpoint E remains open.
+
+- [x] **Step 7: Commit**
+
+Task 18 landed as 31 focused RED/green/hardening commits from `8db582f`
+through `8a1d186` (24 `test:`, 2 `feat:`, and 5 `fix:` commits). It was not
+collapsed into a mega-commit. The exact accepted revision and its build,
+host-contract, physical-CUDA/server, restoration, and transcript identities
+are recorded below.
+
+Task 18 closed on DGX Spark on 2026-08-14 against exact clean code revision
+`8a1d1862b9e3bed56ca2ac1d291f224c6faeab88` (tree
+`063262d4b2e91a8c75e81ced4d753d21c38dab4f`). It was exported with
+`git archive` (SHA-256
+`d5bafaa440190d70a9dea51b0ad96fbc630f5781db35ff01bc09618376128453`)
+into the fresh directory
+`/tmp/ds4-laguna-task18-8a1d1862b9e3bed56ca2ac1d291f224c6faeab88`;
+no remote source patching was used. The exact runner had SHA-256
+`e9ac2b12400379bf8a24904b53ae38c6bfd00a92021c83bc812ab28e927b1131`.
+The acceptance transcript is
+`/tmp/task18-8a1d186-maintenance-250011.log`, SHA-256
+`2b7c2e22c0dcc36705d56073a12ae5f48fe0092e90043e2bcc03fb01eb48dd25`
+(768 lines, 204,373 bytes). Every candidate binary reported
+`ds4.version/v1` with the accepted revision, `dirty=false`, `backend=cuda`,
+and sorted features `laguna,ssd_streaming`.
+
+The implementation gives the foreground server explicit accepting, draining,
+signal-unsafe-draining, unsafe-draining, and forced-exit transitions. Normal
+first-`TERM` drains preserve exit `0`; unsafe or incomplete signal-driven
+drains retain the originating signal status; second signals force their exact
+status; internal unsafe failure exits `1`; invalid invocation remains `2`.
+Chat Completions, Responses, and Anthropic share stable parsing and terminal
+semantics across streaming and non-streaming forms. Recoverable compact
+`pread`/CUDA-copy failures restore cache state before returning 503 and leave
+the same process accepting. Unsafe event-completion failures return a
+structured 500 before headers, while post-header request-barrier failures
+terminate the stream without a false terminal record and then exit `1`.
+
+The fresh accepted plan is
+`/tmp/ds4-task18-8a1d186-two-session-plan.json`, SHA-256
+`41c7d1d03e36e3cb2f38250451bd2522b1270d62409fe52b077a41317ef99bbb`.
+Its sidecar, retained descriptor identity, and every bound were checked before
+execution. Profile `cache-8gib-sessions-2` fixes CUDA, 32,768 context tokens,
+4,096 prefill rows, two sessions, an 8,589,934,592-byte effective cache,
+3,372,220,416 KV bytes, 3,074,105,360 graph bytes, and a
+30,064,771,072-byte qualification bound. The guarded capacity check observed
+51,161,837,568 bytes available against that bound plus an 8,589,934,592-byte
+reserve. Four descriptor-bound cold preparations each attempted and completed
+68,242,178,048 bytes across 671 calls with zero failed calls; their measured
+residence was 6,483,968, 6,492,160, 6,492,160, and 6,492,160 bytes,
+respectively, each below the declared 6,582,272 unavoidable bytes.
+
+Before outage, the archive passed 36 admission/metrics/protocol tests, 3 typed
+failure tests, 11 lifecycle tests, 5 CLI tests, and 9 launcher tests with 3
+intentional model-backed skips. It also passed 65 CUDA source/build contracts,
+6 main-session recovery contracts, 9 Task 18 physical-source contracts, the
+runtime-identity gates, 6,522 plan checks, 290 allocation assertions, 127
+option assertions, 5 output-ceiling tests, and the server unit suite. A
+60-second quiet window then proved stable production and peer counters,
+byte-identical unrelated peer inventories, the canonical production lock
+still owned, and no established port-8003 client before production was
+stopped.
+
+During outage, the three low-level cache fault/unsafe cases passed, followed by
+the 27-assertion two-session request-counter target. The physical server suite
+passed all four cases in 604.855 seconds: recoverable `pread` and CUDA-copy
+failures restored state before 503 and a same-PID follow-up inference;
+event-completion uncertainty produced a pre-header 500, retained one
+unpublished zero-ref `LOADING` owner, and exited `1`; and a post-visible-frame
+request-barrier failure omitted every terminal protocol record before exiting
+`1`. The standard live-server harness then passed all 12 cases in 780.696
+seconds, covering exact model/runtime identity, admission, and Chat
+Completions, Responses, and Anthropic streaming/non-streaming behavior.
+
+After final cold preparation, production restarted as PID `255535` with
+`Result=success`, `NRestarts=0`, and `ExecMainCode/Status=0/0`. It reacquired
+the same canonical lock (device `66306`, inode `524639`), restored the exact
+executable, working directory, and NUL-delimited argv, served exactly the
+Flash and Pro model inventory, and completed an independent non-empty chat
+health request. The three unrelated vLLM peers remained exactly
+`212855/620 MiB`, `212900/1683 MiB`, and `213554/68625 MiB`. No candidate
+process or established port-8003 client remained, and the maintenance-window
+kernel log contained no OOM, killed-process, Xid, NVRM, GPU-fault, or segfault
+record. Only then did the transcript emit:
+
+```text
+TASK18_ACCEPTANCE_GREEN revision=8a1d1862b9e3bed56ca2ac1d291f224c6faeab88 archive_sha256=d5bafaa440190d70a9dea51b0ad96fbc630f5781db35ff01bc09618376128453 plan_sha256=41c7d1d03e36e3cb2f38250451bd2522b1270d62409fe52b077a41317ef99bbb at=2026-08-14T20:08:50+02:00
+```
+
+Three non-acceptance runs are retained as qualification evidence. Attempt 1
+(`/tmp/task18-02212b0-maintenance-239058.log`, SHA-256
+`bd947147f2f06f490cef78f11a24d8bf8414ca83e31e6ddad52b0de2eaaf5d06`,
+263 lines, 19,370 bytes) stopped before outage because a clean real-CUDA build
+proved that `ds4_gpu_laguna_compact` lacked the
+`request_barrier_unsafe_failures` storage required by its public snapshot.
+Commits `8a6ba88` and `064df5f` pinned and added that ABI state. Production was
+never stopped.
+
+Attempt 2 (`/tmp/task18-064df5f-maintenance-240219.log`, SHA-256
+`60ced0f6d7e5d7a2b61c9908e3742a6b47592a9d318fbf4bb0c28d79df406f71`,
+576 lines, 61,818 bytes) stopped before outage when the missing-model CLI
+fixture inherited the canonical production lock held by PID `219291`; it
+therefore exited `2` at lock acquisition instead of exercising the intended
+startup/model failure exit `1`. Commits `6416aab` and `dedea25` gave the Task
+18 CLI harness a private lock and pinned the ambient-held-lock regression.
+Production was never stopped.
+
+Attempt 3 (`/tmp/task18-dedea25-maintenance-243158.log`, SHA-256
+`f27d1994acef2188fe936491cd769da1db71a91d1484e41f0aaba07555b0504b`,
+783 lines, 174,732 bytes) passed every host gate, the 60-second quiet window,
+fresh-plan verification, all three low-level CUDA failure cases, and the
+27-assertion request-counter target. Its fresh plan had SHA-256
+`41c7d1d03e36e3cb2f38250451bd2522b1270d62409fe52b077a41317ef99bbb`;
+capacity was 51,214,737,408 bytes against the 30,064,771,072-byte bound plus
+reserve. The four-case physical suite ran in 342.854 seconds: the post-visible
+request-barrier unsafe case passed, while recoverable `pread` and CUDA-copy
+failures returned 500 instead of 503 and the event-completion oracle expected
+a positive refcount from an unpublished `LOADING` owner.
+
+The two recoverable failures had restored their cache slots, but their terminal
+page-advice seal required `prefill_complete`; a failed prefill has only
+`prefill_started`, so the barrier incorrectly reclassified both as unsafe.
+Commits `c340540` and `8a1d186` defined and fixed that chronology without
+inventing prefill completion or bypassing final advice. Commit `42e51bf`
+corrected the independent event oracle: an event-completion-uncertain load
+owner remains `LOADING` and poisoned but has zero references until publication,
+so a positive refcount would falsely claim execution visibility. The trap
+restored production cleanly as PID `248873`, preserved all three peer
+PID/allocation tuples, and left no candidate or port-8003 client; no acceptance
+marker was emitted. These non-acceptance runs are not counted as product
+acceptance. Their reusable lessons are now executable in the clean CUDA ABI
+gate, private-lock CLI fixture, failed-prefill advice-barrier unit test, and
+physical zero-ref unsafe-owner oracle.
 
 ### Task 19: Report qualification-safe benchmark and eval evidence
 

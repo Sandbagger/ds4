@@ -515,6 +515,7 @@ typedef enum {
     DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_RECORD = 6,
     DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION = 7,
     DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION = 8,
+    DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE = 9,
 } ds4_gpu_laguna_cache_test_fault;
 
 typedef struct {
@@ -548,6 +549,13 @@ typedef struct {
     uint64_t cache_payload_bytes;
     uint64_t cache_slot_count;
     uint64_t cache_slot_stride_bytes;
+    uint64_t cache_slot_empty_count;
+    uint64_t cache_slot_ready_count;
+    uint64_t cache_slot_loading_count;
+    uint64_t cache_slot_in_use_count;
+    uint64_t cache_slot_total_refs;
+    uint64_t cache_payload_id;
+    uint64_t pinned_staging_ids[4];
     uint64_t pinned_staging_live_count;
     uint64_t pinned_staging_bytes;
     uint64_t cache_payload_allocation_attempts;
@@ -567,6 +575,7 @@ typedef struct {
     uint64_t event_record_failures;
     uint64_t event_completion_failures;
     uint64_t cache_cancellations;
+    uint64_t request_barrier_unsafe_failures;
     bool cache_unsafe;
     uint64_t model_mapping_registered_bytes;
     uint64_t whole_model_copied_bytes;
@@ -712,6 +721,7 @@ struct ds4_gpu_laguna_compact {
     uint64_t event_record_failures;
     uint64_t event_completion_failures;
     uint64_t cache_cancellations;
+    uint64_t request_barrier_unsafe_failures;
     ds4_laguna_page_advice_counters page_advice_counters;
     ds4_laguna_page_advice_counters page_advice_fadvise_counters;
     ds4_laguna_page_advice_counters page_advice_madvise_counters;
@@ -4962,7 +4972,7 @@ extern "C" int ds4_gpu_laguna_compact_cache_view(
 extern "C" void ds4_gpu_test_laguna_compact_cache_fault_once(
         ds4_gpu_laguna_cache_test_fault fault) {
     if (fault <= DS4_GPU_LAGUNA_CACHE_FAULT_NONE ||
-        fault > DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION) {
+        fault > DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE) {
         return;
     }
     g_laguna_compact_cache_fault.store(fault, std::memory_order_relaxed);
@@ -5262,7 +5272,33 @@ static int cuda_laguna_compact_snapshot_locked(
     out->cache_slot_count = ctx->plan ? ctx->plan->slot_count : 0;
     out->cache_slot_stride_bytes =
         ctx->plan ? ctx->plan->slot_stride_bytes : 0;
+    out->cache_payload_id = ctx->cache_payload_id;
+    if (ctx->cache_slots && ctx->plan) {
+        for (uint64_t i = 0; i < ctx->plan->slot_count; i++) {
+            const ds4_laguna_cache_slot *slot = &ctx->cache_slots[i];
+            switch (slot->state) {
+            case DS4_LAGUNA_CACHE_SLOT_EMPTY:
+                out->cache_slot_empty_count++;
+                break;
+            case DS4_LAGUNA_CACHE_SLOT_LOADING:
+                out->cache_slot_loading_count++;
+                break;
+            case DS4_LAGUNA_CACHE_SLOT_READY:
+                out->cache_slot_ready_count++;
+                break;
+            case DS4_LAGUNA_CACHE_SLOT_IN_USE:
+                out->cache_slot_in_use_count++;
+                break;
+            }
+            if (UINT64_MAX - out->cache_slot_total_refs < slot->refs) {
+                out->cache_slot_total_refs = UINT64_MAX;
+            } else {
+                out->cache_slot_total_refs += slot->refs;
+            }
+        }
+    }
     for (size_t i = 0; i < 4; i++) {
+        out->pinned_staging_ids[i] = ctx->pinned_staging_ids[i];
         if (ctx->pinned_staging[i]) {
             out->pinned_staging_live_count++;
             if (ctx->plan) {
@@ -5290,6 +5326,8 @@ static int cuda_laguna_compact_snapshot_locked(
     out->event_record_failures = ctx->event_record_failures;
     out->event_completion_failures = ctx->event_completion_failures;
     out->cache_cancellations = ctx->cache_cancellations;
+    out->request_barrier_unsafe_failures =
+        ctx->request_barrier_unsafe_failures;
     out->cache_unsafe = ctx->cache_unsafe != 0;
     out->model_mapping_registered_bytes =
         g_laguna_compact_legacy_full_map_register_bytes.load(
@@ -33408,6 +33446,15 @@ ds4_gpu_laguna_compact_request_barrier(
         ctx->cache_unsafe = 1;
         return DS4_GPU_LAGUNA_EXEC_UNSAFE;
     }
+#ifdef DS4_TEST_HOOKS
+    if (cuda_laguna_compact_take_cache_fault(
+            DS4_GPU_LAGUNA_CACHE_FAULT_REQUEST_BARRIER_UNSAFE)) {
+        cuda_laguna_compact_counter_increment(
+            &ctx->request_barrier_unsafe_failures);
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+#endif
     if (!request->page_advice_observed) {
         return DS4_GPU_LAGUNA_EXEC_SUCCESS;
     }

@@ -64988,7 +64988,7 @@ static int ds4_session_sync_attributed_unlocked(
         if (err && errlen) {
             snprintf(err, errlen, "invalid attributed request context");
         }
-        return 1;
+        return 3;
     }
     if (ds4_session_is_logits_only_terminal(s)) {
         return ds4_session_terminal_error(err, errlen);
@@ -67151,7 +67151,7 @@ static int ds4_session_eval_attributed_unlocked(
         if (err && errlen) {
             snprintf(err, errlen, "invalid attributed request context");
         }
-        return 1;
+        return 3;
     }
     if (ds4_session_is_logits_only_terminal(s)) {
         return ds4_session_terminal_error(err, errlen);
@@ -68075,7 +68075,7 @@ int ds4_sessions_eval_batch_attributed(
                 snprintf(err, errlen,
                          "invalid attributed request context at item %d", i);
             }
-            return 1;
+            return 3;
         }
         if (i == 0) e = s->engine;
         for (int j = 0; j < i; j++) {
@@ -68277,7 +68277,7 @@ int ds4_sessions_eval_batch_with_prefill_attributed(
             snprintf(err, errlen,
                      "invalid attributed mixed prefill request context");
         }
-        return 1;
+        return 3;
     }
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
@@ -68301,7 +68301,7 @@ int ds4_sessions_eval_batch_with_prefill_attributed(
                          "invalid attributed mixed request context at item %d",
                          i);
             }
-            return 1;
+            return 3;
         }
         for (int j = 0; j < i; j++) {
             if (items[j].session == s ||

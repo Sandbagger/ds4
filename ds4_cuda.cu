@@ -6,18 +6,29 @@
 
 #include <stdint.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#ifdef DS4_TEST_HOOKS
+#include <chrono>
+#include <condition_variable>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -72,6 +83,8 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+#include "ds4_laguna_plan.h"
+#include "ds4_laguna_stream.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 typedef struct {
@@ -94,6 +107,9 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
+static const void *g_support_host_base;
+static uint64_t g_support_host_size;
+static uint64_t g_support_offset_bias;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
@@ -120,6 +136,7 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
+static int g_cuda_poolside_mmvq;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
@@ -292,6 +309,13 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_exact_score_split_fuse_inv_rope =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL;
     g_cuda_moe_decode_graph = getenv("DS4_CUDA_MOE_DECODE_GRAPH") != NULL;
+    const char *reduction = getenv("DS4_MM_VQ_REDUCTION");
+    g_cuda_poolside_mmvq =
+        reduction && strcmp(reduction, "poolside") == 0;
+}
+
+static bool cuda_poolside_mmvq_requested(void) {
+    return g_cuda_poolside_mmvq != 0;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -412,6 +436,5050 @@ static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
+
+typedef struct ds4_gpu_laguna_compact ds4_gpu_laguna_compact;
+
+enum {
+    DS4_GPU_NVML_API_IDENTITY_CAPACITY = 64,
+    DS4_GPU_NVML_PROCESS_CAPACITY = 128,
+};
+
+typedef struct ds4_gpu_nvml_inventory_snapshot {
+    uint32_t api_version;
+    char api_identity[DS4_GPU_NVML_API_IDENTITY_CAPACITY];
+    char library_version[DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY];
+    char device_uuid[DS4_RUNTIME_DEVICE_UUID_CAPACITY];
+    ds4_runtime_nvml_process_sample
+        processes[DS4_GPU_NVML_PROCESS_CAPACITY];
+    size_t process_count;
+} ds4_gpu_nvml_inventory_snapshot;
+
+typedef struct ds4_engine_laguna_external_checkpoint_observation {
+    ds4_runtime_external_sample sample;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_before;
+    ds4_gpu_nvml_inventory_snapshot inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_after;
+    ds4_laguna_file_identity model_identity;
+    uint64_t model_map_base;
+    uint64_t model_map_bytes;
+    uint64_t model_file_offset;
+    uint64_t model_source_page_size;
+    uint64_t model_source_resident_bytes;
+    uint64_t model_source_mapped_page_bytes;
+    uint8_t observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+} ds4_engine_laguna_external_checkpoint_observation;
+
+/* ds4_cuda.cu keeps a private copy of this backend ABI rather than including
+ * ds4_gpu.h, whose other declarations overlap the CUDA implementation's
+ * local types.  Keep these layouts byte-for-byte aligned with ds4_gpu.h. */
+typedef bool (*ds4_gpu_laguna_external_checkpoint_barrier_fn)(
+        void *userdata);
+typedef struct {
+    void *userdata;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_ready;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_result;
+} ds4_gpu_laguna_external_checkpoint_barrier;
+
+typedef bool (*ds4_gpu_laguna_runtime_snapshot_fn)(void *userdata);
+
+typedef enum {
+    DS4_GPU_LAGUNA_DESTROY_OK = 0,
+    DS4_GPU_LAGUNA_DESTROY_RECOVERABLE = 1,
+    DS4_GPU_LAGUNA_DESTROY_UNSAFE = 2,
+} ds4_gpu_laguna_destroy_status;
+
+typedef enum {
+    DS4_GPU_LAGUNA_EXEC_SUCCESS = 0,
+    DS4_GPU_LAGUNA_EXEC_CANCELLED = 1,
+    DS4_GPU_LAGUNA_EXEC_RECOVERABLE = 2,
+    DS4_GPU_LAGUNA_EXEC_UNSAFE = 3,
+} ds4_gpu_laguna_exec_result;
+
+typedef bool (*ds4_gpu_laguna_cancel_fn)(void *userdata);
+
+typedef enum {
+    DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
+    DS4_GPU_LAGUNA_LIFECYCLE_CREATING = 1,
+    DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE = 2,
+    DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING = 3,
+    DS4_GPU_LAGUNA_LIFECYCLE_RELEASING = 4,
+} ds4_gpu_laguna_lifecycle;
+
+typedef enum {
+    DS4_GPU_LAGUNA_CACHE_FAULT_NONE = 0,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EINTR = 1,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EOF = 2,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_SHORT = 3,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_ERROR = 4,
+    DS4_GPU_LAGUNA_CACHE_FAULT_CUDA_COPY = 5,
+    DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_RECORD = 6,
+    DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION = 7,
+    DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION = 8,
+} ds4_gpu_laguna_cache_test_fault;
+
+typedef struct {
+    ds4_gpu_laguna_lifecycle lifecycle;
+    int model_fd;
+    const void *model_map;
+    uint64_t model_size;
+    ds4_laguna_file_identity model_identity;
+    void *static_slab;
+    uint64_t *static_offsets;
+    void *cache_payload;
+    ds4_laguna_cache_slot *cache_slots;
+    uint32_t *device_entry_to_slot;
+    bool model_fd_live;
+    bool static_slab_live;
+    bool static_offsets_live;
+    bool cache_payload_live;
+    bool cache_policy_live;
+    bool device_entry_to_slot_live;
+    bool tracker_mapping_live;
+    bool tracker_static_live;
+    bool tracker_offsets_live;
+    uint64_t sync_attempt_count;
+    uint64_t release_attempt_count;
+    uint64_t rejection_count;
+    uint64_t static_slab_bytes;
+    uint64_t static_source_copied_bytes;
+    uint64_t static_range_count;
+    uint64_t static_offset_count;
+    uint64_t static_offset_bytes;
+    uint64_t cache_payload_bytes;
+    uint64_t cache_slot_count;
+    uint64_t cache_slot_stride_bytes;
+    uint64_t pinned_staging_live_count;
+    uint64_t pinned_staging_bytes;
+    uint64_t cache_payload_allocation_attempts;
+    uint64_t pinned_staging_allocation_attempts;
+    uint64_t cache_acquire_hits;
+    uint64_t cache_acquire_misses;
+    uint64_t cache_evictions;
+    uint64_t cache_load_successes;
+    uint64_t cache_load_failures;
+    uint64_t model_file_read_calls;
+    uint64_t model_file_read_bytes;
+    uint64_t pread_eintr_retries;
+    uint64_t pread_eof_failures;
+    uint64_t pread_short_failures;
+    uint64_t pread_error_failures;
+    uint64_t cuda_copy_failures;
+    uint64_t event_record_failures;
+    uint64_t event_completion_failures;
+    uint64_t cache_cancellations;
+    bool cache_unsafe;
+    uint64_t model_mapping_registered_bytes;
+    uint64_t whole_model_copied_bytes;
+    uint64_t routed_payload_bytes;
+    uint64_t opportunistic_range_allocated_bytes;
+    uint64_t legacy_model_range_count;
+    uint64_t legacy_model_arena_count;
+    void *page_advice_state;
+    bool page_advice_state_live;
+    uint64_t page_advice_state_bytes;
+    uint64_t page_advice_touched_eligible_unique_bytes;
+    uint64_t page_advice_touched_eligible_unique_pages;
+    uint64_t page_advice_mapping_touch_pages;
+    uint64_t page_advice_mapping_touch_bytes;
+    uint64_t page_advice_advised_unique_bytes;
+    uint64_t page_advice_advised_unique_pages;
+    uint64_t page_advice_attempted_calls;
+    uint64_t page_advice_attempted_bytes;
+    uint64_t page_advice_successful_calls;
+    uint64_t page_advice_successful_bytes;
+    uint64_t page_advice_failed_calls;
+    uint64_t page_advice_failed_bytes;
+    ds4_laguna_page_advice_errno_bucket
+        page_advice_errno_buckets[
+            DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY];
+    size_t page_advice_errno_bucket_count;
+    uint64_t page_advice_errno_einval_calls;
+    uint64_t page_advice_errno_einval_bytes;
+    uint64_t page_advice_errno_eio_calls;
+    uint64_t page_advice_errno_eio_bytes;
+    uint64_t page_advice_fadvise_attempted_calls;
+    uint64_t page_advice_fadvise_attempted_bytes;
+    uint64_t page_advice_fadvise_successful_calls;
+    uint64_t page_advice_fadvise_successful_bytes;
+    uint64_t page_advice_fadvise_failed_calls;
+    uint64_t page_advice_fadvise_failed_bytes;
+    uint64_t page_advice_madvise_attempted_calls;
+    uint64_t page_advice_madvise_attempted_bytes;
+    uint64_t page_advice_madvise_successful_calls;
+    uint64_t page_advice_madvise_successful_bytes;
+    uint64_t page_advice_madvise_failed_calls;
+    uint64_t page_advice_madvise_failed_bytes;
+    uint64_t page_advice_precharge_source_resident_bytes;
+    uint64_t page_advice_post_source_resident_bytes;
+    uint64_t page_advice_upload_completed_sequence;
+    uint64_t page_advice_precharge_sequence;
+    uint64_t page_advice_mapping_touch_sequence;
+    uint64_t page_advice_attempt_sequence;
+    uint64_t page_advice_post_sample_sequence;
+    uint64_t page_advice_complete_sequence;
+    uint64_t page_advice_complete_monotonic_ns;
+} ds4_gpu_laguna_compact_test_snapshot;
+
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    uint64_t routed_projection_requests;
+    uint64_t engine_slot_resolutions;
+    uint64_t static_slab_resolutions;
+    uint64_t model_mapping_resolutions;
+    uint64_t managed_resolutions;
+    uint64_t per_request_resolutions;
+    uint64_t unknown_resolutions;
+} ds4_gpu_laguna_routed_origin_test_snapshot;
+#endif
+
+struct ds4_gpu_laguna_compact {
+    int model_fd;
+    const void *model_map;
+    uint64_t model_size;
+    ds4_laguna_file_identity model_identity;
+    const ds4_laguna_ledger *ledger;
+    const ds4_laguna_allocation_plan *plan;
+    ds4_runtime_tracker *tracker;
+    ds4_gpu_nvml_inventory_snapshot nvml_baseline;
+    uint64_t baseline_tracked_cuda_physical_bytes;
+    int nvml_baseline_valid;
+    char *static_slab;
+    uint64_t static_slab_bytes;
+    uint64_t static_source_copied_bytes;
+    uint64_t static_range_count;
+    uint64_t *static_offsets;
+    uint64_t static_offset_count;
+    uint64_t static_offset_bytes;
+    char *cache_payload;
+    uint64_t cache_payload_bytes;
+    ds4_laguna_cache_slot *cache_slots;
+    uint64_t *route_hotness;
+    uint32_t *entry_to_slot;
+    uint32_t *device_entry_to_slot;
+    ds4_laguna_cache_policy cache_policy;
+    void *pinned_staging[4];
+    cudaEvent_t pinned_staging_events[4];
+    cudaStream_t upload_stream;
+    void *page_advice_state;
+    uint64_t page_advice_state_bytes;
+    ds4_laguna_page_range *page_advice_touched_ranges;
+    size_t page_advice_touched_range_count;
+    size_t page_advice_touched_range_capacity;
+    uint64_t page_advice_touched_range_bytes;
+    ds4_laguna_page_range *page_advice_since_ranges;
+    size_t page_advice_since_range_count;
+    size_t page_advice_since_range_capacity;
+    uint64_t page_advice_since_range_bytes;
+    ds4_laguna_page_range *page_advice_advised_ranges;
+    size_t page_advice_advised_range_count;
+    size_t page_advice_advised_range_capacity;
+    uint64_t page_advice_advised_range_bytes;
+    uint64_t mapping_id;
+    uint64_t static_id;
+    uint64_t offsets_id;
+    uint64_t cache_payload_id;
+    uint64_t route_hotness_id;
+    uint64_t entry_to_slot_id;
+    uint64_t device_entry_to_slot_id;
+    uint64_t cache_slots_id;
+    uint64_t pinned_staging_ids[4];
+    uint64_t page_advice_state_id;
+    uint64_t legacy_full_map_register_bytes_base;
+    uint64_t legacy_whole_model_copy_bytes_base;
+    uint64_t legacy_range_bytes_base;
+    uint64_t legacy_range_attempts_base;
+    uint64_t legacy_arena_attempts_base;
+    uint64_t sync_attempt_count;
+    uint64_t release_attempt_count;
+    uint64_t rejection_count;
+    uint64_t cache_payload_allocation_attempts;
+    uint64_t pinned_staging_allocation_attempts;
+    uint64_t cache_acquire_hits;
+    uint64_t cache_acquire_misses;
+    uint64_t cache_evictions;
+    uint64_t cache_load_successes;
+    uint64_t cache_load_failures;
+    uint64_t model_file_read_calls;
+    uint64_t model_file_read_bytes;
+    uint64_t model_file_read_ns;
+    uint64_t host_to_device_bytes;
+    uint64_t host_to_device_ns;
+    uint64_t pread_eintr_retries;
+    uint64_t pread_eof_failures;
+    uint64_t pread_short_failures;
+    uint64_t pread_error_failures;
+    uint64_t cuda_copy_failures;
+    uint64_t event_record_failures;
+    uint64_t event_completion_failures;
+    uint64_t cache_cancellations;
+    ds4_laguna_page_advice_counters page_advice_counters;
+    ds4_laguna_page_advice_counters page_advice_fadvise_counters;
+    ds4_laguna_page_advice_counters page_advice_madvise_counters;
+    uint64_t page_advice_mapping_touch_pages;
+    uint64_t page_advice_mapping_touch_bytes;
+    int page_advice_prior_post_resident_valid;
+    uint64_t page_advice_prior_post_resident_bytes;
+    uint64_t page_advice_precharge_source_resident_bytes;
+    uint64_t page_advice_post_source_resident_bytes;
+    uint64_t page_advice_sequence_clock;
+    uint64_t page_advice_upload_completed_sequence;
+    uint64_t page_advice_precharge_sequence;
+    uint64_t page_advice_mapping_touch_sequence;
+    uint64_t page_advice_attempt_sequence;
+    uint64_t page_advice_post_sample_sequence;
+    uint64_t page_advice_complete_sequence;
+    uint64_t page_advice_complete_monotonic_ns;
+    ds4_runtime_request_context *active_request;
+    uint32_t active_graph_scope;
+    uint32_t active_request_group;
+    uint32_t active_request_group_remaining;
+    uint64_t lifecycle_epoch;
+    uint64_t active_execution_count;
+    ds4_laguna_cache_handle active_load_handle;
+    int active_load_phase;
+    size_t baseline_live_record_count;
+    int tracker_mapping_live;
+    int tracker_static_live;
+    int tracker_offsets_live;
+    int tracker_cache_payload_live;
+    int tracker_route_hotness_live;
+    int tracker_entry_to_slot_live;
+    int tracker_device_entry_to_slot_live;
+    int tracker_cache_slots_live;
+    int tracker_pinned_staging_live[4];
+    int tracker_page_advice_state_live;
+    int cache_policy_live;
+    int cache_unsafe;
+#ifdef DS4_TEST_HOOKS
+    ds4_gpu_laguna_routed_origin_test_snapshot routed_origin;
+    int page_advice_test_injection_armed;
+    int page_advice_test_injection_seen;
+    int page_advice_test_reset_pending;
+    uint64_t page_advice_test_page_size;
+    uint64_t page_advice_test_exact_pre_resident_bytes;
+    uint64_t page_advice_test_exact_post_resident_bytes;
+    int page_advice_test_fadvise_errno;
+    int page_advice_test_madvise_errno;
+#endif
+};
+
+static ds4_gpu_laguna_compact g_laguna_compact_storage;
+enum {
+    DS4_LAGUNA_COMPACT_IDLE = 0,
+    DS4_LAGUNA_COMPACT_CREATING = 1,
+    DS4_LAGUNA_COMPACT_ACTIVE = 2,
+    DS4_LAGUNA_COMPACT_DESTROYING = 3,
+    DS4_LAGUNA_COMPACT_RELEASING = 4,
+};
+enum {
+    DS4_LAGUNA_CACHE_LOAD_NONE = 0,
+    DS4_LAGUNA_CACHE_LOAD_RESERVED = 1,
+    DS4_LAGUNA_CACHE_LOAD_TRANSFERRING = 2,
+    DS4_LAGUNA_CACHE_LOAD_COMMITTING = 3,
+};
+static std::atomic<int> g_laguna_compact_state{DS4_LAGUNA_COMPACT_IDLE};
+static std::recursive_mutex g_laguna_compact_mutex;
+static std::mutex g_laguna_compact_cache_io_mutex;
+/* Compact admission currently permits one session, but keep graph-final
+ * disposal serialized with routed wrappers so a future caller cannot enter
+ * between the final CUDA synchronization and the source-page flush. */
+static std::recursive_mutex g_laguna_compact_exec_mutex;
+static std::atomic<bool> g_laguna_compact_cache_cancel_requested{false};
+static std::atomic<uint64_t> g_laguna_compact_lifecycle_epoch{0};
+static std::atomic<uint64_t> g_laguna_compact_published_epoch{0};
+static std::atomic<uint64_t> g_laguna_compact_static_allocation_attempts;
+#ifdef DS4_TEST_HOOKS
+static std::mutex g_laguna_external_injection_mutex;
+static bool g_laguna_external_injection_armed;
+static ds4_gpu_nvml_inventory_snapshot
+    g_laguna_external_injected_before;
+static ds4_gpu_nvml_inventory_snapshot
+    g_laguna_external_injected_inside;
+static ds4_gpu_nvml_inventory_snapshot
+    g_laguna_external_injected_after;
+#endif
+static std::atomic<uint64_t> g_laguna_compact_next_tracker_id{
+    UINT64_C(0x4d00000000000001)};
+static std::atomic<uint64_t> g_laguna_compact_legacy_full_map_register_bytes;
+static std::atomic<uint64_t> g_laguna_compact_legacy_whole_model_copy_bytes;
+static std::atomic<uint64_t> g_laguna_compact_legacy_range_bytes;
+static std::atomic<uint64_t> g_laguna_compact_legacy_range_attempts;
+static std::atomic<uint64_t> g_laguna_compact_legacy_arena_attempts;
+static std::atomic<uint64_t> g_laguna_compact_generic_cleanup_attempts;
+#ifdef DS4_TEST_HOOKS
+static std::atomic<uint64_t> g_laguna_compact_fail_sync_count;
+static std::atomic<uint64_t> g_laguna_compact_fail_release_count;
+static std::atomic<bool> g_laguna_compact_fail_after_identity{false};
+static std::mutex g_laguna_compact_creating_pause_mutex;
+static std::condition_variable g_laguna_compact_creating_pause_condition;
+static bool g_laguna_compact_creating_pause_armed;
+static bool g_laguna_compact_creating_paused;
+static bool g_laguna_compact_creating_resume;
+static std::atomic<bool> g_laguna_compact_fail_before_publish{false};
+static std::atomic<int> g_laguna_compact_cache_fault{
+    DS4_GPU_LAGUNA_CACHE_FAULT_NONE};
+static std::mutex g_laguna_compact_cache_pause_mutex;
+static std::condition_variable g_laguna_compact_cache_pause_condition;
+static bool g_laguna_compact_cache_pause_armed;
+static bool g_laguna_compact_cache_paused;
+static bool g_laguna_compact_cache_resume;
+static ds4_laguna_cache_handle g_laguna_compact_cache_paused_handle;
+static std::mutex g_laguna_compact_cache_begin_pause_mutex;
+static std::condition_variable
+    g_laguna_compact_cache_begin_pause_condition;
+static bool g_laguna_compact_cache_begin_pause_armed;
+static bool g_laguna_compact_cache_begin_paused;
+static bool g_laguna_compact_cache_begin_resume;
+#endif
+
+static const char *const g_laguna_compact_forbidden_env[] = {
+    "DS4_CUDA_COPY_MODEL",
+    "DS4_CUDA_COPY_MODEL_CHUNKED",
+    "DS4_CUDA_WEIGHT_CACHE",
+    "DS4_CUDA_WEIGHT_PRELOAD",
+    "DS4_CUDA_DIRECT_MODEL",
+    "DS4_CUDA_WEIGHT_CACHE_LIMIT_GB",
+    "DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB",
+    "DS4_CUDA_WEIGHT_ARENA_CHUNK_MB",
+    "DS4_CUDA_Q8_F32_PRELOAD",
+    "DS4_CUDA_KEEP_MODEL_PAGES",
+    "DS4_CUDA_MODEL_PREFETCH_SYNC",
+    "DS4_CUDA_Q8_F16_ALL",
+    "DS4_CUDA_Q8_F32_ALL",
+    "DS4_CUDA_Q8_F32_LARGE",
+    "DS4_CUDA_ATTN_Q_B_F32_CACHE",
+    "DS4_CUDA_ATTENTION_OUTPUT_PRELOAD",
+    "DS4_CUDA_MODEL_COPY_CHUNK_MB",
+    "DS4_CUDA_Q8_F16_CACHE_MB",
+    "DS4_CUDA_Q8_F16_CACHE_RESERVE_MB",
+    "DS4_CUDA_STRICT_WEIGHT_CACHE",
+};
+
+/* Keep NVML optional at link time and avoid a build-time nvml.h dependency.
+ * These definitions are the stable v2 ABI exported by libnvidia-ml.so.1. */
+typedef struct nvmlDevice_st *ds4_nvml_device;
+typedef struct {
+    unsigned int pid;
+    unsigned long long used_gpu_memory;
+    unsigned int gpu_instance_id;
+    unsigned int compute_instance_id;
+} ds4_nvml_process_info_v2;
+
+static_assert(offsetof(ds4_nvml_process_info_v2, pid) == 0u,
+              "NVML v2 pid ABI offset");
+static_assert(offsetof(ds4_nvml_process_info_v2, used_gpu_memory) == 8u,
+              "NVML v2 used-memory ABI offset");
+static_assert(offsetof(ds4_nvml_process_info_v2, gpu_instance_id) == 16u,
+              "NVML v2 GPU-instance ABI offset");
+static_assert(offsetof(ds4_nvml_process_info_v2, compute_instance_id) == 20u,
+              "NVML v2 compute-instance ABI offset");
+static_assert(sizeof(ds4_nvml_process_info_v2) == 24u,
+              "NVML v2 process-info ABI size");
+
+typedef int (*ds4_nvml_init_v2_fn)(void);
+typedef int (*ds4_nvml_shutdown_fn)(void);
+typedef int (*ds4_nvml_system_version_fn)(char *, unsigned int);
+typedef int (*ds4_nvml_device_by_index_v2_fn)(
+    unsigned int, ds4_nvml_device *);
+typedef int (*ds4_nvml_device_by_uuid_fn)(
+    const char *, ds4_nvml_device *);
+typedef int (*ds4_nvml_device_uuid_fn)(
+    ds4_nvml_device, char *, unsigned int);
+typedef int (*ds4_nvml_compute_processes_v2_fn)(
+    ds4_nvml_device, unsigned int *, ds4_nvml_process_info_v2 *);
+
+typedef struct {
+    void *library;
+    ds4_nvml_init_v2_fn init_v2;
+    ds4_nvml_shutdown_fn shutdown;
+    ds4_nvml_system_version_fn system_version;
+    ds4_nvml_device_by_index_v2_fn device_by_index_v2;
+    ds4_nvml_device_by_uuid_fn device_by_uuid;
+    ds4_nvml_device_uuid_fn device_uuid;
+    ds4_nvml_compute_processes_v2_fn compute_processes_v2;
+} ds4_nvml_api;
+
+enum {
+    DS4_NVML_SUCCESS = 0,
+    DS4_NVML_ERROR_INSUFFICIENT_SIZE = 7,
+};
+
+static int cuda_laguna_nvml_symbol(
+        void *library, const char *name, void *target,
+        size_t target_size) {
+    if (!library || !name || !target || target_size != sizeof(void *)) {
+        return 0;
+    }
+    (void)dlerror();
+    void *symbol = dlsym(library, name);
+    if (!symbol || dlerror() != NULL) return 0;
+    memcpy(target, &symbol, target_size);
+    return 1;
+}
+
+static int cuda_laguna_nvml_open(ds4_nvml_api *api) {
+    if (!api) return 0;
+    memset(api, 0, sizeof(*api));
+#if !defined(RTLD_NODELETE)
+    /* Repeated external-attribution captures require a loader contract that
+     * cannot leak process descriptors across NVML unload/reload cycles. */
+    return 0;
+#else
+    /* NVIDIA's DSO leaves an eventfd behind on each unload/reload cycle even
+     * after a successful nvmlShutdown().  Keep its process state mapped while
+     * preserving balanced NVML initialization and loader references. */
+    api->library = dlopen(
+        "libnvidia-ml.so.1",
+        RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+#endif
+    if (!api->library ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlInit_v2",
+            &api->init_v2, sizeof(api->init_v2)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlShutdown",
+            &api->shutdown, sizeof(api->shutdown)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlSystemGetNVMLVersion",
+            &api->system_version, sizeof(api->system_version)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetHandleByIndex_v2",
+            &api->device_by_index_v2, sizeof(api->device_by_index_v2)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetHandleByUUID",
+            &api->device_by_uuid, sizeof(api->device_by_uuid)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetUUID",
+            &api->device_uuid, sizeof(api->device_uuid)) ||
+        !cuda_laguna_nvml_symbol(
+            api->library, "nvmlDeviceGetComputeRunningProcesses_v2",
+            &api->compute_processes_v2,
+            sizeof(api->compute_processes_v2))) {
+        if (api->library) (void)dlclose(api->library);
+        memset(api, 0, sizeof(*api));
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_laguna_nvml_close(ds4_nvml_api *api) {
+    if (!api) return;
+    if (api->library) (void)dlclose(api->library);
+    memset(api, 0, sizeof(*api));
+}
+
+static bool cuda_laguna_nvml_process_less(
+        const ds4_runtime_nvml_process_sample &a,
+        const ds4_runtime_nvml_process_sample &b) {
+    return a.pid < b.pid;
+}
+
+static int cuda_laguna_nvml_inventory_capture_bound(
+        const char *expected_device_uuid,
+        ds4_gpu_nvml_inventory_snapshot *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    ds4_nvml_api api;
+    if (!cuda_laguna_nvml_open(&api)) return 0;
+
+    int initialized = 0;
+    int ok = 0;
+    int result = DS4_NVML_SUCCESS;
+    unsigned int count = 0;
+    unsigned int capacity = 0;
+    ds4_nvml_device device = NULL;
+    ds4_nvml_process_info_v2
+        processes[DS4_GPU_NVML_PROCESS_CAPACITY];
+    memset(processes, 0, sizeof(processes));
+    if (api.init_v2() != DS4_NVML_SUCCESS) goto cleanup;
+    initialized = 1;
+    /* The initial pre-CUDA capture selects physical index 0.  Once compact
+     * admission proves that UUID is CUDA logical device 0, every subsequent
+     * capture resolves the immutable UUID directly rather than trusting that
+     * an NVML ordinal remains equivalent to a CUDA ordinal. */
+    if (api.system_version(
+            out->library_version,
+            (unsigned int)sizeof(out->library_version)) !=
+            DS4_NVML_SUCCESS ||
+        out->library_version[0] == '\0' ||
+        memchr(out->library_version, '\0',
+               sizeof(out->library_version)) == NULL ||
+        (expected_device_uuid
+             ? api.device_by_uuid(expected_device_uuid, &device)
+             : api.device_by_index_v2(0u, &device)) != DS4_NVML_SUCCESS ||
+        !device ||
+        api.device_uuid(
+            device, out->device_uuid,
+            (unsigned int)sizeof(out->device_uuid)) != DS4_NVML_SUCCESS ||
+        out->device_uuid[0] == '\0' ||
+        memchr(out->device_uuid, '\0', sizeof(out->device_uuid)) == NULL ||
+        (expected_device_uuid &&
+         strcmp(out->device_uuid, expected_device_uuid) != 0)) {
+        goto cleanup;
+    }
+
+    result = api.compute_processes_v2(device, &count, NULL);
+    if (result == DS4_NVML_SUCCESS && count == 0u) {
+        out->process_count = 0u;
+    } else {
+        if (result != DS4_NVML_ERROR_INSUFFICIENT_SIZE ||
+            count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+            goto cleanup;
+        }
+        capacity = DS4_GPU_NVML_PROCESS_CAPACITY;
+        result = api.compute_processes_v2(device, &capacity, processes);
+        if (result != DS4_NVML_SUCCESS ||
+            capacity > DS4_GPU_NVML_PROCESS_CAPACITY) {
+            goto cleanup;
+        }
+        out->process_count = capacity;
+        for (size_t i = 0; i < out->process_count; i++) {
+            if (processes[i].pid == 0u) goto cleanup;
+            out->processes[i].pid = processes[i].pid;
+            out->processes[i].used_bytes_known =
+                processes[i].used_gpu_memory != ULLONG_MAX;
+            out->processes[i].used_bytes =
+                out->processes[i].used_bytes_known
+                    ? (uint64_t)processes[i].used_gpu_memory : 0u;
+        }
+        std::sort(
+            out->processes,
+            out->processes + out->process_count,
+            cuda_laguna_nvml_process_less);
+        for (size_t i = 1; i < out->process_count; i++) {
+            if (out->processes[i - 1u].pid == out->processes[i].pid) {
+                goto cleanup;
+            }
+        }
+    }
+    out->api_version = 2u;
+    memcpy(out->api_identity,
+           "nvmlDeviceGetComputeRunningProcesses_v2",
+           sizeof("nvmlDeviceGetComputeRunningProcesses_v2"));
+    ok = 1;
+
+cleanup:
+    if (initialized && api.shutdown() != DS4_NVML_SUCCESS) ok = 0;
+    cuda_laguna_nvml_close(&api);
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
+}
+
+extern "C" int ds4_gpu_nvml_inventory_capture(
+        ds4_gpu_nvml_inventory_snapshot *out) {
+    return cuda_laguna_nvml_inventory_capture_bound(NULL, out);
+}
+
+static const ds4_runtime_nvml_process_sample *
+cuda_laguna_nvml_find_process(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot,
+        uint32_t pid) {
+    if (!snapshot || pid == 0u ||
+        snapshot->process_count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return NULL;
+    }
+    const ds4_runtime_nvml_process_sample *found = NULL;
+    for (size_t i = 0; i < snapshot->process_count; i++) {
+        if (snapshot->processes[i].pid != pid) continue;
+        if (found) return NULL;
+        found = &snapshot->processes[i];
+    }
+    return found;
+}
+
+static void cuda_laguna_nvml_inventory_view(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot,
+        ds4_runtime_nvml_inventory *view) {
+    if (!view) return;
+    memset(view, 0, sizeof(*view));
+    if (!snapshot) return;
+    view->api_version = snapshot->api_version;
+    view->library_version = snapshot->library_version;
+    view->device_uuid = snapshot->device_uuid;
+    view->processes = snapshot->processes;
+    view->process_count = snapshot->process_count;
+}
+
+static int cuda_laguna_tracker_cuda_physical_bytes(
+        const ds4_runtime_tracker *tracker,
+        uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0u;
+    if (!tracker || !tracker->records ||
+        !bytes_out ||
+        tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        tracker->record_count > tracker->record_capacity) {
+        return 0;
+    }
+    uint64_t bytes = 0u;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *record = &tracker->records[i];
+        if (!record->live ||
+            record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION) {
+            continue;
+        }
+        if ((record->domain == DS4_RUNTIME_DOMAIN_CUDA_DEVICE ||
+             record->domain == DS4_RUNTIME_DOMAIN_CUDA_MANAGED) &&
+            record->charged_bytes != 0u) {
+            if (bytes > UINT64_MAX - record->charged_bytes) return 0;
+            bytes += record->charged_bytes;
+        }
+    }
+    *bytes_out = bytes;
+    return 1;
+}
+
+static int cuda_laguna_hexadecimal_nibble(char byte) {
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    return -1;
+}
+
+static int cuda_laguna_nvml_uuid_bytes(
+        const char *text, unsigned char out[16]) {
+    if (!text || !out || strncmp(text, "GPU-", 4u) != 0) return 0;
+    const char *cursor = text + 4u;
+    size_t byte = 0u;
+    while (*cursor != '\0') {
+        if (*cursor == '-') {
+            cursor++;
+            continue;
+        }
+        if (byte >= 16u || cursor[1] == '\0') return 0;
+        const int high = cuda_laguna_hexadecimal_nibble(cursor[0]);
+        const int low = cuda_laguna_hexadecimal_nibble(cursor[1]);
+        if (high < 0 || low < 0) return 0;
+        out[byte++] = (unsigned char)((unsigned)high * 16u +
+                                     (unsigned)low);
+        cursor += 2u;
+    }
+    return byte == 16u;
+}
+
+static int cuda_laguna_cuda_uuid_matches_nvml(
+        int cuda_device, const char *nvml_uuid) {
+    unsigned char expected[16];
+    cudaDeviceProp properties;
+    memset(&properties, 0, sizeof(properties));
+    return cuda_laguna_nvml_uuid_bytes(nvml_uuid, expected) &&
+        cudaGetDeviceProperties(&properties, cuda_device) == cudaSuccess &&
+        memcmp(properties.uuid.bytes, expected, sizeof(expected)) == 0;
+}
+
+static int cuda_laguna_compact_environment_allowed(void) {
+    for (size_t i = 0;
+         i < sizeof(g_laguna_compact_forbidden_env) /
+                 sizeof(g_laguna_compact_forbidden_env[0]);
+         i++) {
+        if (getenv(g_laguna_compact_forbidden_env[i]) != NULL) return 0;
+    }
+    return 1;
+}
+
+/* A legacy operation holds this permit until its last mutation.  Creation
+ * takes the same mutex before changing IDLE to CREATING, closing the
+ * check-then-mutate race rather than merely sampling the atomic state. */
+class cuda_laguna_compact_legacy_permit {
+public:
+    cuda_laguna_compact_legacy_permit()
+        : guard_(g_laguna_compact_mutex), allowed_(false) {
+        if (g_laguna_compact_state.load(std::memory_order_relaxed) ==
+                DS4_LAGUNA_COMPACT_IDLE) {
+            allowed_ = true;
+        } else {
+            g_laguna_compact_storage.rejection_count++;
+        }
+    }
+
+    bool allowed(void) const { return allowed_; }
+
+private:
+    std::unique_lock<std::recursive_mutex> guard_;
+    bool allowed_;
+};
+
+/* Return 0 when no compact context exists, 1 only for the exact ACTIVE
+ * mapping, and -1 for every other non-IDLE lookup.  Unlike the legacy
+ * permission predicate above, an exact ACTIVE mapping is the one allowed
+ * compact-resolution path. */
+static int cuda_laguna_compact_lookup_route(const void *model_map) {
+    const int observed =
+        g_laguna_compact_state.load(std::memory_order_acquire);
+    if (observed == DS4_LAGUNA_COMPACT_IDLE) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state == DS4_LAGUNA_COMPACT_ACTIVE &&
+        g_laguna_compact_storage.model_map == model_map) {
+        return 1;
+    }
+    g_laguna_compact_storage.rejection_count++;
+    return -1;
+}
+
+/* g_laguna_compact_mutex must be held. */
+static int cuda_laguna_compact_lookup_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t source_offset,
+        uint64_t bytes,
+        int expected_device,
+        void **out_device_ptr) {
+    if (!ctx || bytes == 0 || !ctx->ledger || !ctx->static_offsets ||
+        g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE ||
+        g_n_gpus != 1 || expected_device != g_gpu[0].device_id) {
+        return 0;
+    }
+    for (size_t i = 0; i < ctx->ledger->tensor_range_count; i++) {
+        const uint64_t device_offset = ctx->static_offsets[i];
+        if (device_offset == UINT64_MAX) continue;
+        const ds4_laguna_tensor_range *range = &ctx->ledger->tensor_ranges[i];
+        if (source_offset < range->source_offset) continue;
+        const uint64_t into = source_offset - range->source_offset;
+        if (into > range->source_bytes ||
+            bytes > range->source_bytes - into) {
+            continue;
+        }
+        if (device_offset > ctx->static_slab_bytes ||
+            into > ctx->static_slab_bytes - device_offset ||
+            bytes > ctx->static_slab_bytes - device_offset - into) {
+            return 0;
+        }
+        if (out_device_ptr) {
+            *out_device_ptr = ctx->static_slab + device_offset + into;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int cuda_laguna_compact_align_256(uint64_t value, uint64_t *out) {
+    if (!out || value > UINT64_MAX - UINT64_C(255)) return 0;
+    *out = (value + UINT64_C(255)) & ~UINT64_C(255);
+    return 1;
+}
+
+static int cuda_laguna_compact_next_lifecycle_epoch(uint64_t *out) {
+    if (!out) return 0;
+    uint64_t observed = g_laguna_compact_lifecycle_epoch.load(
+        std::memory_order_relaxed);
+    for (;;) {
+        if (observed == UINT64_MAX) return 0;
+        if (g_laguna_compact_lifecycle_epoch.compare_exchange_weak(
+                observed, observed + 1u, std::memory_order_relaxed)) {
+            *out = observed + 1u;
+            return 1;
+        }
+    }
+}
+
+static int cuda_laguna_compact_ledger_array_sizes(
+        const ds4_laguna_ledger *ledger,
+        uint64_t bytes[3],
+        uint64_t *total_out) {
+    if (!ledger || !bytes || !total_out ||
+        ledger->tensor_range_count > (SIZE_MAX - 5u) / 2u ||
+        ledger->tensor_range_count > UINT64_MAX /
+            sizeof(ledger->tensor_ranges[0]) ||
+        ledger->expert_entry_count > UINT64_MAX /
+            sizeof(ledger->expert_entries[0])) {
+        return 0;
+    }
+    const uint64_t source_capacity =
+        (uint64_t)ledger->tensor_range_count * 2u + 5u;
+    if (source_capacity > UINT64_MAX /
+            sizeof(ledger->source_ranges[0])) {
+        return 0;
+    }
+    bytes[0] = (uint64_t)ledger->tensor_range_count *
+        sizeof(ledger->tensor_ranges[0]);
+    bytes[1] = source_capacity * sizeof(ledger->source_ranges[0]);
+    bytes[2] = ledger->expert_entry_count *
+        sizeof(ledger->expert_entries[0]);
+    if (bytes[0] == 0 || bytes[1] == 0 || bytes[2] == 0 ||
+        bytes[0] > UINT64_MAX - bytes[1] ||
+        bytes[0] + bytes[1] > UINT64_MAX - bytes[2]) {
+        return 0;
+    }
+    *total_out = bytes[0] + bytes[1] + bytes[2];
+    return 1;
+}
+
+static int cuda_laguna_compact_tracker_has_baseline(
+        const ds4_runtime_tracker *tracker,
+        const ds4_laguna_ledger *ledger,
+        uint64_t ledger_array_bytes,
+        size_t expected_live_count,
+        size_t required_create_capacity,
+        int allow_external_attribution,
+        size_t *live_count_out) {
+    if (!tracker ||
+        (tracker->violation != DS4_RUNTIME_VIOLATION_NONE &&
+         !(allow_external_attribution &&
+           tracker->violation ==
+               DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION)) ||
+        !tracker->callsites || tracker->callsite_count == 0 ||
+        !tracker->records || tracker->record_count > tracker->record_capacity) {
+        return 0;
+    }
+    size_t live_count = 0;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (tracker->records[i].live) live_count++;
+    }
+    if ((live_count != 3 && live_count != 9) ||
+        (expected_live_count != 0 && live_count != expected_live_count) ||
+        live_count > tracker->record_capacity ||
+        tracker->record_capacity - live_count < required_create_capacity) {
+        return 0;
+    }
+
+    uint64_t bytes[3] = {0};
+    uint64_t total = 0;
+    if (!cuda_laguna_compact_ledger_array_sizes(
+            ledger, bytes, &total) || total != ledger_array_bytes) {
+        return 0;
+    }
+    const void *bases[3] = {
+        ledger->tensor_ranges,
+        ledger->source_ranges,
+        ledger->expert_entries,
+    };
+    bool ledger_seen[3] = {false, false, false};
+    bool inventory_seen[6] = {false, false, false, false, false, false};
+    uint64_t inventory_bytes = 0;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *record = &tracker->records[i];
+        if (!record->live) continue;
+        size_t ledger_index = 3;
+        for (size_t j = 0; j < 3; j++) {
+            if (!ledger_seen[j] &&
+                record->base == (uint64_t)(uintptr_t)bases[j] &&
+                record->requested_bytes == bytes[j] &&
+                record->charged_bytes == bytes[j]) {
+                ledger_index = j;
+                break;
+            }
+        }
+        if (ledger_index != 3) {
+            if (record->callsite_id != DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS ||
+                record->category !=
+                    DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES ||
+                record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+                record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+                record->owner_id != 0) {
+                return 0;
+            }
+            ledger_seen[ledger_index] = true;
+            continue;
+        }
+
+        if (live_count != 9 || (uint8_t)(record->id >> 56) != 0x4eu) {
+            return 0;
+        }
+        const uint64_t sequence =
+            record->id & UINT64_C(0x00ffffffffffffff);
+        if (sequence == 0 || sequence > 6 ||
+            inventory_seen[sequence - 1u] || record->base == 0 ||
+            record->requested_bytes == 0 ||
+            record->charged_bytes != record->requested_bytes ||
+            record->base > UINT64_MAX - record->charged_bytes ||
+            record->category != DS4_RUNTIME_CATEGORY_OTHER_HOST ||
+            record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+            record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+            record->owner_id != 0) {
+            return 0;
+        }
+        const uint32_t expected_callsite = sequence == 1 ?
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE : sequence <= 3 ?
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_MODEL :
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_VOCAB;
+        if (record->callsite_id != expected_callsite ||
+            inventory_bytes > UINT64_MAX - record->charged_bytes) {
+            return 0;
+        }
+        inventory_seen[sequence - 1u] = true;
+        inventory_bytes += record->charged_bytes;
+    }
+    for (size_t i = 0; i < 3; i++) {
+        if (!ledger_seen[i]) return 0;
+    }
+    if (live_count == 9) {
+        for (size_t i = 0; i < 6; i++) {
+            if (!inventory_seen[i]) return 0;
+        }
+    }
+    if (ledger_array_bytes > UINT64_MAX - inventory_bytes) return 0;
+    const uint64_t expected_total = ledger_array_bytes + inventory_bytes;
+    for (size_t i = 0; i < DS4_RUNTIME_OWNED_CATEGORY_COUNT; i++) {
+        uint64_t expected = 0;
+        if (i == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES) {
+            expected = ledger_array_bytes;
+        } else if (i == DS4_RUNTIME_CATEGORY_OTHER_HOST) {
+            expected = inventory_bytes;
+        }
+        if (tracker->category_current[i] != expected) return 0;
+    }
+    uint64_t expected_external = 0u;
+    for (size_t i = 0; i < DS4_RUNTIME_REPORT_COUNT; i++) {
+        if (i == DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL ||
+            i == DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED ||
+            !allow_external_attribution) {
+            if (tracker->report_current[i] != 0u) return 0;
+            continue;
+        }
+        if (tracker->report_current[i] >
+            UINT64_MAX - expected_external) {
+            return 0;
+        }
+        expected_external += tracker->report_current[i];
+    }
+    if (expected_total > UINT64_MAX - expected_external) return 0;
+    if (tracker->owned_total_current != expected_total ||
+        tracker->qualification_total_current !=
+            expected_total + expected_external) {
+        return 0;
+    }
+    if (live_count_out) *live_count_out = live_count;
+    return 1;
+}
+
+static int cuda_laguna_compact_callsite_exact(
+        const ds4_laguna_allocation_plan *plan,
+        uint32_t id,
+        ds4_runtime_category category,
+        ds4_runtime_physical_domain domain,
+        uint64_t bound_bytes) {
+    size_t matches = 0;
+    for (size_t i = 0; i < plan->callsite_count; i++) {
+        const ds4_runtime_callsite *site = &plan->callsites[i];
+        if (site->id != id) continue;
+        matches++;
+        if (site->category != category || site->domain != domain ||
+            site->bound_bytes != bound_bytes) return 0;
+    }
+    return matches == 1;
+}
+
+static int cuda_laguna_compact_callsite_at_least(
+        const ds4_laguna_allocation_plan *plan,
+        uint32_t id,
+        ds4_runtime_category category,
+        ds4_runtime_physical_domain domain,
+        uint64_t minimum_bound_bytes) {
+    size_t matches = 0;
+    for (size_t i = 0; i < plan->callsite_count; i++) {
+        const ds4_runtime_callsite *site = &plan->callsites[i];
+        if (site->id != id) continue;
+        matches++;
+        if (site->category != category || site->domain != domain ||
+            site->bound_bytes < minimum_bound_bytes) return 0;
+    }
+    return matches == 1;
+}
+
+typedef struct {
+    int enabled;
+    uint64_t payload_bytes;
+    uint64_t route_hotness_bytes;
+    uint64_t entry_to_slot_bytes;
+    uint64_t device_entry_to_slot_bytes;
+    uint64_t slot_state_bytes;
+    uint64_t staging_total_bytes;
+    uint64_t page_range_capacity;
+    uint64_t page_state_bytes;
+} cuda_laguna_compact_cache_geometry;
+
+static int cuda_laguna_compact_mul_u64(
+        uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || (a != 0 && b > UINT64_MAX / a)) return 0;
+    *out = a * b;
+    return 1;
+}
+
+static int cuda_laguna_compact_add_u64(
+        uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || a > UINT64_MAX - b) return 0;
+    *out = a + b;
+    return 1;
+}
+
+static int cuda_laguna_compact_routed_parent(
+        const ds4_laguna_ledger *ledger,
+        uint32_t layer,
+        ds4_laguna_routed_projection projection,
+        const ds4_laguna_tensor_range **out) {
+    const ds4_laguna_tensor_range *found = NULL;
+    if (!ledger || !out) return 0;
+    for (size_t i = 0; i < ledger->tensor_range_count; i++) {
+        const ds4_laguna_tensor_range *range = &ledger->tensor_ranges[i];
+        if (range->tensor_class != DS4_LAGUNA_TENSOR_ROUTED_EXPERT ||
+            range->routed_layer != layer ||
+            range->routed_projection != projection) {
+            continue;
+        }
+        if (found) return 0;
+        found = range;
+    }
+    if (!found) return 0;
+    *out = found;
+    return 1;
+}
+
+static int cuda_laguna_compact_expert_view_exact(
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_expert_entry *entry,
+        const ds4_laguna_expert_view *view,
+        ds4_laguna_routed_projection projection,
+        uint64_t expected_device_offset,
+        uint64_t *layer_expert_count) {
+    const ds4_laguna_tensor_range *parent = NULL;
+    uint64_t expert_delta = 0;
+    uint64_t expected_source_offset = 0;
+    if (!ledger || !entry || !view || !layer_expert_count ||
+        ledger->routed_projection_expert_bytes == 0 ||
+        !cuda_laguna_compact_routed_parent(
+            ledger, entry->layer, projection, &parent) ||
+        parent->stable_index != view->parent_stable_index ||
+        parent->source_bytes % ledger->routed_projection_expert_bytes != 0 ||
+        !cuda_laguna_compact_mul_u64(
+            entry->expert, ledger->routed_projection_expert_bytes,
+            &expert_delta) ||
+        expert_delta > parent->source_bytes ||
+        ledger->routed_projection_expert_bytes >
+            parent->source_bytes - expert_delta ||
+        !cuda_laguna_compact_add_u64(
+            parent->source_offset, expert_delta,
+            &expected_source_offset) ||
+        view->source_offset != expected_source_offset ||
+        view->source_bytes != ledger->routed_projection_expert_bytes ||
+        view->device_offset != expected_device_offset) {
+        return 0;
+    }
+    const uint64_t count =
+        parent->source_bytes / ledger->routed_projection_expert_bytes;
+    if (count == 0 || entry->expert >= count ||
+        (*layer_expert_count != 0 && *layer_expert_count != count)) {
+        return 0;
+    }
+    *layer_expert_count = count;
+    return 1;
+}
+
+static int cuda_laguna_compact_expert_entries_exact(
+        const ds4_laguna_ledger *ledger) {
+    if (!ledger || !ledger->expert_entries ||
+        ledger->expert_entry_count == 0 ||
+        ledger->routed_projection_expert_bytes == 0) {
+        return 0;
+    }
+    const uint64_t expert_bytes =
+        ledger->routed_projection_expert_bytes;
+    uint64_t gate_end = 0;
+    uint64_t up_offset = 0;
+    uint64_t up_end = 0;
+    uint64_t down_offset = 0;
+    uint64_t down_end = 0;
+    uint64_t used_bytes = 0;
+    if (!cuda_laguna_compact_add_u64(0, expert_bytes, &gate_end) ||
+        !cuda_laguna_compact_align_256(gate_end, &up_offset) ||
+        !cuda_laguna_compact_add_u64(
+            up_offset, expert_bytes, &up_end) ||
+        !cuda_laguna_compact_align_256(up_end, &down_offset) ||
+        !cuda_laguna_compact_add_u64(
+            down_offset, expert_bytes, &down_end) ||
+        !cuda_laguna_compact_align_256(down_end, &used_bytes) ||
+        ledger->slot_stride_bytes != used_bytes) {
+        return 0;
+    }
+
+    uint64_t prior_layer_expert_count = 0;
+    uint64_t expected_layer_expert_count = 0;
+    uint64_t layer_count = 0;
+    for (size_t i = 0; i < (size_t)ledger->expert_entry_count; i++) {
+        const ds4_laguna_expert_entry *entry = &ledger->expert_entries[i];
+        if (i == 0) {
+            if (entry->expert != 0) return 0;
+            layer_count = 1;
+        } else {
+            const ds4_laguna_expert_entry *prior =
+                &ledger->expert_entries[i - 1u];
+            if (entry->layer == prior->layer) {
+                if (prior->expert == UINT32_MAX ||
+                    entry->expert != prior->expert + 1u) {
+                    return 0;
+                }
+            } else {
+                if (prior->layer == UINT32_MAX ||
+                    entry->layer != prior->layer + 1u ||
+                    entry->expert != 0 ||
+                    (uint64_t)prior->expert + 1u !=
+                        prior_layer_expert_count) {
+                    return 0;
+                }
+                prior_layer_expert_count = 0;
+                layer_count++;
+            }
+        }
+        uint64_t layer_expert_count = 0;
+        if (entry->used_bytes != used_bytes ||
+            !cuda_laguna_compact_expert_view_exact(
+                ledger, entry, &entry->gate,
+                DS4_LAGUNA_ROUTED_PROJECTION_GATE, 0,
+                &layer_expert_count) ||
+            !cuda_laguna_compact_expert_view_exact(
+                ledger, entry, &entry->up,
+                DS4_LAGUNA_ROUTED_PROJECTION_UP, up_offset,
+                &layer_expert_count) ||
+            !cuda_laguna_compact_expert_view_exact(
+                ledger, entry, &entry->down,
+                DS4_LAGUNA_ROUTED_PROJECTION_DOWN, down_offset,
+                &layer_expert_count)) {
+            return 0;
+        }
+        if (expected_layer_expert_count != 0 &&
+            layer_expert_count != expected_layer_expert_count) {
+            return 0;
+        }
+        expected_layer_expert_count = layer_expert_count;
+        prior_layer_expert_count = layer_expert_count;
+    }
+    const ds4_laguna_expert_entry *last =
+        &ledger->expert_entries[ledger->expert_entry_count - 1u];
+    return (uint64_t)last->expert + 1u == prior_layer_expert_count &&
+        layer_count <= UINT64_MAX / 3u &&
+        layer_count * 3u == ledger->routed_parent_count;
+}
+
+static int cuda_laguna_compact_cache_geometry_validate(
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        uint64_t ledger_array_bytes,
+        uint64_t static_offset_bytes,
+        cuda_laguna_compact_cache_geometry *geometry) {
+    if (!ledger || !plan || !geometry) return 0;
+    memset(geometry, 0, sizeof(*geometry));
+    if (plan->cache_payload_bytes == 0) {
+        return plan->configured_cache_bytes == 0 &&
+            plan->effective_cache_limit_bytes == 0 &&
+            plan->cache_tail_uncharged_bytes == 0 &&
+            plan->slot_count == 0 &&
+            plan->staging_buffer_count == 0 &&
+            plan->staging_buffer_bytes == 0 &&
+            plan->owned_category_bounds[
+                DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] == 0 &&
+            plan->owned_category_bounds[
+                DS4_RUNTIME_CATEGORY_PINNED_STAGING] == 0 &&
+            cuda_laguna_compact_callsite_exact(
+                plan, DS4_LAGUNA_CALLSITE_EXPERT_CACHE_PAYLOAD,
+                DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD,
+                DS4_RUNTIME_DOMAIN_CUDA_DEVICE, 0);
+    }
+
+    geometry->enabled = 1;
+    uint64_t routed_page_ranges = 0;
+    uint64_t page_range_slots = 0;
+    if (!cuda_laguna_compact_mul_u64(
+            ledger->expert_entry_count, 3u, &routed_page_ranges) ||
+        !cuda_laguna_compact_add_u64(
+            ledger->static_parent_count, routed_page_ranges,
+            &geometry->page_range_capacity) ||
+        !cuda_laguna_compact_mul_u64(
+            geometry->page_range_capacity, 3u, &page_range_slots) ||
+        !cuda_laguna_compact_mul_u64(
+            page_range_slots, sizeof(ds4_laguna_page_range),
+            &geometry->page_state_bytes)) {
+        return 0;
+    }
+    if (!ledger->expert_entries || ledger->expert_entry_count == 0 ||
+        ledger->expert_entry_count > 12032u ||
+        ledger->expert_entry_count > SIZE_MAX ||
+        plan->slot_count == 0 ||
+        plan->slot_stride_bytes != ledger->slot_stride_bytes ||
+        plan->slot_stride_bytes == 0 ||
+        plan->staging_buffer_count != 4u ||
+        plan->staging_buffer_bytes != plan->slot_stride_bytes ||
+        geometry->page_range_capacity == 0 ||
+        geometry->page_range_capacity > SIZE_MAX ||
+        geometry->page_state_bytes == 0 ||
+        geometry->page_state_bytes > SIZE_MAX ||
+        !cuda_laguna_compact_expert_entries_exact(ledger) ||
+        !cuda_laguna_compact_mul_u64(
+            plan->slot_count, plan->slot_stride_bytes,
+            &geometry->payload_bytes) ||
+        geometry->payload_bytes != plan->cache_payload_bytes ||
+        plan->configured_cache_bytes < geometry->payload_bytes ||
+        plan->slot_count !=
+            plan->configured_cache_bytes / plan->slot_stride_bytes ||
+        plan->cache_tail_uncharged_bytes >= plan->slot_stride_bytes ||
+        plan->effective_cache_limit_bytes !=
+            plan->configured_cache_bytes ||
+        plan->cache_tail_uncharged_bytes !=
+            plan->configured_cache_bytes - geometry->payload_bytes ||
+        !cuda_laguna_compact_mul_u64(
+            ledger->expert_entry_count, sizeof(uint64_t),
+            &geometry->route_hotness_bytes) ||
+        !cuda_laguna_compact_mul_u64(
+            ledger->expert_entry_count, sizeof(uint32_t),
+            &geometry->entry_to_slot_bytes) ||
+        !cuda_laguna_compact_mul_u64(
+            ledger->expert_entry_count, sizeof(uint32_t),
+            &geometry->device_entry_to_slot_bytes) ||
+        !cuda_laguna_compact_mul_u64(
+            plan->slot_count, sizeof(ds4_laguna_cache_slot),
+            &geometry->slot_state_bytes) ||
+        !cuda_laguna_compact_mul_u64(
+            plan->staging_buffer_count, plan->staging_buffer_bytes,
+            &geometry->staging_total_bytes) ||
+        geometry->device_entry_to_slot_bytes >
+            plan->staging_buffer_bytes ||
+        plan->owned_category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] <
+            geometry->page_state_bytes ||
+        !cuda_laguna_compact_callsite_at_least(
+            plan, DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
+            DS4_RUNTIME_CATEGORY_OTHER_HOST,
+            DS4_RUNTIME_DOMAIN_HOST, geometry->page_state_bytes)) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < ledger->expert_entry_count; i++) {
+        const ds4_laguna_expert_entry *entry =
+            &ledger->expert_entries[i];
+        if (i != 0) {
+            const ds4_laguna_expert_entry *prior =
+                &ledger->expert_entries[i - 1u];
+            if (prior->layer > entry->layer ||
+                (prior->layer == entry->layer &&
+                 prior->expert >= entry->expert)) {
+                return 0;
+            }
+        }
+        const ds4_laguna_expert_view *views[3] = {
+            &entry->gate, &entry->up, &entry->down,
+        };
+        if (entry->used_bytes == 0 ||
+            entry->used_bytes > plan->slot_stride_bytes) {
+            return 0;
+        }
+        for (size_t projection = 0; projection < 3; projection++) {
+            const ds4_laguna_expert_view *view = views[projection];
+            if (view->source_bytes == 0 ||
+                view->source_offset > ledger->file_size ||
+                view->source_bytes >
+                    ledger->file_size - view->source_offset ||
+                view->device_offset > entry->used_bytes ||
+                view->source_bytes >
+                    entry->used_bytes - view->device_offset) {
+                return 0;
+            }
+        }
+    }
+
+    uint64_t metadata = ledger_array_bytes;
+    const uint64_t metadata_parts[] = {
+        static_offset_bytes,
+        geometry->route_hotness_bytes,
+        geometry->entry_to_slot_bytes,
+        geometry->device_entry_to_slot_bytes,
+        geometry->slot_state_bytes,
+    };
+    for (size_t i = 0;
+         i < sizeof(metadata_parts) / sizeof(metadata_parts[0]); i++) {
+        if (metadata > UINT64_MAX - metadata_parts[i]) return 0;
+        metadata += metadata_parts[i];
+    }
+    if (plan->owned_category_bounds[
+            DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] !=
+            geometry->payload_bytes ||
+        plan->owned_category_bounds[
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] !=
+            metadata ||
+        plan->owned_category_bounds[
+            DS4_RUNTIME_CATEGORY_PINNED_STAGING] !=
+            geometry->staging_total_bytes ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_EXPERT_CACHE_PAYLOAD,
+            DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD,
+            DS4_RUNTIME_DOMAIN_CUDA_DEVICE,
+            geometry->payload_bytes) ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_ROUTE_HOTNESS,
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+            DS4_RUNTIME_DOMAIN_HOST,
+            geometry->route_hotness_bytes) ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_HOST_ENTRY_TO_SLOT,
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+            DS4_RUNTIME_DOMAIN_HOST,
+            geometry->entry_to_slot_bytes) ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_DEVICE_ENTRY_TO_SLOT,
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+            DS4_RUNTIME_DOMAIN_CUDA_DEVICE,
+            geometry->device_entry_to_slot_bytes) ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_SLOT_STATE,
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+            DS4_RUNTIME_DOMAIN_HOST,
+            geometry->slot_state_bytes)) {
+        return 0;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if (!cuda_laguna_compact_callsite_exact(
+                plan,
+                DS4_LAGUNA_CALLSITE_PINNED_STAGING_0 + (uint32_t)i,
+                DS4_RUNTIME_CATEGORY_PINNED_STAGING,
+                DS4_RUNTIME_DOMAIN_HOST,
+                plan->staging_buffer_bytes)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int cuda_laguna_compact_identity_matches(
+        int model_fd,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *expected,
+        struct stat *status_out) {
+    if (model_fd < 0 || model_size == 0 || !expected || !status_out) {
+        return 0;
+    }
+    struct stat status;
+    if (fstat(model_fd, &status) != 0 ||
+        !S_ISREG(status.st_mode) || status.st_size < 0) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    const time_t mtime_seconds = status.st_mtimespec.tv_sec;
+    const long mtime_nanoseconds = status.st_mtimespec.tv_nsec;
+#else
+    const time_t mtime_seconds = status.st_mtim.tv_sec;
+    const long mtime_nanoseconds = status.st_mtim.tv_nsec;
+#endif
+    if (mtime_seconds < 0 || mtime_nanoseconds < 0 ||
+        mtime_nanoseconds >= 1000000000L) {
+        return 0;
+    }
+    const uintmax_t seconds = (uintmax_t)mtime_seconds;
+    const uint64_t nanoseconds = (uint64_t)mtime_nanoseconds;
+    if (seconds >
+            (UINT64_MAX - nanoseconds) / UINT64_C(1000000000)) {
+        return 0;
+    }
+    const uintmax_t device = (uintmax_t)status.st_dev;
+    const uintmax_t inode = (uintmax_t)status.st_ino;
+    const uintmax_t size_bytes = (uintmax_t)status.st_size;
+    if (device > UINT64_MAX || inode > UINT64_MAX ||
+        size_bytes > UINT64_MAX ||
+        (uint64_t)size_bytes != model_size ||
+        expected->device != (uint64_t)device ||
+        expected->inode != (uint64_t)inode ||
+        expected->size_bytes != (uint64_t)size_bytes ||
+        expected->mtime_ns !=
+            (uint64_t)seconds * UINT64_C(1000000000) + nanoseconds) {
+        return 0;
+    }
+    *status_out = status;
+    return 1;
+}
+
+static int cuda_laguna_compact_mapping_matches(
+        const void *model_map,
+        uint64_t model_size,
+        const struct stat *model_status) {
+#if !defined(__linux__)
+    (void)model_map;
+    (void)model_size;
+    (void)model_status;
+    return 0;
+#else
+    if (!model_map || model_size == 0 || !model_status ||
+        model_size > UINTPTR_MAX - (uintptr_t)model_map) {
+        return 0;
+    }
+    const uint64_t range_start = (uint64_t)(uintptr_t)model_map;
+    const uint64_t range_end = range_start + model_size;
+    uint64_t cursor = range_start;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    int valid = 1;
+    char line[1024];
+    while (cursor < range_end && fgets(line, sizeof(line), maps)) {
+        unsigned long long map_start_raw = 0;
+        unsigned long long map_end_raw = 0;
+        unsigned long long file_offset_raw = 0;
+        unsigned int device_major = 0;
+        unsigned int device_minor = 0;
+        unsigned long long inode_raw = 0;
+        char permissions[5] = {0};
+        if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu",
+                   &map_start_raw, &map_end_raw, permissions,
+                   &file_offset_raw, &device_major, &device_minor,
+                   &inode_raw) != 7) {
+            continue;
+        }
+        const uint64_t map_start = (uint64_t)map_start_raw;
+        const uint64_t map_end = (uint64_t)map_end_raw;
+        if (map_end <= cursor) continue;
+        if (map_start > cursor || map_end <= map_start ||
+            permissions[0] != 'r' ||
+            device_major != (unsigned int)major(model_status->st_dev) ||
+            device_minor != (unsigned int)minor(model_status->st_dev) ||
+            (uint64_t)inode_raw != (uint64_t)model_status->st_ino) {
+            valid = 0;
+            break;
+        }
+        const uint64_t into_vma = cursor - map_start;
+        const uint64_t expected_offset = cursor - range_start;
+        if ((uint64_t)file_offset_raw > UINT64_MAX - into_vma ||
+            (uint64_t)file_offset_raw + into_vma != expected_offset) {
+            valid = 0;
+            break;
+        }
+        cursor = map_end < range_end ? map_end : range_end;
+    }
+    if (ferror(maps) || cursor != range_end) valid = 0;
+    fclose(maps);
+    return valid;
+#endif
+}
+
+static int cuda_laguna_compact_validate(
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        const ds4_runtime_tracker *tracker,
+        uint64_t *static_offset_bytes_out,
+        size_t *baseline_live_record_count_out,
+        cuda_laguna_compact_cache_geometry *cache_geometry_out) {
+    if (model_fd < 0 || !model_map || model_size == 0 || !model_identity ||
+        model_size > SIZE_MAX || !ledger || !plan || !tracker ||
+        !static_offset_bytes_out || !baseline_live_record_count_out ||
+        !cache_geometry_out ||
+        g_n_gpus != 1 || g_gpu[0].device_id != 0 ||
+        g_model_host_base || g_model_registered || g_model_device_owned ||
+        g_model_fd >= 0 || g_model_direct_fd >= 0 ||
+        g_model_fd_host_base || !g_cache_ranges.empty() ||
+        g_support_host_base || g_support_host_size != 0 ||
+        g_support_offset_bias != 0 || g_stream_selected_cache.valid ||
+        g_stream_selected_cache.gate_ptr ||
+        g_stream_selected_cache.up_ptr ||
+        g_stream_selected_cache.down_ptr ||
+        g_stream_selected_cache.slot_selected_ptr ||
+        !g_model_ranges.empty() || !g_model_arenas.empty() ||
+        !g_q8_f16_ranges.empty() || !g_q8_f32_ranges.empty()) {
+        return 0;
+    }
+    for (size_t i = 0; i < DS4_MAX_GPUS; i++) {
+        if (g_dev_cache[i].present || g_dev_cache[i].base ||
+            g_dev_cache[i].bytes != 0) {
+            return 0;
+        }
+    }
+    const uintptr_t map_base = (uintptr_t)model_map;
+    if (map_base == 0 || model_size > UINTPTR_MAX - map_base) return 0;
+    struct stat model_stat;
+    struct stat model_stat_after;
+    if (!cuda_laguna_compact_identity_matches(
+            model_fd, model_size, model_identity, &model_stat) ||
+        !cuda_laguna_compact_mapping_matches(
+            model_map, model_size, &model_stat) ||
+        !cuda_laguna_compact_identity_matches(
+            model_fd, model_size, model_identity, &model_stat_after)) {
+        return 0;
+    }
+    if (ledger->file_size != model_size || !ledger->tensor_ranges ||
+        ledger->tensor_range_count == 0 ||
+        ledger->tensor_range_count != ledger->tensor_count ||
+        ledger->tensor_range_count > SIZE_MAX / sizeof(uint64_t) ||
+        ledger->static_parent_count == 0 ||
+        ledger->static_aligned_device_bytes == 0 ||
+        ledger->static_aligned_device_bytes > SIZE_MAX) {
+        return 0;
+    }
+
+    uint64_t static_count = 0;
+    uint64_t routed_count = 0;
+    uint64_t static_source_bytes = 0;
+    uint64_t routed_source_bytes = 0;
+    uint64_t static_aligned_bytes = 0;
+    for (size_t i = 0; i < ledger->tensor_range_count; i++) {
+        const ds4_laguna_tensor_range *range = &ledger->tensor_ranges[i];
+        if (range->source_bytes == 0 || range->source_offset > model_size ||
+            range->source_bytes > model_size - range->source_offset) {
+            return 0;
+        }
+        for (size_t j = 0; j < i; j++) {
+            const ds4_laguna_tensor_range *prior =
+                &ledger->tensor_ranges[j];
+            if (range->stable_index == prior->stable_index) return 0;
+            const uint64_t range_end =
+                range->source_offset + range->source_bytes;
+            const uint64_t prior_end =
+                prior->source_offset + prior->source_bytes;
+            if (range->source_offset < prior_end &&
+                prior->source_offset < range_end) {
+                return 0;
+            }
+        }
+        if (range->tensor_class == DS4_LAGUNA_TENSOR_STATIC) {
+            uint64_t aligned = 0;
+            if (static_source_bytes > UINT64_MAX - range->source_bytes ||
+                !cuda_laguna_compact_align_256(range->source_bytes,
+                                               &aligned) ||
+                static_aligned_bytes > UINT64_MAX - aligned) {
+                return 0;
+            }
+            static_count++;
+            static_source_bytes += range->source_bytes;
+            static_aligned_bytes += aligned;
+        } else if (range->tensor_class ==
+                       DS4_LAGUNA_TENSOR_ROUTED_EXPERT) {
+            if (routed_source_bytes > UINT64_MAX - range->source_bytes) {
+                return 0;
+            }
+            routed_count++;
+            routed_source_bytes += range->source_bytes;
+        } else {
+            return 0;
+        }
+    }
+    if (static_count != ledger->static_parent_count ||
+        routed_count != ledger->routed_parent_count ||
+        static_source_bytes != ledger->static_source_bytes ||
+        routed_source_bytes != ledger->routed_source_bytes ||
+        static_aligned_bytes != ledger->static_aligned_device_bytes) {
+        return 0;
+    }
+
+    const uint64_t static_offset_bytes =
+        (uint64_t)ledger->tensor_range_count * sizeof(uint64_t);
+    uint64_t ledger_array_parts[3] = {0};
+    uint64_t ledger_array_bytes = 0;
+    if (!cuda_laguna_compact_ledger_array_sizes(
+            ledger, ledger_array_parts, &ledger_array_bytes) ||
+        ledger_array_bytes > UINT64_MAX - static_offset_bytes) {
+        return 0;
+    }
+    cuda_laguna_compact_cache_geometry cache_geometry;
+    if (!cuda_laguna_compact_cache_geometry_validate(
+            ledger, plan, ledger_array_bytes, static_offset_bytes,
+            &cache_geometry)) {
+        return 0;
+    }
+    if (plan->slot_stride_bytes != ledger->slot_stride_bytes ||
+        plan->owned_category_bounds[
+            DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] != static_aligned_bytes ||
+        plan->owned_category_bounds[
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] <
+                ledger_array_bytes + static_offset_bytes ||
+        plan->report_bounds[
+            DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] != model_size ||
+        plan->report_bounds[
+            DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] != 0 ||
+        plan->callsite_count == 0 ||
+        plan->callsite_count > DS4_LAGUNA_ALLOCATION_CALLSITE_COUNT ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_STATIC_SLAB,
+            DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS,
+            DS4_RUNTIME_DOMAIN_CUDA_DEVICE, static_aligned_bytes) ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_STATIC_OFFSETS,
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+            DS4_RUNTIME_DOMAIN_HOST, static_offset_bytes) ||
+        !cuda_laguna_compact_callsite_exact(
+            plan, DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS,
+            DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES,
+            DS4_RUNTIME_DOMAIN_HOST, ledger_array_bytes)) {
+        return 0;
+    }
+    if (tracker->callsites != plan->callsites ||
+        tracker->callsite_count != plan->callsite_count ||
+        memcmp(tracker->category_bounds, plan->owned_category_bounds,
+               sizeof(tracker->category_bounds)) != 0 ||
+        memcmp(tracker->report_bounds, plan->report_bounds,
+               sizeof(tracker->report_bounds)) != 0 ||
+        tracker->owned_total_bound_bytes != plan->owned_total_bound_bytes ||
+        tracker->qualification_total_bound_bytes !=
+            plan->qualification_total_bound_bytes ||
+        !cuda_laguna_compact_tracker_has_baseline(
+            tracker, ledger, ledger_array_bytes, 0,
+            cache_geometry.enabled ? 13u : 3u,
+            0,
+            baseline_live_record_count_out)) {
+        return 0;
+    }
+    *static_offset_bytes_out = static_offset_bytes;
+    *cache_geometry_out = cache_geometry;
+    return 1;
+}
+
+static int cuda_laguna_compact_track_owned(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t id,
+        uint32_t callsite,
+        const void *base,
+        uint64_t bytes,
+        int *live) {
+    if (!ctx || !ctx->tracker || !base || bytes == 0 || !live ||
+        ds4_runtime_tracker_allocate(
+            ctx->tracker, id, callsite,
+            (uint64_t)(uintptr_t)base, bytes, bytes) !=
+            DS4_RUNTIME_STATUS_OK) {
+        return 0;
+    }
+    *live = 1;
+    return 1;
+}
+
+static int cuda_laguna_compact_host_allocate(
+        ds4_gpu_laguna_compact *ctx,
+        void **out,
+        uint64_t bytes,
+        uint64_t id,
+        uint32_t callsite,
+        int *live) {
+    if (!out || bytes == 0 || bytes > SIZE_MAX) return 0;
+    *out = malloc((size_t)bytes);
+    if (!*out) return 0;
+    return cuda_laguna_compact_track_owned(
+        ctx, id, callsite, *out, bytes, live);
+}
+
+static int cuda_laguna_compact_device_allocate(
+        ds4_gpu_laguna_compact *ctx,
+        void **out,
+        uint64_t bytes,
+        uint64_t id,
+        uint32_t callsite,
+        int *live) {
+    if (!out || bytes == 0 || bytes > SIZE_MAX) return 0;
+    const cudaError_t error = cudaMalloc(out, (size_t)bytes);
+    if (error != cudaSuccess || !*out) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return cuda_laguna_compact_track_owned(
+        ctx, id, callsite, *out, bytes, live);
+}
+
+static int cuda_laguna_compact_pinned_allocate(
+        ds4_gpu_laguna_compact *ctx,
+        void **out,
+        uint64_t bytes,
+        uint64_t id,
+        uint32_t callsite,
+        int *live) {
+    if (!out || bytes == 0 || bytes > SIZE_MAX) return 0;
+    const cudaError_t error = cudaMallocHost(out, (size_t)bytes);
+    if (error != cudaSuccess || !*out) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return cuda_laguna_compact_track_owned(
+        ctx, id, callsite, *out, bytes, live);
+}
+
+static int cuda_laguna_compact_system_page_size(uint64_t *page_size_out) {
+    if (!page_size_out) return 0;
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0) return 0;
+    const uint64_t page_size = (uint64_t)raw_page_size;
+    if ((page_size & (page_size - 1u)) != 0) return 0;
+    *page_size_out = page_size;
+    return 1;
+}
+
+/* Compact source reads are sparse by construction.  Disable kernel
+ * readahead for both access paths before the first residency sample: routed
+ * experts use pread through model_fd, while static attachment and disposal
+ * touch the retained model mapping.  Otherwise clean pages outside the exact
+ * inward-rounded disposal union can accumulate and falsely consume the
+ * bounded model-source residency allowance. */
+static int cuda_laguna_compact_source_set_random_access_locked(
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity) {
+#if defined(POSIX_FADV_RANDOM) && defined(MADV_RANDOM)
+    struct stat before;
+    struct stat after;
+    if (model_fd < 0 || !model_map || !model_identity ||
+        model_size == 0u || model_size > SIZE_MAX ||
+        !cuda_laguna_compact_identity_matches(
+            model_fd, model_size, model_identity, &before)) {
+        return 0;
+    }
+    if (posix_fadvise(
+            model_fd, 0, 0, POSIX_FADV_RANDOM) != 0) {
+        return 0;
+    }
+    if (madvise(
+            (void *)model_map,
+            (size_t)model_size, MADV_RANDOM) != 0) {
+        return 0;
+    }
+    return cuda_laguna_compact_identity_matches(
+        model_fd, model_size, model_identity, &after);
+#else
+    (void)model_fd;
+    (void)model_map;
+    (void)model_size;
+    (void)model_identity;
+    return 0;
+#endif
+}
+
+/* The injection changes arithmetic only for the next safely completed
+ * transfer.  It is inspected without consuming it so the raw ranges are
+ * normalized with the same page size later used by the advice operation. */
+static int cuda_laguna_compact_page_size_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t default_page_size,
+        uint64_t *page_size_out) {
+    if (!ctx || !page_size_out) return 0;
+    uint64_t page_size = default_page_size;
+#ifdef DS4_TEST_HOOKS
+    if (ctx->page_advice_test_injection_armed) {
+        page_size = ctx->page_advice_test_page_size;
+    }
+#endif
+    if (page_size == 0 || (page_size & (page_size - 1u)) != 0) return 0;
+    *page_size_out = page_size;
+    return 1;
+}
+
+static int cuda_laguna_compact_page_sequence_next(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t *stage) {
+    if (!ctx || !stage || ctx->page_advice_sequence_clock == UINT64_MAX) {
+        return 0;
+    }
+    *stage = ++ctx->page_advice_sequence_clock;
+    return 1;
+}
+
+static uint64_t cuda_laguna_compact_monotonic_ns_after(uint64_t prior) {
+    struct timespec now;
+    uint64_t value = prior;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0 &&
+        now.tv_nsec >= 0 && now.tv_nsec < 1000000000L &&
+        (uint64_t)now.tv_sec <= UINT64_MAX / UINT64_C(1000000000)) {
+        value = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+            (uint64_t)now.tv_nsec;
+    }
+    if (value <= prior && prior != UINT64_MAX) value = prior + 1u;
+    return value;
+}
+
+static int cuda_laguna_compact_page_sample_exact_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t page_size,
+        uint64_t *resident_bytes_out) {
+    if (!ctx || !ctx->model_map || ctx->model_size == 0 ||
+        !resident_bytes_out || page_size == 0 ||
+        (page_size & (page_size - 1u)) != 0 ||
+        ((uintptr_t)ctx->model_map & (uintptr_t)(page_size - 1u)) != 0) {
+        return 0;
+    }
+    if (ctx->model_size > UINT64_MAX - (page_size - 1u)) return 0;
+    const uint64_t mapped_page_bytes =
+        (ctx->model_size + page_size - 1u) & ~(page_size - 1u);
+    if (mapped_page_bytes == 0) return 0;
+    /* Keep sampling allocation-free, but amortize a 68 GiB mapping over
+     * roughly 255 mincore calls rather than roughly 4,068 calls.  mincore
+     * reports physical pages, so a resident final partial file page is
+     * charged as one full system page, never as only the remaining bytes. */
+    unsigned char residency[65536];
+    uint64_t resident = 0;
+    uint64_t offset = 0;
+    while (offset < mapped_page_bytes) {
+        const uint64_t remaining = mapped_page_bytes - offset;
+        uint64_t pages = remaining / page_size;
+        if (pages > sizeof(residency)) pages = sizeof(residency);
+        if (pages == 0 || pages > UINT64_MAX / page_size) return 0;
+        const uint64_t span = pages * page_size;
+        if (span == 0 || span > SIZE_MAX ||
+            offset > UINTPTR_MAX - (uintptr_t)ctx->model_map) {
+            return 0;
+        }
+        memset(residency, 0, (size_t)pages);
+        if (mincore((char *)ctx->model_map + offset,
+                    (size_t)span, residency) != 0) {
+            return 0;
+        }
+        for (uint64_t page = 0; page < pages; page++) {
+            if ((residency[page] & 1u) == 0) continue;
+            if (resident > mapped_page_bytes - page_size) return 0;
+            resident += page_size;
+        }
+        offset += span;
+    }
+    *resident_bytes_out = resident;
+    return 1;
+}
+
+static int cuda_laguna_compact_page_promote_locked(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t page_size,
+        uint64_t source_offset,
+        uint64_t source_bytes) {
+    if (!ctx || !ctx->page_advice_state) return 0;
+    size_t touched_count = 0;
+    size_t since_count = 0;
+    uint64_t touched_bytes = 0;
+    uint64_t touched_pages = 0;
+    uint64_t since_bytes = 0;
+    uint64_t since_pages = 0;
+    ds4_laguna_page_advice_counters counters =
+        ctx->page_advice_counters;
+    if (!ds4_laguna_page_range_union_preview(
+            ctx->page_advice_touched_ranges,
+            ctx->page_advice_touched_range_count,
+            ctx->page_advice_touched_range_capacity,
+            page_size, source_offset, source_bytes,
+            &touched_count, &touched_bytes, &touched_pages) ||
+        !ds4_laguna_page_range_union_preview(
+            ctx->page_advice_since_ranges,
+            ctx->page_advice_since_range_count,
+            ctx->page_advice_since_range_capacity,
+            page_size, source_offset, source_bytes,
+            &since_count, &since_bytes, &since_pages) ||
+        ctx->page_advice_touched_range_bytes >
+            UINT64_MAX - touched_bytes ||
+        ctx->page_advice_since_range_bytes > UINT64_MAX - since_bytes ||
+        !ds4_laguna_page_advice_note_touched(
+            &counters, touched_pages)) {
+        return 0;
+    }
+    uint64_t committed_bytes = 0;
+    uint64_t committed_pages = 0;
+    if (!ds4_laguna_page_range_union_insert(
+            ctx->page_advice_touched_ranges,
+            &ctx->page_advice_touched_range_count,
+            ctx->page_advice_touched_range_capacity,
+            page_size, source_offset, source_bytes,
+            &committed_bytes, &committed_pages) ||
+        ctx->page_advice_touched_range_count != touched_count ||
+        committed_bytes != touched_bytes ||
+        committed_pages != touched_pages) {
+        return 0;
+    }
+    committed_bytes = 0;
+    committed_pages = 0;
+    if (!ds4_laguna_page_range_union_insert(
+            ctx->page_advice_since_ranges,
+            &ctx->page_advice_since_range_count,
+            ctx->page_advice_since_range_capacity,
+            page_size, source_offset, source_bytes,
+            &committed_bytes, &committed_pages) ||
+        ctx->page_advice_since_range_count != since_count ||
+        committed_bytes != since_bytes || committed_pages != since_pages) {
+        return 0;
+    }
+    ctx->page_advice_counters = counters;
+    ctx->page_advice_touched_range_bytes += touched_bytes;
+    ctx->page_advice_since_range_bytes += since_bytes;
+    return 1;
+}
+
+static int cuda_laguna_compact_page_note_syscall_locked(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_page_advice_counters *specific,
+        uint64_t page_size,
+        const ds4_laguna_page_range *range,
+        int error_number,
+        ds4_runtime_request_context *request_staged,
+        int *request_touched,
+        int *request_stage_failed) {
+    if (!ctx || !specific || !range || error_number < 0) return 0;
+    size_t advised_count = ctx->page_advice_advised_range_count;
+    uint64_t new_bytes = 0;
+    uint64_t new_pages = 0;
+    ds4_laguna_page_advice_counters specific_next = *specific;
+    ds4_laguna_page_advice_counters aggregate_next =
+        ctx->page_advice_counters;
+    ds4_runtime_request_context request_next;
+    int request_ok = 1;
+    if (request_staged) {
+        request_next = *request_staged;
+        ds4_runtime_wire_counters delta = {};
+        delta.page_advice_attempts = 1u;
+        delta.page_advice_bytes = range->bytes;
+        delta.page_advice_failures = error_number != 0 ? 1u : 0u;
+        request_ok = ds4_runtime_request_add_counters(
+            &request_next, &delta) ? 1 : 0;
+    }
+    if ((error_number == 0 &&
+         (!ds4_laguna_page_range_union_preview(
+              ctx->page_advice_advised_ranges,
+              ctx->page_advice_advised_range_count,
+              ctx->page_advice_advised_range_capacity,
+              page_size, range->offset, range->bytes,
+              &advised_count, &new_bytes, &new_pages) ||
+          ctx->page_advice_advised_range_bytes >
+              UINT64_MAX - new_bytes)) ||
+        !ds4_laguna_page_advice_note_result(
+            &specific_next, range->bytes, 0, error_number) ||
+        !ds4_laguna_page_advice_note_result(
+            &aggregate_next, range->bytes, new_pages, error_number)) {
+        return 0;
+    }
+    if (error_number == 0) {
+        uint64_t committed_bytes = 0;
+        uint64_t committed_pages = 0;
+        if (!ds4_laguna_page_range_union_insert(
+                ctx->page_advice_advised_ranges,
+                &ctx->page_advice_advised_range_count,
+                ctx->page_advice_advised_range_capacity,
+                page_size, range->offset, range->bytes,
+                &committed_bytes, &committed_pages) ||
+            ctx->page_advice_advised_range_count != advised_count ||
+            committed_bytes != new_bytes || committed_pages != new_pages) {
+            return 0;
+        }
+    }
+    *specific = specific_next;
+    ctx->page_advice_counters = aggregate_next;
+    ctx->page_advice_advised_range_bytes += new_bytes;
+    if (request_touched) *request_touched = 1;
+    if (!request_ok) {
+        if (request_stage_failed) *request_stage_failed = 1;
+        return 0;
+    }
+    if (request_staged) *request_staged = request_next;
+    return 1;
+}
+
+/* Routed reads enter the inode cache through pread(), so the retained model
+ * mapping may have no PTEs for those pages.  Linux can otherwise leave active
+ * clean pages behind after an apparently successful DONTNEED pair.  Establish
+ * read-only PTEs after the conservative source charge and immediately before
+ * disposal; the final exact mincore sample remains authoritative. */
+static int cuda_laguna_compact_page_establish_read_ptes_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t page_size,
+        const ds4_laguna_page_range *range) {
+    if (!ctx || !ctx->model_map || !range || page_size == 0u ||
+        (page_size & (page_size - 1u)) != 0u || range->bytes == 0u ||
+        (range->offset & (page_size - 1u)) != 0u ||
+        (range->bytes & (page_size - 1u)) != 0u ||
+        range->offset > ctx->model_size ||
+        range->bytes > ctx->model_size - range->offset) {
+        return 0;
+    }
+    const uint64_t range_end = range->offset + range->bytes;
+    const volatile unsigned char *model_bytes =
+        (const volatile unsigned char *)ctx->model_map;
+    for (uint64_t offset = range->offset; offset < range_end;
+         offset += page_size) {
+        (void)model_bytes[offset];
+    }
+    return 1;
+}
+
+static int cuda_laguna_compact_page_test_reset_locked(
+        ds4_gpu_laguna_compact *ctx) {
+#ifdef DS4_TEST_HOOKS
+    if (!ctx || !ctx->page_advice_test_reset_pending) return 1;
+    memset(ctx->page_advice_touched_ranges, 0,
+           ctx->page_advice_state_bytes);
+    ctx->page_advice_touched_range_count = 0;
+    ctx->page_advice_since_range_count = 0;
+    ctx->page_advice_advised_range_count = 0;
+    ctx->page_advice_touched_range_bytes = 0;
+    ctx->page_advice_since_range_bytes = 0;
+    ctx->page_advice_advised_range_bytes = 0;
+    memset(&ctx->page_advice_counters, 0,
+           sizeof(ctx->page_advice_counters));
+    memset(&ctx->page_advice_fadvise_counters, 0,
+           sizeof(ctx->page_advice_fadvise_counters));
+    memset(&ctx->page_advice_madvise_counters, 0,
+           sizeof(ctx->page_advice_madvise_counters));
+    ctx->page_advice_mapping_touch_pages = 0;
+    ctx->page_advice_mapping_touch_bytes = 0;
+    ctx->page_advice_prior_post_resident_valid = 1;
+    ctx->page_advice_prior_post_resident_bytes = 0;
+    ctx->page_advice_precharge_source_resident_bytes = 0;
+    ctx->page_advice_post_source_resident_bytes = 0;
+    ctx->page_advice_sequence_clock = 0;
+    ctx->page_advice_upload_completed_sequence = 0;
+    ctx->page_advice_precharge_sequence = 0;
+    ctx->page_advice_mapping_touch_sequence = 0;
+    ctx->page_advice_attempt_sequence = 0;
+    ctx->page_advice_post_sample_sequence = 0;
+    ctx->page_advice_complete_sequence = 0;
+    ctx->page_advice_complete_monotonic_ns = 0;
+    ctx->page_advice_test_reset_pending = 0;
+    return ds4_runtime_tracker_checkpoint_model_source(ctx->tracker, 0) ==
+        DS4_RUNTIME_STATUS_OK;
+#else
+    (void)ctx;
+    return 1;
+#endif
+}
+
+/* The compact mutex must be held and every submitted source consumer must
+ * already be synchronized or drained.  Advice failures are diagnostic and
+ * nonfatal; sampling, accounting, identity, or tracker failures are unsafe. */
+static int cuda_laguna_compact_page_dispose_locked(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t page_size,
+        int sample_pre,
+        int injected,
+        uint64_t injected_pre,
+        uint64_t injected_post,
+        int injected_fadvise_errno,
+        int injected_madvise_errno,
+        ds4_runtime_request_context *request_staged,
+        int *request_touched,
+        int *request_stage_failed) {
+    if (!ctx || ctx->page_advice_since_range_count == 0) return 1;
+    struct stat before;
+    struct stat after;
+    uint64_t exact_pre = 0;
+    uint64_t exact_post = 0;
+    if (!cuda_laguna_compact_page_sequence_next(
+            ctx, &ctx->page_advice_upload_completed_sequence) ||
+        !cuda_laguna_compact_identity_matches(
+            ctx->model_fd, ctx->model_size, &ctx->model_identity, &before) ||
+        (!injected && sample_pre &&
+         !cuda_laguna_compact_page_sample_exact_locked(
+            ctx, page_size, &exact_pre))) {
+        return 0;
+    }
+    if (injected) exact_pre = injected_pre;
+    uint64_t charge = 0;
+    if (!ds4_laguna_page_conservative_source_charge(
+            ctx->model_size,
+            ctx->page_advice_prior_post_resident_valid ?
+                ctx->page_advice_prior_post_resident_bytes : 0,
+            ctx->page_advice_since_range_bytes,
+            injected || sample_pre, exact_pre, &charge) ||
+        ds4_runtime_tracker_checkpoint_model_source(
+            ctx->tracker, charge) != DS4_RUNTIME_STATUS_OK ||
+        !cuda_laguna_compact_page_sequence_next(
+            ctx, &ctx->page_advice_precharge_sequence)) {
+        return 0;
+    }
+    ctx->page_advice_precharge_source_resident_bytes = charge;
+    if (!injected) {
+        uint64_t touch_pages = 0;
+        uint64_t touch_bytes = 0;
+        for (size_t i = 0; i < ctx->page_advice_since_range_count; i++) {
+            const ds4_laguna_page_range *range =
+                &ctx->page_advice_since_ranges[i];
+            if (range->offset > (uint64_t)INT64_MAX ||
+                range->bytes > (uint64_t)INT64_MAX - range->offset ||
+                range->offset > ctx->model_size ||
+                range->bytes > ctx->model_size - range->offset ||
+                range->bytes > SIZE_MAX || range->bytes == 0u ||
+                (range->offset & (page_size - 1u)) != 0u ||
+                (range->bytes & (page_size - 1u)) != 0u ||
+                touch_bytes > UINT64_MAX - range->bytes ||
+                touch_pages > UINT64_MAX - range->bytes / page_size) {
+                return 0;
+            }
+            touch_bytes += range->bytes;
+            touch_pages += range->bytes / page_size;
+        }
+        if (ctx->page_advice_mapping_touch_bytes >
+                UINT64_MAX - touch_bytes ||
+            ctx->page_advice_mapping_touch_pages >
+                UINT64_MAX - touch_pages ||
+            ctx->page_advice_sequence_clock == UINT64_MAX) {
+            return 0;
+        }
+        for (size_t i = 0; i < ctx->page_advice_since_range_count; i++) {
+            const ds4_laguna_page_range *range =
+                &ctx->page_advice_since_ranges[i];
+            if (!cuda_laguna_compact_page_establish_read_ptes_locked(
+                    ctx, page_size, range)) {
+                return 0;
+            }
+        }
+        ctx->page_advice_mapping_touch_pages += touch_pages;
+        ctx->page_advice_mapping_touch_bytes += touch_bytes;
+        if (!cuda_laguna_compact_page_sequence_next(
+                ctx, &ctx->page_advice_mapping_touch_sequence)) {
+            return 0;
+        }
+    }
+    if (!cuda_laguna_compact_page_sequence_next(
+            ctx, &ctx->page_advice_attempt_sequence)) {
+        return 0;
+    }
+    int fadvise_fault_pending = injected_fadvise_errno;
+    int madvise_fault_pending = injected_madvise_errno;
+    for (size_t i = 0; i < ctx->page_advice_since_range_count; i++) {
+        const ds4_laguna_page_range *range =
+            &ctx->page_advice_since_ranges[i];
+        if (range->offset > (uint64_t)INT64_MAX ||
+            range->bytes > (uint64_t)INT64_MAX - range->offset ||
+            range->offset > ctx->model_size ||
+            range->bytes > ctx->model_size - range->offset ||
+            range->bytes > SIZE_MAX) {
+            return 0;
+        }
+        /* Drop the mapping PTE first, then ask the inode cache to discard
+         * clean pages.  Reversing this order can leave a page pinned by the
+         * still-live mapping PTE even though both calls report success. */
+        int madvise_error = 0;
+        if (injected) {
+            madvise_error = madvise_fault_pending;
+            madvise_fault_pending = 0;
+        } else {
+#if defined(MADV_DONTNEED)
+            if (madvise(
+                    (char *)ctx->model_map + range->offset,
+                    (size_t)range->bytes, MADV_DONTNEED) != 0) {
+                madvise_error = errno != 0 ? errno : EIO;
+            }
+#else
+            madvise_error = ENOTSUP;
+#endif
+        }
+        if (!cuda_laguna_compact_page_note_syscall_locked(
+                ctx, &ctx->page_advice_madvise_counters,
+                page_size, range, madvise_error,
+                request_staged, request_touched,
+                request_stage_failed)) {
+            return 0;
+        }
+
+        int fadvise_error = 0;
+        if (injected) {
+            fadvise_error = fadvise_fault_pending;
+            fadvise_fault_pending = 0;
+        } else {
+#if defined(POSIX_FADV_DONTNEED)
+            fadvise_error = posix_fadvise(
+                ctx->model_fd, (off_t)range->offset,
+                (off_t)range->bytes, POSIX_FADV_DONTNEED);
+#else
+            fadvise_error = ENOTSUP;
+#endif
+        }
+        if (!cuda_laguna_compact_page_note_syscall_locked(
+                ctx, &ctx->page_advice_fadvise_counters,
+                page_size, range, fadvise_error,
+                request_staged, request_touched,
+                request_stage_failed)) {
+            return 0;
+        }
+    }
+    if ((!injected && !cuda_laguna_compact_page_sample_exact_locked(
+            ctx, page_size, &exact_post)) ||
+        !cuda_laguna_compact_identity_matches(
+            ctx->model_fd, ctx->model_size, &ctx->model_identity, &after)) {
+        return 0;
+    }
+    if (injected) exact_post = injected_post;
+    if (ds4_runtime_tracker_checkpoint_model_source(
+            ctx->tracker, exact_post) != DS4_RUNTIME_STATUS_OK ||
+        !cuda_laguna_compact_page_sequence_next(
+            ctx, &ctx->page_advice_post_sample_sequence)) {
+        return 0;
+    }
+    ctx->page_advice_prior_post_resident_valid = 1;
+    ctx->page_advice_prior_post_resident_bytes = exact_post;
+    ctx->page_advice_post_source_resident_bytes = exact_post;
+    memset(ctx->page_advice_since_ranges, 0,
+           ctx->page_advice_since_range_count *
+               sizeof(ctx->page_advice_since_ranges[0]));
+    ctx->page_advice_since_range_count = 0;
+    ctx->page_advice_since_range_bytes = 0;
+    if (!cuda_laguna_compact_page_sequence_next(
+            ctx, &ctx->page_advice_complete_sequence)) {
+        return 0;
+    }
+    ctx->page_advice_complete_monotonic_ns =
+        cuda_laguna_compact_monotonic_ns_after(
+            ctx->page_advice_complete_monotonic_ns);
+    return 1;
+}
+
+static int cuda_laguna_compact_page_flush_locked(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t default_page_size,
+        int sample_pre) {
+    if (!ctx || ctx->page_advice_since_range_count == 0) return 1;
+    int injected = 0;
+    uint64_t page_size = default_page_size;
+    uint64_t exact_pre = 0;
+    uint64_t exact_post = 0;
+    int fadvise_error = 0;
+    int madvise_error = 0;
+#ifdef DS4_TEST_HOOKS
+    if (ctx->page_advice_test_injection_armed) {
+        injected = 1;
+        page_size = ctx->page_advice_test_page_size;
+        exact_pre = ctx->page_advice_test_exact_pre_resident_bytes;
+        exact_post = ctx->page_advice_test_exact_post_resident_bytes;
+        fadvise_error = ctx->page_advice_test_fadvise_errno;
+        madvise_error = ctx->page_advice_test_madvise_errno;
+        ctx->page_advice_test_injection_armed = 0;
+    }
+#endif
+    ds4_runtime_request_context request_staged;
+    ds4_runtime_request_context *request_stage = NULL;
+    if (ctx->active_request) {
+        request_staged = *ctx->active_request;
+        request_stage = &request_staged;
+    }
+    int request_touched = 0;
+    int request_stage_failed = 0;
+    const int disposed = cuda_laguna_compact_page_dispose_locked(
+        ctx, page_size, sample_pre, injected, exact_pre, exact_post,
+        fadvise_error, madvise_error, request_stage,
+        &request_touched, &request_stage_failed);
+    if (request_stage && request_touched && !request_stage_failed &&
+        disposed && !ds4_runtime_request_observe_page_advice(
+            request_stage, ctx->page_advice_complete_monotonic_ns)) {
+        request_stage_failed = 1;
+    }
+    if (request_stage && request_touched && !request_stage_failed &&
+        disposed) {
+        *ctx->active_request = *request_stage;
+    }
+    if (request_stage && request_touched &&
+        (request_stage_failed || !disposed)) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    return disposed;
+}
+
+static int cuda_laguna_compact_page_flush_pending_locked(
+        ds4_gpu_laguna_compact *ctx,
+        int sample_pre) {
+    if (!ctx || ctx->page_advice_since_range_count == 0) return 1;
+    uint64_t page_size = 0;
+    return cuda_laguna_compact_system_page_size(&page_size) &&
+        cuda_laguna_compact_page_flush_locked(
+        ctx, page_size, sample_pre);
+}
+
+static int cuda_laguna_compact_tracker_record_dead(
+        const ds4_runtime_tracker *tracker,
+        uint64_t record_id,
+        ds4_runtime_relation expected_relation) {
+    if (!tracker || !tracker->records || record_id == 0u ||
+        tracker->record_count > tracker->record_capacity) {
+        return 0;
+    }
+    size_t matches = 0u;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *record = &tracker->records[i];
+        if (record->id != record_id) continue;
+        matches++;
+        if (record->live || record->relation != expected_relation) return 0;
+    }
+    return matches == 1u;
+}
+
+/* Runtime violations are historical and deliberately sticky.  Release still
+ * mutates a structurally valid record before returning UNSAFE, so teardown
+ * accepts that status only when the exact record is now uniquely dead. */
+static int cuda_laguna_compact_tracker_release_record(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t record_id) {
+    if (!ctx || !ctx->tracker) return 0;
+    const ds4_runtime_status result =
+        ds4_runtime_tracker_release(ctx->tracker, record_id);
+    return result == DS4_RUNTIME_STATUS_OK ||
+        cuda_laguna_compact_tracker_record_dead(
+            ctx->tracker, record_id,
+            DS4_RUNTIME_RELATION_OWNED_ALLOCATION);
+}
+
+static int cuda_laguna_compact_tracker_unmap_record(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t record_id) {
+    if (!ctx || !ctx->tracker) return 0;
+    const ds4_runtime_status result =
+        ds4_runtime_tracker_unmap_model(ctx->tracker, record_id);
+    return result == DS4_RUNTIME_STATUS_OK ||
+        cuda_laguna_compact_tracker_record_dead(
+            ctx->tracker, record_id,
+            DS4_RUNTIME_RELATION_MODEL_MAPPING);
+}
+
+/* g_laguna_compact_mutex must be held.  Physical allocations are destroyed
+ * before their tracker records are released, so accounting never claims a
+ * live object has disappeared while CUDA or the host allocator still owns it. */
+static int cuda_laguna_compact_release_locked(
+        ds4_gpu_laguna_compact *ctx) {
+    if (!ctx) return 1;
+#ifdef DS4_TEST_HOOKS
+    uint64_t pending =
+        g_laguna_compact_fail_release_count.load(std::memory_order_relaxed);
+    while (pending != 0) {
+        if (g_laguna_compact_fail_release_count.compare_exchange_weak(
+                pending, pending - 1u, std::memory_order_relaxed)) {
+            return 0;
+        }
+    }
+#endif
+    if (ctx->cache_policy_live) {
+        const ds4_laguna_cache_status drained =
+            ds4_laguna_cache_policy_drain(&ctx->cache_policy);
+        if (drained != DS4_LAGUNA_CACHE_OK) return 0;
+        ctx->cache_policy_live = 0;
+    }
+    if (!cuda_laguna_compact_page_flush_pending_locked(ctx, 0)) {
+        return 0;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if (ctx->pinned_staging_events[i]) {
+            const cudaError_t error =
+                cudaEventDestroy(ctx->pinned_staging_events[i]);
+            if (error != cudaSuccess) {
+                (void)cudaGetLastError();
+                return 0;
+            }
+            ctx->pinned_staging_events[i] = NULL;
+        }
+    }
+    if (ctx->upload_stream) {
+        const cudaError_t error = cudaStreamDestroy(ctx->upload_stream);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        ctx->upload_stream = NULL;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if (ctx->pinned_staging[i]) {
+            const cudaError_t error = cudaFreeHost(ctx->pinned_staging[i]);
+            if (error != cudaSuccess) {
+                (void)cudaGetLastError();
+                return 0;
+            }
+            ctx->pinned_staging[i] = NULL;
+        }
+        if (ctx->tracker_pinned_staging_live[i]) {
+            if (!cuda_laguna_compact_tracker_release_record(
+                    ctx, ctx->pinned_staging_ids[i])) {
+                return 0;
+            }
+            ctx->tracker_pinned_staging_live[i] = 0;
+        }
+    }
+    if (ctx->device_entry_to_slot) {
+        const cudaError_t error = cudaFree(ctx->device_entry_to_slot);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        ctx->device_entry_to_slot = NULL;
+    }
+    if (ctx->tracker_device_entry_to_slot_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->device_entry_to_slot_id)) {
+            return 0;
+        }
+        ctx->tracker_device_entry_to_slot_live = 0;
+    }
+    free(ctx->cache_slots);
+    ctx->cache_slots = NULL;
+    if (ctx->tracker_cache_slots_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->cache_slots_id)) {
+            return 0;
+        }
+        ctx->tracker_cache_slots_live = 0;
+    }
+    free(ctx->entry_to_slot);
+    ctx->entry_to_slot = NULL;
+    if (ctx->tracker_entry_to_slot_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->entry_to_slot_id)) {
+            return 0;
+        }
+        ctx->tracker_entry_to_slot_live = 0;
+    }
+    free(ctx->route_hotness);
+    ctx->route_hotness = NULL;
+    if (ctx->tracker_route_hotness_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->route_hotness_id)) {
+            return 0;
+        }
+        ctx->tracker_route_hotness_live = 0;
+    }
+    if (ctx->cache_payload) {
+        const cudaError_t error = cudaFree(ctx->cache_payload);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        ctx->cache_payload = NULL;
+    }
+    if (ctx->tracker_cache_payload_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->cache_payload_id)) {
+            return 0;
+        }
+        ctx->tracker_cache_payload_live = 0;
+    }
+    free(ctx->page_advice_state);
+    ctx->page_advice_state = NULL;
+    ctx->page_advice_touched_ranges = NULL;
+    ctx->page_advice_since_ranges = NULL;
+    ctx->page_advice_advised_ranges = NULL;
+    if (ctx->tracker_page_advice_state_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->page_advice_state_id)) {
+            return 0;
+        }
+        ctx->tracker_page_advice_state_live = 0;
+    }
+    if (ctx->static_slab) {
+        const cudaError_t error = cudaFree(ctx->static_slab);
+        if (error != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: compact Laguna static slab release failed: %s\n",
+                    cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        ctx->static_slab = NULL;
+    }
+    if (ctx->tracker_static_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->static_id)) {
+            fprintf(stderr,
+                    "ds4: compact Laguna static tracker release failed\n");
+            return 0;
+        }
+        ctx->tracker_static_live = 0;
+    }
+    free(ctx->static_offsets);
+    ctx->static_offsets = NULL;
+    if (ctx->tracker_offsets_live) {
+        if (!cuda_laguna_compact_tracker_release_record(
+                ctx, ctx->offsets_id)) {
+            fprintf(stderr,
+                    "ds4: compact Laguna offset tracker release failed\n");
+            return 0;
+        }
+        ctx->tracker_offsets_live = 0;
+    }
+    if (ctx->tracker &&
+        ctx->tracker->violation !=
+            DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION &&
+        ds4_runtime_tracker_checkpoint_external(
+            ctx->tracker, 0, 0, 0) !=
+            DS4_RUNTIME_STATUS_OK) {
+        return 0;
+    }
+    if (ctx->tracker_mapping_live) {
+        if (!cuda_laguna_compact_tracker_unmap_record(
+                ctx, ctx->mapping_id)) {
+            fprintf(stderr,
+                    "ds4: compact Laguna model-map tracker release failed\n");
+            return 0;
+        }
+        ctx->tracker_mapping_live = 0;
+    }
+    uint64_t ledger_array_parts[3] = {0};
+    uint64_t ledger_array_bytes = 0;
+    if ((ctx->baseline_live_record_count != 3 &&
+         ctx->baseline_live_record_count != 9) ||
+        !cuda_laguna_compact_ledger_array_sizes(
+            ctx->ledger, ledger_array_parts, &ledger_array_bytes) ||
+        !cuda_laguna_compact_tracker_has_baseline(
+            ctx->tracker, ctx->ledger, ledger_array_bytes,
+            ctx->baseline_live_record_count, 0,
+            ctx->tracker->violation ==
+                DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION,
+            NULL)) {
+        fprintf(stderr,
+                "ds4: compact Laguna baseline tracker reconciliation failed\n");
+        return 0;
+    }
+    if (ctx->model_fd >= 0) {
+        if (close(ctx->model_fd) != 0) {
+            fprintf(stderr,
+                    "ds4: compact Laguna model descriptor close failed: %s\n",
+                    strerror(errno));
+            return 0;
+        }
+        ctx->model_fd = -1;
+    }
+    return 1;
+}
+
+static int cuda_laguna_compact_reserve_tracker_ids(
+        ds4_gpu_laguna_compact *ctx,
+        int cache_enabled) {
+    const uint64_t sequence_mask = UINT64_C(0x00ffffffffffffff);
+    const uint64_t count = cache_enabled ? 13u : 3u;
+    uint64_t first =
+        g_laguna_compact_next_tracker_id.load(std::memory_order_relaxed);
+    for (;;) {
+        if ((uint8_t)(first >> 56) != 0x4du ||
+            (first & sequence_mask) > sequence_mask - (count - 1u)) {
+            return 0;
+        }
+        if (g_laguna_compact_next_tracker_id.compare_exchange_weak(
+                first, first + count, std::memory_order_relaxed)) {
+            ctx->offsets_id = first;
+            ctx->static_id = first + 1u;
+            ctx->mapping_id = first + 2u;
+            if (cache_enabled) {
+                ctx->page_advice_state_id = first + 3u;
+                ctx->cache_payload_id = first + 4u;
+                ctx->route_hotness_id = first + 5u;
+                ctx->entry_to_slot_id = first + 6u;
+                ctx->device_entry_to_slot_id = first + 7u;
+                ctx->cache_slots_id = first + 8u;
+                for (size_t i = 0; i < 4; i++) {
+                    ctx->pinned_staging_ids[i] = first + 9u + i;
+                }
+            }
+            return 1;
+        }
+    }
+}
+
+/* g_laguna_compact_mutex must be held.  The mapping tracker record already
+ * exists, so every cache owner appends in its reserved-ID order. */
+static int cuda_laguna_compact_cache_create_locked(
+        ds4_gpu_laguna_compact *ctx,
+        const cuda_laguna_compact_cache_geometry *geometry) {
+    if (!ctx || !geometry) return 0;
+    if (!geometry->enabled) return 1;
+
+    if (!cuda_laguna_compact_host_allocate(
+            ctx, &ctx->page_advice_state,
+            geometry->page_state_bytes, ctx->page_advice_state_id,
+            DS4_LAGUNA_CALLSITE_OTHER_HOST_TRACKER,
+            &ctx->tracker_page_advice_state_live)) {
+        return 0;
+    }
+    memset(ctx->page_advice_state, 0, (size_t)geometry->page_state_bytes);
+    ctx->page_advice_state_bytes = geometry->page_state_bytes;
+    ctx->page_advice_touched_range_capacity =
+        (size_t)geometry->page_range_capacity;
+    ctx->page_advice_since_range_capacity =
+        (size_t)geometry->page_range_capacity;
+    ctx->page_advice_advised_range_capacity =
+        (size_t)geometry->page_range_capacity;
+    ctx->page_advice_touched_ranges =
+        (ds4_laguna_page_range *)ctx->page_advice_state;
+    ctx->page_advice_since_ranges = ctx->page_advice_touched_ranges +
+        geometry->page_range_capacity;
+    ctx->page_advice_advised_ranges = ctx->page_advice_since_ranges +
+        geometry->page_range_capacity;
+
+    ctx->cache_payload_allocation_attempts++;
+    if (!cuda_laguna_compact_device_allocate(
+            ctx, (void **)&ctx->cache_payload,
+            geometry->payload_bytes, ctx->cache_payload_id,
+            DS4_LAGUNA_CALLSITE_EXPERT_CACHE_PAYLOAD,
+            &ctx->tracker_cache_payload_live)) {
+        return 0;
+    }
+    ctx->cache_payload_bytes = geometry->payload_bytes;
+    if (!cuda_laguna_compact_host_allocate(
+            ctx, (void **)&ctx->route_hotness,
+            geometry->route_hotness_bytes, ctx->route_hotness_id,
+            DS4_LAGUNA_CALLSITE_ROUTE_HOTNESS,
+            &ctx->tracker_route_hotness_live) ||
+        !cuda_laguna_compact_host_allocate(
+            ctx, (void **)&ctx->entry_to_slot,
+            geometry->entry_to_slot_bytes, ctx->entry_to_slot_id,
+            DS4_LAGUNA_CALLSITE_HOST_ENTRY_TO_SLOT,
+            &ctx->tracker_entry_to_slot_live) ||
+        !cuda_laguna_compact_device_allocate(
+            ctx, (void **)&ctx->device_entry_to_slot,
+            geometry->device_entry_to_slot_bytes,
+            ctx->device_entry_to_slot_id,
+            DS4_LAGUNA_CALLSITE_DEVICE_ENTRY_TO_SLOT,
+            &ctx->tracker_device_entry_to_slot_live) ||
+        !cuda_laguna_compact_host_allocate(
+            ctx, (void **)&ctx->cache_slots,
+            geometry->slot_state_bytes, ctx->cache_slots_id,
+            DS4_LAGUNA_CALLSITE_SLOT_STATE,
+            &ctx->tracker_cache_slots_live)) {
+        return 0;
+    }
+    cudaError_t error = cudaMemset(
+        ctx->device_entry_to_slot, 0xff,
+        (size_t)geometry->device_entry_to_slot_bytes);
+    if (error != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (ds4_laguna_cache_policy_init(
+            &ctx->cache_policy,
+            ctx->ledger->expert_entries,
+            (size_t)ctx->ledger->expert_entry_count,
+            ctx->cache_slots,
+            ctx->plan->slot_count,
+            ctx->route_hotness,
+            ctx->entry_to_slot,
+            ctx->plan->slot_count) != DS4_LAGUNA_CACHE_OK) {
+        return 0;
+    }
+    ctx->cache_policy_live = 1;
+
+    /* CUDA owns opaque stream/event bookkeeping.  Its bytes have no stable
+     * allocation size to charge here and remain library-unattributed in the
+     * process inventory; every explicit buffer is tracker-owned above. */
+    error = cudaStreamCreateWithFlags(
+        &ctx->upload_stream, cudaStreamNonBlocking);
+    if (error != cudaSuccess || !ctx->upload_stream) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        ctx->pinned_staging_allocation_attempts++;
+        if (!cuda_laguna_compact_pinned_allocate(
+                ctx, &ctx->pinned_staging[i],
+                ctx->plan->staging_buffer_bytes,
+                ctx->pinned_staging_ids[i],
+                DS4_LAGUNA_CALLSITE_PINNED_STAGING_0 + (uint32_t)i,
+                &ctx->tracker_pinned_staging_live[i])) {
+            return 0;
+        }
+        error = cudaEventCreateWithFlags(
+            &ctx->pinned_staging_events[i], cudaEventDisableTiming);
+        if (error != cudaSuccess || !ctx->pinned_staging_events[i]) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* g_laguna_compact_mutex must be held and state must be CREATING. */
+static void cuda_laguna_compact_create_unwind_locked(
+        ds4_gpu_laguna_compact *ctx) {
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_RELEASING, std::memory_order_release);
+    ctx->release_attempt_count++;
+    if (!cuda_laguna_compact_release_locked(ctx)) {
+        return;
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
+}
+
+#ifdef DS4_TEST_HOOKS
+static void cuda_laguna_compact_pause_creating_if_armed(
+        std::unique_lock<std::recursive_mutex> *compact_lock) {
+    std::unique_lock<std::mutex> pause_lock(
+        g_laguna_compact_creating_pause_mutex);
+    if (!g_laguna_compact_creating_pause_armed) return;
+
+    g_laguna_compact_creating_paused = true;
+    compact_lock->unlock();
+    g_laguna_compact_creating_pause_condition.notify_all();
+    g_laguna_compact_creating_pause_condition.wait(
+        pause_lock, [] { return g_laguna_compact_creating_resume; });
+    g_laguna_compact_creating_pause_armed = false;
+    g_laguna_compact_creating_paused = false;
+    g_laguna_compact_creating_resume = false;
+    g_laguna_compact_creating_pause_condition.notify_all();
+    pause_lock.unlock();
+    compact_lock->lock();
+}
+#endif
+
+static void cuda_laguna_compact_counter_add(
+        uint64_t *counter, uint64_t amount);
+
+extern "C" int ds4_gpu_laguna_compact_create(
+        ds4_gpu_laguna_compact **out,
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        ds4_runtime_tracker *tracker) {
+    if (out) *out = NULL;
+    if (!out) return 0;
+#ifdef DS4_TEST_HOOKS
+    std::unique_lock<std::recursive_mutex> guard(g_laguna_compact_mutex);
+#else
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+#endif
+    int expected = DS4_LAGUNA_COMPACT_IDLE;
+    if (!g_laguna_compact_state.compare_exchange_strong(
+            expected, DS4_LAGUNA_COMPACT_CREATING,
+            std::memory_order_acq_rel)) return 0;
+
+    ds4_gpu_laguna_compact *ctx = &g_laguna_compact_storage;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->model_fd = -1;
+    ctx->legacy_full_map_register_bytes_base =
+        g_laguna_compact_legacy_full_map_register_bytes.load(
+            std::memory_order_relaxed);
+    ctx->legacy_whole_model_copy_bytes_base =
+        g_laguna_compact_legacy_whole_model_copy_bytes.load(
+            std::memory_order_relaxed);
+    ctx->legacy_range_bytes_base =
+        g_laguna_compact_legacy_range_bytes.load(std::memory_order_relaxed);
+    ctx->legacy_range_attempts_base =
+        g_laguna_compact_legacy_range_attempts.load(
+            std::memory_order_relaxed);
+    ctx->legacy_arena_attempts_base =
+        g_laguna_compact_legacy_arena_attempts.load(
+            std::memory_order_relaxed);
+#ifdef DS4_TEST_HOOKS
+    cuda_laguna_compact_pause_creating_if_armed(&guard);
+#endif
+    const int owned_fd = fcntl(model_fd, F_DUPFD_CLOEXEC, 0);
+    uint64_t static_offset_bytes = 0;
+    uint64_t baseline_tracked_cuda_physical_bytes = 0;
+    size_t baseline_live_record_count = 0;
+    cuda_laguna_compact_cache_geometry cache_geometry;
+    ds4_gpu_nvml_inventory_snapshot nvml_baseline;
+    memset(&nvml_baseline, 0, sizeof(nvml_baseline));
+    memset(&cache_geometry, 0, sizeof(cache_geometry));
+    if (owned_fd < 0 || !cuda_laguna_compact_environment_allowed() ||
+        !cuda_laguna_compact_validate(
+            owned_fd, model_map, model_size, model_identity,
+            ledger, plan, tracker,
+            &static_offset_bytes, &baseline_live_record_count,
+            &cache_geometry) ||
+        !cuda_laguna_compact_source_set_random_access_locked(
+            owned_fd, model_map, model_size, model_identity)) {
+        if (owned_fd >= 0) (void)close(owned_fd);
+        g_laguna_compact_state.store(
+            DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
+        return 0;
+    }
+    if (!cuda_laguna_tracker_cuda_physical_bytes(
+            tracker, &baseline_tracked_cuda_physical_bytes) ||
+        baseline_tracked_cuda_physical_bytes != 0u ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        !ds4_gpu_nvml_inventory_capture(&nvml_baseline) ||
+        !cuda_laguna_cuda_uuid_matches_nvml(
+            0, nvml_baseline.device_uuid)) {
+        if (owned_fd >= 0) (void)close(owned_fd);
+        (void)cudaGetLastError();
+        g_laguna_compact_state.store(
+            DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
+        return 0;
+    }
+    const uint32_t own_pid = (uint32_t)getpid();
+    const ds4_runtime_nvml_process_sample *baseline_process =
+        cuda_laguna_nvml_find_process(&nvml_baseline, own_pid);
+    if (own_pid == 0u || !baseline_process ||
+        !baseline_process->used_bytes_known) {
+        (void)close(owned_fd);
+        g_laguna_compact_state.store(
+            DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
+        return 0;
+    }
+
+    ctx->model_fd = owned_fd;
+    ctx->model_map = model_map;
+    ctx->model_size = model_size;
+    ctx->model_identity = *model_identity;
+    ctx->ledger = ledger;
+    ctx->plan = plan;
+    ctx->tracker = tracker;
+    ctx->nvml_baseline = nvml_baseline;
+    ctx->baseline_tracked_cuda_physical_bytes =
+        baseline_tracked_cuda_physical_bytes;
+    ctx->nvml_baseline_valid = 1;
+    ctx->static_slab_bytes = ledger->static_aligned_device_bytes;
+    ctx->static_offset_count = ledger->tensor_range_count;
+    ctx->static_offset_bytes = static_offset_bytes;
+    ctx->baseline_live_record_count = baseline_live_record_count;
+#ifdef DS4_TEST_HOOKS
+    if (g_laguna_compact_fail_after_identity.exchange(
+            false, std::memory_order_relaxed)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+#endif
+    if (!cuda_laguna_compact_reserve_tracker_ids(
+            ctx, cache_geometry.enabled)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+    if (!cuda_laguna_compact_host_allocate(
+            ctx, (void **)&ctx->static_offsets,
+            static_offset_bytes, ctx->offsets_id,
+            DS4_LAGUNA_CALLSITE_STATIC_OFFSETS,
+            &ctx->tracker_offsets_live)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+    for (size_t i = 0; i < ledger->tensor_range_count; i++) {
+        ctx->static_offsets[i] = UINT64_MAX;
+    }
+    g_laguna_compact_static_allocation_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (!cuda_laguna_compact_device_allocate(
+            ctx, (void **)&ctx->static_slab,
+            ctx->static_slab_bytes, ctx->static_id,
+            DS4_LAGUNA_CALLSITE_STATIC_SLAB,
+            &ctx->tracker_static_live)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+
+    if (ds4_runtime_tracker_map_model(
+            tracker, ctx->mapping_id,
+            (uint64_t)(uintptr_t)model_map, model_size) !=
+            DS4_RUNTIME_STATUS_OK) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+    ctx->tracker_mapping_live = 1;
+    if (!cuda_laguna_compact_cache_create_locked(
+            ctx, &cache_geometry)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+
+    uint64_t page_size = 0;
+    struct stat page_sample_before;
+    struct stat page_sample_after;
+    if (ctx->page_advice_state &&
+        (!cuda_laguna_compact_identity_matches(
+             ctx->model_fd, ctx->model_size, &ctx->model_identity,
+             &page_sample_before) ||
+         !cuda_laguna_compact_system_page_size(&page_size) ||
+         !cuda_laguna_compact_page_sample_exact_locked(
+             ctx, page_size,
+             &ctx->page_advice_prior_post_resident_bytes) ||
+         !cuda_laguna_compact_identity_matches(
+             ctx->model_fd, ctx->model_size, &ctx->model_identity,
+             &page_sample_after))) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+    if (ctx->page_advice_state) {
+        ctx->page_advice_prior_post_resident_valid = 1;
+        ctx->page_advice_post_source_resident_bytes =
+            ctx->page_advice_prior_post_resident_bytes;
+        if (!cuda_laguna_compact_page_sequence_next(
+                ctx, &ctx->page_advice_post_sample_sequence)) {
+            cuda_laguna_compact_create_unwind_locked(ctx);
+            return 0;
+        }
+    }
+
+    const uint64_t static_flush_bytes = UINT64_C(512) << 20;
+    cudaError_t error = cudaSuccess;
+    uint64_t device_cursor = 0;
+    for (size_t i = 0; i < ledger->tensor_range_count; i++) {
+        const ds4_laguna_tensor_range *range = &ledger->tensor_ranges[i];
+        if (range->tensor_class != DS4_LAGUNA_TENSOR_STATIC) continue;
+        uint64_t aligned = 0;
+        if (!cuda_laguna_compact_align_256(range->source_bytes, &aligned) ||
+            aligned > ctx->static_slab_bytes ||
+            device_cursor > ctx->static_slab_bytes - aligned) {
+            cuda_laguna_compact_create_unwind_locked(ctx);
+            return 0;
+        }
+        ctx->static_offsets[i] = device_cursor;
+        const uint64_t copy_started =
+            cuda_laguna_compact_monotonic_ns_after(0u);
+        error = cudaMemcpy(
+            ctx->static_slab + device_cursor,
+            (const char *)model_map + range->source_offset,
+            (size_t)range->source_bytes,
+            cudaMemcpyHostToDevice);
+        const uint64_t copy_finished =
+            cuda_laguna_compact_monotonic_ns_after(copy_started);
+        cuda_laguna_compact_counter_add(
+            &ctx->host_to_device_ns, copy_finished - copy_started);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_create_unwind_locked(ctx);
+            return 0;
+        }
+        cuda_laguna_compact_counter_add(
+            &ctx->host_to_device_bytes, range->source_bytes);
+        device_cursor += aligned;
+        ctx->static_source_copied_bytes += range->source_bytes;
+        ctx->static_range_count++;
+        if (ctx->page_advice_state &&
+            (!cuda_laguna_compact_page_promote_locked(
+                 ctx, page_size, range->source_offset,
+                 range->source_bytes) ||
+             (ctx->page_advice_since_range_bytes >= static_flush_bytes &&
+              !cuda_laguna_compact_page_flush_locked(
+                  ctx, page_size, 0)))) {
+            cuda_laguna_compact_create_unwind_locked(ctx);
+            return 0;
+        }
+    }
+    if (device_cursor != ctx->static_slab_bytes ||
+        ctx->static_source_copied_bytes != ledger->static_source_bytes ||
+        ctx->static_range_count != ledger->static_parent_count ||
+        (ctx->page_advice_state &&
+         !cuda_laguna_compact_page_flush_locked(ctx, page_size, 0))) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+#ifdef DS4_TEST_HOOKS
+    if (g_laguna_compact_fail_before_publish.exchange(
+            false, std::memory_order_relaxed)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+#endif
+    if (!cuda_laguna_compact_next_lifecycle_epoch(
+            &ctx->lifecycle_epoch)) {
+        cuda_laguna_compact_create_unwind_locked(ctx);
+        return 0;
+    }
+    ctx->active_load_phase = DS4_LAGUNA_CACHE_LOAD_NONE;
+    g_laguna_compact_cache_cancel_requested.store(
+        false, std::memory_order_release);
+    g_laguna_compact_published_epoch.store(
+        ctx->lifecycle_epoch, std::memory_order_release);
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_ACTIVE, std::memory_order_release);
+    *out = ctx;
+    return 1;
+}
+
+static ds4_gpu_laguna_destroy_status cuda_laguna_compact_destroy_checked(
+        ds4_gpu_laguna_compact *ctx) {
+    if (!ctx) return DS4_GPU_LAGUNA_DESTROY_OK;
+    const uint64_t entry_epoch = g_laguna_compact_published_epoch.load(
+        std::memory_order_acquire);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (ctx != &g_laguna_compact_storage) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state == DS4_LAGUNA_COMPACT_IDLE) {
+        return entry_epoch == 0 ? DS4_GPU_LAGUNA_DESTROY_OK :
+                                  DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    if (state == DS4_LAGUNA_COMPACT_RELEASING ||
+        state == DS4_LAGUNA_COMPACT_CREATING) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    if (state != DS4_LAGUNA_COMPACT_ACTIVE &&
+        state != DS4_LAGUNA_COMPACT_DESTROYING) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    if (entry_epoch == 0 || ctx->lifecycle_epoch != entry_epoch ||
+        g_laguna_compact_published_epoch.load(
+            std::memory_order_relaxed) != entry_epoch) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    if (ctx->cache_unsafe) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    if (ctx->active_execution_count != 0u) {
+        return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+    }
+    if (state == DS4_LAGUNA_COMPACT_ACTIVE &&
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE) {
+        return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+    }
+    if (state == DS4_LAGUNA_COMPACT_ACTIVE && ctx->cache_policy_live) {
+        const ds4_laguna_cache_status drained =
+            ds4_laguna_cache_policy_drain(&ctx->cache_policy);
+        if (drained == DS4_LAGUNA_CACHE_RECOVERABLE) {
+            return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+        }
+        if (drained != DS4_LAGUNA_CACHE_OK) {
+            ctx->cache_unsafe = 1;
+            return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+        }
+    }
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_DESTROYING, std::memory_order_release);
+    ctx->sync_attempt_count++;
+#ifdef DS4_TEST_HOOKS
+    uint64_t pending =
+        g_laguna_compact_fail_sync_count.load(std::memory_order_relaxed);
+    while (pending != 0) {
+        if (g_laguna_compact_fail_sync_count.compare_exchange_weak(
+                pending, pending - 1u, std::memory_order_relaxed)) {
+            return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+        }
+    }
+#endif
+    const cudaError_t sync_error = cudaDeviceSynchronize();
+    if (sync_error != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: compact Laguna teardown synchronization failed: %s\n",
+                cudaGetErrorString(sync_error));
+        (void)cudaGetLastError();
+        return DS4_GPU_LAGUNA_DESTROY_RECOVERABLE;
+    }
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_RELEASING, std::memory_order_release);
+    ctx->release_attempt_count++;
+    if (!cuda_laguna_compact_release_locked(ctx)) {
+        return DS4_GPU_LAGUNA_DESTROY_UNSAFE;
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    g_laguna_compact_published_epoch.store(0, std::memory_order_release);
+    g_laguna_compact_state.store(
+        DS4_LAGUNA_COMPACT_IDLE, std::memory_order_release);
+    return DS4_GPU_LAGUNA_DESTROY_OK;
+}
+
+extern "C" ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
+        ds4_gpu_laguna_compact *ctx) {
+    return cuda_laguna_compact_destroy_checked(ctx);
+}
+
+extern "C" bool ds4_gpu_laguna_compact_ownership_pending(
+        const ds4_runtime_tracker *tracker) {
+    if (!tracker) return false;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    return g_laguna_compact_state.load(std::memory_order_relaxed) !=
+               DS4_LAGUNA_COMPACT_IDLE &&
+           g_laguna_compact_storage.tracker == tracker;
+}
+
+static int cuda_laguna_nvml_snapshot_valid(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot) {
+    static const char expected_api_identity[] =
+        "nvmlDeviceGetComputeRunningProcesses_v2";
+    if (!snapshot || snapshot->api_version != 2u) return 0;
+    const char *const api_identity_end = (const char *)memchr(
+        snapshot->api_identity, '\0', sizeof(snapshot->api_identity));
+    if (!api_identity_end ||
+        api_identity_end != snapshot->api_identity +
+            sizeof(expected_api_identity) - 1u ||
+        memcmp(snapshot->api_identity, expected_api_identity,
+               sizeof(expected_api_identity)) != 0 ||
+        snapshot->library_version[0] == '\0' ||
+        memchr(snapshot->library_version, '\0',
+               sizeof(snapshot->library_version)) == NULL ||
+        snapshot->device_uuid[0] == '\0' ||
+        memchr(snapshot->device_uuid, '\0',
+               sizeof(snapshot->device_uuid)) == NULL ||
+        snapshot->process_count > DS4_GPU_NVML_PROCESS_CAPACITY) {
+        return 0;
+    }
+    for (size_t i = 0; i < snapshot->process_count; i++) {
+        if (snapshot->processes[i].pid == 0u) return 0;
+        for (size_t j = i + 1u; j < snapshot->process_count; j++) {
+            if (snapshot->processes[i].pid ==
+                snapshot->processes[j].pid) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+typedef struct {
+    int previous_device;
+    int target_device;
+    int armed;
+} cuda_laguna_checkpoint_device_scope;
+
+static int cuda_laguna_checkpoint_device_scope_enter(
+        cuda_laguna_checkpoint_device_scope *scope,
+        int target_device) {
+    if (!scope || target_device < 0) return 0;
+    memset(scope, 0, sizeof(*scope));
+    scope->previous_device = -1;
+    scope->target_device = target_device;
+    if (cudaGetDevice(&scope->previous_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (scope->previous_device != target_device &&
+        cudaSetDevice(target_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    scope->armed = 1;
+    return 1;
+}
+
+static int cuda_laguna_checkpoint_device_scope_leave(
+        cuda_laguna_checkpoint_device_scope *scope) {
+    if (!scope || !scope->armed || scope->previous_device < 0) return 0;
+    const int previous_device = scope->previous_device;
+    const int target_device = scope->target_device;
+    scope->armed = 0;
+    if (previous_device == target_device) return 1;
+    if (cudaSetDevice(scope->previous_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_laguna_read_smaps(char **text_out, size_t *bytes_out) {
+    if (!text_out || !bytes_out) return 0;
+    *text_out = NULL;
+    *bytes_out = 0;
+    const int fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    const size_t maximum = 32u * 1024u * 1024u;
+    size_t capacity = 1024u * 1024u;
+    char *text = (char *)malloc(capacity + 1u);
+    if (!text) {
+        (void)close(fd);
+        return 0;
+    }
+    size_t used = 0;
+    int ok = 1;
+    for (;;) {
+        if (used == capacity) {
+            if (capacity >= maximum) {
+                ok = 0;
+                break;
+            }
+            size_t next = capacity * 2u;
+            if (next > maximum) next = maximum;
+            char *grown = (char *)realloc(text, next + 1u);
+            if (!grown) {
+                ok = 0;
+                break;
+            }
+            text = grown;
+            capacity = next;
+        }
+        const ssize_t count = read(fd, text + used, capacity - used);
+        if (count > 0) {
+            used += (size_t)count;
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        ok = 0;
+        break;
+    }
+    if (close(fd) != 0) ok = 0;
+    if (!ok || used == 0 || memchr(text, '\0', used) != NULL) {
+        free(text);
+        return 0;
+    }
+    text[used] = '\0';
+    *text_out = text;
+    *bytes_out = used;
+    return 1;
+}
+
+static ds4_runtime_status cuda_laguna_external_checkpoint_fail(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    if (out) memset(&out->sample, 0, sizeof(out->sample));
+    if (!ctx || !ctx->tracker || !out) return DS4_RUNTIME_STATUS_UNSAFE;
+    ds4_runtime_external_checkpoint_input invalid;
+    memset(&invalid, 0, sizeof(invalid));
+    return ds4_runtime_tracker_checkpoint_attributed(
+        ctx->tracker, &invalid, &out->sample);
+}
+
+static int cuda_laguna_external_checkpoint_enter(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t *execution_epoch) {
+    if (execution_epoch) *execution_epoch = 0u;
+    if (!ctx || !execution_epoch) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const uint64_t epoch = g_laguna_compact_published_epoch.load(
+        std::memory_order_acquire);
+    if (ctx != &g_laguna_compact_storage || epoch == 0u ||
+        ctx->lifecycle_epoch != epoch ||
+        g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE ||
+        ctx->cache_unsafe || !ctx->tracker ||
+        !ctx->nvml_baseline_valid ||
+        ctx->baseline_tracked_cuda_physical_bytes != 0u ||
+        ctx->active_execution_count == UINT64_MAX) {
+        return 0;
+    }
+    ctx->active_execution_count++;
+    *execution_epoch = epoch;
+    return 1;
+}
+
+static ds4_runtime_status cuda_laguna_external_checkpoint_finish(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        const ds4_runtime_external_checkpoint_input *input,
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!ctx || !out || ctx != &g_laguna_compact_storage ||
+        execution_epoch == 0u || ctx->lifecycle_epoch != execution_epoch ||
+        g_laguna_compact_published_epoch.load(
+            std::memory_order_relaxed) != execution_epoch ||
+        g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE ||
+        ctx->active_execution_count == 0u) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    if (barrier && !barrier->sample_result(barrier->userdata)) {
+        const ds4_runtime_status result =
+            cuda_laguna_external_checkpoint_fail(ctx, out);
+        ctx->active_execution_count--;
+        return result;
+    }
+    const ds4_runtime_status result = input
+        ? ds4_runtime_tracker_checkpoint_attributed(
+              ctx->tracker, input, &out->sample)
+        : cuda_laguna_external_checkpoint_fail(ctx, out);
+    ctx->active_execution_count--;
+    return result;
+}
+
+static bool cuda_laguna_external_barrier_valid(
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier) {
+    return !barrier ||
+        (barrier->sample_ready && barrier->sample_result);
+}
+
+static bool cuda_laguna_external_barrier_ready(
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier) {
+    return !barrier || barrier->sample_ready(barrier->userdata);
+}
+
+static ds4_runtime_status
+cuda_laguna_external_checkpoint_complete(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        const ds4_runtime_external_checkpoint_input *input,
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    return cuda_laguna_external_checkpoint_finish(
+        ctx, execution_epoch, input, barrier, out);
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int
+ds4_test_engine_laguna_external_checkpoint_inject_nvml_once(
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_before,
+        const ds4_gpu_nvml_inventory_snapshot *inside_ds4,
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_after) {
+    if (!cuda_laguna_nvml_snapshot_valid(checkpoint_before) ||
+        !cuda_laguna_nvml_snapshot_valid(inside_ds4) ||
+        !cuda_laguna_nvml_snapshot_valid(checkpoint_after)) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> guard(g_laguna_external_injection_mutex);
+    if (g_laguna_external_injection_armed) return 0;
+    g_laguna_external_injected_before = *checkpoint_before;
+    g_laguna_external_injected_inside = *inside_ds4;
+    g_laguna_external_injected_after = *checkpoint_after;
+    g_laguna_external_injection_armed = true;
+    return 1;
+}
+
+static int cuda_laguna_external_injection_take(
+        ds4_gpu_nvml_inventory_snapshot *checkpoint_before,
+        ds4_gpu_nvml_inventory_snapshot *inside_ds4,
+        ds4_gpu_nvml_inventory_snapshot *checkpoint_after) {
+    std::lock_guard<std::mutex> guard(g_laguna_external_injection_mutex);
+    if (!g_laguna_external_injection_armed) return 0;
+    *checkpoint_before = g_laguna_external_injected_before;
+    *inside_ds4 = g_laguna_external_injected_inside;
+    *checkpoint_after = g_laguna_external_injected_after;
+    memset(&g_laguna_external_injected_before, 0,
+           sizeof(g_laguna_external_injected_before));
+    memset(&g_laguna_external_injected_inside, 0,
+           sizeof(g_laguna_external_injected_inside));
+    memset(&g_laguna_external_injected_after, 0,
+           sizeof(g_laguna_external_injected_after));
+    g_laguna_external_injection_armed = false;
+    return 1;
+}
+#endif
+
+static ds4_runtime_status
+cuda_laguna_compact_external_checkpoint_device_zero(
+        ds4_gpu_laguna_compact *ctx,
+        const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const uint8_t
+            observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !frozen_pre_child || !expected_build_identity ||
+        !observed_build_identity || !out) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    uint64_t execution_epoch = 0u;
+    if (!cuda_laguna_external_checkpoint_enter(ctx, &execution_epoch) ||
+        !cuda_laguna_external_barrier_valid(barrier) ||
+        !cuda_laguna_nvml_snapshot_valid(frozen_pre_child) ||
+        !cuda_laguna_nvml_snapshot_valid(&ctx->nvml_baseline)) {
+        return execution_epoch != 0u
+            ? cuda_laguna_external_checkpoint_finish(
+                  ctx, execution_epoch, NULL, NULL, out)
+            : cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, NULL, out);
+    }
+    if (!cuda_laguna_external_barrier_ready(barrier)) {
+        return cuda_laguna_external_checkpoint_finish(
+            ctx, execution_epoch, NULL, NULL, out);
+    }
+
+    int injected = 0;
+#ifdef DS4_TEST_HOOKS
+    injected = cuda_laguna_external_injection_take(
+        &out->checkpoint_before,
+        &out->inside_ds4,
+        &out->checkpoint_after);
+#endif
+    if (!injected &&
+        !cuda_laguna_nvml_inventory_capture_bound(
+            ctx->nvml_baseline.device_uuid,
+            &out->checkpoint_before)) {
+        return cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, NULL, barrier, out);
+    }
+
+    const uint32_t own_pid = (uint32_t)getpid();
+    const ds4_runtime_nvml_process_sample *baseline_process =
+        cuda_laguna_nvml_find_process(&ctx->nvml_baseline, own_pid);
+    uint64_t page_size = 0;
+    uint64_t mapped_page_bytes = 0;
+    uint64_t resident_bytes = 0;
+    struct stat identity_before;
+    struct stat identity_after;
+    size_t cuda_free = 0;
+    size_t cuda_total = 0;
+    char *smaps_text = NULL;
+    size_t smaps_text_bytes = 0;
+    if (own_pid == 0u || !baseline_process ||
+        !baseline_process->used_bytes_known ||
+        !cuda_laguna_compact_identity_matches(
+            ctx->model_fd, ctx->model_size, &ctx->model_identity,
+            &identity_before) ||
+        !cuda_laguna_compact_system_page_size(&page_size) ||
+        ctx->model_size > UINT64_MAX - (page_size - 1u)) {
+        return cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, NULL, barrier, out);
+    }
+    mapped_page_bytes =
+        (ctx->model_size + page_size - 1u) & ~(page_size - 1u);
+    if (!cuda_laguna_compact_page_sample_exact_locked(
+            ctx, page_size, &resident_bytes) ||
+        !cuda_laguna_compact_identity_matches(
+            ctx->model_fd, ctx->model_size, &ctx->model_identity,
+            &identity_after) ||
+        (!injected &&
+         !cuda_laguna_nvml_inventory_capture_bound(
+             ctx->nvml_baseline.device_uuid,
+             &out->inside_ds4)) ||
+        cudaMemGetInfo(&cuda_free, &cuda_total) != cudaSuccess ||
+        !cuda_laguna_read_smaps(&smaps_text, &smaps_text_bytes) ||
+        (!injected &&
+         !cuda_laguna_nvml_inventory_capture_bound(
+             ctx->nvml_baseline.device_uuid,
+             &out->checkpoint_after))) {
+        (void)cudaGetLastError();
+        free(smaps_text);
+        return cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, NULL, barrier, out);
+    }
+
+    out->model_identity = ctx->model_identity;
+    out->model_map_base = (uint64_t)(uintptr_t)ctx->model_map;
+    out->model_map_bytes = ctx->model_size;
+    out->model_file_offset = 0u;
+    out->model_source_page_size = page_size;
+    out->model_source_resident_bytes = resident_bytes;
+    out->model_source_mapped_page_bytes = mapped_page_bytes;
+    memcpy(out->observed_build_identity, observed_build_identity,
+           DS4_RUNTIME_BUILD_IDENTITY_BYTES);
+
+    ds4_runtime_nvml_inventory pre_child_view;
+    ds4_runtime_nvml_inventory before_view;
+    ds4_runtime_nvml_inventory inside_view;
+    ds4_runtime_nvml_inventory after_view;
+    cuda_laguna_nvml_inventory_view(frozen_pre_child, &pre_child_view);
+    cuda_laguna_nvml_inventory_view(
+        &out->checkpoint_before, &before_view);
+    cuda_laguna_nvml_inventory_view(&out->inside_ds4, &inside_view);
+    cuda_laguna_nvml_inventory_view(
+        &out->checkpoint_after, &after_view);
+
+    ds4_runtime_external_checkpoint_input input;
+    memset(&input, 0, sizeof(input));
+    input.smaps_text = smaps_text;
+    input.smaps_text_bytes = smaps_text_bytes;
+    input.model_device_major =
+        (uint32_t)major((dev_t)ctx->model_identity.device);
+    input.model_device_minor =
+        (uint32_t)minor((dev_t)ctx->model_identity.device);
+    input.model_inode = ctx->model_identity.inode;
+    input.model_map_base = out->model_map_base;
+    input.model_map_bytes = out->model_map_bytes;
+    input.model_file_offset = out->model_file_offset;
+    input.attribution_records = ctx->tracker->records;
+    input.attribution_record_count = ctx->tracker->record_count;
+    input.expected_nvml_api_version = frozen_pre_child->api_version;
+    input.expected_nvml_library_version =
+        frozen_pre_child->library_version;
+    input.expected_device_uuid = frozen_pre_child->device_uuid;
+    input.own_pid = own_pid;
+    input.expected_build_identity = expected_build_identity;
+    input.observed_build_identity = observed_build_identity;
+    input.build_identity_bytes = DS4_RUNTIME_BUILD_IDENTITY_BYTES;
+    input.baseline_nvml_api_version = ctx->nvml_baseline.api_version;
+    input.baseline_nvml_library_version =
+        ctx->nvml_baseline.library_version;
+    input.baseline_device_uuid = ctx->nvml_baseline.device_uuid;
+    input.baseline_process_id = own_pid;
+    input.baseline_nvml_process_present = true;
+    input.baseline_nvml_process_bytes_known = true;
+    input.baseline_nvml_process_bytes = baseline_process->used_bytes;
+    input.baseline_tracked_cuda_physical_bytes =
+        ctx->baseline_tracked_cuda_physical_bytes;
+    input.pre_child_inventory = &pre_child_view;
+    input.checkpoint_before_inventory = &before_view;
+    input.inside_ds4_inventory = &inside_view;
+    input.checkpoint_after_inventory = &after_view;
+    input.cuda_mem_info_known = true;
+    input.cuda_mem_free_bytes = (uint64_t)cuda_free;
+    input.cuda_mem_total_bytes = (uint64_t)cuda_total;
+    input.model_source_page_size = page_size;
+    input.model_source_resident_bytes = resident_bytes;
+    input.model_source_mapped_page_bytes = mapped_page_bytes;
+
+    const ds4_runtime_status result =
+        cuda_laguna_external_checkpoint_complete(
+            ctx, execution_epoch, &input, barrier, out);
+    free(smaps_text);
+    return result;
+}
+
+extern "C" ds4_runtime_status
+ds4_gpu_laguna_compact_external_checkpoint(
+        ds4_gpu_laguna_compact *ctx,
+        const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const uint8_t
+            observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
+        ds4_engine_laguna_external_checkpoint_observation *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !frozen_pre_child || !expected_build_identity ||
+        !observed_build_identity || !out) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    cuda_laguna_checkpoint_device_scope device_scope;
+    if (!cuda_laguna_checkpoint_device_scope_enter(&device_scope, 0)) {
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    const ds4_runtime_status result =
+        cuda_laguna_compact_external_checkpoint_device_zero(
+            ctx, frozen_pre_child, expected_build_identity,
+            observed_build_identity, barrier, out);
+    if (!cuda_laguna_checkpoint_device_scope_leave(&device_scope)) {
+        memset(out, 0, sizeof(*out));
+        return cuda_laguna_external_checkpoint_fail(ctx, out);
+    }
+    return result;
+}
+
+static void cuda_laguna_compact_counter_increment(uint64_t *counter) {
+    if (counter && *counter != UINT64_MAX) (*counter)++;
+}
+
+static void cuda_laguna_compact_counter_add(
+        uint64_t *counter, uint64_t amount) {
+    if (!counter) return;
+    if (amount > UINT64_MAX - *counter) {
+        *counter = UINT64_MAX;
+    } else {
+        *counter += amount;
+    }
+}
+
+static void cuda_laguna_compact_cache_handle_clear(
+        ds4_laguna_cache_handle *handle) {
+    if (!handle) return;
+    memset(handle, 0, sizeof(*handle));
+    handle->slot_index = DS4_LAGUNA_CACHE_SLOT_NONE;
+    handle->entry_index = SIZE_MAX;
+    handle->key.layer_id = UINT32_MAX;
+    handle->key.expert_id = UINT32_MAX;
+    handle->lifecycle_epoch = 0;
+}
+
+static int cuda_laguna_compact_cache_published_locked(
+        const ds4_gpu_laguna_compact *ctx) {
+    return ctx == &g_laguna_compact_storage && ctx->cache_policy_live &&
+        ctx->cache_payload && ctx->lifecycle_epoch != 0 &&
+        g_laguna_compact_published_epoch.load(
+            std::memory_order_relaxed) == ctx->lifecycle_epoch &&
+        g_laguna_compact_state.load(std::memory_order_relaxed) ==
+            DS4_LAGUNA_COMPACT_ACTIVE;
+}
+
+static int cuda_laguna_compact_cache_active_locked(
+        const ds4_gpu_laguna_compact *ctx) {
+    return cuda_laguna_compact_cache_published_locked(ctx) &&
+        !ctx->cache_unsafe;
+}
+
+/* The compact mutex is the publication boundary for process and request
+ * counters.  Stage the borrowed request first, then expose both views before
+ * releasing that mutex.  A policy acquire has already changed bounded cache
+ * state, so a staging failure publishes process truth and poisons the cache. */
+static int cuda_laguna_compact_publish_cache_acquire_locked(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t hits,
+        uint64_t misses,
+        uint64_t evictions) {
+    if (!ctx) return 0;
+    ds4_runtime_request_context request_staged;
+    int request_ok = 1;
+    if (ctx->active_request) {
+        request_staged = *ctx->active_request;
+        ds4_runtime_wire_counters delta = {};
+        delta.cache_acquire_hits = hits;
+        delta.cache_acquire_misses = misses;
+        delta.cache_evictions = evictions;
+        request_ok = ds4_runtime_request_add_counters(
+            &request_staged, &delta) ? 1 : 0;
+    }
+    cuda_laguna_compact_counter_add(&ctx->cache_acquire_hits, hits);
+    cuda_laguna_compact_counter_add(&ctx->cache_acquire_misses, misses);
+    cuda_laguna_compact_counter_add(&ctx->cache_evictions, evictions);
+    if (!request_ok) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    if (ctx->active_request) {
+        *ctx->active_request = request_staged;
+    }
+    return 1;
+}
+
+#ifdef DS4_TEST_HOOKS
+enum { DS4_GPU_LAGUNA_CACHE_FAULT_SHORT_EOF_INTERNAL = 100 };
+
+static int cuda_laguna_compact_take_cache_fault(int expected) {
+    int observed = expected;
+    return g_laguna_compact_cache_fault.compare_exchange_strong(
+        observed, DS4_GPU_LAGUNA_CACHE_FAULT_NONE,
+        std::memory_order_relaxed);
+}
+#endif
+
+typedef struct {
+    uint64_t model_file_read_calls;
+    uint64_t model_file_read_bytes;
+    uint64_t model_file_read_ns;
+    uint64_t host_to_device_bytes;
+    uint64_t host_to_device_ns;
+    uint64_t pread_eintr_retries;
+    uint64_t pread_eof_failures;
+    uint64_t pread_short_failures;
+    uint64_t pread_error_failures;
+    uint64_t cuda_copy_failures;
+    uint64_t event_record_failures;
+    uint64_t event_completion_failures;
+    ds4_laguna_page_range source_ranges[3];
+    size_t source_range_count;
+    int source_ranges_safe;
+} cuda_laguna_compact_cache_transfer_stats;
+
+typedef enum {
+    CUDA_LAGUNA_CACHE_TRANSFER_OK = 0,
+    CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE = 1,
+    CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED = 2,
+    CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE = 3,
+} cuda_laguna_compact_cache_transfer_result;
+
+static int cuda_laguna_compact_cache_handle_equal(
+        ds4_laguna_cache_handle a,
+        ds4_laguna_cache_handle b) {
+    return a.slot_index == b.slot_index &&
+        a.generation == b.generation &&
+        a.entry_index == b.entry_index &&
+        a.key.layer_id == b.key.layer_id &&
+        a.key.expert_id == b.key.expert_id &&
+        a.lifecycle_epoch == b.lifecycle_epoch;
+}
+
+static int cuda_laguna_compact_cache_handle_current_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle) {
+    return cuda_laguna_compact_cache_active_locked(ctx) &&
+        handle.lifecycle_epoch != 0 &&
+        handle.lifecycle_epoch == ctx->lifecycle_epoch;
+}
+
+/* Mirror only READY/IN_USE entries for bounded-state diagnostics.  This table
+ * is not an execution-consumable directory: streamed kernels take pinned
+ * cache_view() pointers, so no GPU reader races this whole-image update.  The
+ * fourth fixed staging allocation holds the image while one loader owns the
+ * other three projection buffers. */
+static int cuda_laguna_compact_cache_sync_device_map_locked(
+        ds4_gpu_laguna_compact *ctx) {
+    if (!ctx || !ctx->entry_to_slot || !ctx->device_entry_to_slot ||
+        !ctx->pinned_staging[3] || !ctx->ledger || !ctx->plan ||
+        ctx->ledger->expert_entry_count > SIZE_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+    const size_t entry_count =
+        (size_t)ctx->ledger->expert_entry_count;
+    const size_t bytes = entry_count * sizeof(uint32_t);
+    if (bytes > ctx->plan->staging_buffer_bytes) return 0;
+    uint32_t *image = (uint32_t *)ctx->pinned_staging[3];
+    for (size_t i = 0; i < entry_count; i++) {
+        const uint32_t slot_index = ctx->entry_to_slot[i];
+        image[i] = DS4_LAGUNA_CACHE_SLOT_NONE;
+        if (slot_index == DS4_LAGUNA_CACHE_SLOT_NONE ||
+            (size_t)slot_index >= ctx->cache_policy.slot_count) {
+            continue;
+        }
+        const ds4_laguna_cache_slot *slot =
+            &ctx->cache_slots[slot_index];
+        if (slot->state == DS4_LAGUNA_CACHE_SLOT_READY ||
+            slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            image[i] = slot_index;
+        }
+    }
+    const cudaError_t error = cudaMemcpy(
+        ctx->device_entry_to_slot, image, bytes,
+        cudaMemcpyHostToDevice);
+    if (error == cudaSuccess) return 1;
+    (void)cudaGetLastError();
+    cuda_laguna_compact_counter_increment(&ctx->cuda_copy_failures);
+    return 0;
+}
+
+static int cuda_laguna_compact_cache_merge_stats_locked(
+        ds4_gpu_laguna_compact *ctx,
+        const cuda_laguna_compact_cache_transfer_stats *stats) {
+    if (!ctx || !stats) return 0;
+    ds4_runtime_request_context request_staged;
+    int request_ok = 1;
+    if (ctx->active_request) {
+        request_staged = *ctx->active_request;
+        ds4_runtime_wire_counters delta = {};
+        delta.model_file_read_operations = stats->model_file_read_calls;
+        delta.model_file_read_bytes = stats->model_file_read_bytes;
+        delta.model_file_read_ns = stats->model_file_read_ns;
+        delta.host_to_device_bytes = stats->host_to_device_bytes;
+        delta.host_to_device_ns = stats->host_to_device_ns;
+        request_ok = ds4_runtime_request_add_counters(
+            &request_staged, &delta) ? 1 : 0;
+    }
+    cuda_laguna_compact_counter_add(
+        &ctx->model_file_read_calls, stats->model_file_read_calls);
+    cuda_laguna_compact_counter_add(
+        &ctx->model_file_read_bytes, stats->model_file_read_bytes);
+    cuda_laguna_compact_counter_add(
+        &ctx->model_file_read_ns, stats->model_file_read_ns);
+    cuda_laguna_compact_counter_add(
+        &ctx->host_to_device_bytes, stats->host_to_device_bytes);
+    cuda_laguna_compact_counter_add(
+        &ctx->host_to_device_ns, stats->host_to_device_ns);
+    cuda_laguna_compact_counter_add(
+        &ctx->pread_eintr_retries, stats->pread_eintr_retries);
+    cuda_laguna_compact_counter_add(
+        &ctx->pread_eof_failures, stats->pread_eof_failures);
+    cuda_laguna_compact_counter_add(
+        &ctx->pread_short_failures, stats->pread_short_failures);
+    cuda_laguna_compact_counter_add(
+        &ctx->pread_error_failures, stats->pread_error_failures);
+    cuda_laguna_compact_counter_add(
+        &ctx->cuda_copy_failures, stats->cuda_copy_failures);
+    cuda_laguna_compact_counter_add(
+        &ctx->event_record_failures, stats->event_record_failures);
+    cuda_laguna_compact_counter_add(
+        &ctx->event_completion_failures,
+        stats->event_completion_failures);
+    if (!request_ok) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    if (ctx->active_request) {
+        *ctx->active_request = request_staged;
+    }
+    return 1;
+}
+
+static int cuda_laguna_compact_cache_dispose_sources_locked(
+        ds4_gpu_laguna_compact *ctx,
+        const cuda_laguna_compact_cache_transfer_stats *stats) {
+    if (!ctx || !stats || stats->source_range_count > 3u) return 0;
+    if (stats->source_range_count == 0) return 1;
+    if (!stats->source_ranges_safe || !ctx->page_advice_state ||
+        !cuda_laguna_compact_page_test_reset_locked(ctx)) {
+        return 0;
+    }
+    uint64_t default_page_size = 0;
+    uint64_t page_size = 0;
+    if (!cuda_laguna_compact_system_page_size(&default_page_size) ||
+        !cuda_laguna_compact_page_size_locked(
+            ctx, default_page_size, &page_size)) {
+        return 0;
+    }
+    for (size_t i = 0; i < stats->source_range_count; i++) {
+        if (!cuda_laguna_compact_page_promote_locked(
+                ctx, page_size, stats->source_ranges[i].offset,
+                stats->source_ranges[i].bytes)) {
+            return 0;
+        }
+    }
+#ifdef DS4_TEST_HOOKS
+    if (ctx->page_advice_test_injection_armed) {
+        return cuda_laguna_compact_page_flush_locked(
+            ctx, default_page_size, 1);
+    }
+#endif
+    const uint64_t page_flush_threshold = UINT64_C(512) << 20;
+    if (ctx->page_advice_since_range_bytes >= page_flush_threshold) {
+        return cuda_laguna_compact_page_flush_locked(
+            ctx, default_page_size, 0);
+    }
+    return 1;
+}
+
+static ssize_t cuda_laguna_compact_cache_pread(
+        ds4_gpu_laguna_compact *ctx,
+        void *buffer,
+        size_t bytes,
+        uint64_t offset) {
+#ifdef DS4_TEST_HOOKS
+    if (cuda_laguna_compact_take_cache_fault(
+            DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EINTR)) {
+        errno = EINTR;
+        return -1;
+    }
+    if (cuda_laguna_compact_take_cache_fault(
+            DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EOF)) {
+        return 0;
+    }
+    if (cuda_laguna_compact_take_cache_fault(
+            DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_ERROR)) {
+        errno = EIO;
+        return -1;
+    }
+    if (cuda_laguna_compact_take_cache_fault(
+            DS4_GPU_LAGUNA_CACHE_FAULT_SHORT_EOF_INTERNAL)) {
+        return 0;
+    }
+    if (bytes > 1u && cuda_laguna_compact_take_cache_fault(
+            DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_SHORT)) {
+        const ssize_t result = pread(
+            ctx->model_fd, buffer, bytes - 1u, (off_t)offset);
+        if (result > 0) {
+            g_laguna_compact_cache_fault.store(
+                DS4_GPU_LAGUNA_CACHE_FAULT_SHORT_EOF_INTERNAL,
+                std::memory_order_relaxed);
+        }
+        return result;
+    }
+#endif
+    return pread(ctx->model_fd, buffer, bytes, (off_t)offset);
+}
+
+static int cuda_laguna_compact_cache_transfer_cancelled(
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *cancel_userdata) {
+    return g_laguna_compact_cache_cancel_requested.load(
+               std::memory_order_acquire) ||
+        (cancel && cancel(cancel_userdata));
+}
+
+static int cuda_laguna_compact_cache_read_exact(
+        ds4_gpu_laguna_compact *ctx,
+        void *buffer,
+        uint64_t bytes,
+        uint64_t offset,
+        cuda_laguna_compact_cache_transfer_stats *stats,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *cancel_userdata) {
+    uint64_t done = 0;
+    while (done < bytes) {
+        if (cuda_laguna_compact_cache_transfer_cancelled(
+                cancel, cancel_userdata)) {
+            return -1;
+        }
+        const uint64_t remaining = bytes - done;
+        const size_t requested = remaining > (uint64_t)SSIZE_MAX ?
+            (size_t)SSIZE_MAX : (size_t)remaining;
+        if (offset > UINT64_MAX - done ||
+            offset + done > (uint64_t)INT64_MAX) {
+            cuda_laguna_compact_counter_increment(
+                &stats->pread_error_failures);
+            return 0;
+        }
+        cuda_laguna_compact_counter_increment(
+            &stats->model_file_read_calls);
+        const uint64_t read_started =
+            cuda_laguna_compact_monotonic_ns_after(0u);
+        const ssize_t result = cuda_laguna_compact_cache_pread(
+            ctx, (char *)buffer + done, requested, offset + done);
+        const uint64_t read_finished =
+            cuda_laguna_compact_monotonic_ns_after(read_started);
+        cuda_laguna_compact_counter_add(
+            &stats->model_file_read_ns, read_finished - read_started);
+        if (result < 0) {
+            if (errno == EINTR) {
+                cuda_laguna_compact_counter_increment(
+                    &stats->pread_eintr_retries);
+                continue;
+            }
+            cuda_laguna_compact_counter_increment(
+                &stats->pread_error_failures);
+            return 0;
+        }
+        if (result == 0) {
+            cuda_laguna_compact_counter_increment(
+                done == 0 ? &stats->pread_eof_failures :
+                            &stats->pread_short_failures);
+            return 0;
+        }
+        done += (uint64_t)result;
+        cuda_laguna_compact_counter_add(
+            &stats->model_file_read_bytes, (uint64_t)result);
+    }
+    return cuda_laguna_compact_cache_transfer_cancelled(
+               cancel, cancel_userdata) ? -1 : 1;
+}
+
+#ifdef DS4_TEST_HOOKS
+static void cuda_laguna_compact_pause_cache_load_if_armed(
+        ds4_laguna_cache_handle handle);
+#endif
+
+static cuda_laguna_compact_cache_transfer_result
+cuda_laguna_compact_cache_transfer(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle,
+        cuda_laguna_compact_cache_transfer_stats *stats,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *cancel_userdata) {
+    const ds4_laguna_expert_entry *entry =
+        &ctx->ledger->expert_entries[handle.entry_index];
+    const ds4_laguna_expert_view *views[3] = {
+        &entry->gate, &entry->up, &entry->down,
+    };
+    const uint64_t slot_offset =
+        (uint64_t)handle.slot_index * ctx->plan->slot_stride_bytes;
+    int submitted = 0;
+    cuda_laguna_compact_cache_transfer_result result =
+        CUDA_LAGUNA_CACHE_TRANSFER_OK;
+    for (size_t projection = 0; projection < 3; projection++) {
+        const ds4_laguna_expert_view *view = views[projection];
+        if (cuda_laguna_compact_cache_transfer_cancelled(
+                cancel, cancel_userdata)) {
+            result = CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED;
+            break;
+        }
+        if (slot_offset > ctx->cache_payload_bytes ||
+            view->device_offset >
+                ctx->cache_payload_bytes - slot_offset ||
+            view->source_bytes >
+                ctx->cache_payload_bytes - slot_offset -
+                    view->device_offset ||
+            view->source_bytes > ctx->plan->staging_buffer_bytes) {
+            result = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+            break;
+        }
+        if (stats->source_range_count >= 3u) {
+            result = CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+            break;
+        }
+        stats->source_ranges[stats->source_range_count].offset =
+            view->source_offset;
+        stats->source_ranges[stats->source_range_count].bytes =
+            view->source_bytes;
+        stats->source_range_count++;
+        const int read = cuda_laguna_compact_cache_read_exact(
+            ctx, ctx->pinned_staging[projection],
+            view->source_bytes, view->source_offset, stats,
+            cancel, cancel_userdata);
+        if (read <= 0) {
+            result = read < 0 ? CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED :
+                               CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+            break;
+        }
+#ifdef DS4_TEST_HOOKS
+        if (cuda_laguna_compact_take_cache_fault(
+                DS4_GPU_LAGUNA_CACHE_FAULT_CUDA_COPY)) {
+            cuda_laguna_compact_counter_increment(
+                &stats->cuda_copy_failures);
+            result = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+            break;
+        }
+#endif
+        const uint64_t copy_started =
+            cuda_laguna_compact_monotonic_ns_after(0u);
+        const cudaError_t copied = cudaMemcpyAsync(
+            ctx->cache_payload + slot_offset + view->device_offset,
+            ctx->pinned_staging[projection],
+            (size_t)view->source_bytes,
+            cudaMemcpyHostToDevice, ctx->upload_stream);
+        const uint64_t copy_finished =
+            cuda_laguna_compact_monotonic_ns_after(copy_started);
+        cuda_laguna_compact_counter_add(
+            &stats->host_to_device_ns, copy_finished - copy_started);
+        if (copied != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &stats->cuda_copy_failures);
+            result = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+            break;
+        }
+        cuda_laguna_compact_counter_add(
+            &stats->host_to_device_bytes, view->source_bytes);
+        submitted = 1;
+#ifdef DS4_TEST_HOOKS
+        if (projection == 0) {
+            cuda_laguna_compact_pause_cache_load_if_armed(handle);
+            if (cuda_laguna_compact_take_cache_fault(
+                    DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION)) {
+                g_laguna_compact_cache_cancel_requested.store(
+                    true, std::memory_order_release);
+            }
+        }
+#endif
+    }
+    if (result == CUDA_LAGUNA_CACHE_TRANSFER_OK) {
+#ifdef DS4_TEST_HOOKS
+        if (cuda_laguna_compact_take_cache_fault(
+                DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_RECORD)) {
+            cuda_laguna_compact_counter_increment(
+                &stats->event_record_failures);
+            result = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+        }
+#endif
+    }
+    if (result == CUDA_LAGUNA_CACHE_TRANSFER_OK) {
+        const cudaError_t recorded = cudaEventRecord(
+            ctx->pinned_staging_events[0], ctx->upload_stream);
+        if (recorded != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &stats->event_record_failures);
+            result = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+        }
+    }
+    if (result == CUDA_LAGUNA_CACHE_TRANSFER_OK &&
+        cuda_laguna_compact_cache_transfer_cancelled(
+            cancel, cancel_userdata)) {
+        result = CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED;
+    }
+    if (result == CUDA_LAGUNA_CACHE_TRANSFER_OK) {
+#ifdef DS4_TEST_HOOKS
+        if (cuda_laguna_compact_take_cache_fault(
+                DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION)) {
+            cuda_laguna_compact_counter_increment(
+                &stats->event_completion_failures);
+            return CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+        }
+#endif
+        const cudaError_t completed = cudaEventSynchronize(
+            ctx->pinned_staging_events[0]);
+        if (completed != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &stats->event_completion_failures);
+            return CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+        }
+        stats->source_ranges_safe = 1;
+        return cuda_laguna_compact_cache_transfer_cancelled(
+                   cancel, cancel_userdata) ?
+            CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED :
+            CUDA_LAGUNA_CACHE_TRANSFER_OK;
+    }
+    if (submitted) {
+        const cudaError_t drained =
+            cudaStreamSynchronize(ctx->upload_stream);
+        if (drained != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &stats->event_completion_failures);
+            return CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+        }
+    }
+    stats->source_ranges_safe = 1;
+    return result;
+}
+
+#ifdef DS4_TEST_HOOKS
+static void cuda_laguna_compact_pause_cache_load_if_armed(
+        ds4_laguna_cache_handle handle) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_cache_pause_mutex);
+    if (!g_laguna_compact_cache_pause_armed) return;
+    g_laguna_compact_cache_paused_handle = handle;
+    g_laguna_compact_cache_paused = true;
+    g_laguna_compact_cache_pause_condition.notify_all();
+    g_laguna_compact_cache_pause_condition.wait(
+        guard, [] { return g_laguna_compact_cache_resume; });
+    g_laguna_compact_cache_pause_armed = false;
+    g_laguna_compact_cache_paused = false;
+    g_laguna_compact_cache_resume = false;
+    g_laguna_compact_cache_pause_condition.notify_all();
+}
+#endif
+
+static ds4_laguna_cache_status
+cuda_laguna_compact_cache_terminal_failure_locked(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle *handle,
+        cuda_laguna_compact_cache_transfer_result result) {
+    cuda_laguna_compact_counter_increment(&ctx->cache_load_failures);
+    if (result == CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE) {
+        ctx->cache_unsafe = 1;
+        cuda_laguna_compact_cache_handle_clear(handle);
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const int cancelled =
+        result == CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED;
+    const ds4_laguna_cache_status restored = cancelled ?
+        ds4_laguna_cache_policy_cancel(&ctx->cache_policy, *handle) :
+        ds4_laguna_cache_policy_fail(&ctx->cache_policy, *handle);
+    if (cancelled) {
+        cuda_laguna_compact_counter_increment(&ctx->cache_cancellations);
+    }
+    cuda_laguna_compact_cache_handle_clear(handle);
+    if (restored == DS4_LAGUNA_CACHE_UNSAFE ||
+        !cuda_laguna_compact_cache_sync_device_map_locked(ctx)) {
+        ctx->cache_unsafe = 1;
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    return DS4_LAGUNA_CACHE_RECOVERABLE;
+}
+
+static int cuda_laguna_compact_cache_entry_index_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        size_t *entry_index) {
+    if (!ctx || !ctx->ledger || !ctx->ledger->expert_entries ||
+        !entry_index) return 0;
+    size_t low = 0;
+    size_t high = (size_t)ctx->ledger->expert_entry_count;
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2u;
+        const ds4_laguna_expert_entry *entry =
+            &ctx->ledger->expert_entries[middle];
+        if (entry->layer < key.layer_id ||
+            (entry->layer == key.layer_id &&
+             entry->expert < key.expert_id)) {
+            low = middle + 1u;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= (size_t)ctx->ledger->expert_entry_count ||
+        ctx->ledger->expert_entries[low].layer != key.layer_id ||
+        ctx->ledger->expert_entries[low].expert != key.expert_id) {
+        return 0;
+    }
+    *entry_index = low;
+    return 1;
+}
+
+static void cuda_laguna_compact_cache_active_clear_locked(
+        ds4_gpu_laguna_compact *ctx) {
+    if (!ctx) return;
+    ctx->active_load_phase = DS4_LAGUNA_CACHE_LOAD_NONE;
+    cuda_laguna_compact_cache_handle_clear(&ctx->active_load_handle);
+    g_laguna_compact_cache_cancel_requested.store(
+        false, std::memory_order_release);
+}
+
+#ifdef DS4_TEST_HOOKS
+static void cuda_laguna_compact_pause_cache_begin_if_armed(void) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_cache_begin_pause_mutex);
+    if (!g_laguna_compact_cache_begin_pause_armed) return;
+    g_laguna_compact_cache_begin_paused = true;
+    g_laguna_compact_cache_begin_pause_condition.notify_all();
+    g_laguna_compact_cache_begin_pause_condition.wait(
+        guard, [] { return g_laguna_compact_cache_begin_resume; });
+    g_laguna_compact_cache_begin_pause_armed = false;
+    g_laguna_compact_cache_begin_paused = false;
+    g_laguna_compact_cache_begin_resume = false;
+    g_laguna_compact_cache_begin_pause_condition.notify_all();
+}
+#endif
+
+extern "C" ds4_laguna_cache_status
+ds4_gpu_laguna_compact_cache_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome) {
+    cuda_laguna_compact_cache_handle_clear(handle);
+    if (outcome) *outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    if (!ctx || !handle || !outcome) return DS4_LAGUNA_CACHE_UNSAFE;
+    const uint64_t entry_epoch =
+        g_laguna_compact_published_epoch.load(std::memory_order_acquire);
+#ifdef DS4_TEST_HOOKS
+    cuda_laguna_compact_pause_cache_begin_if_armed();
+#endif
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (ctx != &g_laguna_compact_storage) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const uint64_t current_epoch =
+        g_laguna_compact_published_epoch.load(std::memory_order_relaxed);
+    if (entry_epoch != current_epoch ||
+        ctx->lifecycle_epoch != entry_epoch) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (entry_epoch == 0 ||
+        !cuda_laguna_compact_cache_active_locked(ctx)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+
+    if (ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE) {
+        size_t entry_index = SIZE_MAX;
+        if (!cuda_laguna_compact_cache_entry_index_locked(
+                ctx, key, &entry_index)) {
+            ctx->cache_unsafe = 1;
+            return DS4_LAGUNA_CACHE_UNSAFE;
+        }
+        if (ctx->entry_to_slot[entry_index] ==
+                DS4_LAGUNA_CACHE_SLOT_NONE) {
+            *outcome = DS4_LAGUNA_CACHE_ACQUIRE_PRESSURE;
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
+    }
+
+    int had_empty = 0;
+    for (size_t i = 0; i < ctx->cache_policy.slot_count; i++) {
+        if (ctx->cache_slots[i].state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+            had_empty = 1;
+            break;
+        }
+    }
+    ds4_laguna_cache_status status = ds4_laguna_cache_policy_acquire(
+        &ctx->cache_policy, key, handle, outcome);
+    if (status != DS4_LAGUNA_CACHE_OK) {
+        if (status == DS4_LAGUNA_CACHE_UNSAFE) ctx->cache_unsafe = 1;
+        return status;
+    }
+    handle->lifecycle_epoch = ctx->lifecycle_epoch;
+    if (*outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED) {
+        if (!cuda_laguna_compact_publish_cache_acquire_locked(
+                ctx, 1u, 0u, 0u)) {
+            return DS4_LAGUNA_CACHE_UNSAFE;
+        }
+        return DS4_LAGUNA_CACHE_OK;
+    }
+    if (*outcome != DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER ||
+        handle->entry_index >= ctx->ledger->expert_entry_count ||
+        handle->slot_index >= ctx->plan->slot_count ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE) {
+        ctx->cache_unsafe = 1;
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (!cuda_laguna_compact_publish_cache_acquire_locked(
+            ctx, 0u, 1u, had_empty ? 0u : 1u)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    ctx->active_load_handle = *handle;
+    ctx->active_load_phase = DS4_LAGUNA_CACHE_LOAD_RESERVED;
+    g_laguna_compact_cache_cancel_requested.store(
+        false, std::memory_order_release);
+    if (!cuda_laguna_compact_cache_sync_device_map_locked(ctx)) {
+        cuda_laguna_compact_counter_increment(&ctx->cache_load_failures);
+        ctx->cache_unsafe = 1;
+        cuda_laguna_compact_cache_active_clear_locked(ctx);
+        cuda_laguna_compact_cache_handle_clear(handle);
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    return DS4_LAGUNA_CACHE_OK;
+}
+
+static ds4_laguna_cache_status
+cuda_laguna_compact_cache_complete_internal(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle *handle,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *cancel_userdata,
+        cuda_laguna_compact_cache_transfer_result *transfer_cause) {
+    if (transfer_cause) {
+        *transfer_cause = CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+    }
+    if (!ctx || !handle) return DS4_LAGUNA_CACHE_UNSAFE;
+    {
+        std::lock_guard<std::recursive_mutex> preflight(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_cache_handle_current_locked(ctx, *handle) ||
+            ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_RESERVED ||
+            !cuda_laguna_compact_cache_handle_equal(
+                *handle, ctx->active_load_handle)) {
+            return DS4_LAGUNA_CACHE_RECOVERABLE;
+        }
+    }
+
+    std::lock_guard<std::mutex> io_guard(
+        g_laguna_compact_cache_io_mutex);
+    std::unique_lock<std::recursive_mutex> guard(
+        g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_handle_current_locked(ctx, *handle) ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_RESERVED ||
+        !cuda_laguna_compact_cache_handle_equal(
+            *handle, ctx->active_load_handle)) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    const ds4_laguna_cache_handle load_handle = *handle;
+    ctx->active_load_phase = DS4_LAGUNA_CACHE_LOAD_TRANSFERRING;
+    guard.unlock();
+
+    cuda_laguna_compact_cache_transfer_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    cuda_laguna_compact_cache_transfer_result transfer =
+        cuda_laguna_compact_cache_transfer(
+            ctx, load_handle, &stats, cancel, cancel_userdata);
+    if (transfer_cause) *transfer_cause = transfer;
+
+    guard.lock();
+    const int counters_merged =
+        cuda_laguna_compact_cache_merge_stats_locked(ctx, &stats);
+    if (!counters_merged ||
+        !cuda_laguna_compact_cache_handle_current_locked(
+            ctx, load_handle) ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_TRANSFERRING ||
+        !cuda_laguna_compact_cache_handle_equal(
+            load_handle, ctx->active_load_handle)) {
+        cuda_laguna_compact_counter_increment(&ctx->cache_load_failures);
+        ctx->cache_unsafe = 1;
+        cuda_laguna_compact_cache_active_clear_locked(ctx);
+        cuda_laguna_compact_cache_handle_clear(handle);
+        if (transfer_cause) {
+            *transfer_cause = CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+        }
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (transfer != CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE &&
+        !cuda_laguna_compact_cache_dispose_sources_locked(ctx, &stats)) {
+        transfer = CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+    }
+    ctx->active_load_phase = DS4_LAGUNA_CACHE_LOAD_COMMITTING;
+    if (transfer == CUDA_LAGUNA_CACHE_TRANSFER_OK &&
+        g_laguna_compact_cache_cancel_requested.load(
+            std::memory_order_acquire)) {
+        transfer = CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED;
+    }
+    if (transfer_cause) *transfer_cause = transfer;
+    if (transfer != CUDA_LAGUNA_CACHE_TRANSFER_OK) {
+        const ds4_laguna_cache_status status =
+            cuda_laguna_compact_cache_terminal_failure_locked(
+                ctx, handle, transfer);
+        cuda_laguna_compact_cache_active_clear_locked(ctx);
+        return status;
+    }
+    const ds4_laguna_cache_status status =
+        ds4_laguna_cache_policy_publish(&ctx->cache_policy, *handle);
+    if (status != DS4_LAGUNA_CACHE_OK ||
+        !cuda_laguna_compact_cache_sync_device_map_locked(ctx)) {
+        cuda_laguna_compact_counter_increment(&ctx->cache_load_failures);
+        ctx->cache_unsafe = 1;
+        cuda_laguna_compact_cache_active_clear_locked(ctx);
+        cuda_laguna_compact_cache_handle_clear(handle);
+        if (transfer_cause) {
+            *transfer_cause = CUDA_LAGUNA_CACHE_TRANSFER_UNSAFE;
+        }
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    cuda_laguna_compact_counter_increment(&ctx->cache_load_successes);
+    cuda_laguna_compact_cache_active_clear_locked(ctx);
+    if (transfer_cause) {
+        *transfer_cause = CUDA_LAGUNA_CACHE_TRANSFER_OK;
+    }
+    return DS4_LAGUNA_CACHE_OK;
+}
+
+extern "C" ds4_laguna_cache_status
+ds4_gpu_laguna_compact_cache_complete(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle *handle) {
+    return cuda_laguna_compact_cache_complete_internal(
+        ctx, handle, NULL, NULL, NULL);
+}
+
+extern "C" ds4_laguna_cache_status
+ds4_gpu_laguna_compact_cache_acquire(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome) {
+    const ds4_laguna_cache_status begun =
+        ds4_gpu_laguna_compact_cache_begin(
+            ctx, key, handle, outcome);
+    if (begun != DS4_LAGUNA_CACHE_OK ||
+        *outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED) {
+        return begun;
+    }
+    if (*outcome != DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    return ds4_gpu_laguna_compact_cache_complete(ctx, handle);
+}
+
+extern "C" ds4_laguna_cache_status
+ds4_gpu_laguna_compact_cache_unpin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle) {
+    if (!ctx) return DS4_LAGUNA_CACHE_UNSAFE;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (!cuda_laguna_compact_cache_handle_current_locked(ctx, handle)) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    const ds4_laguna_cache_status status =
+        ds4_laguna_cache_policy_unpin(&ctx->cache_policy, handle);
+    if (status == DS4_LAGUNA_CACHE_UNSAFE) ctx->cache_unsafe = 1;
+    return status;
+}
+
+extern "C" ds4_laguna_cache_status
+ds4_gpu_laguna_compact_cache_cancel(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle) {
+    if (!ctx) return DS4_LAGUNA_CACHE_UNSAFE;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (!cuda_laguna_compact_cache_handle_current_locked(ctx, handle)) {
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    if (ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE &&
+        cuda_laguna_compact_cache_handle_equal(
+            handle, ctx->active_load_handle)) {
+        if (ctx->active_load_phase == DS4_LAGUNA_CACHE_LOAD_RESERVED) {
+            const ds4_laguna_cache_status restored =
+                ds4_laguna_cache_policy_cancel(
+                    &ctx->cache_policy, handle);
+            if (restored == DS4_LAGUNA_CACHE_UNSAFE ||
+                !cuda_laguna_compact_cache_sync_device_map_locked(ctx)) {
+                ctx->cache_unsafe = 1;
+                return DS4_LAGUNA_CACHE_UNSAFE;
+            }
+            cuda_laguna_compact_counter_increment(
+                &ctx->cache_cancellations);
+            cuda_laguna_compact_counter_increment(
+                &ctx->cache_load_failures);
+            cuda_laguna_compact_cache_active_clear_locked(ctx);
+        } else if (ctx->active_load_phase ==
+                       DS4_LAGUNA_CACHE_LOAD_TRANSFERRING) {
+            g_laguna_compact_cache_cancel_requested.store(
+                true, std::memory_order_release);
+        }
+        return DS4_LAGUNA_CACHE_RECOVERABLE;
+    }
+    const int loading =
+        handle.slot_index != DS4_LAGUNA_CACHE_SLOT_NONE &&
+        (size_t)handle.slot_index < ctx->cache_policy.slot_count &&
+        ctx->cache_slots[handle.slot_index].generation ==
+            handle.generation &&
+        ctx->cache_slots[handle.slot_index].state ==
+            DS4_LAGUNA_CACHE_SLOT_LOADING;
+    const ds4_laguna_cache_status status =
+        ds4_laguna_cache_policy_cancel(&ctx->cache_policy, handle);
+    if (status == DS4_LAGUNA_CACHE_UNSAFE ||
+        (loading &&
+         !cuda_laguna_compact_cache_sync_device_map_locked(ctx))) {
+        ctx->cache_unsafe = 1;
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    if (loading) {
+        cuda_laguna_compact_counter_increment(&ctx->cache_cancellations);
+    }
+    return status;
+}
+
+extern "C" int ds4_gpu_laguna_compact_cache_view(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle,
+        ds4_laguna_routed_projection projection,
+        const void **device_ptr,
+        uint64_t *bytes) {
+    if (device_ptr) *device_ptr = NULL;
+    if (bytes) *bytes = 0;
+    if (!ctx || !device_ptr || !bytes) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_handle_current_locked(ctx, handle) ||
+        handle.slot_index >= ctx->cache_policy.slot_count ||
+        handle.entry_index >= ctx->cache_policy.entry_count) {
+        return 0;
+    }
+    const ds4_laguna_cache_slot *slot =
+        &ctx->cache_slots[handle.slot_index];
+    const ds4_laguna_expert_entry *entry =
+        &ctx->ledger->expert_entries[handle.entry_index];
+    if (slot->generation != handle.generation ||
+        slot->state != DS4_LAGUNA_CACHE_SLOT_IN_USE ||
+        slot->refs == 0 || slot->layer != handle.key.layer_id ||
+        slot->expert != handle.key.expert_id ||
+        entry->layer != handle.key.layer_id ||
+        entry->expert != handle.key.expert_id ||
+        ctx->entry_to_slot[handle.entry_index] != handle.slot_index) {
+        return 0;
+    }
+    const ds4_laguna_expert_view *view =
+        projection == DS4_LAGUNA_ROUTED_PROJECTION_GATE ? &entry->gate :
+        projection == DS4_LAGUNA_ROUTED_PROJECTION_UP ? &entry->up :
+        projection == DS4_LAGUNA_ROUTED_PROJECTION_DOWN ? &entry->down :
+        NULL;
+    const uint64_t slot_offset =
+        (uint64_t)handle.slot_index * ctx->plan->slot_stride_bytes;
+    if (!view || slot_offset > ctx->cache_payload_bytes ||
+        view->device_offset > ctx->cache_payload_bytes - slot_offset ||
+        view->source_bytes >
+            ctx->cache_payload_bytes - slot_offset - view->device_offset) {
+        return 0;
+    }
+    *device_ptr = ctx->cache_payload + slot_offset + view->device_offset;
+    *bytes = view->source_bytes;
+    return 1;
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" void ds4_gpu_test_laguna_compact_cache_fault_once(
+        ds4_gpu_laguna_cache_test_fault fault) {
+    if (fault <= DS4_GPU_LAGUNA_CACHE_FAULT_NONE ||
+        fault > DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION) {
+        return;
+    }
+    g_laguna_compact_cache_fault.store(fault, std::memory_order_relaxed);
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_page_advice_inject(
+        uint64_t page_size,
+        uint64_t exact_pre_resident_bytes,
+        uint64_t exact_post_resident_bytes,
+        int fadvise_errno,
+        int madvise_errno) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE || page_size == 0) {
+        return;
+    }
+    ds4_gpu_laguna_compact *ctx = &g_laguna_compact_storage;
+    if (!ctx->page_advice_test_injection_seen) {
+        ctx->page_advice_test_reset_pending = 1;
+        ctx->page_advice_test_injection_seen = 1;
+    }
+    ctx->page_advice_test_page_size = page_size;
+    ctx->page_advice_test_exact_pre_resident_bytes =
+        exact_pre_resident_bytes;
+    ctx->page_advice_test_exact_post_resident_bytes =
+        exact_post_resident_bytes;
+    ctx->page_advice_test_fadvise_errno = fadvise_errno;
+    ctx->page_advice_test_madvise_errno = madvise_errno;
+    ctx->page_advice_test_injection_armed = 1;
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_pause_cache_load_once(void) {
+    std::lock_guard<std::mutex> guard(
+        g_laguna_compact_cache_pause_mutex);
+    if (!g_laguna_compact_cache_paused) {
+        g_laguna_compact_cache_pause_armed = true;
+        g_laguna_compact_cache_resume = false;
+    }
+}
+
+extern "C" int ds4_gpu_test_laguna_compact_wait_cache_load_paused(
+        ds4_laguna_cache_handle *handle) {
+    if (handle) cuda_laguna_compact_cache_handle_clear(handle);
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_cache_pause_mutex);
+    if (!g_laguna_compact_cache_pause_condition.wait_for(
+            guard, std::chrono::seconds(5),
+            [] { return g_laguna_compact_cache_paused; })) {
+        return 0;
+    }
+    if (handle) *handle = g_laguna_compact_cache_paused_handle;
+    return 1;
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_resume_cache_load(void) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_cache_pause_mutex);
+    if (!g_laguna_compact_cache_paused) return;
+    g_laguna_compact_cache_resume = true;
+    g_laguna_compact_cache_pause_condition.notify_all();
+    g_laguna_compact_cache_pause_condition.wait(
+        guard, [] { return !g_laguna_compact_cache_paused; });
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_pause_cache_begin_once(void) {
+    std::lock_guard<std::mutex> guard(
+        g_laguna_compact_cache_begin_pause_mutex);
+    if (!g_laguna_compact_cache_begin_paused) {
+        g_laguna_compact_cache_begin_pause_armed = true;
+        g_laguna_compact_cache_begin_resume = false;
+    }
+}
+
+extern "C" int ds4_gpu_test_laguna_compact_wait_cache_begin_paused(void) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_cache_begin_pause_mutex);
+    return g_laguna_compact_cache_begin_pause_condition.wait_for(
+        guard, std::chrono::seconds(5),
+        [] { return g_laguna_compact_cache_begin_paused; }) ? 1 : 0;
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_resume_cache_begin(void) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_cache_begin_pause_mutex);
+    if (!g_laguna_compact_cache_begin_paused) {
+        g_laguna_compact_cache_begin_pause_armed = false;
+        g_laguna_compact_cache_begin_resume = false;
+        return;
+    }
+    g_laguna_compact_cache_begin_resume = true;
+    g_laguna_compact_cache_begin_pause_condition.notify_all();
+    g_laguna_compact_cache_begin_pause_condition.wait(
+        guard, [] { return !g_laguna_compact_cache_begin_paused; });
+}
+
+extern "C" uint64_t ds4_gpu_test_laguna_compact_snapshot_size(void) {
+    return sizeof(ds4_gpu_laguna_compact_test_snapshot);
+}
+
+extern "C" ds4_laguna_cache_status
+ds4_gpu_test_laguna_compact_cache_reserve_loading(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome) {
+    cuda_laguna_compact_cache_handle_clear(handle);
+    if (outcome) *outcome = DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+    if (!ctx || !handle || !outcome) return DS4_LAGUNA_CACHE_UNSAFE;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const ds4_laguna_cache_status status = ds4_laguna_cache_policy_acquire(
+        &ctx->cache_policy, key, handle, outcome);
+    if (status == DS4_LAGUNA_CACHE_OK) {
+        handle->lifecycle_epoch = ctx->lifecycle_epoch;
+    }
+    if (status == DS4_LAGUNA_CACHE_UNSAFE ||
+        (status == DS4_LAGUNA_CACHE_OK &&
+         *outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER &&
+         !cuda_laguna_compact_cache_sync_device_map_locked(ctx))) {
+        ctx->cache_unsafe = 1;
+        cuda_laguna_compact_cache_handle_clear(handle);
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    return status;
+}
+#endif
+
+extern "C" bool
+ds4_gpu_laguna_compact_runtime_snapshot(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_wire_counters *out,
+        bool *unsafe_out,
+        ds4_gpu_laguna_runtime_snapshot_fn capture,
+        void *userdata) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (unsafe_out) *unsafe_out = false;
+    if (!ctx || !out || !unsafe_out || !capture) return false;
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    std::lock_guard<std::recursive_mutex> compact_guard(
+        g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_published_locked(ctx)) return false;
+    *unsafe_out = ctx->cache_unsafe;
+    out->cache_acquire_hits = ctx->cache_acquire_hits;
+    out->cache_acquire_misses = ctx->cache_acquire_misses;
+    out->cache_evictions = ctx->cache_evictions;
+    out->model_file_read_operations = ctx->model_file_read_calls;
+    out->model_file_read_bytes = ctx->model_file_read_bytes;
+    out->model_file_read_ns = ctx->model_file_read_ns;
+    out->host_to_device_bytes = ctx->host_to_device_bytes;
+    out->host_to_device_ns = ctx->host_to_device_ns;
+    out->page_advice_attempts = ctx->page_advice_counters.attempted_calls;
+    out->page_advice_bytes = ctx->page_advice_counters.attempted_bytes;
+    out->page_advice_failures = ctx->page_advice_counters.failed_calls;
+    if (!capture(userdata)) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    return true;
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_fail_sync_once(void) {
+#ifdef DS4_TEST_HOOKS
+    g_laguna_compact_fail_sync_count.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_fail_release_once(void) {
+#ifdef DS4_TEST_HOOKS
+    g_laguna_compact_fail_release_count.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_laguna_compact_exec_mutex_try_lock(void) {
+    if (!g_laguna_compact_exec_mutex.try_lock()) return 0;
+    g_laguna_compact_exec_mutex.unlock();
+    return 1;
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_fail_after_identity_once(void) {
+    g_laguna_compact_fail_after_identity.store(
+        true, std::memory_order_relaxed);
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_pause_creating_once(void) {
+    std::lock_guard<std::mutex> guard(
+        g_laguna_compact_creating_pause_mutex);
+    if (!g_laguna_compact_creating_paused) {
+        g_laguna_compact_creating_pause_armed = true;
+        g_laguna_compact_creating_resume = false;
+    }
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_wait_creating_paused(void) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_creating_pause_mutex);
+    g_laguna_compact_creating_pause_condition.wait(
+        guard, [] { return g_laguna_compact_creating_paused; });
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_resume_creating(void) {
+    std::unique_lock<std::mutex> guard(
+        g_laguna_compact_creating_pause_mutex);
+    if (!g_laguna_compact_creating_paused) return;
+    g_laguna_compact_creating_resume = true;
+    g_laguna_compact_creating_pause_condition.notify_all();
+    g_laguna_compact_creating_pause_condition.wait(
+        guard, [] { return !g_laguna_compact_creating_paused; });
+}
+
+extern "C" void ds4_gpu_test_laguna_compact_fail_before_publish_once(void) {
+    g_laguna_compact_fail_before_publish.store(
+        true, std::memory_order_relaxed);
+}
+#endif
+
+/* g_laguna_compact_mutex must be held and state must be non-IDLE. */
+static uint64_t cuda_laguna_compact_routed_current_bytes_locked(
+        const ds4_gpu_laguna_compact *ctx) {
+    if (!ctx || !ctx->ledger || !ctx->entry_to_slot ||
+        !ctx->cache_slots) {
+        return 0;
+    }
+    uint64_t current = 0;
+    for (size_t i = 0;
+         i < (size_t)ctx->ledger->expert_entry_count; i++) {
+        const uint32_t slot_index = ctx->entry_to_slot[i];
+        if (slot_index == DS4_LAGUNA_CACHE_SLOT_NONE) continue;
+        if ((size_t)slot_index >= ctx->cache_policy.slot_count) {
+            return UINT64_MAX;
+        }
+        const ds4_laguna_cache_slot *slot =
+            &ctx->cache_slots[slot_index];
+        if (slot->state != DS4_LAGUNA_CACHE_SLOT_READY &&
+            slot->state != DS4_LAGUNA_CACHE_SLOT_IN_USE) {
+            continue;
+        }
+        const ds4_laguna_expert_entry *entry =
+            &ctx->ledger->expert_entries[i];
+        const uint64_t parts[3] = {
+            entry->gate.source_bytes,
+            entry->up.source_bytes,
+            entry->down.source_bytes,
+        };
+        for (size_t part = 0; part < 3; part++) {
+            if (parts[part] > UINT64_MAX - current) {
+                return UINT64_MAX;
+            }
+            current += parts[part];
+        }
+    }
+    return current;
+}
+
+static int cuda_laguna_compact_snapshot_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_laguna_compact_test_snapshot *out,
+        int state) {
+    if (ctx != &g_laguna_compact_storage || !out ||
+        state == DS4_LAGUNA_COMPACT_IDLE) return 0;
+    out->lifecycle = (ds4_gpu_laguna_lifecycle)state;
+    out->model_fd = ctx->model_fd;
+    out->model_map = ctx->model_map;
+    out->model_size = ctx->model_size;
+    out->model_identity = ctx->model_identity;
+    out->static_slab = ctx->static_slab;
+    out->static_offsets = ctx->static_offsets;
+    out->cache_payload = ctx->cache_payload;
+    out->cache_slots = ctx->cache_slots;
+    out->device_entry_to_slot = ctx->device_entry_to_slot;
+    out->model_fd_live = ctx->model_fd >= 0;
+    out->static_slab_live = ctx->static_slab != NULL;
+    out->static_offsets_live = ctx->static_offsets != NULL;
+    out->cache_payload_live = ctx->cache_payload != NULL &&
+        ctx->tracker_cache_payload_live != 0;
+    out->cache_policy_live = ctx->cache_policy_live != 0;
+    out->device_entry_to_slot_live =
+        ctx->device_entry_to_slot != NULL &&
+        ctx->tracker_device_entry_to_slot_live != 0;
+    out->tracker_mapping_live = ctx->tracker_mapping_live != 0;
+    out->tracker_static_live = ctx->tracker_static_live != 0;
+    out->tracker_offsets_live = ctx->tracker_offsets_live != 0;
+    out->sync_attempt_count = ctx->sync_attempt_count;
+    out->release_attempt_count = ctx->release_attempt_count;
+    out->rejection_count = ctx->rejection_count;
+    out->static_slab_bytes = ctx->static_slab_bytes;
+    out->static_source_copied_bytes = ctx->static_source_copied_bytes;
+    out->static_range_count = ctx->static_range_count;
+    out->static_offset_count = ctx->static_offset_count;
+    out->static_offset_bytes = ctx->static_offset_bytes;
+    out->cache_payload_bytes = ctx->cache_payload_bytes;
+    out->cache_slot_count = ctx->plan ? ctx->plan->slot_count : 0;
+    out->cache_slot_stride_bytes =
+        ctx->plan ? ctx->plan->slot_stride_bytes : 0;
+    for (size_t i = 0; i < 4; i++) {
+        if (ctx->pinned_staging[i]) {
+            out->pinned_staging_live_count++;
+            if (ctx->plan) {
+                out->pinned_staging_bytes +=
+                    ctx->plan->staging_buffer_bytes;
+            }
+        }
+    }
+    out->cache_payload_allocation_attempts =
+        ctx->cache_payload_allocation_attempts;
+    out->pinned_staging_allocation_attempts =
+        ctx->pinned_staging_allocation_attempts;
+    out->cache_acquire_hits = ctx->cache_acquire_hits;
+    out->cache_acquire_misses = ctx->cache_acquire_misses;
+    out->cache_evictions = ctx->cache_evictions;
+    out->cache_load_successes = ctx->cache_load_successes;
+    out->cache_load_failures = ctx->cache_load_failures;
+    out->model_file_read_calls = ctx->model_file_read_calls;
+    out->model_file_read_bytes = ctx->model_file_read_bytes;
+    out->pread_eintr_retries = ctx->pread_eintr_retries;
+    out->pread_eof_failures = ctx->pread_eof_failures;
+    out->pread_short_failures = ctx->pread_short_failures;
+    out->pread_error_failures = ctx->pread_error_failures;
+    out->cuda_copy_failures = ctx->cuda_copy_failures;
+    out->event_record_failures = ctx->event_record_failures;
+    out->event_completion_failures = ctx->event_completion_failures;
+    out->cache_cancellations = ctx->cache_cancellations;
+    out->cache_unsafe = ctx->cache_unsafe != 0;
+    out->model_mapping_registered_bytes =
+        g_laguna_compact_legacy_full_map_register_bytes.load(
+            std::memory_order_relaxed) -
+        ctx->legacy_full_map_register_bytes_base;
+    out->whole_model_copied_bytes =
+        g_laguna_compact_legacy_whole_model_copy_bytes.load(
+            std::memory_order_relaxed) -
+        ctx->legacy_whole_model_copy_bytes_base;
+    out->routed_payload_bytes =
+        cuda_laguna_compact_routed_current_bytes_locked(ctx);
+    out->opportunistic_range_allocated_bytes =
+        g_laguna_compact_legacy_range_bytes.load(std::memory_order_relaxed) -
+        ctx->legacy_range_bytes_base;
+    out->legacy_model_range_count =
+        g_laguna_compact_legacy_range_attempts.load(
+            std::memory_order_relaxed) -
+        ctx->legacy_range_attempts_base;
+    out->legacy_model_arena_count =
+        g_laguna_compact_legacy_arena_attempts.load(
+            std::memory_order_relaxed) -
+        ctx->legacy_arena_attempts_base;
+    out->page_advice_state = ctx->page_advice_state;
+    out->page_advice_state_live =
+        ctx->page_advice_state != NULL &&
+        ctx->tracker_page_advice_state_live != 0;
+    out->page_advice_state_bytes = ctx->page_advice_state_bytes;
+    out->page_advice_touched_eligible_unique_bytes =
+        ctx->page_advice_touched_range_bytes;
+    out->page_advice_touched_eligible_unique_pages =
+        ctx->page_advice_counters.touched_eligible_unique_pages;
+    out->page_advice_mapping_touch_pages =
+        ctx->page_advice_mapping_touch_pages;
+    out->page_advice_mapping_touch_bytes =
+        ctx->page_advice_mapping_touch_bytes;
+    out->page_advice_advised_unique_bytes =
+        ctx->page_advice_advised_range_bytes;
+    out->page_advice_advised_unique_pages =
+        ctx->page_advice_counters.advised_unique_pages;
+    out->page_advice_attempted_calls =
+        ctx->page_advice_counters.attempted_calls;
+    out->page_advice_attempted_bytes =
+        ctx->page_advice_counters.attempted_bytes;
+    out->page_advice_successful_calls =
+        ctx->page_advice_counters.successful_calls;
+    out->page_advice_successful_bytes =
+        ctx->page_advice_counters.successful_bytes;
+    out->page_advice_failed_calls =
+        ctx->page_advice_counters.failed_calls;
+    out->page_advice_failed_bytes =
+        ctx->page_advice_counters.failed_bytes;
+    out->page_advice_errno_bucket_count =
+        ctx->page_advice_counters.errno_bucket_count;
+    if (out->page_advice_errno_bucket_count >
+            DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY) {
+        out->page_advice_errno_bucket_count =
+            DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY;
+    }
+    memcpy(out->page_advice_errno_buckets,
+           ctx->page_advice_counters.errno_buckets,
+           sizeof(out->page_advice_errno_buckets));
+    for (size_t i = 0; i < out->page_advice_errno_bucket_count; i++) {
+        const ds4_laguna_page_advice_errno_bucket *bucket =
+            &out->page_advice_errno_buckets[i];
+        if (bucket->error_number == EINVAL) {
+            out->page_advice_errno_einval_calls = bucket->calls;
+            out->page_advice_errno_einval_bytes = bucket->bytes;
+        } else if (bucket->error_number == EIO) {
+            out->page_advice_errno_eio_calls = bucket->calls;
+            out->page_advice_errno_eio_bytes = bucket->bytes;
+        }
+    }
+    out->page_advice_fadvise_attempted_calls =
+        ctx->page_advice_fadvise_counters.attempted_calls;
+    out->page_advice_fadvise_attempted_bytes =
+        ctx->page_advice_fadvise_counters.attempted_bytes;
+    out->page_advice_fadvise_successful_calls =
+        ctx->page_advice_fadvise_counters.successful_calls;
+    out->page_advice_fadvise_successful_bytes =
+        ctx->page_advice_fadvise_counters.successful_bytes;
+    out->page_advice_fadvise_failed_calls =
+        ctx->page_advice_fadvise_counters.failed_calls;
+    out->page_advice_fadvise_failed_bytes =
+        ctx->page_advice_fadvise_counters.failed_bytes;
+    out->page_advice_madvise_attempted_calls =
+        ctx->page_advice_madvise_counters.attempted_calls;
+    out->page_advice_madvise_attempted_bytes =
+        ctx->page_advice_madvise_counters.attempted_bytes;
+    out->page_advice_madvise_successful_calls =
+        ctx->page_advice_madvise_counters.successful_calls;
+    out->page_advice_madvise_successful_bytes =
+        ctx->page_advice_madvise_counters.successful_bytes;
+    out->page_advice_madvise_failed_calls =
+        ctx->page_advice_madvise_counters.failed_calls;
+    out->page_advice_madvise_failed_bytes =
+        ctx->page_advice_madvise_counters.failed_bytes;
+    out->page_advice_precharge_source_resident_bytes =
+        ctx->page_advice_precharge_source_resident_bytes;
+    out->page_advice_post_source_resident_bytes =
+        ctx->page_advice_post_source_resident_bytes;
+    out->page_advice_upload_completed_sequence =
+        ctx->page_advice_upload_completed_sequence;
+    out->page_advice_precharge_sequence =
+        ctx->page_advice_precharge_sequence;
+    out->page_advice_mapping_touch_sequence =
+        ctx->page_advice_mapping_touch_sequence;
+    out->page_advice_attempt_sequence =
+        ctx->page_advice_attempt_sequence;
+    out->page_advice_post_sample_sequence =
+        ctx->page_advice_post_sample_sequence;
+    out->page_advice_complete_sequence =
+        ctx->page_advice_complete_sequence;
+    out->page_advice_complete_monotonic_ns =
+        ctx->page_advice_complete_monotonic_ns;
+    return 1;
+}
+
+extern "C" int ds4_gpu_test_laguna_compact_snapshot(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_laguna_compact_test_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !out) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    return cuda_laguna_compact_snapshot_locked(ctx, out, state);
+}
+
+extern "C" int ds4_gpu_test_laguna_compact_active_snapshot(
+        ds4_gpu_laguna_compact_test_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state != DS4_LAGUNA_COMPACT_ACTIVE) return 0;
+    return cuda_laguna_compact_snapshot_locked(
+        &g_laguna_compact_storage, out, state);
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_laguna_compact_routed_origin_snapshot(
+        ds4_gpu_laguna_routed_origin_test_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state != DS4_LAGUNA_COMPACT_ACTIVE) return 0;
+    *out = g_laguna_compact_storage.routed_origin;
+    return 1;
+}
+#endif
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_laguna_compact_nonidle_snapshot(
+        ds4_gpu_laguna_compact_test_snapshot *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return 0;
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    const int state =
+        g_laguna_compact_state.load(std::memory_order_relaxed);
+    if (state == DS4_LAGUNA_COMPACT_IDLE) return 0;
+    return cuda_laguna_compact_snapshot_locked(
+        &g_laguna_compact_storage, out, state);
+}
+#endif
+
+extern "C" uint64_t
+ds4_gpu_test_laguna_compact_static_allocation_attempts(void) {
+    return g_laguna_compact_static_allocation_attempts.load(
+        std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ds4_gpu_test_generic_cleanup_attempts(void) {
+    return g_laguna_compact_generic_cleanup_attempts.load(
+        std::memory_order_relaxed);
+}
+
+extern "C" int ds4_gpu_test_laguna_compact_lookup(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t source_offset,
+        uint64_t bytes,
+        int expected_device,
+        void **out_device_ptr) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (ctx != &g_laguna_compact_storage) return 0;
+    return cuda_laguna_compact_lookup_locked(
+        ctx, source_offset, bytes, expected_device, out_device_ptr);
+}
 
 static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
@@ -539,6 +5607,8 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
@@ -701,10 +5771,6 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
 /* Optional second (support) model map for speculative decoding. The strict
  * multi-tier cache is keyed by source offset only, so support tensors are
  * installed and resolved with a large disjoint offset bias. */
-static const void *g_support_host_base = NULL;
-static uint64_t g_support_host_size = 0;
-static uint64_t g_support_offset_bias = 0;
-
 extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
     int prev = -1;
@@ -718,6 +5784,8 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
 }
 
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!map || size == 0 || bias == 0) return 0;
     g_support_host_base = map;
     g_support_host_size = size;
@@ -730,6 +5798,23 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t bytes,
                                             int logical_tier,
                                             const char *label) {
+    const int compact_route = cuda_laguna_compact_lookup_route(model_map);
+    if (compact_route != 0) {
+        if (compact_route < 0 || logical_tier != 0 || g_n_gpus != 1) {
+            return NULL;
+        }
+        std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+        void *device_ptr = NULL;
+        if (g_laguna_compact_state.load(std::memory_order_relaxed) !=
+                DS4_LAGUNA_COMPACT_ACTIVE ||
+            g_laguna_compact_storage.model_map != model_map ||
+            !cuda_laguna_compact_lookup_locked(
+                &g_laguna_compact_storage, offset, bytes,
+                g_gpu[0].device_id, &device_ptr)) {
+            return NULL;
+        }
+        return (const char *)device_ptr;
+    }
     if (g_n_gpus <= 1) {
         return cuda_model_range_ptr(model_map, offset, bytes, label);
     }
@@ -766,6 +5851,17 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
         (unsigned long long)offset, (unsigned long long)bytes,
         logical_tier, physical_device, cur_dev, label ? label : "?");
     return NULL;
+}
+
+extern "C" const void *ds4_gpu_test_laguna_compact_resolve_weight_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const char *label) {
+    return cuda_resolve_weight_ptr(
+        model_map, offset, bytes, logical_tier,
+        label ? label : "laguna_compact_test");
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
@@ -1080,6 +6176,8 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (g_n_gpus <= 1) {
         auto exact = g_q8_f16_by_offset.find(offset);
         if (exact != g_q8_f16_by_offset.end()) {
@@ -1195,6 +6293,8 @@ static float *cuda_q8_f32_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (g_n_gpus <= 1) {
         auto exact = g_q8_f32_by_offset.find(offset);
         if (exact != g_q8_f32_by_offset.end()) {
@@ -1355,6 +6455,8 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 }
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
         getenv("DS4_CUDA_COPY_MODEL") != NULL ||
@@ -1660,6 +6762,8 @@ static int cuda_model_copy_to_device_streamed(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!dst || !model_map || offset > model_size ||
         bytes > model_size - offset) {
         return 0;
@@ -1775,6 +6879,8 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
@@ -1820,6 +6926,8 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return NULL;
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
@@ -1912,6 +7020,8 @@ static const char *cuda_model_range_ptr_from_fd(
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
@@ -2222,7 +7332,24 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    (void)cudaDeviceSynchronize();
+    g_laguna_compact_generic_cleanup_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    const int compact_cleanup_required =
+        g_laguna_compact_state.load(std::memory_order_acquire) !=
+            DS4_LAGUNA_COMPACT_IDLE;
+    if (compact_cleanup_required) {
+        const ds4_gpu_laguna_destroy_status destroy_status =
+            cuda_laguna_compact_destroy_checked(
+                &g_laguna_compact_storage);
+        if (destroy_status != DS4_GPU_LAGUNA_DESTROY_OK) {
+            fprintf(stderr,
+                    "ds4: CUDA cleanup retained compact Laguna ownership "
+                    "after teardown failure\n");
+            return;
+        }
+    } else {
+        (void)cudaDeviceSynchronize();
+    }
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -2326,6 +7453,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_fd = -1;
+    g_model_fd_host_base = NULL;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
@@ -2333,6 +7461,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_support_host_base = NULL;
+    g_support_host_size = 0;
+    g_support_offset_bias = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -3122,6 +8253,8 @@ extern "C" int ds4_gpu_end_commands(void) {
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
@@ -3200,6 +8333,8 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 }
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)max_tensor_bytes;
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
@@ -3218,6 +8353,8 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
  * for the host pointer plus cudaHostRegister, but skipping the
  * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
@@ -3359,6 +8496,8 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
 extern "C" int ds4_gpu_device_cache_tensors(int device_id,
                                             const ds4_tensor_range *ranges,
                                             int n_ranges) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 11;
     if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
     if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
     if (n_ranges == 0) return 0;
@@ -3515,6 +8654,8 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
                                                     const ds4_tensor_range *ranges,
                                                     int n_ranges,
                                                     int from_main_map) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 10;
     if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
     if (entry_device_id < 0 || entry_device_id >= DS4_MAX_GPUS) return 1;
     if (n_ranges <= 0 || !ranges) return 2;
@@ -3614,6 +8755,8 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
 
 extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                                     int *out_device_id, void **out_device_ptr) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     int active_device = -1;
     (void)cudaGetDevice(&active_device);
 
@@ -3675,6 +8818,8 @@ extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
 }
 
 extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return -1;
     int d = -1;
     if (!ds4_gpu_lookup_cache(source_offset, bytes, &d, NULL)) return -1;
     return d;
@@ -3698,6 +8843,8 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
                                             uint64_t bytes,
                                             int      expected_device,
                                             void   **out_device_ptr) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (g_cache_ranges.empty()) return 0;
 
     auto it = std::upper_bound(
@@ -3726,6 +8873,8 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
@@ -3762,6 +8911,8 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
@@ -3769,6 +8920,8 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     static int optional_q8_preload_disabled = 0;
@@ -3838,6 +8991,10 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
         }
         if (prev >= 0) (void)cudaSetDevice(prev);
     }
+}
+
+extern "C" void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed) {
+    (void)suppressed;
 }
 
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
@@ -4247,16 +9404,66 @@ __global__ static void quantize_q8_0_f32_kernel(
         if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
         __syncthreads();
     }
-    const float d = vals[0] / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    /* Match llama.cpp's MMQ Q8_1 D4 activation contract exactly: form the
+     * reciprocal first, quantize with roundf, then recover the stored scale.
+     * Reversing those divisions and using lrintf changes boundary values and
+     * compounds across Laguna's resident graph. */
+    const float id = vals[0] != 0.0f ? 127.0f / vals[0] : 0.0f;
+    const float d = id != 0.0f ? 1.0f / id : 0.0f;
     if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
     int8_t *dst = xq + (tok * blocks + b) * 32;
     if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
+        int v = (int)roundf(xr[threadIdx.x] * id);
         v = v > 127 ? 127 : (v < -128 ? -128 : v);
         dst[threadIdx.x] = (int8_t)v;
     } else {
         dst[threadIdx.x] = 0;
+    }
+}
+
+typedef struct {
+    __half d;
+    __half s;
+    int8_t qs[32];
+} poolside_q8_1_block;
+
+static_assert(sizeof(poolside_q8_1_block) == 36u,
+              "unexpected Poolside Q8_1 block size");
+
+/* Match Poolside llama.cpp's MMVQ activation quantizer.  A 256-thread CUDA
+ * block contains eight independent quantization warps; Q8_1 retains its
+ * FP16 scale even though Q8_0 dot products do not consume the sum field. */
+__launch_bounds__(256, 1)
+static __global__ void
+quantize_poolside_q8_1_f32_kernel(
+        poolside_q8_1_block *y,
+        const float *x,
+        uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const float xi = x[i];
+    float amax = fabsf(xi);
+    float sum = xi;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        amax = fmaxf(amax,
+                     __shfl_xor_sync(0xffffffffu, amax, offset, 32));
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(0xffffffffu, sum, offset, 32));
+    }
+
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : (int8_t)roundf(xi / d);
+    poolside_q8_1_block *block = y + i / 32u;
+    block->qs[lane] = q;
+    if (lane == 0u) {
+        block->d = __float2half_rn(d);
+        block->s = __float2half_rn(sum);
     }
 }
 
@@ -5219,6 +10426,156 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
     }
 }
 
+__device__ __forceinline__ static float poolside_q8_streamk_segment(
+        const unsigned char *wr,
+        const int8_t *xqr,
+        const float *xsr,
+        uint32_t begin,
+        uint32_t end) {
+    float acc = 0.0f;
+    for (uint32_t b = begin; b < end; b++) {
+        const unsigned char *wb = wr + (uint64_t)b * 34u;
+        const int8_t *wq = (const int8_t *)(wb + 2u);
+        const int8_t *aq = xqr + (uint64_t)b * 32u;
+        const int32_t dot = dot_i8x32_dp4a(wq, aq);
+        const float weighted = __fmul_rn(
+            __half2float(*(const __half *)wb), __int2float_rn(dot));
+        acc = __fmaf_rn(weighted, xsr[b], acc);
+    }
+    return acc;
+}
+
+/* Poolside llama.cpp 04b2b72's one-token Q8_0 MMVQ topology for K >= 1024.
+ * Four warps split each Q8 block into eight-value quarters.  Warp zero then
+ * combines the other warp partials in source order before the XOR reduction. */
+__launch_bounds__(128, 1)
+static __global__ void
+matmul_q8_0_preq_poolside_mmvq1_kernel(
+        float *out,
+        const unsigned char *w,
+        const poolside_q8_1_block *xq,
+        uint32_t blocks) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = 32u * warp + lane;
+    const uint32_t quarter = tid & 3u;
+    const unsigned char *wr =
+        w + (uint64_t)row * blocks * 34u;
+    float partial = 0.0f;
+
+    for (uint32_t b = tid / 4u; b < blocks; b += 32u) {
+        const unsigned char *wb = wr + (uint64_t)b * 34u;
+        const uint32_t q = quarter * 8u;
+        int32_t dot = 0;
+        dot = __dp4a(load_i8x4_i32_unaligned(
+                         (const int8_t *)(wb + 2u) + q),
+                     load_i8x4_i32_aligned(xq[b].qs + q), dot);
+        dot = __dp4a(load_i8x4_i32_unaligned(
+                         (const int8_t *)(wb + 2u) + q + 4u),
+                     load_i8x4_i32_aligned(xq[b].qs + q + 4u), dot);
+        const float scale = __fmul_rn(
+            __half2float(*(const __half *)wb), __half2float(xq[b].d));
+        partial = __fmaf_rn(scale, __int2float_rn(dot), partial);
+    }
+
+    __shared__ float warp_partials[3][32];
+    if (warp > 0u) {
+        warp_partials[warp - 1u][lane] = partial;
+    }
+    __syncthreads();
+    if (warp > 0u) return;
+
+#pragma unroll
+    for (uint32_t other = 0u; other < 3u; other++) {
+        partial = __fadd_rn(partial, warp_partials[other][lane]);
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        partial = __fadd_rn(
+            partial,
+            __shfl_xor_sync(0xffffffffu, partial, offset, 32));
+    }
+    if (lane == 0u) out[row] = partial;
+}
+
+/* Exact numeric emulation of Poolside llama.cpp 04b2b72's Q8_0 Stream-K
+ * association for Laguna projections on a 48-SM GB10.  Each CUDA
+ * worker receives a proportional interval in continuous tile/K space, then
+ * rounds its bounds down within the tile to an eight-Q8-block iteration.
+ * The highest-index nonempty interval writes directly; the fixup walks all
+ * earlier intervals in reverse worker order before adding that aggregate. */
+__global__ static void matmul_q8_0_preq_poolside_streamk_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint32_t out_dim,
+        uint32_t blocks,
+        uint32_t n_tokens,
+        uint32_t tokens_per_tile,
+        uint32_t token_tiles,
+        uint32_t tiles,
+        uint32_t launch_blocks) {
+    const uint32_t row = blockIdx.x * 128u + threadIdx.x;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+
+    const unsigned char *wr = w + (uint64_t)row * blocks * 34u;
+    const int8_t *xqr = xq + (uint64_t)tok * blocks * 32u;
+    const float *xsr = xscale + (uint64_t)tok * blocks;
+    const uint32_t tile = (row / 128u) * token_tiles +
+        tok / tokens_per_tile;
+    const uint64_t tile_begin = (uint64_t)tile * blocks;
+    const uint64_t tile_end = tile_begin + blocks;
+    const uint64_t total_work = (uint64_t)tiles * blocks;
+    bool have_direct = false;
+    float direct = 0.0f;
+    float fixup = 0.0f;
+    for (int32_t worker = (int32_t)launch_blocks - 1;
+         worker >= 0; worker--) {
+        uint64_t begin =
+            (uint64_t)worker * total_work / launch_blocks;
+        uint64_t end =
+            (uint64_t)(worker + 1) * total_work / launch_blocks;
+        begin -= (begin % blocks) % 8u;
+        end -= (end % blocks) % 8u;
+        const uint64_t intersection_begin =
+            begin > tile_begin ? begin : tile_begin;
+        const uint64_t intersection_end =
+            end < tile_end ? end : tile_end;
+        if (intersection_begin >= intersection_end) continue;
+        const float partial = poolside_q8_streamk_segment(
+            wr, xqr, xsr,
+            (uint32_t)(intersection_begin - tile_begin),
+            (uint32_t)(intersection_end - tile_begin));
+        if (!have_direct) {
+            direct = partial;
+            have_direct = true;
+        } else {
+            fixup = __fadd_rn(fixup, partial);
+        }
+    }
+    out[(uint64_t)tok * out_dim + row] =
+        have_direct ? __fadd_rn(direct, fixup) : __int_as_float(0x7fffffff);
+}
+
+static uint32_t poolside_q8_mmq_tokens_per_tile(
+        uint64_t n_tokens, bool fallback) {
+    static const uint32_t regular[] = {
+        8u, 16u, 24u, 32u, 40u, 48u, 64u, 80u, 96u, 112u, 128u,
+    };
+    static const uint32_t ragged[] = { 8u, 16u, 32u, 64u, 128u };
+    const uint32_t *choices = fallback ? ragged : regular;
+    const size_t count = fallback ?
+        sizeof(ragged) / sizeof(ragged[0]) :
+        sizeof(regular) / sizeof(regular[0]);
+    for (size_t i = 0; i < count; i++) {
+        if (n_tokens <= choices[i]) return choices[i];
+    }
+    return 128u;
+}
+
 
 /* ---- INT8 tensor-core exact Q8_0 batch matmul --------------------------
  * Bit-identical replacement for the exact tok2/warp8-family batched Q8_0
@@ -5231,7 +10588,9 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
  * tree levels), plus per-(j&3) sequential accumulators and a fixed tail for
  * the remaining levels. Fuzz-verified bitwise against both reference
  * kernels across shapes, including blocks < T and ragged out_dim/n_tok.
- * Rollback: DS4_CUDA_NO_Q8_MMA=1. */
+ * Rollback: DS4_CUDA_NO_Q8_MMA=1. The sm_121 path is bypassed automatically:
+ * a pinned 22-token Poolside projection exposed silent zero/corrupt outputs
+ * on GB10, while the exact native kernel remained numerically stable. */
 __device__ __forceinline__ static uint32_t ldu32_unaligned(const uint8_t *p) {
     const uintptr_t addr = (uintptr_t)p;
     const uint32_t *base = (const uint32_t *)(addr & ~(uintptr_t)3);
@@ -5428,7 +10787,23 @@ static int cuda_q8_mma_try_launch(
         uint64_t out_stride,
         uint32_t T) {
     static int disabled = -1;
-    if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
+    if (disabled < 0) {
+        disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
+        if (!disabled) {
+            int dev = 0, major = 0, minor = 0;
+            if (cudaGetDevice(&dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(
+                    &major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(
+                    &minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                major == 12 && minor == 1) {
+                disabled = 1;
+                fprintf(stderr,
+                        "ds4: CUDA Q8 MMA disabled on sm_121 after parity failure; "
+                        "using exact kernels\n");
+            }
+        }
+    }
     if (disabled || !cuda_q4_mma_ok()) return 0;
     if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < 8u) return 0;
     if (((uintptr_t)w & 1u) || ((uintptr_t)xq & 3u) || ((uintptr_t)xscale & 3u)) return 0;
@@ -5715,6 +11090,48 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
+    }
+}
+
+__device__ __forceinline__ static float poolside_warp_sum_f32(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+    }
+    return value;
+}
+
+/* Poolside llama.cpp 04b2b72 launches its fused weighted RMSNorm with 1024
+ * threads for widths >= 1024. Laguna's 3072-wide norms feed Q8 activation
+ * quantization, where a one-ULP reduction difference can cross a rounding
+ * boundary, so preserve Poolside's two-stage XOR tree and multiply order. */
+__global__ static void rms_norm_weight_poolside3072_kernel(
+        float *out,
+        const float *x,
+        const float *w,
+        uint32_t rows,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const float *xr = x + (uint64_t)row * 3072u;
+    float *orow = out + (uint64_t)row * 3072u;
+    float sum = 0.0f;
+    for (uint32_t col = tid; col < 3072u; col += 1024u) {
+        const float value = xr[col];
+        sum += value * value;
+    }
+    sum = poolside_warp_sum_f32(sum);
+    __shared__ float warp_sums[32];
+    if (lane == 0u) warp_sums[warp] = sum;
+    __syncthreads();
+    sum = warp_sums[lane];
+    sum = poolside_warp_sum_f32(sum);
+    const float scale = rsqrtf(sum / 3072.0f + eps);
+    for (uint32_t col = tid; col < 3072u; col += 1024u) {
+        orow[col] = scale * xr[col] * w[col];
     }
 }
 
@@ -12370,6 +17787,163 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (out && x && model_map && in_dim >= 1024u && out_dim != 0u &&
+        (in_dim & 31u) == 0u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok == 1u) {
+        const uint64_t blocks = in_dim / 32u;
+        if (out_dim <= UINT64_MAX / (blocks * 34u)) {
+            const uint64_t weight_bytes = out_dim * blocks * 34u;
+            if (weight_offset <= model_size &&
+                weight_bytes <= model_size - weight_offset &&
+                x->bytes >= in_dim * sizeof(float) &&
+                out->bytes >= out_dim * sizeof(float)) {
+                const int logical_tier = ds4_tensor_device_idx(out);
+                if (logical_tier >= 0 && logical_tier < g_n_gpus) {
+                    const int physical_device =
+                        g_gpu[logical_tier].device_id;
+                    int current_device = -1;
+                    int major = 0;
+                    int minor = 0;
+                    int nsm = 0;
+                    if (cudaGetDevice(&current_device) == cudaSuccess &&
+                        current_device == physical_device &&
+                        cudaDeviceGetAttribute(
+                            &major, cudaDevAttrComputeCapabilityMajor,
+                            physical_device) == cudaSuccess &&
+                        cudaDeviceGetAttribute(
+                            &minor, cudaDevAttrComputeCapabilityMinor,
+                            physical_device) == cudaSuccess &&
+                        cudaDeviceGetAttribute(
+                            &nsm, cudaDevAttrMultiProcessorCount,
+                            physical_device) == cudaSuccess &&
+                        major == 12 && minor == 1 && nsm == 48) {
+                        const char *wptr = cuda_resolve_weight_ptr(
+                            model_map, weight_offset, weight_bytes,
+                            logical_tier, "laguna_poolside_q8_0");
+                        poolside_q8_1_block *xq =
+                            (poolside_q8_1_block *)cuda_tmp_alloc_on(
+                                logical_tier,
+                                blocks * sizeof(poolside_q8_1_block),
+                                "laguna poolside q8_1 MMVQ prequant");
+                        if (!wptr || !xq) return 0;
+                        quantize_poolside_q8_1_f32_kernel
+                            <<<(unsigned)((in_dim + 255u) / 256u), 256>>>(
+                                xq, (const float *)x->ptr,
+                                (uint32_t)in_dim);
+                        if (!cuda_ok(
+                                cudaGetLastError(),
+                                "laguna poolside q8_1 MMVQ quantize launch")) {
+                            return 0;
+                        }
+                        const dim3 block(32u, 4u, 1u);
+                        matmul_q8_0_preq_poolside_mmvq1_kernel
+                            <<<(unsigned)out_dim, block>>>(
+                                (float *)out->ptr,
+                                (const unsigned char *)wptr,
+                                xq,
+                                (uint32_t)blocks);
+                        return cuda_ok(cudaGetLastError(),
+                                       "laguna poolside q8_0 MMVQ launch");
+                    }
+                    (void)cudaGetLastError();
+                }
+            }
+        }
+    }
+    if (out && x && model_map && in_dim != 0u && out_dim != 0u &&
+        (in_dim & 31u) == 0u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok > 1u && n_tok <= UINT32_MAX) {
+        const uint64_t blocks = in_dim / 32u;
+        if (out_dim > UINT64_MAX / (blocks * 34u)) {
+            return cuda_matmul_q8_0_tensor_labeled(
+                out, model_map, model_size, weight_offset,
+                in_dim, out_dim, x, n_tok, "laguna_poolside_q8_0");
+        }
+        const uint64_t weight_bytes = out_dim * blocks * 34u;
+        if (weight_offset <= model_size &&
+            weight_bytes <= model_size - weight_offset &&
+            x->bytes >= n_tok * in_dim * sizeof(float) &&
+            out->bytes >= n_tok * out_dim * sizeof(float)) {
+            const int logical_tier = ds4_tensor_device_idx(out);
+            const int physical_device =
+                (g_n_gpus > 1 && logical_tier >= 0 &&
+                 logical_tier < g_n_gpus)
+                    ? g_gpu[logical_tier].device_id : 0;
+            int nsm = 0;
+            if (cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount,
+                                       physical_device) == cudaSuccess &&
+                nsm == 48) {
+                const char *wptr = cuda_resolve_weight_ptr(
+                    model_map, weight_offset, weight_bytes, logical_tier,
+                    "laguna_poolside_q8_0");
+                const uint64_t xq_bytes = n_tok * blocks * 32u;
+                const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+                const uint64_t tmp_bytes =
+                    scale_offset + n_tok * blocks * sizeof(float);
+                void *tmp = cuda_tmp_alloc_on(
+                    logical_tier, tmp_bytes, "laguna poolside q8_0 prequant");
+                if (!wptr || !tmp) return 0;
+                int8_t *xq = (int8_t *)tmp;
+                float *xscale = (float *)((char *)tmp + scale_offset);
+                dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+                quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                    xq, xscale, (const float *)x->ptr, in_dim, blocks);
+                if (!cuda_ok(cudaGetLastError(),
+                             "laguna poolside q8_0 quantize launch")) {
+                    return 0;
+                }
+                const bool fallback = (out_dim & 127u) != 0u;
+                const uint32_t tokens_per_tile =
+                    poolside_q8_mmq_tokens_per_tile(n_tok, fallback);
+                const uint64_t token_tiles64 =
+                    (n_tok + tokens_per_tile - 1u) / tokens_per_tile;
+                const uint64_t row_tiles64 = (out_dim + 127u) / 128u;
+                if (token_tiles64 > UINT32_MAX ||
+                    row_tiles64 > UINT32_MAX ||
+                    row_tiles64 > UINT32_MAX / token_tiles64) {
+                    return 0;
+                }
+                const uint32_t token_tiles = (uint32_t)token_tiles64;
+                const uint32_t row_tiles = (uint32_t)row_tiles64;
+                const uint32_t tiles = row_tiles * token_tiles;
+                const uint32_t waves = (tiles + 47u) / 48u;
+                const uint32_t efficiency =
+                    100u * tiles / (48u * waves);
+                const uint32_t launch_blocks =
+                    efficiency >= 90u ? tiles : 48u;
+                dim3 grid(row_tiles, (unsigned)n_tok, 1);
+                matmul_q8_0_preq_poolside_streamk_kernel
+                    <<<grid, 128>>>((float *)out->ptr,
+                                    (const unsigned char *)wptr,
+                                    xq,
+                                    xscale,
+                                    (uint32_t)out_dim,
+                                    (uint32_t)blocks,
+                                    (uint32_t)n_tok,
+                                    tokens_per_tile,
+                                    token_tiles,
+                                    tiles,
+                                    launch_blocks);
+                return cuda_ok(cudaGetLastError(),
+                               "laguna poolside q8_0 Stream-K launch");
+            }
+            (void)cudaGetLastError();
+        }
+    }
+    return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size,
+                                           weight_offset, in_dim, out_dim,
+                                           x, n_tok, "laguna_poolside_q8_0");
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
@@ -13672,7 +19246,13 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    if (n == 3072u) {
+        rms_norm_weight_poolside3072_kernel<<<1, 1024>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, 1u, eps);
+    } else {
+        rms_norm_weight_kernel<<<1, 256>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, n, 1u, eps);
+    }
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -13684,7 +19264,13 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    if (n == 3072u) {
+        rms_norm_weight_poolside3072_kernel<<<rows, 1024>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, rows, eps);
+    } else {
+        rms_norm_weight_kernel<<<rows, 256>>>(
+                (float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    }
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
@@ -16408,6 +21994,83 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
         isum += (int)sc * dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
     }
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
+/* Poolside MMVQ reconstructs each minimum term from d*sum(q).  Prompt MMQ
+ * uses the separate MMA row accumulator below; keeping these helpers split
+ * prevents decode from silently inheriting prompt-only scale rounding. */
+__device__ static float dev_dot_q4_K_q8_1_mmvq_block(
+        const cuda_block_q4_K *x,
+        const poolside_q8_1_block *y) {
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    float scaled_sum = 0.0f;
+    float minimum_sum = 0.0f;
+#pragma unroll
+    for (uint32_t group = 0; group < 8u; group++) {
+        uint8_t scale = 0;
+        uint8_t minimum = 0;
+        dev_q4_K_get_scale_min(group, x->scales, &scale, &minimum);
+        const uint32_t byte_offset = (group >> 1u) * 32u;
+        const int shift = (group & 1u) ? 4 : 0;
+        const int32_t integer_dot = dev_dot_q4_32(
+            x->qs + byte_offset, y[group].qs, shift);
+        const float d8 = __half2float(y[group].d);
+        scaled_sum = __fadd_rn(
+            scaled_sum,
+            __fmul_rn(d8, __int2float_rn((int32_t)scale * integer_dot)));
+        int32_t quantized_sum = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < 32u; i += 4u) {
+            quantized_sum = __dp4a(
+                0x01010101,
+                *(const int32_t *)(y[group].qs + i),
+                quantized_sum);
+        }
+        const float minimum_term = __fmul_rn(
+            d8,
+            __int2float_rn(quantized_sum * (int32_t)minimum));
+        minimum_sum = __fadd_rn(minimum_sum, minimum_term);
+    }
+    return __fsub_rn(__fmul_rn(xd, scaled_sum),
+                     __fmul_rn(xmin, minimum_sum));
+}
+
+/* Poolside's GB10 Q4_K MMQ loader folds each six-bit group scale into the
+ * block d/dmin pair in FP16 before MMA.  Its dot kernel then carries one
+ * float accumulator across the whole row, adding the scaled integer dot and
+ * minimum term separately for every 32-value group. */
+__device__ static float dev_dot_q4_K_q8_1_mma_row(
+        const cuda_block_q4_K *x,
+        const poolside_q8_1_block *y,
+        uint32_t q4_blocks) {
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < q4_blocks; block++) {
+        const cuda_block_q4_K *weight = x + block;
+        const float d = dev_f16_to_f32(weight->d);
+        const float dmin = dev_f16_to_f32(weight->dmin);
+#pragma unroll
+        for (uint32_t group = 0; group < 8u; group++) {
+            uint8_t scale = 0;
+            uint8_t minimum = 0;
+            dev_q4_K_get_scale_min(
+                group, weight->scales, &scale, &minimum);
+            const uint32_t byte_offset = (group >> 1u) * 32u;
+            const int shift = (group & 1u) ? 4 : 0;
+            const poolside_q8_1_block *activation =
+                y + (uint64_t)block * 8u + group;
+            const int32_t integer_dot = dev_dot_q4_32(
+                weight->qs + byte_offset, activation->qs, shift);
+            const float scaled_d = __half2float(__float2half_rn(
+                d * (float)scale));
+            const float scaled_min = __half2float(__float2half_rn(
+                -dmin * (float)minimum));
+            sum += scaled_d * __half2float(activation->d) *
+                (float)integer_dot;
+            sum += scaled_min * __half2float(activation->s);
+        }
+    }
+    return sum;
 }
 
 /* Vector-load variant of dev_dot_q4_K_q8_K_block: loads the whole 144-byte
@@ -25284,8 +30947,2487 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride) {
-    fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor\n");
-    return 0;
+    if (!out || !mid || !model_map || !selected || !weights || !x ||
+        gate_type != 12u || up_type != 12u || down_type != 12u ||
+        n_tokens == 0u || n_expert == 0u || n_total_expert == 0u ||
+        mid_token_stride != n_expert * expert_mid_dim ||
+        gate_expert_bytes != up_expert_bytes ||
+        gate_row_bytes != up_row_bytes ||
+        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= DS4_MAX_GPUS || ds4_tensor_device_idx(mid) != tier ||
+        ds4_tensor_device_idx(selected) != tier || ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(x) != tier) return 0;
+    const uint64_t gate_bytes = (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
+    const uint64_t down_bytes = (uint64_t)n_tokens * n_expert * out_dim * sizeof(float);
+    static ds4_gpu_tensor *gate_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *up_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *down_scratch[DS4_MAX_GPUS] = {0};
+    if (!gate_scratch[tier] || gate_scratch[tier]->bytes < gate_bytes) {
+        ds4_gpu_tensor_free(gate_scratch[tier]);
+        gate_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, gate_bytes);
+    }
+    if (!up_scratch[tier] || up_scratch[tier]->bytes < gate_bytes) {
+        ds4_gpu_tensor_free(up_scratch[tier]);
+        up_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, gate_bytes);
+    }
+    if (!down_scratch[tier] || down_scratch[tier]->bytes < down_bytes) {
+        ds4_gpu_tensor_free(down_scratch[tier]);
+        down_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, down_bytes);
+    }
+    if (!gate_scratch[tier] || !up_scratch[tier] || !down_scratch[tier]) return 0;
+    return routed_moe_launch(out, gate_scratch[tier], up_scratch[tier], mid,
+                             down_scratch[tier], model_map, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_type, down_type,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes,
+                             expert_in_dim, expert_mid_dim, out_dim,
+                             selected, weights, n_total_expert, n_expert,
+                             0.0f, x, layer_index, n_tokens, 0, 0);
+}
+
+/* Poolside's Q4_K MUL_MAT_ID changes activation quantization at its GB10
+ * MMVQ/MMQ boundary.  The existing full-warp quantizer above covers MMVQ.
+ * This kernel covers MMQ while retaining the ordinary 36-byte Q8_1 layout
+ * consumed by the correctness-first resident kernels below.  Eight lanes
+ * jointly quantize one 32-value group, matching Poolside's float4 load and
+ * reciprocal-first arithmetic. */
+__launch_bounds__(256, 1)
+static __global__ void glm_poolside_q8_1_mmq_quantize_kernel(
+        poolside_q8_1_block *out,
+        const float *input,
+        uint64_t group_count) {
+    const uint32_t lane8 = threadIdx.x & 7u;
+    const uint64_t group =
+        (uint64_t)blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (group >= group_count) return;
+
+    const float4 values = ((const float4 *)(input + group * 32u))[lane8];
+    float amax = fabsf(values.x);
+    amax = fmaxf(amax, fabsf(values.y));
+    amax = fmaxf(amax, fabsf(values.z));
+    amax = fmaxf(amax, fabsf(values.w));
+    float sum = __fadd_rn(values.x, values.y);
+    sum = __fadd_rn(sum, values.z);
+    sum = __fadd_rn(sum, values.w);
+    const uint32_t mask = __activemask();
+#pragma unroll
+    for (uint32_t offset = 4u; offset > 0u; offset >>= 1u) {
+        amax = fmaxf(
+            amax, __shfl_xor_sync(mask, amax, offset, 32));
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(mask, sum, offset, 32));
+    }
+
+    const float inverse_scale = amax == 0.0f ? 0.0f : 127.0f / amax;
+    char4 quantized;
+    quantized.x = (signed char)roundf(values.x * inverse_scale);
+    quantized.y = (signed char)roundf(values.y * inverse_scale);
+    quantized.z = (signed char)roundf(values.z * inverse_scale);
+    quantized.w = (signed char)roundf(values.w * inverse_scale);
+    *(char4 *)(out[group].qs + lane8 * 4u) = quantized;
+    if (lane8 == 0u) {
+        const float scale = inverse_scale == 0.0f ? 0.0f :
+            1.0f / inverse_scale;
+        out[group].d = __float2half_rn(scale);
+        out[group].s = __float2half_rn(sum);
+    }
+}
+
+__device__ __forceinline__ static float
+dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+        const cuda_block_q4_K *weight,
+        const poolside_q8_1_block *input,
+        uint32_t iqs) {
+    const uint32_t q8_offset = 2u * ((iqs / 2u) / 4u);
+    const uint32_t chunk = (iqs / 2u) % 4u;
+    const int32_t *q4 = (const int32_t *)(weight->qs +
+        16u * q8_offset + 4u * chunk);
+    const int32_t v0 = q4[0];
+    const int32_t v1 = q4[4];
+
+    const uint16_t *packed_scales =
+        (const uint16_t *)weight->scales;
+    uint16_t auxiliary[2];
+    const uint32_t j = q8_offset / 2u;
+    if (j < 2u) {
+        auxiliary[0] = packed_scales[j] & 0x3f3fu;
+        auxiliary[1] = packed_scales[j + 2u] & 0x3f3fu;
+    } else {
+        auxiliary[0] =
+            ((packed_scales[j + 2u] >> 0u) & 0x0f0fu) |
+            ((packed_scales[j - 2u] & 0xc0c0u) >> 2u);
+        auxiliary[1] =
+            ((packed_scales[j + 2u] >> 4u) & 0x0f0fu) |
+            ((packed_scales[j] & 0xc0c0u) >> 2u);
+    }
+    const uint8_t *scales = (const uint8_t *)auxiliary;
+    const uint8_t *minimums = scales + 2u;
+
+    float scaled_sum = 0.0f;
+    float minimum_sum = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < 2u; i++) {
+        const int32_t q40 = (v0 >> (4u * i)) & 0x0f0f0f0f;
+        const int32_t q41 = (v1 >> (4u * i)) & 0x0f0f0f0f;
+        const int32_t *q8 =
+            (const int32_t *)input[q8_offset + i].qs + chunk;
+        const int32_t u0 = q8[0];
+        const int32_t u1 = q8[4];
+        const int32_t dot = __dp4a(q41, u1, __dp4a(q40, u0, 0));
+        const int32_t q8_sum = __dp4a(
+            0x01010101, u1, __dp4a(0x01010101, u0, 0));
+        const float d8 = __half2float(input[q8_offset + i].d);
+        scaled_sum += d8 * (dot * scales[i]);
+        minimum_sum += d8 * (q8_sum * minimums[i]);
+    }
+    return dev_f16_to_f32(weight->d) * scaled_sum -
+           dev_f16_to_f32(weight->dmin) * minimum_sum;
+}
+
+#ifdef DS4_TEST_HOOKS
+__global__ static void f32_mmvf_poolside_microscope_kernel(
+        float *value,
+        const float *weight,
+        const float *activation,
+        uint32_t input_elements) {
+    const uint32_t tid = threadIdx.x;
+    const float2 *weight2 = (const float2 *)weight;
+    const float2 *activation2 = (const float2 *)activation;
+    const uint32_t input_pairs = input_elements / 2u;
+    float sum = 0.0f;
+    for (uint32_t col2 = tid; col2 < input_pairs; col2 += 256u) {
+        const float2 w = weight2[col2];
+        const float2 x = activation2[col2];
+        sum += w.x * x.x;
+        sum += w.y * x.y;
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    }
+
+    extern __shared__ float warp_sums[];
+    if (tid < 32u) warp_sums[tid] = 0.0f;
+    __syncthreads();
+    if ((tid & 31u) == 0u) warp_sums[tid / 32u] = sum;
+    __syncthreads();
+    if (tid < 32u) {
+        sum = warp_sums[tid];
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+        }
+        if (tid == 0u) value[0] = sum;
+    }
+}
+
+extern "C" int ds4_gpu_test_f32_mmvf_microscope_tensor(
+        ds4_gpu_tensor *values,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements) {
+    if (!values || !weight_row || !activation ||
+        !values->ptr || !weight_row->ptr || !activation->ptr ||
+        input_elements == 0u || (input_elements & 1u) != 0u ||
+        values->bytes < 2u * sizeof(float) ||
+        weight_row->bytes < (uint64_t)input_elements * sizeof(float) ||
+        activation->bytes < (uint64_t)input_elements * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(values);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(weight_row) != tier ||
+        ds4_tensor_device_idx(activation) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "F32 MMVF microscope get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    matmul_f32_kernel<<<1, 256>>>(
+        (float *)values->ptr,
+        (const float *)weight_row->ptr,
+        (const float *)activation->ptr,
+        input_elements, 1u, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "F32 MMVF microscope serial launch")) {
+        return 0;
+    }
+    f32_mmvf_poolside_microscope_kernel<<<1, 256, 32u * sizeof(float)>>>(
+        (float *)values->ptr + 1u,
+        (const float *)weight_row->ptr,
+        (const float *)activation->ptr,
+        input_elements);
+    return cuda_ok(cudaGetLastError(),
+                   "F32 MMVF microscope Poolside launch");
+}
+
+__global__ static void q4_k_mmvq_serial_microscope_kernel(
+        float *values,
+        const cuda_block_q4_K *weight_row,
+        const poolside_q8_1_block *input,
+        uint32_t q4_blocks) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    float result = 0.0f;
+    for (uint32_t block = 0; block < q4_blocks; block++) {
+        result = __fadd_rn(
+            result,
+            dev_dot_q4_K_q8_1_mmvq_block(
+                weight_row + block, input + (uint64_t)block * 8u));
+    }
+    values[0] = result;
+}
+
+__global__ static void q4_k_mmvq_poolside_microscope_kernel(
+        float *values,
+        const cuda_block_q4_K *weight_row,
+        const poolside_q8_1_block *input,
+        uint32_t q4_blocks) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    float partial = 0.0f;
+    for (uint32_t block = tid / 16u;
+         block < q4_blocks;
+         block += 8u) {
+        partial += dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+            weight_row + block,
+            input + (uint64_t)block * 8u,
+            2u * (tid % 16u));
+    }
+    values[2u + tid] = partial;
+
+    __shared__ float other_warps[3][32];
+    if (warp > 0u) other_warps[warp - 1u][lane] = partial;
+    __syncthreads();
+    if (warp > 0u) return;
+    partial += other_warps[0][lane];
+    partial += other_warps[1][lane];
+    partial += other_warps[2][lane];
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset, 32);
+    }
+    if (lane == 0u) values[1] = partial;
+}
+
+extern "C" int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
+        ds4_gpu_tensor *values,
+        ds4_gpu_tensor *quantized_input,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements) {
+    if (!values || !quantized_input || !weight_row || !activation ||
+        !values->ptr || !quantized_input->ptr || !weight_row->ptr ||
+        !activation->ptr || input_elements == 0u ||
+        (input_elements & 255u) != 0u) {
+        return 0;
+    }
+    const uint32_t q4_blocks = input_elements / 256u;
+    const uint32_t q8_blocks = input_elements / 32u;
+    const uint64_t row_bytes =
+        (uint64_t)q4_blocks * sizeof(cuda_block_q4_K);
+    const uint64_t q8_bytes =
+        (uint64_t)q8_blocks * sizeof(poolside_q8_1_block);
+    if (values->bytes < 130u * sizeof(float) ||
+        quantized_input->bytes < q8_bytes ||
+        weight_row->bytes < row_bytes ||
+        activation->bytes < (uint64_t)input_elements * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(values);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(quantized_input) != tier ||
+        ds4_tensor_device_idx(weight_row) != tier ||
+        ds4_tensor_device_idx(activation) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "Q4_K MMVQ microscope get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    quantize_poolside_q8_1_f32_kernel<<<
+        (input_elements + 255u) / 256u, 256>>>(
+            (poolside_q8_1_block *)quantized_input->ptr,
+            (const float *)activation->ptr,
+            input_elements);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Q4_K MMVQ microscope quantize")) {
+        return 0;
+    }
+    q4_k_mmvq_serial_microscope_kernel<<<1, 1>>>(
+        (float *)values->ptr,
+        (const cuda_block_q4_K *)weight_row->ptr,
+        (const poolside_q8_1_block *)quantized_input->ptr,
+        q4_blocks);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Q4_K MMVQ serial microscope")) {
+        return 0;
+    }
+    q4_k_mmvq_poolside_microscope_kernel<<<1, dim3(32, 4, 1)>>>(
+        (float *)values->ptr,
+        (const cuda_block_q4_K *)weight_row->ptr,
+        (const poolside_q8_1_block *)quantized_input->ptr,
+        q4_blocks);
+    return cuda_ok(cudaGetLastError(),
+                   "Q4_K MMVQ Poolside microscope");
+}
+
+__global__ static void glm_poolside_q4_mmq_gate_up_test_kernel(
+        float *out,
+        const cuda_block_q4_K *gate_row,
+        const cuda_block_q4_K *up_row,
+        const poolside_q8_1_block *input_q8,
+        uint32_t q4_blocks) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    const float gate = dev_dot_q4_K_q8_1_mma_row(
+        gate_row, input_q8, q4_blocks);
+    const float up = dev_dot_q4_K_q8_1_mma_row(
+        up_row, input_q8, q4_blocks);
+    out[0] = gate;
+    out[1] = up;
+    out[2] = __fmul_rn(gate / (1.0f + expf(-gate)), up);
+}
+
+extern "C" int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate_row,
+        const ds4_gpu_tensor *up_row,
+        const ds4_gpu_tensor *input,
+        uint32_t input_elements) {
+    if (!out || !gate_row || !up_row || !input ||
+        !out->ptr || !gate_row->ptr || !up_row->ptr || !input->ptr ||
+        input_elements == 0u || (input_elements & 255u) != 0u ||
+        (((uintptr_t)gate_row->ptr) & 15u) != 0u ||
+        (((uintptr_t)up_row->ptr) & 15u) != 0u ||
+        (((uintptr_t)input->ptr) & 15u) != 0u) {
+        return 0;
+    }
+    const uint32_t q4_blocks = input_elements / 256u;
+    const uint32_t q8_groups = input_elements / 32u;
+    const uint64_t row_bytes =
+        (uint64_t)q4_blocks * sizeof(cuda_block_q4_K);
+    const uint64_t q8_bytes =
+        (uint64_t)q8_groups * sizeof(poolside_q8_1_block);
+    if (out->bytes < 3u * sizeof(float) ||
+        gate_row->bytes < row_bytes || up_row->bytes < row_bytes ||
+        input->bytes < (uint64_t)input_elements * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(gate_row) != tier ||
+        ds4_tensor_device_idx(up_row) != tier ||
+        ds4_tensor_device_idx(input) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "test Poolside Q4 MMQ get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    static ds4_gpu_tensor *q8_scratch[DS4_MAX_GPUS] = {0};
+    if (!q8_scratch[tier] || q8_scratch[tier]->bytes < q8_bytes) {
+        ds4_gpu_tensor_free(q8_scratch[tier]);
+        q8_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, q8_bytes);
+    }
+    if (!q8_scratch[tier]) return 0;
+    glm_poolside_q8_1_mmq_quantize_kernel<<<
+        (q8_groups + 31u) / 32u, 256>>>(
+            (poolside_q8_1_block *)q8_scratch[tier]->ptr,
+            (const float *)input->ptr, q8_groups);
+    if (!cuda_ok(cudaGetLastError(),
+                 "test Poolside Q4 MMQ input quantize")) {
+        return 0;
+    }
+    glm_poolside_q4_mmq_gate_up_test_kernel<<<1, 1>>>(
+        (float *)out->ptr,
+        (const cuda_block_q4_K *)gate_row->ptr,
+        (const cuda_block_q4_K *)up_row->ptr,
+        (const poolside_q8_1_block *)q8_scratch[tier]->ptr,
+        q4_blocks);
+    return cuda_ok(cudaGetLastError(),
+                   "test Poolside Q4 MMQ gate up");
+}
+#endif
+
+/* Opt-in decode microscope promoted to the routed expert path.  Poolside's
+ * generic CUDA MMVQ assigns four warps to one Q4_K row when there is one
+ * Q8_1 activation column.  Keep this separate from the existing serial
+ * kernel so the default path and the >8-token MMQ path remain unchanged. */
+__launch_bounds__(128, 1)
+__global__ static void glm_poolside_q4_gate_up_poolside_mmvq_kernel(
+        float *mid,
+        const char *gate_base,
+        const char *up_base,
+        const poolside_q8_1_block *input_q8,
+        const int32_t *selected,
+        const uint32_t *cache_slots,
+        uint64_t cache_slot_stride,
+        uint64_t gate_slot_offset,
+        uint64_t up_slot_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t input_q4_blocks,
+        uint32_t input_q8_groups,
+        uint32_t expert_mid_dim,
+        uint32_t mid_token_stride,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens
+#ifdef DS4_TEST_HOOKS
+        , float *capture_gate,
+        float *capture_up,
+        float *capture_swiglu
+#endif
+        ) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    const uint32_t row = blockIdx.x;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (row >= expert_mid_dim || slot >= n_expert || token >= n_tokens) {
+        return;
+    }
+    const uint64_t pair = (uint64_t)token * n_expert + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) return;
+    const uint64_t gate_expert_offset = cache_slots ?
+        (uint64_t)cache_slots[pair] * cache_slot_stride +
+            gate_slot_offset :
+        (uint64_t)(uint32_t)expert * gate_expert_bytes;
+    const uint64_t up_expert_offset = cache_slots ?
+        (uint64_t)cache_slots[pair] * cache_slot_stride +
+            up_slot_offset :
+        (uint64_t)(uint32_t)expert * up_expert_bytes;
+
+    const cuda_block_q4_K *gate_row =
+        (const cuda_block_q4_K *)(gate_base +
+            gate_expert_offset +
+            (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *up_row =
+        (const cuda_block_q4_K *)(up_base +
+            up_expert_offset +
+            (uint64_t)row * up_row_bytes);
+    const poolside_q8_1_block *input_row =
+        input_q8 + (uint64_t)token * input_q8_groups;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t block = tid / 16u;
+         block < input_q4_blocks;
+         block += 8u) {
+        const uint32_t iqs = 2u * (tid % 16u);
+        gate += dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+            gate_row + block,
+            input_row + (uint64_t)block * 8u,
+            iqs);
+        up += dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+            up_row + block,
+            input_row + (uint64_t)block * 8u,
+            iqs);
+    }
+
+    __shared__ float gate_other_warps[3][32];
+    __shared__ float up_other_warps[3][32];
+    if (warp > 0u) {
+        gate_other_warps[warp - 1u][lane] = gate;
+        up_other_warps[warp - 1u][lane] = up;
+    }
+    __syncthreads();
+    if (warp > 0u) return;
+    gate += gate_other_warps[0][lane];
+    gate += gate_other_warps[1][lane];
+    gate += gate_other_warps[2][lane];
+    up += up_other_warps[0][lane];
+    up += up_other_warps[1][lane];
+    up += up_other_warps[2][lane];
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        gate += __shfl_xor_sync(0xffffffffu, gate, offset, 32);
+        up += __shfl_xor_sync(0xffffffffu, up, offset, 32);
+    }
+    if (lane != 0u) return;
+
+    const float activated = gate / (1.0f + expf(-gate));
+    const uint64_t mid_index = (uint64_t)token * mid_token_stride +
+        (uint64_t)slot * expert_mid_dim + row;
+    const float swiglu = __fmul_rn(activated, up);
+#ifdef DS4_TEST_HOOKS
+    if (capture_gate) capture_gate[mid_index] = gate;
+    if (capture_up) capture_up[mid_index] = up;
+    if (capture_swiglu) capture_swiglu[mid_index] = swiglu;
+#endif
+    mid[mid_index] = swiglu;
+}
+
+__global__ static void glm_poolside_q4_gate_up_kernel(
+        float *mid,
+        const char *gate_base,
+        const char *up_base,
+        const poolside_q8_1_block *input_q8,
+        const int32_t *selected,
+        const uint32_t *cache_slots,
+        uint64_t cache_slot_stride,
+        uint64_t gate_slot_offset,
+        uint64_t up_slot_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t up_row_bytes,
+        uint32_t input_q4_blocks,
+        uint32_t input_q8_groups,
+        uint32_t expert_mid_dim,
+        uint32_t mid_token_stride,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        bool mmq
+#ifdef DS4_TEST_HOOKS
+        , float *capture_gate,
+        float *capture_up,
+        float *capture_swiglu
+#endif
+        ) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (row >= expert_mid_dim || slot >= n_expert || token >= n_tokens) {
+        return;
+    }
+    const uint64_t pair = (uint64_t)token * n_expert + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) return;
+    const uint64_t gate_expert_offset = cache_slots ?
+        (uint64_t)cache_slots[pair] * cache_slot_stride +
+            gate_slot_offset :
+        (uint64_t)(uint32_t)expert * gate_expert_bytes;
+    const uint64_t up_expert_offset = cache_slots ?
+        (uint64_t)cache_slots[pair] * cache_slot_stride +
+            up_slot_offset :
+        (uint64_t)(uint32_t)expert * up_expert_bytes;
+
+    const cuda_block_q4_K *gate_row =
+        (const cuda_block_q4_K *)(gate_base +
+            gate_expert_offset +
+            (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *up_row =
+        (const cuda_block_q4_K *)(up_base +
+            up_expert_offset +
+            (uint64_t)row * up_row_bytes);
+    const poolside_q8_1_block *input_row =
+        input_q8 + (uint64_t)token * input_q8_groups;
+    float gate = 0.0f;
+    float up = 0.0f;
+    if (mmq) {
+        gate = dev_dot_q4_K_q8_1_mma_row(
+            gate_row, input_row, input_q4_blocks);
+        up = dev_dot_q4_K_q8_1_mma_row(
+            up_row, input_row, input_q4_blocks);
+    } else {
+        for (uint32_t block = 0; block < input_q4_blocks; block++) {
+            gate = __fadd_rn(gate, dev_dot_q4_K_q8_1_mmvq_block(
+                gate_row + block, input_row + (uint64_t)block * 8u));
+            up = __fadd_rn(up, dev_dot_q4_K_q8_1_mmvq_block(
+                up_row + block, input_row + (uint64_t)block * 8u));
+        }
+    }
+    const float activated = gate / (1.0f + expf(-gate));
+    const uint64_t mid_index = (uint64_t)token * mid_token_stride +
+        (uint64_t)slot * expert_mid_dim + row;
+    const float swiglu = __fmul_rn(activated, up);
+#ifdef DS4_TEST_HOOKS
+    if (capture_gate) capture_gate[mid_index] = gate;
+    if (capture_up) capture_up[mid_index] = up;
+    if (capture_swiglu) capture_swiglu[mid_index] = swiglu;
+#endif
+    mid[mid_index] = swiglu;
+}
+
+static uint32_t glm_poolside_q4_l2_thread_count(
+        uint32_t expert_mid_dim,
+        uint64_t pair_count,
+        uint32_t multiprocessors) {
+    uint32_t threads = 512u;
+    if (multiprocessors > 0u && pair_count / multiprocessors >= 2u) {
+        threads = expert_mid_dim < 1024u ? 32u : 128u;
+    }
+    return threads;
+}
+
+/* Match Poolside's separate SQR -> SUM_ROWS -> SQRT/CLAMP -> MUL/DIV graph
+ * without materializing a second full-size float tensor.  __fmul_rn rounds
+ * each square before it enters the same eight-stream reduction topology used
+ * by reduce_rows_f32. */
+__global__ static void glm_poolside_q4_l2_rescale_kernel(
+        float *mid,
+        float *column_l2,
+        uint32_t expert_mid_dim,
+        uint64_t pair_count) {
+    const uint64_t pair = blockIdx.x;
+    if (pair >= pair_count) return;
+    const uint32_t column = threadIdx.x;
+    float partials[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+    };
+    uint32_t index = column;
+    while (index < expert_mid_dim) {
+        float values[8];
+#pragma unroll
+        for (uint32_t item = 0; item < 8u; item++) {
+            if (index < expert_mid_dim) {
+                const float value =
+                    mid[pair * expert_mid_dim + index];
+                values[item] = __fmul_rn(value, value);
+            } else {
+                values[item] = 0.0f;
+            }
+            index += blockDim.x;
+        }
+#pragma unroll
+        for (uint32_t item = 0; item < 8u; item++) {
+            partials[item] = __fadd_rn(partials[item], values[item]);
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t item = 0; item < 8u; item++) {
+        sum = __fadd_rn(sum, partials[item]);
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(0xffffffffu, sum, offset, 32));
+    }
+
+    __shared__ float warp_values[32];
+    const uint32_t lane = column & 31u;
+    const uint32_t warp = column >> 5u;
+    if (lane == 0u) warp_values[warp] = sum;
+    __syncthreads();
+    sum = lane < (blockDim.x >> 5u) ? warp_values[lane] : 0.0f;
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum = __fadd_rn(
+            sum, __shfl_xor_sync(0xffffffffu, sum, offset, 32));
+    }
+    if (column == 0u) {
+        float l2 = sqrtf(sum);
+        l2 = fminf(1.0e30f, fmaxf(1.0e-8f, l2));
+        column_l2[pair] = l2;
+        warp_values[0] = l2;
+    }
+    __syncthreads();
+    const float l2 = warp_values[0];
+    for (uint32_t i = column; i < expert_mid_dim; i += blockDim.x) {
+        const uint64_t offset = pair * expert_mid_dim + i;
+        const float scaled = __fmul_rn(mid[offset], 32768.0f);
+        mid[offset] = scaled / l2;
+    }
+}
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_glm_poolside_q4_l2_tensor(
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *column_l2,
+        uint32_t expert_mid_dim,
+        uint64_t pair_count,
+        uint64_t topology_pair_count) {
+    if (!mid || !column_l2 || !mid->ptr || !column_l2->ptr ||
+        expert_mid_dim != 1024u || pair_count == 0u ||
+        topology_pair_count == 0u ||
+        pair_count > (uint64_t)INT_MAX ||
+        (((uintptr_t)mid->ptr) & (sizeof(float) - 1u)) != 0u ||
+        (((uintptr_t)column_l2->ptr) & (sizeof(float) - 1u)) != 0u ||
+        pair_count > UINT64_MAX / expert_mid_dim) {
+        return 0;
+    }
+    const uint64_t mid_values = pair_count * expert_mid_dim;
+    if (mid_values > UINT64_MAX / sizeof(float) ||
+        pair_count > UINT64_MAX / sizeof(float) ||
+        mid->bytes < mid_values * sizeof(float) ||
+        column_l2->bytes < pair_count * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(mid);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(column_l2) != tier) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "test Poolside Q4 L2 get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+    int multiprocessors = 0;
+    if (!cuda_ok(cudaDeviceGetAttribute(
+            &multiprocessors, cudaDevAttrMultiProcessorCount,
+            current_device),
+            "test Poolside Q4 L2 multiprocessor count") ||
+        multiprocessors <= 0) {
+        return 0;
+    }
+    const uint32_t l2_threads = glm_poolside_q4_l2_thread_count(
+        expert_mid_dim, topology_pair_count, (uint32_t)multiprocessors);
+    glm_poolside_q4_l2_rescale_kernel<<<
+        (uint32_t)pair_count, l2_threads>>>(
+            (float *)mid->ptr, (float *)column_l2->ptr,
+            expert_mid_dim, pair_count);
+    return cuda_ok(cudaGetLastError(), "test Poolside Q4 L2 rescale");
+}
+#endif
+
+/* Poolside's small-K specialization covers four adjacent down-projection
+ * rows per four-warp block for Laguna's K=1024.  Experts remain serial in
+ * slot order inside each block so this experiment changes only each expert
+ * dot-product reduction, not DS4's routing-weight accumulation order. */
+__launch_bounds__(128, 1)
+__global__ static void glm_poolside_q4_down_poolside_mmvq_kernel(
+        float *out,
+        const char *down_base,
+        const poolside_q8_1_block *mid_q8,
+        const float *column_l2,
+        const int32_t *selected,
+        const uint32_t *cache_slots,
+        uint64_t cache_slot_stride,
+        uint64_t down_slot_offset,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t mid_q4_blocks,
+        uint32_t mid_q8_groups,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens
+#ifdef DS4_TEST_HOOKS
+        , float *capture_down,
+        float *capture_weighted
+#endif
+        ) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    const uint32_t row0 = blockIdx.x * 4u;
+    const uint32_t token = blockIdx.y;
+    if (token >= n_tokens) return;
+
+    float output = 0.0f;
+    __shared__ float other_warps[3][4][32];
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)token * n_expert + slot;
+        const int32_t expert = selected[pair];
+        const bool valid_expert =
+            expert >= 0 && (uint32_t)expert < n_total_expert;
+        const uint64_t down_expert_offset = cache_slots ?
+            (uint64_t)cache_slots[pair] * cache_slot_stride +
+                down_slot_offset :
+            (uint64_t)(uint32_t)expert * down_expert_bytes;
+        const poolside_q8_1_block *mid_row =
+            mid_q8 + pair * mid_q8_groups;
+        float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+            const uint32_t row = row0 + local_row;
+            if (!valid_expert || row >= out_dim) continue;
+            const cuda_block_q4_K *down_row =
+                (const cuda_block_q4_K *)(down_base +
+                    down_expert_offset +
+                    (uint64_t)row * down_row_bytes);
+            for (uint32_t block = tid / 16u;
+                 block < mid_q4_blocks;
+                 block += 8u) {
+                partial[local_row] +=
+                    dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
+                        down_row + block,
+                        mid_row + (uint64_t)block * 8u,
+                        2u * (tid % 16u));
+            }
+        }
+
+        if (warp > 0u) {
+#pragma unroll
+            for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+                other_warps[warp - 1u][local_row][lane] =
+                    partial[local_row];
+            }
+        }
+        __syncthreads();
+        if (warp == 0u) {
+#pragma unroll
+            for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+                partial[local_row] += other_warps[0][local_row][lane];
+                partial[local_row] += other_warps[1][local_row][lane];
+                partial[local_row] += other_warps[2][local_row][lane];
+            }
+#pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+#pragma unroll
+                for (uint32_t local_row = 0; local_row < 4u; local_row++) {
+                    partial[local_row] += __shfl_xor_sync(
+                        0xffffffffu, partial[local_row], offset, 32);
+                }
+            }
+            if (lane < 4u) {
+                const uint32_t row = row0 + lane;
+                if (valid_expert && row < out_dim) {
+                    float expert_value = __fmul_rn(
+                        partial[lane], column_l2[pair]);
+                    expert_value = __fmul_rn(
+                        expert_value, 1.0f / 32768.0f);
+#ifdef DS4_TEST_HOOKS
+                    if (capture_down) {
+                        capture_down[pair * out_dim + row] = expert_value;
+                    }
+#endif
+                    expert_value = __fmul_rn(
+                        expert_value, weights[pair]);
+#ifdef DS4_TEST_HOOKS
+                    if (capture_weighted) {
+                        capture_weighted[pair * out_dim + row] =
+                            expert_value;
+                    }
+#endif
+                    output = __fadd_rn(output, expert_value);
+                }
+            }
+        }
+        /* Warps 1-3 must not race the next slot's shared-memory writes with
+         * warp 0's current-slot reads. */
+        __syncthreads();
+    }
+    if (warp == 0u && lane < 4u && row0 + lane < out_dim) {
+        out[(uint64_t)token * out_dim + row0 + lane] = output;
+    }
+}
+
+__global__ static void glm_poolside_q4_down_kernel(
+        float *out,
+        const char *down_base,
+        const poolside_q8_1_block *mid_q8,
+        const float *column_l2,
+        const int32_t *selected,
+        const uint32_t *cache_slots,
+        uint64_t cache_slot_stride,
+        uint64_t down_slot_offset,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t mid_q4_blocks,
+        uint32_t mid_q8_groups,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        bool mmq
+#ifdef DS4_TEST_HOOKS
+        , float *capture_down,
+        float *capture_weighted
+#endif
+        ) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tokens) return;
+    float output = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)token * n_expert + slot;
+        const int32_t expert = selected[pair];
+        if (expert < 0 || (uint32_t)expert >= n_total_expert) continue;
+        const uint64_t down_expert_offset = cache_slots ?
+            (uint64_t)cache_slots[pair] * cache_slot_stride +
+                down_slot_offset :
+            (uint64_t)(uint32_t)expert * down_expert_bytes;
+        const cuda_block_q4_K *down_row =
+            (const cuda_block_q4_K *)(down_base +
+                down_expert_offset +
+                (uint64_t)row * down_row_bytes);
+        const poolside_q8_1_block *mid_row =
+            mid_q8 + pair * mid_q8_groups;
+        float expert_value = 0.0f;
+        if (mmq) {
+            expert_value = dev_dot_q4_K_q8_1_mma_row(
+                down_row, mid_row, mid_q4_blocks);
+        } else {
+            for (uint32_t block = 0; block < mid_q4_blocks; block++) {
+                expert_value = __fadd_rn(
+                    expert_value,
+                    dev_dot_q4_K_q8_1_mmvq_block(
+                        down_row + block,
+                        mid_row + (uint64_t)block * 8u));
+            }
+        }
+        expert_value = __fmul_rn(expert_value, column_l2[pair]);
+        expert_value = __fmul_rn(expert_value, 1.0f / 32768.0f);
+#ifdef DS4_TEST_HOOKS
+        if (capture_down) {
+            capture_down[pair * out_dim + row] = expert_value;
+        }
+#endif
+        expert_value = __fmul_rn(expert_value, weights[pair]);
+#ifdef DS4_TEST_HOOKS
+        if (capture_weighted) {
+            capture_weighted[pair * out_dim + row] = expert_value;
+        }
+#endif
+        output = __fadd_rn(output, expert_value);
+    }
+    out[(uint64_t)token * out_dim + row] = output;
+}
+
+typedef struct {
+    const char *payload_base;
+    const uint32_t *slot_indices;
+    uint64_t slot_stride;
+    uint64_t gate_slot_offset;
+    uint64_t up_slot_offset;
+    uint64_t down_slot_offset;
+    ds4_gpu_tensor *input_q8_scratch;
+    ds4_gpu_tensor *mid_q8_scratch;
+    ds4_gpu_tensor *l2_scratch;
+} glm_poolside_q4_compact_launch;
+
+/* Correctness-first Q4_K routed path.  Resident execution uses lazily grown
+ * per-device scratch and whole-parent addressing.  Compact execution supplies
+ * bounded engine-lifetime scratch and an immutable route-position-to-cache-
+ * slot descriptor; both modes share the exact arithmetic kernels. */
+static int glm_poolside_routed_moe_q4_launch(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        const ds4_gpu_tensor *input,
+        uint32_t              n_tokens,
+        uint32_t              mid_token_stride,
+        const glm_poolside_q4_compact_launch *compact
+#ifdef DS4_TEST_HOOKS
+        , ds4_gpu_tensor     *capture
+#endif
+        ) {
+    if (!out || !mid || !selected || !weights || !input ||
+        (!compact && !model_map) ||
+        !out->ptr || !mid->ptr || !selected->ptr || !weights->ptr ||
+        !input->ptr || n_tokens == 0u || n_expert == 0u ||
+        n_total_expert == 0u || expert_in_dim == 0u ||
+        expert_mid_dim == 0u || out_dim == 0u ||
+        (expert_in_dim & 255u) != 0u ||
+        (expert_mid_dim & 255u) != 0u ||
+        n_tokens > 65535u || n_expert > 65535u) {
+        return 0;
+    }
+    if (compact &&
+        (!compact->payload_base || !compact->slot_indices ||
+         !compact->input_q8_scratch || !compact->mid_q8_scratch ||
+         !compact->l2_scratch || compact->slot_stride == 0u)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(mid) != tier ||
+        ds4_tensor_device_idx(selected) != tier ||
+        ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(input) != tier ||
+        (compact &&
+         (ds4_tensor_device_idx(compact->input_q8_scratch) != tier ||
+          ds4_tensor_device_idx(compact->mid_q8_scratch) != tier ||
+          ds4_tensor_device_idx(compact->l2_scratch) != tier))) {
+        return 0;
+    }
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "glm Poolside routed moe get device") ||
+        current_device != g_gpu[tier].device_id) {
+        return 0;
+    }
+
+    const uint64_t input_q4_blocks = expert_in_dim / 256u;
+    const uint64_t mid_q4_blocks = expert_mid_dim / 256u;
+    const uint64_t input_q8_groups = expert_in_dim / 32u;
+    const uint64_t mid_q8_groups = expert_mid_dim / 32u;
+    const uint64_t required_gate_row =
+        input_q4_blocks * sizeof(cuda_block_q4_K);
+    const uint64_t required_down_row =
+        mid_q4_blocks * sizeof(cuda_block_q4_K);
+    if (gate_row_bytes < required_gate_row ||
+        up_row_bytes < required_gate_row ||
+        down_row_bytes < required_down_row ||
+        (uint64_t)expert_mid_dim > UINT64_MAX / gate_row_bytes ||
+        (uint64_t)expert_mid_dim > UINT64_MAX / up_row_bytes ||
+        (uint64_t)out_dim > UINT64_MAX / down_row_bytes ||
+        gate_expert_bytes < (uint64_t)expert_mid_dim * gate_row_bytes ||
+        up_expert_bytes < (uint64_t)expert_mid_dim * up_row_bytes ||
+        down_expert_bytes < (uint64_t)out_dim * down_row_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / up_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
+        return 0;
+    }
+    const uint64_t gate_bytes =
+        (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t up_bytes =
+        (uint64_t)n_total_expert * up_expert_bytes;
+    const uint64_t down_bytes =
+        (uint64_t)n_total_expert * down_expert_bytes;
+    if (!compact &&
+        (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+         up_offset > model_size || up_bytes > model_size - up_offset ||
+         down_offset > model_size || down_bytes > model_size - down_offset)) {
+        return 0;
+    }
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    const uint64_t expected_mid_stride =
+        (uint64_t)n_expert * expert_mid_dim;
+    if (pair_count > UINT32_MAX || expected_mid_stride > UINT32_MAX ||
+        mid_token_stride != expected_mid_stride ||
+        (uint64_t)n_tokens > UINT64_MAX / expert_in_dim ||
+        pair_count > UINT64_MAX / expert_mid_dim ||
+        (uint64_t)n_tokens > UINT64_MAX / out_dim) {
+        return 0;
+    }
+    const uint64_t input_values = (uint64_t)n_tokens * expert_in_dim;
+    const uint64_t mid_values = pair_count * expert_mid_dim;
+    const uint64_t output_values = (uint64_t)n_tokens * out_dim;
+    const uint64_t output_grid_x = ((uint64_t)out_dim + 255u) / 256u;
+    const bool mmq = n_tokens > 8u;
+    const bool poolside_mmvq = !mmq && n_tokens == 1u &&
+        n_total_expert == 256u && n_expert == 10u &&
+        expert_in_dim == 3072u && expert_mid_dim == 1024u &&
+        out_dim == 3072u && cuda_poolside_mmvq_requested();
+    if ((mmq && ((((uintptr_t)input->ptr) & 15u) != 0u ||
+                 (((uintptr_t)mid->ptr) & 15u) != 0u)) ||
+        input_values > UINT32_MAX ||
+        input_values > UINT64_MAX / sizeof(float) ||
+        mid_values > UINT32_MAX ||
+        mid_values > UINT64_MAX / sizeof(float) ||
+        output_values > UINT64_MAX / sizeof(float) ||
+        output_grid_x > UINT32_MAX ||
+        pair_count > UINT64_MAX / sizeof(int32_t) ||
+        input->bytes < input_values * sizeof(float) ||
+        mid->bytes < mid_values * sizeof(float) ||
+        out->bytes < output_values * sizeof(float) ||
+        selected->bytes < pair_count * sizeof(int32_t) ||
+        weights->bytes < pair_count * sizeof(float)) {
+        return 0;
+    }
+
+    const uint64_t input_group_count =
+        (uint64_t)n_tokens * input_q8_groups;
+    const uint64_t mid_group_count = pair_count * mid_q8_groups;
+    if (input_group_count > UINT64_MAX / sizeof(poolside_q8_1_block) ||
+        mid_group_count > UINT64_MAX / sizeof(poolside_q8_1_block) ||
+        pair_count > UINT64_MAX / sizeof(float) ||
+        (input_group_count + 31u) / 32u > UINT32_MAX ||
+        (mid_group_count + 31u) / 32u > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t input_q8_bytes =
+        input_group_count * sizeof(poolside_q8_1_block);
+    const uint64_t mid_q8_bytes =
+        mid_group_count * sizeof(poolside_q8_1_block);
+    const uint64_t l2_bytes = pair_count * sizeof(float);
+    static ds4_gpu_tensor *input_q8_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *mid_q8_scratch[DS4_MAX_GPUS] = {0};
+    static ds4_gpu_tensor *l2_scratch[DS4_MAX_GPUS] = {0};
+    if (!compact) {
+        if (!input_q8_scratch[tier] ||
+            input_q8_scratch[tier]->bytes < input_q8_bytes) {
+            ds4_gpu_tensor_free(input_q8_scratch[tier]);
+            input_q8_scratch[tier] =
+                ds4_gpu_tensor_alloc_ptr_on(tier, input_q8_bytes);
+        }
+        if (!mid_q8_scratch[tier] ||
+            mid_q8_scratch[tier]->bytes < mid_q8_bytes) {
+            ds4_gpu_tensor_free(mid_q8_scratch[tier]);
+            mid_q8_scratch[tier] =
+                ds4_gpu_tensor_alloc_ptr_on(tier, mid_q8_bytes);
+        }
+        if (!l2_scratch[tier] || l2_scratch[tier]->bytes < l2_bytes) {
+            ds4_gpu_tensor_free(l2_scratch[tier]);
+            l2_scratch[tier] = ds4_gpu_tensor_alloc_ptr_on(tier, l2_bytes);
+        }
+    }
+    ds4_gpu_tensor *input_q8_work = compact ?
+        compact->input_q8_scratch : input_q8_scratch[tier];
+    ds4_gpu_tensor *mid_q8_work = compact ?
+        compact->mid_q8_scratch : mid_q8_scratch[tier];
+    ds4_gpu_tensor *l2_work = compact ?
+        compact->l2_scratch : l2_scratch[tier];
+    if (!input_q8_work || !mid_q8_work || !l2_work ||
+        !input_q8_work->ptr || !mid_q8_work->ptr || !l2_work->ptr ||
+        input_q8_work->bytes < input_q8_bytes ||
+        mid_q8_work->bytes < mid_q8_bytes ||
+        l2_work->bytes < l2_bytes) {
+        return 0;
+    }
+
+#ifdef DS4_TEST_HOOKS
+    float *capture_gate = NULL;
+    float *capture_up = NULL;
+    float *capture_swiglu = NULL;
+    float *capture_column_l2 = NULL;
+    float *capture_down_input = NULL;
+    float *capture_down = NULL;
+    float *capture_weighted = NULL;
+    void *capture_input_q8 = NULL;
+    void *capture_down_q8 = NULL;
+    if (capture) {
+        if (!capture->ptr || ds4_tensor_device_idx(capture) != tier ||
+            capture->bytes < DS4_GPU_GLM_MOE_CAPTURE_BYTES ||
+            n_tokens > 1u || n_expert != 10u ||
+            expert_in_dim != 3072u || expert_mid_dim != 1024u ||
+            out_dim != 3072u ||
+            input_q8_bytes != DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_BYTES ||
+            mid_q8_bytes != DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_BYTES) {
+            return 0;
+        }
+        float *capture_f32 = (float *)capture->ptr;
+        capture_gate = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_GATE_F32;
+        capture_up = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_UP_F32;
+        capture_swiglu = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_SWIGLU_F32;
+        capture_column_l2 =
+            capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_COLUMN_L2_F32;
+        capture_down_input =
+            capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_DOWN_INPUT_F32;
+        capture_down = capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_DOWN_F32;
+        capture_weighted =
+            capture_f32 + DS4_GPU_GLM_MOE_CAPTURE_WEIGHTED_F32;
+        capture_input_q8 = (char *)capture->ptr +
+            DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_OFFSET;
+        capture_down_q8 = (char *)capture->ptr +
+            DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_OFFSET;
+    }
+#endif
+
+    const char *gate = compact ? compact->payload_base :
+        cuda_resolve_weight_ptr(
+            model_map, gate_offset, gate_bytes, tier,
+            "laguna_poolside_gate_exps");
+    const char *up = compact ? compact->payload_base :
+        cuda_resolve_weight_ptr(
+            model_map, up_offset, up_bytes, tier,
+            "laguna_poolside_up_exps");
+    const char *down = compact ? compact->payload_base :
+        cuda_resolve_weight_ptr(
+            model_map, down_offset, down_bytes, tier,
+            "laguna_poolside_down_exps");
+    if (!gate || !up || !down) return 0;
+
+    poolside_q8_1_block *input_q8 =
+        (poolside_q8_1_block *)input_q8_work->ptr;
+    poolside_q8_1_block *mid_q8 =
+        (poolside_q8_1_block *)mid_q8_work->ptr;
+    if (mmq) {
+        glm_poolside_q8_1_mmq_quantize_kernel<<<
+            (uint32_t)((input_group_count + 31u) / 32u), 256>>>(
+                input_q8, (const float *)input->ptr,
+                input_group_count);
+    } else {
+        quantize_poolside_q8_1_f32_kernel<<<
+            (uint32_t)((input_values + 255u) / 256u), 256>>>(
+                input_q8, (const float *)input->ptr,
+                (uint32_t)input_values);
+    }
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe input quantize")) {
+        return 0;
+    }
+#ifdef DS4_TEST_HOOKS
+    if (capture_input_q8 &&
+        !cuda_ok(cudaMemcpyAsync(capture_input_q8,
+                                 input_q8,
+                                 input_q8_bytes,
+                                 cudaMemcpyDeviceToDevice),
+                 "glm Poolside routed moe capture input q8")) {
+        return 0;
+    }
+#endif
+
+    if (poolside_mmvq) {
+        const dim3 gate_grid(expert_mid_dim, n_expert, n_tokens);
+        glm_poolside_q4_gate_up_poolside_mmvq_kernel<<<
+            gate_grid, dim3(32, 4, 1)>>>(
+                (float *)mid->ptr, gate, up, input_q8,
+                (const int32_t *)selected->ptr,
+                compact ? compact->slot_indices : NULL,
+                compact ? compact->slot_stride : 0u,
+                compact ? compact->gate_slot_offset : 0u,
+                compact ? compact->up_slot_offset : 0u,
+                gate_expert_bytes, gate_row_bytes,
+                up_expert_bytes, up_row_bytes,
+                (uint32_t)input_q4_blocks,
+                (uint32_t)input_q8_groups,
+                expert_mid_dim, mid_token_stride, n_total_expert,
+                n_expert, n_tokens
+#ifdef DS4_TEST_HOOKS
+                , capture_gate, capture_up, capture_swiglu
+#endif
+                );
+    } else {
+        const dim3 gate_grid(
+            (expert_mid_dim + 255u) / 256u, n_expert, n_tokens);
+        glm_poolside_q4_gate_up_kernel<<<gate_grid, 256>>>(
+            (float *)mid->ptr, gate, up, input_q8,
+            (const int32_t *)selected->ptr,
+            compact ? compact->slot_indices : NULL,
+            compact ? compact->slot_stride : 0u,
+            compact ? compact->gate_slot_offset : 0u,
+            compact ? compact->up_slot_offset : 0u,
+            gate_expert_bytes, gate_row_bytes,
+            up_expert_bytes, up_row_bytes,
+            (uint32_t)input_q4_blocks, (uint32_t)input_q8_groups,
+            expert_mid_dim, mid_token_stride, n_total_expert,
+            n_expert, n_tokens, mmq
+#ifdef DS4_TEST_HOOKS
+            , capture_gate, capture_up, capture_swiglu
+#endif
+            );
+    }
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe gate up")) {
+        return 0;
+    }
+
+    int multiprocessors = 0;
+    if (!cuda_ok(cudaDeviceGetAttribute(
+            &multiprocessors, cudaDevAttrMultiProcessorCount,
+            current_device),
+            "glm Poolside routed moe multiprocessor count") ||
+        multiprocessors <= 0) {
+        return 0;
+    }
+    const uint32_t l2_threads = glm_poolside_q4_l2_thread_count(
+        expert_mid_dim, pair_count, (uint32_t)multiprocessors);
+    glm_poolside_q4_l2_rescale_kernel<<<
+        (uint32_t)pair_count, l2_threads>>>(
+            (float *)mid->ptr, (float *)l2_work->ptr,
+            expert_mid_dim, pair_count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe L2 rescale")) {
+        return 0;
+    }
+#ifdef DS4_TEST_HOOKS
+    if (capture_column_l2 &&
+        (!cuda_ok(cudaMemcpyAsync(capture_column_l2,
+                                  l2_work->ptr,
+                                  l2_bytes,
+                                  cudaMemcpyDeviceToDevice),
+                  "glm Poolside routed moe capture column l2") ||
+         !cuda_ok(cudaMemcpyAsync(capture_down_input,
+                                  mid->ptr,
+                                  mid_values * sizeof(float),
+                                  cudaMemcpyDeviceToDevice),
+                  "glm Poolside routed moe capture down input"))) {
+        return 0;
+    }
+#endif
+
+    if (mmq) {
+        glm_poolside_q8_1_mmq_quantize_kernel<<<
+            (uint32_t)((mid_group_count + 31u) / 32u), 256>>>(
+                mid_q8, (const float *)mid->ptr,
+                mid_group_count);
+    } else {
+        quantize_poolside_q8_1_f32_kernel<<<
+            (uint32_t)((mid_values + 255u) / 256u), 256>>>(
+                mid_q8, (const float *)mid->ptr,
+                (uint32_t)mid_values);
+    }
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm Poolside routed moe mid quantize")) {
+        return 0;
+    }
+#ifdef DS4_TEST_HOOKS
+    if (capture_down_q8 &&
+        !cuda_ok(cudaMemcpyAsync(capture_down_q8,
+                                 mid_q8,
+                                 mid_q8_bytes,
+                                 cudaMemcpyDeviceToDevice),
+                 "glm Poolside routed moe capture down q8")) {
+        return 0;
+    }
+#endif
+
+    if (poolside_mmvq) {
+        const dim3 down_grid((out_dim + 3u) / 4u, n_tokens, 1u);
+        glm_poolside_q4_down_poolside_mmvq_kernel<<<
+            down_grid, dim3(32, 4, 1)>>>(
+                (float *)out->ptr, down, mid_q8,
+                (const float *)l2_work->ptr,
+                (const int32_t *)selected->ptr,
+                compact ? compact->slot_indices : NULL,
+                compact ? compact->slot_stride : 0u,
+                compact ? compact->down_slot_offset : 0u,
+                (const float *)weights->ptr,
+                down_expert_bytes, down_row_bytes,
+                (uint32_t)mid_q4_blocks,
+                (uint32_t)mid_q8_groups,
+                out_dim, n_total_expert, n_expert, n_tokens
+#ifdef DS4_TEST_HOOKS
+                , capture_down, capture_weighted
+#endif
+                );
+    } else {
+        const dim3 down_grid((uint32_t)output_grid_x, n_tokens, 1u);
+        glm_poolside_q4_down_kernel<<<down_grid, 256>>>(
+            (float *)out->ptr, down, mid_q8,
+            (const float *)l2_work->ptr,
+            (const int32_t *)selected->ptr,
+            compact ? compact->slot_indices : NULL,
+            compact ? compact->slot_stride : 0u,
+            compact ? compact->down_slot_offset : 0u,
+            (const float *)weights->ptr,
+            down_expert_bytes, down_row_bytes,
+            (uint32_t)mid_q4_blocks, (uint32_t)mid_q8_groups,
+            out_dim, n_total_expert, n_expert, n_tokens, mmq
+#ifdef DS4_TEST_HOOKS
+            , capture_down, capture_weighted
+#endif
+            );
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "glm Poolside routed moe down");
+}
+
+enum {
+    CUDA_LAGUNA_ROUTED_TOTAL_EXPERT = 256u,
+    CUDA_LAGUNA_ROUTED_SELECTED = 10u,
+    CUDA_LAGUNA_ROUTED_INPUT_DIM = 3072u,
+    CUDA_LAGUNA_ROUTED_MID_DIM = 1024u,
+    CUDA_LAGUNA_ROUTED_OUTPUT_DIM = 3072u,
+    CUDA_LAGUNA_ROUTED_AUX_ALIGNMENT = 64u,
+};
+
+static int cuda_laguna_compact_exec_epoch_matches_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch) {
+    return ctx == &g_laguna_compact_storage && execution_epoch != 0u &&
+        ctx->lifecycle_epoch == execution_epoch &&
+        g_laguna_compact_published_epoch.load(
+            std::memory_order_relaxed) == execution_epoch &&
+        g_laguna_compact_state.load(std::memory_order_relaxed) ==
+            DS4_LAGUNA_COMPACT_ACTIVE;
+}
+
+static int cuda_laguna_compact_exec_enter(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t *execution_epoch) {
+    if (execution_epoch) *execution_epoch = 0u;
+    if (!ctx || !execution_epoch) return 0;
+    const uint64_t entry_epoch =
+        g_laguna_compact_published_epoch.load(std::memory_order_acquire);
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (entry_epoch == 0u ||
+        !cuda_laguna_compact_exec_epoch_matches_locked(ctx, entry_epoch) ||
+        !cuda_laguna_compact_cache_active_locked(ctx)) {
+        return 0;
+    }
+    if (ctx->active_execution_count == UINT64_MAX) {
+        ctx->cache_unsafe = 1;
+        return 0;
+    }
+    ctx->active_execution_count++;
+    *execution_epoch = entry_epoch;
+    return 1;
+}
+
+static int cuda_laguna_compact_exec_leave(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        ds4_gpu_laguna_exec_result *result) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!result || ctx != &g_laguna_compact_storage ||
+        execution_epoch == 0u ||
+        ctx->lifecycle_epoch != execution_epoch ||
+        g_laguna_compact_published_epoch.load(
+            std::memory_order_relaxed) != execution_epoch ||
+        ctx->active_execution_count == 0u) {
+        return 0;
+    }
+    if (*result == DS4_GPU_LAGUNA_EXEC_UNSAFE ||
+        g_laguna_compact_state.load(std::memory_order_relaxed) !=
+            DS4_LAGUNA_COMPACT_ACTIVE ||
+        !ctx->cache_policy_live || !ctx->cache_payload ||
+        ctx->cache_unsafe) {
+        ctx->cache_unsafe = 1;
+        *result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    ctx->active_execution_count--;
+    return 1;
+}
+
+static int cuda_laguna_compact_exec_cancelled(
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata) {
+    return cancel && cancel(userdata);
+}
+
+static void cuda_laguna_compact_exec_latch_unsafe(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (cuda_laguna_compact_exec_epoch_matches_locked(
+            ctx, execution_epoch) &&
+        ctx->active_execution_count != 0u) {
+        ctx->cache_unsafe = 1;
+    }
+}
+
+static ds4_gpu_laguna_exec_result cuda_laguna_compact_exec_unsafe(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch) {
+    cuda_laguna_compact_exec_latch_unsafe(ctx, execution_epoch);
+    return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+}
+
+static int cuda_laguna_compact_request_valid(
+        const ds4_runtime_request_context *request) {
+    if (!request || !request->prefill_started) return 0;
+    ds4_runtime_request_context staged = *request;
+    const ds4_runtime_wire_counters zero = {};
+    return ds4_runtime_request_add_counters(&staged, &zero) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_laguna_compact_graph_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    if (!ctx || (request && !cuda_laguna_compact_request_valid(request))) {
+        return 0;
+    }
+    g_laguna_compact_exec_mutex.lock();
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx) ||
+        ctx->active_graph_scope != 0u || ctx->active_request != NULL ||
+        ctx->active_request_group_remaining > ctx->active_request_group ||
+        (ctx->active_request_group != 0u &&
+         (ctx->active_request_group_remaining == 0u || !request))) {
+        g_laguna_compact_exec_mutex.unlock();
+        return 0;
+    }
+    if (ctx->page_advice_since_range_count != 0u ||
+        ctx->active_execution_count != 0u ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE) {
+        ctx->cache_unsafe = 1;
+        g_laguna_compact_exec_mutex.unlock();
+        return 0;
+    }
+    if (ctx->active_request_group != 0u) {
+        ctx->active_request_group_remaining--;
+    }
+    ctx->active_request = request;
+    ctx->active_graph_scope = 1u;
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_compact_graph_end(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    if (!ctx) return 0;
+    int valid = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+        const cudaError_t synchronized = cudaDeviceSynchronize();
+        if (synchronized != cudaSuccess) {
+            (void)cudaGetLastError();
+            ctx->cache_unsafe = 1;
+        }
+        if (ctx->page_advice_since_range_count != 0u &&
+            (synchronized != cudaSuccess ||
+             !cuda_laguna_compact_page_flush_pending_locked(ctx, 0))) {
+            /* The borrowed owner cannot outlive this synchronous call.  Once
+             * unsafe, abandon the unresolved union together with its owner;
+             * already-issued syscall counters remain process-global truth. */
+            memset(ctx->page_advice_since_ranges, 0,
+                   ctx->page_advice_since_range_count *
+                       sizeof(ctx->page_advice_since_ranges[0]));
+            ctx->page_advice_since_range_count = 0u;
+            ctx->page_advice_since_range_bytes = 0u;
+            ctx->cache_unsafe = 1;
+        }
+        valid = ctx->active_graph_scope == 1u &&
+            ctx->active_request == request &&
+            ctx->active_execution_count == 0u &&
+            ctx->active_load_phase == DS4_LAGUNA_CACHE_LOAD_NONE &&
+            ctx->page_advice_since_range_count == 0u;
+        if (!valid) {
+            ctx->cache_unsafe = 1;
+        }
+        ctx->active_request = NULL;
+        ctx->active_graph_scope = 0u;
+        if (ctx->cache_unsafe) valid = 0;
+    }
+    g_laguna_compact_exec_mutex.unlock();
+    return valid;
+}
+
+static int cuda_laguna_compact_routed_layer_count_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t *count_out) {
+    if (count_out) *count_out = 0u;
+    if (!ctx || !ctx->ledger || !ctx->ledger->expert_entries ||
+        ctx->ledger->expert_entry_count == 0u || !count_out) {
+        return 0;
+    }
+    uint64_t count = 0u;
+    uint32_t prior = UINT32_MAX;
+    for (uint64_t i = 0u; i < ctx->ledger->expert_entry_count; i++) {
+        const uint32_t layer = ctx->ledger->expert_entries[i].layer;
+        if (i == 0u || layer != prior) {
+            if (count == UINT64_MAX ||
+                (i != 0u && layer <= prior)) return 0;
+            count++;
+            prior = layer;
+        }
+    }
+    *count_out = count;
+    return count != 0u;
+}
+
+extern "C" int ds4_gpu_laguna_compact_request_group_begin(
+        ds4_gpu_laguna_compact *ctx,
+        uint32_t request_count) {
+    if (!ctx || request_count == 0u) return 0;
+    g_laguna_compact_exec_mutex.lock();
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    uint64_t layers = 0u;
+    uint64_t per_request = 0u;
+    uint64_t required = 0u;
+    uint64_t empty_slots = 0u;
+    int cache_quiescent = 1;
+    if (ctx->cache_policy_live) {
+        for (size_t i = 0u; i < ctx->cache_policy.slot_count; i++) {
+            const ds4_laguna_cache_slot *slot = &ctx->cache_slots[i];
+            if (slot->state == DS4_LAGUNA_CACHE_SLOT_EMPTY) {
+                empty_slots++;
+            }
+            if (slot->state == DS4_LAGUNA_CACHE_SLOT_LOADING ||
+                slot->state == DS4_LAGUNA_CACHE_SLOT_IN_USE ||
+                slot->refs != 0u) {
+                cache_quiescent = 0;
+                break;
+            }
+        }
+    }
+    if (!cuda_laguna_compact_cache_active_locked(ctx) ||
+        ctx->active_request_group != 0u || ctx->active_graph_scope != 0u ||
+        ctx->active_request_group_remaining != 0u ||
+        ctx->active_execution_count != 0u ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE ||
+        !cache_quiescent ||
+        !ctx->plan ||
+        !cuda_laguna_compact_routed_layer_count_locked(ctx, &layers) ||
+        layers > UINT64_MAX / CUDA_LAGUNA_ROUTED_SELECTED ||
+        (per_request = layers * CUDA_LAGUNA_ROUTED_SELECTED) >
+            UINT64_MAX / request_count ||
+        (required = per_request * request_count) > empty_slots) {
+        g_laguna_compact_exec_mutex.unlock();
+        return 0;
+    }
+    ctx->active_request_group = request_count;
+    ctx->active_request_group_remaining = request_count;
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_compact_request_group_end(
+        ds4_gpu_laguna_compact *ctx) {
+    if (!ctx) return 0;
+    int valid = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+        valid = ctx->active_request_group != 0u &&
+            ctx->active_request_group_remaining == 0u &&
+            ctx->active_graph_scope == 0u &&
+            ctx->active_request == NULL &&
+            ctx->active_execution_count == 0u &&
+            ctx->active_load_phase == DS4_LAGUNA_CACHE_LOAD_NONE &&
+            ctx->page_advice_since_range_count == 0u;
+        if (!valid) {
+            ctx->cache_unsafe = 1;
+        }
+        ctx->active_request = NULL;
+        ctx->active_graph_scope = 0u;
+        ctx->active_request_group = 0u;
+        ctx->active_request_group_remaining = 0u;
+        if (ctx->cache_unsafe) valid = 0;
+    }
+    g_laguna_compact_exec_mutex.unlock();
+    return valid;
+}
+
+static ds4_laguna_cache_status cuda_laguna_compact_exec_note_routes(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        const ds4_laguna_expert_key *keys,
+        size_t key_count) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_exec_epoch_matches_locked(
+            ctx, execution_epoch) ||
+        ctx->active_execution_count == 0u ||
+        !cuda_laguna_compact_cache_active_locked(ctx)) {
+        return DS4_LAGUNA_CACHE_UNSAFE;
+    }
+    const ds4_laguna_cache_status status =
+        ds4_laguna_cache_policy_note_routes(
+            &ctx->cache_policy, keys, key_count);
+    if (status == DS4_LAGUNA_CACHE_UNSAFE) ctx->cache_unsafe = 1;
+    return status;
+}
+
+static int cuda_laguna_compact_request_scope_matches_locked(
+        const ds4_gpu_laguna_compact *ctx,
+        const ds4_runtime_request_context *request) {
+    if (!ctx) return 0;
+    if (request) {
+        return ctx->active_graph_scope == 1u &&
+            ctx->active_request == request;
+    }
+    return ctx->active_graph_scope == 0u ||
+        (ctx->active_graph_scope == 1u && ctx->active_request == NULL);
+}
+
+#ifdef DS4_TEST_HOOKS
+/* The caller invokes this only after every unique projection view has been
+ * range-checked against the fixed cache payload.  Record route occurrences,
+ * rather than unique cache views, so batch deduplication does not weaken the
+ * pair-by-pair origin audit. */
+static void cuda_laguna_compact_exec_record_cache_origins(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        uint64_t projection_count) {
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_exec_epoch_matches_locked(
+            ctx, execution_epoch) ||
+        ctx->active_execution_count == 0u) {
+        return;
+    }
+    cuda_laguna_compact_counter_add(
+        &ctx->routed_origin.routed_projection_requests, projection_count);
+    cuda_laguna_compact_counter_add(
+        &ctx->routed_origin.engine_slot_resolutions, projection_count);
+}
+#else
+static void cuda_laguna_compact_exec_record_cache_origins(
+        ds4_gpu_laguna_compact *, uint64_t, uint64_t) {
+}
+#endif
+
+static ds4_gpu_laguna_exec_result cuda_laguna_compact_exec_release(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        ds4_laguna_cache_handle *handles,
+        size_t handle_count,
+        ds4_gpu_laguna_exec_result result,
+        int latch_unsafe) {
+    if (handle_count != 0u) {
+        const cudaError_t synchronized = cudaDeviceSynchronize();
+        if (synchronized != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_exec_latch_unsafe(
+                ctx, execution_epoch);
+            return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+        }
+    }
+    {
+        const uint64_t page_flush_threshold = UINT64_C(512) << 20;
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_exec_epoch_matches_locked(
+                ctx, execution_epoch) ||
+            ctx->active_execution_count == 0u ||
+            (ctx->page_advice_since_range_bytes >= page_flush_threshold &&
+             !cuda_laguna_compact_page_flush_pending_locked(ctx, 0))) {
+            latch_unsafe = 1;
+            result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+        }
+    }
+    if (handle_count != 0u) {
+        for (size_t i = handle_count; i > 0u; i--) {
+            const ds4_laguna_cache_status status =
+                ds4_gpu_laguna_compact_cache_unpin(ctx, handles[i - 1u]);
+            if (status != DS4_LAGUNA_CACHE_OK) {
+                latch_unsafe = 1;
+                result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+            }
+        }
+    }
+    if (latch_unsafe || result == DS4_GPU_LAGUNA_EXEC_UNSAFE) {
+        cuda_laguna_compact_exec_latch_unsafe(ctx, execution_epoch);
+    }
+    return result;
+}
+
+typedef struct {
+    const void *ptr;
+    uint64_t bytes;
+} cuda_laguna_compact_exec_range;
+
+static int cuda_laguna_compact_exec_ranges_overlap(
+        const void *a,
+        uint64_t a_bytes,
+        const void *b,
+        uint64_t b_bytes) {
+    if (!a || !b || a_bytes == 0u || b_bytes == 0u) return 1;
+    const uintptr_t a_begin = (uintptr_t)a;
+    const uintptr_t b_begin = (uintptr_t)b;
+    if (a_begin > UINTPTR_MAX - a_bytes ||
+        b_begin > UINTPTR_MAX - b_bytes) {
+        return 1;
+    }
+    return a_begin < b_begin + b_bytes && b_begin < a_begin + a_bytes;
+}
+
+static int cuda_laguna_compact_exec_ranges_isolated(
+        const ds4_gpu_laguna_compact *ctx,
+        const cuda_laguna_compact_exec_range *writable,
+        size_t writable_count,
+        const cuda_laguna_compact_exec_range *read_only,
+        size_t read_only_count) {
+    if (!ctx || !writable || writable_count == 0u ||
+        !read_only || read_only_count == 0u || !ctx->ledger ||
+        ctx->ledger->expert_entry_count > UINT64_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+    for (size_t i = 0u; i < writable_count; i++) {
+        for (size_t j = i + 1u; j < writable_count; j++) {
+            if (cuda_laguna_compact_exec_ranges_overlap(
+                    writable[i].ptr, writable[i].bytes,
+                    writable[j].ptr, writable[j].bytes)) {
+                return 0;
+            }
+        }
+        for (size_t j = 0u; j < read_only_count; j++) {
+            if (cuda_laguna_compact_exec_ranges_overlap(
+                    writable[i].ptr, writable[i].bytes,
+                    read_only[j].ptr, read_only[j].bytes)) {
+                return 0;
+            }
+        }
+    }
+    for (size_t i = 0u; i < read_only_count; i++) {
+        for (size_t j = i + 1u; j < read_only_count; j++) {
+            if (cuda_laguna_compact_exec_ranges_overlap(
+                    read_only[i].ptr, read_only[i].bytes,
+                    read_only[j].ptr, read_only[j].bytes)) {
+                return 0;
+            }
+        }
+    }
+
+    const uint64_t device_map_bytes =
+        ctx->ledger->expert_entry_count * sizeof(uint32_t);
+    const cuda_laguna_compact_exec_range protected_ranges[] = {
+        {ctx->cache_payload, ctx->cache_payload_bytes},
+        {ctx->static_slab, ctx->static_slab_bytes},
+        {ctx->device_entry_to_slot, device_map_bytes},
+    };
+    for (size_t i = 0u; i < writable_count; i++) {
+        for (size_t j = 0u;
+             j < sizeof(protected_ranges) / sizeof(protected_ranges[0]);
+             j++) {
+            if (cuda_laguna_compact_exec_ranges_overlap(
+                    writable[i].ptr, writable[i].bytes,
+                    protected_ranges[j].ptr, protected_ranges[j].bytes)) {
+                return 0;
+            }
+        }
+    }
+    for (size_t i = 0u; i < read_only_count; i++) {
+        for (size_t j = 0u;
+             j < sizeof(protected_ranges) / sizeof(protected_ranges[0]);
+             j++) {
+            if (cuda_laguna_compact_exec_ranges_overlap(
+                    read_only[i].ptr, read_only[i].bytes,
+                    protected_ranges[j].ptr, protected_ranges[j].bytes)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static ds4_gpu_laguna_exec_result
+cuda_laguna_compact_routed_moe_batch_tensor_core(
+        ds4_gpu_laguna_compact *ctx,
+        uint64_t execution_epoch,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata) {
+    const uint64_t pair_count =
+        (uint64_t)n_tokens * CUDA_LAGUNA_ROUTED_SELECTED;
+    const uint64_t input_q8_bytes =
+        (uint64_t)n_tokens *
+        (CUDA_LAGUNA_ROUTED_INPUT_DIM / 32u) *
+        sizeof(poolside_q8_1_block);
+    const uint64_t mid_q8_bytes =
+        pair_count *
+        (CUDA_LAGUNA_ROUTED_MID_DIM / 32u) *
+        sizeof(poolside_q8_1_block);
+    const uint64_t l2_bytes = pair_count * sizeof(float);
+    const uint64_t descriptor_bytes = pair_count * sizeof(uint32_t);
+    const uint64_t descriptor_offset =
+        (l2_bytes + CUDA_LAGUNA_ROUTED_AUX_ALIGNMENT - 1u) &
+        ~(uint64_t)(CUDA_LAGUNA_ROUTED_AUX_ALIGNMENT - 1u);
+    const uint64_t aux_bytes = descriptor_offset + descriptor_bytes;
+    const uint64_t output_bytes =
+        (uint64_t)n_tokens * CUDA_LAGUNA_ROUTED_OUTPUT_DIM *
+        sizeof(float);
+    const uint64_t mid_bytes =
+        pair_count *
+        CUDA_LAGUNA_ROUTED_MID_DIM * sizeof(float);
+    const uint64_t weights_bytes = pair_count * sizeof(float);
+    const uint64_t input_bytes =
+        (uint64_t)n_tokens * CUDA_LAGUNA_ROUTED_INPUT_DIM * sizeof(float);
+    const uint64_t route_key_offset =
+        (descriptor_bytes + alignof(ds4_laguna_expert_key) - 1u) &
+        ~(uint64_t)(alignof(ds4_laguna_expert_key) - 1u);
+    const uint64_t route_key_bytes =
+        pair_count * sizeof(ds4_laguna_expert_key);
+    const uint64_t staging_bytes = route_key_offset + route_key_bytes;
+    if (!ctx || !out || !mid || !input_q8_scratch ||
+        !mid_q8_scratch || !aux_scratch || !selected || !weights || !x ||
+        !out->ptr || !mid->ptr || !input_q8_scratch->ptr ||
+        !mid_q8_scratch->ptr || !aux_scratch->ptr || !selected->ptr ||
+        !weights->ptr || !x->ptr ||
+        gate_type != 12u || up_type != 12u || down_type != 12u ||
+        expert_in_dim != CUDA_LAGUNA_ROUTED_INPUT_DIM ||
+        expert_mid_dim != CUDA_LAGUNA_ROUTED_MID_DIM ||
+        out_dim != CUDA_LAGUNA_ROUTED_OUTPUT_DIM ||
+        n_total_expert != CUDA_LAGUNA_ROUTED_TOTAL_EXPERT ||
+        n_selected != CUDA_LAGUNA_ROUTED_SELECTED ||
+        n_tokens == 0u || n_tokens > 65535u || !ctx->plan ||
+        n_tokens > ctx->plan->prefill_rows ||
+        !ctx->pinned_staging[3] ||
+        staging_bytes > ctx->plan->staging_buffer_bytes ||
+        out->bytes < output_bytes || mid->bytes < mid_bytes ||
+        selected->bytes < descriptor_bytes ||
+        weights->bytes < weights_bytes || x->bytes < input_bytes ||
+        input_q8_scratch->bytes < input_q8_bytes ||
+        mid_q8_scratch->bytes < mid_q8_bytes ||
+        aux_scratch->bytes < aux_bytes) {
+        return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
+    }
+
+    const cuda_laguna_compact_exec_range writable_ranges[] = {
+        {out->ptr, output_bytes},
+        {mid->ptr, mid_bytes},
+        {input_q8_scratch->ptr, input_q8_bytes},
+        {mid_q8_scratch->ptr, mid_q8_bytes},
+        {aux_scratch->ptr, aux_bytes},
+    };
+    const cuda_laguna_compact_exec_range read_only_ranges[] = {
+        {selected->ptr, descriptor_bytes},
+        {weights->ptr, weights_bytes},
+        {x->ptr, input_bytes},
+    };
+    if (!cuda_laguna_compact_exec_ranges_isolated(
+            ctx,
+            writable_ranges,
+            sizeof(writable_ranges) / sizeof(writable_ranges[0]),
+            read_only_ranges,
+            sizeof(read_only_ranges) / sizeof(read_only_ranges[0]))) {
+        return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
+    }
+
+    const int tier = ds4_tensor_device_idx(out);
+    if (tier < 0 || tier >= g_n_gpus ||
+        ds4_tensor_device_idx(mid) != tier ||
+        ds4_tensor_device_idx(input_q8_scratch) != tier ||
+        ds4_tensor_device_idx(mid_q8_scratch) != tier ||
+        ds4_tensor_device_idx(aux_scratch) != tier ||
+        ds4_tensor_device_idx(selected) != tier ||
+        ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(x) != tier) {
+        return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
+    }
+    uint32_t *slot_descriptor = (uint32_t *)(
+        (char *)aux_scratch->ptr + descriptor_offset);
+    if ((((uintptr_t)input_q8_scratch->ptr) & 15u) != 0u ||
+        (((uintptr_t)mid_q8_scratch->ptr) & 15u) != 0u ||
+        (((uintptr_t)aux_scratch->ptr) & 3u) != 0u ||
+        (((uintptr_t)slot_descriptor) & 3u) != 0u ||
+        (((uintptr_t)out->ptr) & 3u) != 0u ||
+        (((uintptr_t)mid->ptr) & 3u) != 0u ||
+        (((uintptr_t)selected->ptr) & 3u) != 0u ||
+        (((uintptr_t)weights->ptr) & 3u) != 0u ||
+        (((uintptr_t)x->ptr) & 3u) != 0u) {
+        return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
+    }
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess ||
+        current_device != g_gpu[tier].device_id) {
+        (void)cudaGetLastError();
+        return cuda_laguna_compact_exec_unsafe(ctx, execution_epoch);
+    }
+    if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+        return DS4_GPU_LAGUNA_EXEC_CANCELLED;
+    }
+
+    ds4_laguna_expert_key unique_keys[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT];
+    size_t unique_count = 0u;
+    ds4_laguna_cache_status noted = DS4_LAGUNA_CACHE_UNSAFE;
+    cudaError_t error = cudaSuccess;
+    {
+        /* Staging buffer three is also the cache directory upload buffer.
+         * Hold the compact mutex across the selected read, validation, and
+         * route-note call so no cache transition can overwrite it. */
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_exec_epoch_matches_locked(
+                ctx, execution_epoch) ||
+            ctx->active_execution_count == 0u ||
+            !cuda_laguna_compact_cache_active_locked(ctx)) {
+            return cuda_laguna_compact_exec_unsafe(
+                ctx, execution_epoch);
+        }
+        int32_t *selected_host =
+            (int32_t *)ctx->pinned_staging[3];
+        ds4_laguna_expert_key *route_keys =
+            (ds4_laguna_expert_key *)(
+                (char *)ctx->pinned_staging[3] + route_key_offset);
+        error = cudaMemcpy(
+            selected_host, selected->ptr, (size_t)descriptor_bytes,
+            cudaMemcpyDeviceToHost);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &ctx->cuda_copy_failures);
+            return cuda_laguna_compact_exec_unsafe(
+                ctx, execution_epoch);
+        }
+        bool seen[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT] = {false};
+        for (uint32_t token = 0u; token < n_tokens; token++) {
+            const uint64_t row =
+                (uint64_t)token * CUDA_LAGUNA_ROUTED_SELECTED;
+            for (uint32_t slot = 0u;
+                 slot < CUDA_LAGUNA_ROUTED_SELECTED;
+                 slot++) {
+                const uint64_t pair = row + slot;
+                const int32_t expert = selected_host[pair];
+                if (expert < 0 ||
+                    (uint32_t)expert >=
+                        CUDA_LAGUNA_ROUTED_TOTAL_EXPERT) {
+                    return cuda_laguna_compact_exec_unsafe(
+                        ctx, execution_epoch);
+                }
+                for (uint32_t earlier = 0u;
+                     earlier < slot;
+                     earlier++) {
+                    if (selected_host[row + earlier] == expert) {
+                        return cuda_laguna_compact_exec_unsafe(
+                            ctx, execution_epoch);
+                    }
+                }
+                route_keys[pair].layer_id = layer_id;
+                route_keys[pair].expert_id = (uint32_t)expert;
+                if (!seen[(uint32_t)expert]) {
+                    seen[(uint32_t)expert] = true;
+                    unique_keys[unique_count++] = route_keys[pair];
+                }
+            }
+        }
+        noted = cuda_laguna_compact_exec_note_routes(
+            ctx, execution_epoch, route_keys, (size_t)pair_count);
+    }
+    if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+        return DS4_GPU_LAGUNA_EXEC_CANCELLED;
+    }
+    if (noted != DS4_LAGUNA_CACHE_OK) {
+        return noted == DS4_LAGUNA_CACHE_UNSAFE ?
+            cuda_laguna_compact_exec_unsafe(ctx, execution_epoch) :
+            DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
+    if (unique_count > ctx->plan->slot_count) {
+        return DS4_GPU_LAGUNA_EXEC_RECOVERABLE;
+    }
+
+    ds4_laguna_cache_handle handles[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT];
+    memset(handles, 0, sizeof(handles));
+    size_t handle_count = 0u;
+    for (size_t i = 0u; i < unique_count; i++) {
+        if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_CANCELLED, 0);
+        }
+        ds4_laguna_cache_acquire_outcome outcome =
+            DS4_LAGUNA_CACHE_ACQUIRE_NONE;
+        ds4_laguna_cache_status status =
+            ds4_gpu_laguna_compact_cache_begin(
+                ctx, unique_keys[i], &handles[handle_count], &outcome);
+        if (status != DS4_LAGUNA_CACHE_OK) {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                status == DS4_LAGUNA_CACHE_UNSAFE ?
+                    DS4_GPU_LAGUNA_EXEC_UNSAFE :
+                    DS4_GPU_LAGUNA_EXEC_RECOVERABLE,
+                status == DS4_LAGUNA_CACHE_UNSAFE);
+        }
+        if (outcome == DS4_LAGUNA_CACHE_ACQUIRE_HIT_RESERVED) {
+            handle_count++;
+        } else if (outcome == DS4_LAGUNA_CACHE_ACQUIRE_LOAD_OWNER) {
+            if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+                const ds4_laguna_cache_status cancelled =
+                    ds4_gpu_laguna_compact_cache_cancel(
+                        ctx, handles[handle_count]);
+                return cuda_laguna_compact_exec_release(
+                    ctx, execution_epoch, handles, handle_count,
+                    cancelled == DS4_LAGUNA_CACHE_UNSAFE ?
+                        DS4_GPU_LAGUNA_EXEC_UNSAFE :
+                        DS4_GPU_LAGUNA_EXEC_CANCELLED,
+                    cancelled == DS4_LAGUNA_CACHE_UNSAFE);
+            }
+            cuda_laguna_compact_cache_transfer_result transfer_cause =
+                CUDA_LAGUNA_CACHE_TRANSFER_RECOVERABLE;
+            status = cuda_laguna_compact_cache_complete_internal(
+                ctx, &handles[handle_count], cancel, userdata,
+                &transfer_cause);
+            if (status != DS4_LAGUNA_CACHE_OK) {
+                const int was_cancelled =
+                    transfer_cause == CUDA_LAGUNA_CACHE_TRANSFER_CANCELLED;
+                return cuda_laguna_compact_exec_release(
+                    ctx, execution_epoch, handles, handle_count,
+                    status == DS4_LAGUNA_CACHE_UNSAFE ?
+                        DS4_GPU_LAGUNA_EXEC_UNSAFE :
+                    was_cancelled ? DS4_GPU_LAGUNA_EXEC_CANCELLED :
+                        DS4_GPU_LAGUNA_EXEC_RECOVERABLE,
+                    status == DS4_LAGUNA_CACHE_UNSAFE);
+            }
+            handle_count++;
+        } else {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+        }
+        if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_CANCELLED, 0);
+        }
+    }
+
+    uint32_t slot_for_expert[CUDA_LAGUNA_ROUTED_TOTAL_EXPERT];
+    for (size_t i = 0u; i < CUDA_LAGUNA_ROUTED_TOTAL_EXPERT; i++) {
+        slot_for_expert[i] = DS4_LAGUNA_CACHE_SLOT_NONE;
+    }
+    uint64_t projection_offsets[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    const uint64_t expert_bytes =
+        ctx->ledger ? ctx->ledger->routed_projection_expert_bytes : 0u;
+    if (!ctx->ledger || !ctx->plan || !ctx->cache_payload ||
+        expert_bytes == 0u || ctx->plan->slot_stride_bytes == 0u ||
+        expert_bytes % expert_mid_dim != 0u ||
+        expert_bytes % out_dim != 0u) {
+        return cuda_laguna_compact_exec_release(
+            ctx, execution_epoch, handles, handle_count,
+            DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+    }
+    const uint64_t gate_row_bytes = expert_bytes / expert_mid_dim;
+    const uint64_t down_row_bytes = expert_bytes / out_dim;
+    if (gate_row_bytes !=
+            (uint64_t)(expert_in_dim / 256u) * sizeof(cuda_block_q4_K) ||
+        down_row_bytes !=
+            (uint64_t)(expert_mid_dim / 256u) * sizeof(cuda_block_q4_K)) {
+        return cuda_laguna_compact_exec_release(
+            ctx, execution_epoch, handles, handle_count,
+            DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+    }
+
+    const ds4_laguna_routed_projection projections[3] = {
+        DS4_LAGUNA_ROUTED_PROJECTION_GATE,
+        DS4_LAGUNA_ROUTED_PROJECTION_UP,
+        DS4_LAGUNA_ROUTED_PROJECTION_DOWN,
+    };
+    for (size_t i = 0u; i < unique_count; i++) {
+        const ds4_laguna_cache_handle handle = handles[i];
+        if (handle.slot_index >= ctx->plan->slot_count ||
+            handle.entry_index >= ctx->ledger->expert_entry_count) {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+        }
+        slot_for_expert[unique_keys[i].expert_id] = handle.slot_index;
+        const ds4_laguna_expert_entry *entry =
+            &ctx->ledger->expert_entries[handle.entry_index];
+        const ds4_laguna_expert_view *views[3] = {
+            &entry->gate, &entry->up, &entry->down,
+        };
+        for (uint32_t projection = 0u; projection < 3u; projection++) {
+            const void *device_ptr = NULL;
+            uint64_t bytes = 0u;
+            const int view_ok = ds4_gpu_laguna_compact_cache_view(
+                ctx, handle, projections[projection],
+                &device_ptr, &bytes);
+            const uint64_t slot_offset =
+                (uint64_t)handle.slot_index *
+                ctx->plan->slot_stride_bytes;
+            if (!view_ok || bytes != expert_bytes ||
+                views[projection]->source_bytes != expert_bytes ||
+                entry->used_bytes > ctx->plan->slot_stride_bytes ||
+                views[projection]->device_offset >
+                    ctx->plan->slot_stride_bytes ||
+                expert_bytes > ctx->plan->slot_stride_bytes -
+                    views[projection]->device_offset ||
+                slot_offset > ctx->cache_payload_bytes ||
+                views[projection]->device_offset >
+                    ctx->cache_payload_bytes - slot_offset ||
+                expert_bytes > ctx->cache_payload_bytes - slot_offset -
+                    views[projection]->device_offset ||
+                device_ptr != ctx->cache_payload + slot_offset +
+                    views[projection]->device_offset ||
+                (((uintptr_t)device_ptr) & 15u) != 0u ||
+                (projection_offsets[projection] != UINT64_MAX &&
+                 projection_offsets[projection] !=
+                    views[projection]->device_offset)) {
+                return cuda_laguna_compact_exec_release(
+                    ctx, execution_epoch, handles, handle_count,
+                    DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+            }
+            projection_offsets[projection] =
+                views[projection]->device_offset;
+        }
+    }
+
+    {
+        /* Cache completion may have used staging[3] for directory mirrors.
+         * Read selected IDs again, then convert them in place to the physical
+         * token-major slot descriptor while the shared staging owner is held. */
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_exec_epoch_matches_locked(
+                ctx, execution_epoch) ||
+            ctx->active_execution_count == 0u ||
+            !cuda_laguna_compact_cache_active_locked(ctx)) {
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+        }
+        int32_t *selected_host =
+            (int32_t *)ctx->pinned_staging[3];
+        error = cudaMemcpy(
+            selected_host, selected->ptr, (size_t)descriptor_bytes,
+            cudaMemcpyDeviceToHost);
+        if (error == cudaSuccess) {
+            uint32_t *descriptor_host =
+                (uint32_t *)ctx->pinned_staging[3];
+            for (uint64_t pair = 0u; pair < pair_count; pair++) {
+                const int32_t expert = selected_host[pair];
+                if (expert < 0 ||
+                    (uint32_t)expert >=
+                        CUDA_LAGUNA_ROUTED_TOTAL_EXPERT ||
+                    slot_for_expert[(uint32_t)expert] ==
+                        DS4_LAGUNA_CACHE_SLOT_NONE) {
+                    return cuda_laguna_compact_exec_release(
+                        ctx, execution_epoch, handles, handle_count,
+                        DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+                }
+                descriptor_host[pair] =
+                    slot_for_expert[(uint32_t)expert];
+            }
+            error = cudaMemcpy(
+                slot_descriptor, descriptor_host,
+                (size_t)descriptor_bytes, cudaMemcpyHostToDevice);
+        }
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_laguna_compact_counter_increment(
+                &ctx->cuda_copy_failures);
+            return cuda_laguna_compact_exec_release(
+                ctx, execution_epoch, handles, handle_count,
+                DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+        }
+    }
+    cuda_laguna_compact_exec_record_cache_origins(
+        ctx, execution_epoch, pair_count * 3u);
+    if (cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+        return cuda_laguna_compact_exec_release(
+            ctx, execution_epoch, handles, handle_count,
+            DS4_GPU_LAGUNA_EXEC_CANCELLED, 0);
+    }
+
+    ds4_gpu_tensor l2_view;
+    l2_view.ptr = aux_scratch->ptr;
+    l2_view.bytes = l2_bytes;
+    l2_view.owner = 0;
+    l2_view.device_id = aux_scratch->device_id;
+    glm_poolside_q4_compact_launch compact;
+    memset(&compact, 0, sizeof(compact));
+    compact.payload_base = ctx->cache_payload;
+    compact.slot_indices = slot_descriptor;
+    compact.slot_stride = ctx->plan->slot_stride_bytes;
+    compact.gate_slot_offset = projection_offsets[0];
+    compact.up_slot_offset = projection_offsets[1];
+    compact.down_slot_offset = projection_offsets[2];
+    compact.input_q8_scratch = input_q8_scratch;
+    compact.mid_q8_scratch = mid_q8_scratch;
+    compact.l2_scratch = &l2_view;
+    const int launched = glm_poolside_routed_moe_q4_launch(
+        out, mid, NULL, 0u, 0u, 0u, 0u,
+        expert_bytes, gate_row_bytes,
+        expert_bytes, gate_row_bytes,
+        expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim,
+        selected, weights, n_total_expert, n_selected,
+        x, n_tokens, n_selected * expert_mid_dim, &compact
+#ifdef DS4_TEST_HOOKS
+        , NULL
+#endif
+        );
+    if (!launched) {
+        return cuda_laguna_compact_exec_release(
+            ctx, execution_epoch, handles, handle_count,
+            DS4_GPU_LAGUNA_EXEC_UNSAFE, 1);
+    }
+    ds4_gpu_laguna_exec_result result =
+        cuda_laguna_compact_exec_release(
+            ctx, execution_epoch, handles, handle_count,
+            DS4_GPU_LAGUNA_EXEC_SUCCESS, 0);
+    if (result == DS4_GPU_LAGUNA_EXEC_SUCCESS &&
+        cuda_laguna_compact_exec_cancelled(cancel, userdata)) {
+        result = DS4_GPU_LAGUNA_EXEC_CANCELLED;
+    }
+    return result;
+}
+
+extern "C" ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_batch_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata,
+        ds4_runtime_request_context *request) {
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    uint64_t execution_epoch = 0u;
+    if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    int scope_matches = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        scope_matches = cuda_laguna_compact_request_scope_matches_locked(
+            ctx, request);
+        if (!scope_matches) ctx->cache_unsafe = 1;
+    }
+    ds4_gpu_laguna_exec_result result = scope_matches ?
+        cuda_laguna_compact_routed_moe_batch_tensor_core(
+            ctx, execution_epoch, out, mid,
+            input_q8_scratch, mid_q8_scratch, aux_scratch,
+            layer_id, gate_type, up_type, down_type,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_selected, x,
+            n_tokens, cancel, userdata) :
+        DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    if (!cuda_laguna_compact_exec_leave(
+            ctx, execution_epoch, &result)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    return result;
+}
+
+extern "C" ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_one_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata,
+        ds4_runtime_request_context *request) {
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    uint64_t execution_epoch = 0u;
+    if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    int scope_matches = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        scope_matches = cuda_laguna_compact_request_scope_matches_locked(
+            ctx, request);
+        if (!scope_matches) ctx->cache_unsafe = 1;
+    }
+    ds4_gpu_laguna_exec_result result = scope_matches ?
+        cuda_laguna_compact_routed_moe_batch_tensor_core(
+            ctx, execution_epoch, out, mid,
+            input_q8_scratch, mid_q8_scratch, aux_scratch,
+            layer_id, gate_type, up_type, down_type,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_selected, x,
+            1u, cancel, userdata) :
+        DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    if (!cuda_laguna_compact_exec_leave(
+            ctx, execution_epoch, &result)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    return result;
+}
+
+extern "C" ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_finish_graph(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    uint64_t execution_epoch = 0u;
+    if (!cuda_laguna_compact_exec_enter(ctx, &execution_epoch)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    ds4_gpu_laguna_exec_result result = DS4_GPU_LAGUNA_EXEC_SUCCESS;
+    int scope_matches = 0;
+    {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        scope_matches = cuda_laguna_compact_request_scope_matches_locked(
+            ctx, request);
+        if (!scope_matches) ctx->cache_unsafe = 1;
+    }
+    const cudaError_t synchronized = scope_matches ?
+        cudaDeviceSynchronize() : cudaErrorUnknown;
+    if (!scope_matches || synchronized != cudaSuccess) {
+        (void)cudaGetLastError();
+        result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    } else {
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        if (!cuda_laguna_compact_exec_epoch_matches_locked(
+                ctx, execution_epoch) ||
+            ctx->active_execution_count != 1u ||
+            !cuda_laguna_compact_page_flush_pending_locked(ctx, 0)) {
+            ctx->cache_unsafe = 1;
+            result = DS4_GPU_LAGUNA_EXEC_UNSAFE;
+        }
+    }
+    if (!cuda_laguna_compact_exec_leave(
+            ctx, execution_epoch, &result)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    return result;
+}
+
+extern "C" ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_request_barrier(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request) {
+    if (!ctx || !cuda_laguna_compact_request_valid(request)) {
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    std::lock_guard<std::recursive_mutex> execution_guard(
+        g_laguna_compact_exec_mutex);
+    const cudaError_t synchronized = cudaDeviceSynchronize();
+    if (synchronized != cudaSuccess) {
+        (void)cudaGetLastError();
+        std::lock_guard<std::recursive_mutex> guard(
+            g_laguna_compact_mutex);
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
+    if (!cuda_laguna_compact_cache_active_locked(ctx) ||
+        ctx->active_graph_scope != 0u || ctx->active_request != NULL ||
+        ctx->active_request_group != 0u ||
+        ctx->active_request_group_remaining != 0u ||
+        ctx->active_execution_count != 0u ||
+        ctx->active_load_phase != DS4_LAGUNA_CACHE_LOAD_NONE ||
+        ctx->page_advice_since_range_count != 0u) {
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    if (!request->page_advice_observed) {
+        return DS4_GPU_LAGUNA_EXEC_SUCCESS;
+    }
+    ds4_runtime_request_context staged = *request;
+    uint64_t lower_bound = staged.latest_page_advice_monotonic_ns;
+    if (lower_bound < staged.prefill_complete_monotonic_ns) {
+        lower_bound = staged.prefill_complete_monotonic_ns;
+    }
+    if (lower_bound < staged.last_visible_decode_monotonic_ns) {
+        lower_bound = staged.last_visible_decode_monotonic_ns;
+    }
+    const uint64_t complete =
+        cuda_laguna_compact_monotonic_ns_after(lower_bound);
+    if (!ds4_runtime_request_record_page_advice_complete(
+            &staged, complete)) {
+        ctx->cache_unsafe = 1;
+        return DS4_GPU_LAGUNA_EXEC_UNSAFE;
+    }
+    *request = staged;
+    return DS4_GPU_LAGUNA_EXEC_SUCCESS;
 }
 
 /* Scalar-correct GLM routed MoE (q2_K experts): per (token, slot) block
@@ -25891,6 +34033,73 @@ static int glm_routed_moe_finish_batch(
                    "glm routed moe local output copy");
 }
 
+__global__ static void glm_routed_moe_validate_selected_kernel(
+        const int32_t *selected,
+        uint64_t n_selected,
+        uint32_t n_total_expert,
+        int *invalid) {
+    const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= n_selected) return;
+    const int32_t expert = selected[index];
+    if (expert < 0 || (uint32_t)expert >= n_total_expert) {
+        atomicExch(invalid, 1);
+    }
+}
+
+static int glm_routed_moe_selected_ids_valid(
+        const ds4_gpu_tensor *selected,
+        uint64_t n_selected,
+        uint32_t n_total_expert) {
+    int *device_invalid = NULL;
+    int host_invalid = 0;
+    int previous_device = -1;
+    int ok = 0;
+    uint64_t blocks = 0;
+    if (!selected || !selected->ptr || n_selected == 0u ||
+        n_total_expert == 0u) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(selected);
+    if (tier < 0 || tier >= DS4_MAX_GPUS) {
+        return 0;
+    }
+    if (!cuda_ok(cudaGetDevice(&previous_device),
+                 "glm routed moe selected validation get device") ||
+        !cuda_ok(cudaSetDevice(g_gpu[tier].device_id),
+                 "glm routed moe selected validation set device") ||
+        !cuda_ok(cudaMalloc(&device_invalid, sizeof(*device_invalid)),
+                 "glm routed moe selected validation alloc") ||
+        !cuda_ok(cudaMemset(device_invalid, 0, sizeof(*device_invalid)),
+                 "glm routed moe selected validation clear")) {
+        goto cleanup;
+    }
+    blocks = (n_selected + 255u) / 256u;
+    if (blocks > 0xffffffffu) goto cleanup;
+    glm_routed_moe_validate_selected_kernel<<<(uint32_t)blocks, 256>>>(
+            (const int32_t *)selected->ptr, n_selected, n_total_expert,
+            device_invalid);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm routed moe selected validation launch") ||
+        !cuda_ok(cudaMemcpy(&host_invalid, device_invalid,
+                            sizeof(host_invalid), cudaMemcpyDeviceToHost),
+                 "glm routed moe selected validation readback")) {
+        goto cleanup;
+    }
+    ok = host_invalid == 0;
+cleanup:
+    if (device_invalid &&
+        !cuda_ok(cudaFree(device_invalid),
+                 "glm routed moe selected validation free")) {
+        ok = 0;
+    }
+    if (previous_device >= 0 &&
+        !cuda_ok(cudaSetDevice(previous_device),
+                 "glm routed moe selected validation restore device")) {
+        ok = 0;
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -25918,12 +34127,37 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
-        uint32_t                mid_token_stride) {
-    (void)layer_index; (void)n_total_expert;
+        uint32_t                mid_token_stride,
+        bool                    force_resident) {
+    (void)layer_index;
     if (!out || !mid || !x || !selected || !weights || !model_map ||
         n_tokens == 0 || n_expert == 0 ||
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
+    }
+    const bool q4_types =
+        gate_type == 12u && up_type == 12u && down_type == 12u;
+    if (q4_types) {
+        if (!force_resident) return 0;
+        if (getenv("DS4_CUDA_VALIDATE_SELECTED") != NULL &&
+            !glm_routed_moe_selected_ids_valid(
+                    selected, (uint64_t)n_tokens * n_expert,
+                    n_total_expert)) {
+            return 0;
+        }
+        return glm_poolside_routed_moe_q4_launch(
+                out, mid, model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, gate_row_bytes,
+                up_expert_bytes, up_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert,
+                x, n_tokens, mid_token_stride, NULL
+#ifdef DS4_TEST_HOOKS
+                , NULL
+#endif
+                );
     }
     if (gate_type != 10u || up_type != 10u || down_type != 10u) {
         fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",
@@ -26271,7 +34505,6 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         bool                    force_resident) {
-    (void)force_resident;
     return ds4_gpu_glm_routed_moe_batch_tensor(out, mid,
             model_map, model_size,
             gate_offset, up_offset, down_offset,
@@ -26281,8 +34514,71 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, layer_index,
-            x, 1, n_expert * expert_mid_dim);
+            x, 1, n_expert * expert_mid_dim, force_resident);
 }
+
+#ifdef DS4_TEST_HOOKS
+extern "C" int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
+        ds4_gpu_tensor       *capture,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              up_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              layer_index,
+        const ds4_gpu_tensor *x,
+        bool                  force_resident) {
+    if (!capture) {
+        return ds4_gpu_glm_routed_moe_one_tensor(
+                out, mid, model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                gate_type, up_type, down_type,
+                gate_expert_bytes, gate_row_bytes,
+                up_expert_bytes, up_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert,
+                layer_index, x, force_resident);
+    }
+    (void)layer_index;
+    if (!force_resident || gate_type != 12u || up_type != 12u ||
+        down_type != 12u) {
+        return 0;
+    }
+    if (getenv("DS4_CUDA_VALIDATE_SELECTED") != NULL &&
+        !glm_routed_moe_selected_ids_valid(
+                selected, n_expert, n_total_expert)) {
+        return 0;
+    }
+    return glm_poolside_routed_moe_q4_launch(
+            out, mid, model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, gate_row_bytes,
+            up_expert_bytes, up_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert,
+            x, 1u, n_expert * expert_mid_dim, NULL, capture);
+}
+#endif
 
 /* Parallel router select: 256 threads compute sigmoid probs, then top-k
  * via k rounds of shared-memory argmax over probs+bias (value desc, index
@@ -26308,7 +34604,6 @@ __global__ static void glm_router_select_parallel_kernel(
     __shared__ float sh_v[256];
     __shared__ int sh_i[256];
     __shared__ float sh_sel_v[256];
-    __shared__ float sh_sum;
 
     float my_v = -1e30f;
     if (tid < n_expert) {
@@ -26316,7 +34611,6 @@ __global__ static void glm_router_select_parallel_kernel(
         probs[tid] = p;
         my_v = p + bias[tid];
     }
-    if (tid == 0u) sh_sum = 0.0f;
     sh_sel_v[tid] = my_v;
     __syncthreads();
 
@@ -26340,16 +34634,26 @@ __global__ static void glm_router_select_parallel_kernel(
             sel[k2] = best;
             const float p = probs[best];
             w[k2] = p;
-            sh_sum += p;
             sh_sel_v[best] = -1e30f;
         }
         __syncthreads();
     }
-    if (tid == 0u) {
-        float sum = sh_sum;
-        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    if (tid < 32u) {
+        float sum = 0.0f;
         for (uint32_t k2 = 0; k2 < n_expert_used; k2++) {
-            w[k2] = w[k2] / sum * expert_weight_scale;
+            if (((uint32_t)sel[k2] & 31u) == tid) {
+                sum += w[k2];
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, (int)mask, 32);
+        }
+        sum = fmaxf(sum, 0x1p-14f);
+        const float inv_sum = 1.0f / sum;
+        for (uint32_t k2 = tid; k2 < n_expert_used; k2 += 32u) {
+            const float normalized = w[k2] * inv_sum;
+            w[k2] = normalized * expert_weight_scale;
         }
     }
 }
@@ -26378,7 +34682,7 @@ __global__ static void glm_router_select_batch_kernel(
     /* top-k over probs+bias, ties by smaller index (matches CPU topk_desc) */
     bool taken[384];
     for (uint32_t i = 0; i < n_expert; i++) taken[i] = false;
-    float sum = 0.0f;
+    float lane_sum[32] = {0.0f};
     for (uint32_t k2 = 0; k2 < n_expert_used; k2++) {
         int best = -1; float bv = -1e30f;
         for (uint32_t i = 0; i < n_expert; i++) {
@@ -26389,11 +34693,18 @@ __global__ static void glm_router_select_batch_kernel(
         taken[best] = true;
         sel[k2] = best;
         w[k2] = probs[best];
-        sum += probs[best];
+        lane_sum[(uint32_t)best & 31u] += probs[best];
     }
-    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (uint32_t step = 16u; step > 0u; step >>= 1u) {
+        for (uint32_t lane = 0; lane < step; lane++) {
+            lane_sum[lane] += lane_sum[lane + step];
+        }
+    }
+    const float sum = fmaxf(lane_sum[0], 0x1p-14f);
+    const float inv_sum = 1.0f / sum;
     for (uint32_t k2 = 0; k2 < n_expert_used; k2++) {
-        w[k2] = w[k2] / sum * expert_weight_scale;
+        const float normalized = w[k2] * inv_sum;
+        w[k2] = normalized * expert_weight_scale;
     }
 }
 
@@ -26696,6 +35007,8 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || n_selected == 0 ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
@@ -26932,6 +35245,41 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b * (uint64_t)n;
 }
 
+extern "C" uint64_t ds4_gpu_default_device_working_set_size(
+        uint32_t *visible_devices_out) {
+    if (visible_devices_out) *visible_devices_out = 0;
+
+    int visible = 0;
+    if (cudaGetDeviceCount(&visible) != cudaSuccess || visible <= 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaSetDevice(0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    const cudaError_t query_rc = cudaMemGetInfo(&free_b, &total_b);
+    const cudaError_t restore_rc =
+        previous == 0 ? cudaSuccess : cudaSetDevice(previous);
+    if (query_rc != cudaSuccess || restore_rc != cudaSuccess || total_b == 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    (void)free_b;
+    if (visible_devices_out) *visible_devices_out = (uint32_t)visible;
+    return (uint64_t)total_b;
+}
+
 extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
     (void)selected;
     (void)n_selected;
@@ -26947,6 +35295,8 @@ extern "C" void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
 }
 
 extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)max_tensor_bytes;
     if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) {
         return 0;
@@ -27253,6 +35603,8 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
                                                  n_selected);
 }
@@ -27346,6 +35698,8 @@ extern "C" int ds4_gpu_commit_and_wait_selected_readback(
 }
 
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     const int ok = ds4_gpu_set_model_fd(fd);
     if (ok) g_model_fd_host_base = model_map;
     return ok;
@@ -27360,6 +35714,8 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)model_map; (void)model_size;
     (void)gate_offset; (void)up_offset; (void)down_offset;
     (void)gate_expert_bytes; (void)down_expert_bytes;
@@ -27372,6 +35728,8 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
@@ -27398,6 +35756,8 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return;
     cuda_stream_selected_cache_release();
 }
 
@@ -27405,6 +35765,8 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)table; (void)selected_ids; (void)n_selected;
     return 1;
 }
@@ -27414,6 +35776,8 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t *selected_ids,
         uint32_t n_tokens,
         uint32_t n_selected) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     if (n_tokens == 0 || n_selected == 0 ||
         (uint64_t)n_tokens * n_selected > UINT32_MAX) {
         return 0;
@@ -27427,6 +35791,8 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t *expert_ids,
         const uint32_t *expert_priorities,
         uint32_t n_experts) {
+    cuda_laguna_compact_legacy_permit compact_permit;
+    if (!compact_permit.allowed()) return 0;
     (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
     return 1;
 }
@@ -27662,5 +36028,1110 @@ extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     (void)layer; (void)rows;
     return 0;
+}
+
+extern "C" int ds4_gpu_matmul_q6_K_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
+        uint64_t q_weight_offset, uint64_t k_weight_offset,
+        uint64_t v_weight_offset, uint64_t gate_weight_offset,
+        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
+        uint32_t gate_dim, const ds4_gpu_tensor *x) {
+    (void)q; (void)k; (void)v; (void)gate; (void)model_map; (void)model_size;
+    (void)q_weight_offset; (void)k_weight_offset; (void)v_weight_offset;
+    (void)gate_weight_offset; (void)in_dim; (void)q_dim; (void)kv_dim;
+    (void)gate_dim; (void)x;
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)residual;
+    return 0;
+}
+
+__global__ static void laguna_head_rms_norm_rope_neox_kernel(
+        float *x, const float *weight, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, float freq_scale, float ext_factor,
+        float attn_factor, float corr0, float corr1, float theta_scale,
+        float eps) {
+    const uint64_t row_idx = (uint64_t)blockIdx.x;
+    const uint32_t token = (uint32_t)(row_idx / n_head);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    float *row = x + row_idx * head_dim;
+
+    float sum = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        const float v = row[d];
+        sum += v * v;
+    }
+    sum = poolside_warp_sum_f32(sum);
+    __shared__ float warp_sums[8];
+    if (lane == 0u) warp_sums[warp] = sum;
+    __syncthreads();
+    sum = lane < 8u ? warp_sums[lane] : 0.0f;
+    sum = poolside_warp_sum_f32(sum);
+
+    const float scale = rsqrtf(sum / (float)head_dim + eps);
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        row[d] = scale * row[d] * weight[d];
+    }
+    __syncthreads();
+
+    const uint32_t half_rot = n_rot >> 1u;
+    for (uint32_t d = tid; d < half_rot; d += blockDim.x) {
+        const int i0 = (int)(d * 2u);
+        const float theta_extrap =
+            (float)(pos0 + token) * powf(theta_scale, i0 / 2.0f);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float mix = rope_yarn_ramp_dev(corr0, corr1, i0) *
+                ext_factor;
+            theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        const float c = cosf(theta) * mscale;
+        const float s = sinf(theta) * mscale;
+        const float x0 = row[d];
+        const float x1 = row[d + half_rot];
+        row[d] = x0 * c - x1 * s;
+        row[d + half_rot] = x0 * s + x1 * c;
+    }
+}
+
+static int laguna_norm_rope_tensor_bytes(uint32_t n_tokens, uint32_t n_head,
+                                          uint32_t head_dim, uint32_t n_rot,
+                                          float eps, uint64_t *bytes_out) {
+    if (!bytes_out || n_tokens == 0u || n_head == 0u || head_dim == 0u ||
+        n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u ||
+        !isfinite(eps) || eps <= 0.0f) {
+        return 0;
+    }
+    const uint64_t rows = (uint64_t)n_tokens * n_head;
+    if (rows > UINT_MAX || rows > UINT64_MAX / head_dim) return 0;
+    const uint64_t elems = rows * head_dim;
+    if (elems > UINT64_MAX / sizeof(float)) return 0;
+    *bytes_out = elems * sizeof(float);
+    return 1;
+}
+
+static int laguna_norm_rope_params_valid(float freq_base, float freq_scale,
+                                         float ext_factor, float attn_factor,
+                                         float beta_fast, float beta_slow,
+                                         uint32_t n_ctx_orig) {
+    if (!isfinite(freq_base) || !isfinite(freq_scale) ||
+        !isfinite(ext_factor) || !isfinite(attn_factor) ||
+        !isfinite(beta_fast) || !isfinite(beta_slow) ||
+        freq_base <= 1.0f || freq_scale <= 0.0f || ext_factor < 0.0f) {
+        return 0;
+    }
+    if (ext_factor != 0.0f &&
+        (n_ctx_orig == 0u || beta_fast <= 0.0f || beta_slow <= 0.0f)) {
+        return 0;
+    }
+    return 1;
+}
+
+static float laguna_rope_yarn_corr_dim_host(
+        uint32_t n_rot, uint32_t n_ctx_orig, float beta,
+        float freq_base) {
+    return (float)n_rot *
+        logf((float)n_ctx_orig / (beta * 2.0f * (float)M_PI)) /
+        (2.0f * logf(freq_base));
+}
+
+static void laguna_poolside_rope_params(
+        uint32_t n_rot, uint32_t n_ctx_orig, float freq_base,
+        float ext_factor, float beta_fast, float beta_slow,
+        float *corr0, float *corr1, float *theta_scale) {
+    *corr0 = 0.0f;
+    *corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float start = floorf(laguna_rope_yarn_corr_dim_host(
+                n_rot, n_ctx_orig, beta_fast, freq_base));
+        const float end = ceilf(laguna_rope_yarn_corr_dim_host(
+                n_rot, n_ctx_orig, beta_slow, freq_base));
+        *corr0 = fmaxf(0.0f, start);
+        *corr1 = fminf((float)(n_rot - 1u), end);
+    }
+    *theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+}
+
+extern "C" int ds4_gpu_laguna_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t n_ctx_orig, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast,
+        float beta_slow, float eps) {
+    uint64_t tensor_bytes = 0;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    if (!x || !x->ptr || !model_map || pos0 > UINT32_MAX - n_tokens ||
+        !laguna_norm_rope_tensor_bytes(n_tokens, n_head, head_dim, n_rot,
+                                       eps, &tensor_bytes) ||
+        !laguna_norm_rope_params_valid(freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow,
+                                       n_ctx_orig) ||
+        weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < tensor_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(x);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    float corr0 = 0.0f;
+    float corr1 = 0.0f;
+    float theta_scale = 0.0f;
+    laguna_poolside_rope_params(
+        n_rot, n_ctx_orig, freq_base, ext_factor, beta_fast, beta_slow,
+        &corr0, &corr1, &theta_scale);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        const float *weight = (const float *)cuda_resolve_weight_ptr(
+                model_map, weight_offset, weight_bytes, logical_tier,
+                "laguna_head_rms_weight");
+        if (weight) {
+            laguna_head_rms_norm_rope_neox_kernel<<<
+                    (unsigned)((uint64_t)n_tokens * n_head), 256>>>(
+                    (float *)x->ptr, weight, n_head, head_dim, n_rot, pos0,
+                    freq_scale, ext_factor, attn_factor, corr0, corr1,
+                    theta_scale, eps);
+            ok = cuda_ok(cudaGetLastError(), "laguna head rms norm rope launch");
+        }
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, const void *model_map,
+        uint64_t model_size, uint64_t q_weight_offset,
+        uint64_t k_weight_offset, uint32_t n_tokens, uint32_t n_q_head,
+        uint32_t n_k_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+    uint64_t q_bytes = 0;
+    uint64_t k_bytes = 0;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    if (!q || !q->ptr || !k || !k->ptr || !model_map ||
+        pos0 > UINT32_MAX - n_tokens ||
+        !laguna_norm_rope_tensor_bytes(n_tokens, n_q_head, head_dim, n_rot,
+                                       eps, &q_bytes) ||
+        !laguna_norm_rope_tensor_bytes(n_tokens, n_k_head, head_dim, n_rot,
+                                       eps, &k_bytes) ||
+        !laguna_norm_rope_params_valid(freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow,
+                                       n_ctx_orig) ||
+        q_weight_offset > model_size ||
+        weight_bytes > model_size - q_weight_offset ||
+        k_weight_offset > model_size ||
+        weight_bytes > model_size - k_weight_offset ||
+        q->bytes < q_bytes || k->bytes < k_bytes) {
+        return 0;
+    }
+
+    const int logical_tier = ds4_tensor_device_idx(q);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(k) != logical_tier) {
+        return 0;
+    }
+    float corr0 = 0.0f;
+    float corr1 = 0.0f;
+    float theta_scale = 0.0f;
+    laguna_poolside_rope_params(
+        n_rot, n_ctx_orig, freq_base, ext_factor, beta_fast, beta_slow,
+        &corr0, &corr1, &theta_scale);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        const float *q_weight = (const float *)cuda_resolve_weight_ptr(
+                model_map, q_weight_offset, weight_bytes, logical_tier,
+                "laguna_q_rms_weight");
+        const float *k_weight = (const float *)cuda_resolve_weight_ptr(
+                model_map, k_weight_offset, weight_bytes, logical_tier,
+                "laguna_k_rms_weight");
+        if (q_weight && k_weight) {
+            laguna_head_rms_norm_rope_neox_kernel<<<
+                    (unsigned)((uint64_t)n_tokens * n_q_head), 256>>>(
+                    (float *)q->ptr, q_weight, n_q_head, head_dim, n_rot,
+                    pos0, freq_scale, ext_factor, attn_factor, corr0, corr1,
+                    theta_scale, eps);
+            ok = cuda_ok(cudaGetLastError(), "laguna q head rms norm rope launch");
+            if (ok) {
+                laguna_head_rms_norm_rope_neox_kernel<<<
+                        (unsigned)((uint64_t)n_tokens * n_k_head), 256>>>(
+                        (float *)k->ptr, k_weight, n_k_head, head_dim, n_rot,
+                        pos0, freq_scale, ext_factor, attn_factor, corr0, corr1,
+                        theta_scale, eps);
+                ok = cuda_ok(cudaGetLastError(),
+                             "laguna k head rms norm rope launch");
+            }
+        }
+    }
+    return ok;
+}
+
+__global__ static void laguna_store_kv_f16_kernel(
+        const float *k, const float *v, __half *key_cache,
+        __half *value_cache, uint64_t cache_row, uint64_t kv_values) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_values) return;
+    const uint64_t dst = cache_row * kv_values + i;
+    key_cache[dst] = __float2half_rn(k[i]);
+    value_cache[dst] = __float2half_rn(v[i]);
+}
+
+/* Correctness-first decode path: one block owns one query head and thread zero
+ * performs a stable online reduction over the caller's causal logical rows.
+ * This is intentionally not grouped, flash, or fused; later work can replace
+ * it once this revised ring layout has a locked parity baseline. */
+__global__ static void laguna_attention_decode_gqa_f16_kernel(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const float *gate, uint32_t key_start,
+        uint32_t key_count, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, float scale) {
+    const uint32_t head = blockIdx.x;
+    if (threadIdx.x != 0u || head >= n_head) return;
+
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const float *query = q + (uint64_t)head * head_dim;
+    float acc[128] = {0.0f};
+    float max_score = -INFINITY;
+    float sum = 0.0f;
+    for (uint32_t r = 0u; r < key_count; r++) {
+        const uint32_t row = (key_start + r) % cache_cap;
+        const uint64_t base = (uint64_t)row * kv_width +
+            (uint64_t)kv_head * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0u; d < head_dim; d++) {
+            dot += query[d] * __half2float(key_cache[base + d]);
+        }
+        const float score = scale * dot;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = max_score == -INFINITY ?
+            0.0f : expf(max_score - next_max);
+        const float value_scale = expf(score - next_max);
+        sum = sum * old_scale + value_scale;
+        for (uint32_t d = 0u; d < head_dim; d++) {
+            acc[d] = acc[d] * old_scale +
+                value_scale * __half2float(value_cache[base + d]);
+        }
+        max_score = next_max;
+    }
+    const float gate_value = gate[head];
+    const float gate_scale = gate_value > 0.0f ?
+        gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    float *out = heads + (uint64_t)head * head_dim;
+    for (uint32_t d = 0u; d < head_dim; d++) {
+        out[d] = acc[d] / sum * gate_scale;
+    }
+}
+
+extern "C" int ds4_gpu_laguna_store_attention_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
+        ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate, uint32_t pos, uint32_t cache_cap,
+        uint32_t key_start, uint32_t key_count, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, float scale) {
+    if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !heads->ptr || !key_cache->ptr || !value_cache->ptr || !q->ptr ||
+        !k->ptr || !v->ptr || !gate->ptr || cache_cap == 0u ||
+        key_count == 0u || key_count > cache_cap || n_head == 0u ||
+        n_head_kv == 0u || n_head % n_head_kv != 0u || head_dim != 128u ||
+        !isfinite(scale) || scale <= 0.0f || key_start > pos ||
+        key_count - 1u != pos - key_start) {
+        return 0;
+    }
+    const uint64_t q_values = (uint64_t)n_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_head_kv * head_dim;
+    if (kv_values == 0u || cache_cap > UINT64_MAX / kv_values) return 0;
+    const uint64_t cache_values = (uint64_t)cache_cap * kv_values;
+    if (q_values > UINT64_MAX / sizeof(float) ||
+        kv_values > UINT64_MAX / sizeof(float) ||
+        cache_values > UINT64_MAX / sizeof(__half) ||
+        kv_values > (uint64_t)UINT_MAX * 256u ||
+        q->bytes < q_values * sizeof(float) ||
+        k->bytes < kv_values * sizeof(float) ||
+        v->bytes < kv_values * sizeof(float) ||
+        gate->bytes < (uint64_t)n_head * sizeof(float) ||
+        heads->bytes < q_values * sizeof(float) ||
+        key_cache->bytes < cache_values * sizeof(__half) ||
+        value_cache->bytes < cache_values * sizeof(__half)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(key_cache) != logical_tier ||
+        ds4_tensor_device_idx(value_cache) != logical_tier ||
+        ds4_tensor_device_idx(q) != logical_tier ||
+        ds4_tensor_device_idx(k) != logical_tier ||
+        ds4_tensor_device_idx(v) != logical_tier ||
+        ds4_tensor_device_idx(gate) != logical_tier) {
+        return 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        laguna_store_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
+                (const float *)k->ptr, (const float *)v->ptr,
+                (__half *)key_cache->ptr, (__half *)value_cache->ptr,
+                (uint64_t)(pos % cache_cap), kv_values);
+        ok = cuda_ok(cudaGetLastError(), "laguna KV store launch");
+        if (ok) {
+            laguna_attention_decode_gqa_f16_kernel<<<n_head, 1>>>(
+                    (float *)heads->ptr, (const float *)q->ptr,
+                    (const __half *)key_cache->ptr,
+                    (const __half *)value_cache->ptr, (const float *)gate->ptr,
+                    key_start, key_count, cache_cap, n_head, n_head_kv,
+                    head_dim, scale);
+            ok = cuda_ok(cudaGetLastError(), "laguna decode attention launch");
+        }
+    }
+    return ok;
+}
+
+/* Stage every incoming KV row before attention, then make attention read the
+ * staged copy for rows in this chunk.  The final cache commit is deliberately
+ * a later launch: a wrapped chunk must never make a future row visible by
+ * overwriting an older logical cache slot before that older query ran. */
+__global__ static void laguna_stage_kv_f16_kernel(
+        const float *k, const float *v, __half *staged_key,
+        __half *staged_value, uint64_t values) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < values) {
+        staged_key[i] = __float2half_rn(k[i]);
+        staged_value[i] = __float2half_rn(v[i]);
+    }
+}
+
+/* Poolside's AUTO flash-attention path crosses two important fp16 boundaries:
+ * Q is scaled after conversion to fp16, and the unnormalised softmax weights
+ * are accumulated with V by fp16 tensor-core MMA.  Keep this small kernel
+ * deliberately limited to the short, first-prefill shape while the scalar
+ * implementation remains the general fallback. */
+__global__ static void laguna_attention_prefill_auto_mma32_kernel(
+        float *heads, const float *q, const __half *staged_key,
+        const __half *staged_value, const float *gate, uint32_t n_tokens,
+        uint32_t n_head, uint32_t n_head_kv, float scale) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    constexpr uint32_t tile_rows = 16u;
+    constexpr uint32_t max_keys = 32u;
+    constexpr uint32_t head_dim = 128u;
+    const uint32_t row0 = blockIdx.x * tile_rows;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 256u || row0 >= n_tokens || head >= n_head) return;
+
+    __shared__ __align__(32) __half q_sh[tile_rows * head_dim];
+    __shared__ __align__(32) __half k_sh[max_keys * head_dim];
+    __shared__ __align__(32) __half p_sh[tile_rows * max_keys];
+    __shared__ __align__(32) __half v_sh[head_dim * max_keys];
+    __shared__ __align__(32) __half out_sh[tile_rows * head_dim];
+    __shared__ __align__(32) float score_sh[tile_rows * max_keys];
+    __shared__ float rowsum_sh[tile_rows];
+    __shared__ float partition_max_sh[2u * tile_rows];
+    __shared__ float partition_rowsum_sh[2u * tile_rows];
+
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const __half scale_h = __float2half_rn(scale);
+    const bool partitioned_gqa9 = n_head == 72u;
+
+    for (uint32_t i = tid; i < tile_rows * head_dim; i += 256u) {
+        const uint32_t row = row0 + i / head_dim;
+        const uint32_t d = i % head_dim;
+        const float value = row < n_tokens
+            ? q[((uint64_t)row * n_head + head) * head_dim + d]
+            : 0.0f;
+        q_sh[i] = __hmul(__float2half_rn(value), scale_h);
+    }
+    for (uint32_t i = tid; i < max_keys * head_dim; i += 256u) {
+        const uint32_t key = i / head_dim;
+        const uint32_t d = i % head_dim;
+        __half key_value = __float2half_rn(0.0f);
+        __half value_value = __float2half_rn(0.0f);
+        if (key < n_tokens) {
+            const uint64_t source =
+                (uint64_t)key * kv_width + (uint64_t)kv_head * head_dim + d;
+            key_value = staged_key[source];
+            value_value = staged_value[source];
+        }
+        k_sh[i] = key_value;
+        v_sh[(uint64_t)d * max_keys + key] = value_value;
+    }
+    __syncthreads();
+
+    if (warp < 2u) {
+        const uint32_t key0 = warp * 16u;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                       __half, wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                       __half, wmma::col_major> k_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> score_frag;
+        wmma::fill_fragment(score_frag, 0.0f);
+        for (uint32_t d0 = 0; d0 < head_dim; d0 += 16u) {
+            wmma::load_matrix_sync(q_frag, q_sh + d0, head_dim);
+            wmma::load_matrix_sync(
+                    k_frag, k_sh + (uint64_t)key0 * head_dim + d0,
+                    head_dim);
+            wmma::mma_sync(score_frag, q_frag, k_frag, score_frag);
+        }
+        wmma::store_matrix_sync(
+                score_sh + key0, score_frag, max_keys,
+                wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    if (tid < tile_rows) {
+        const uint32_t row = row0 + tid;
+        float sum = 0.0f;
+        if (row < n_tokens) {
+            if (partitioned_gqa9) {
+                for (uint32_t partition = 0; partition < 2u; partition++) {
+                    const uint32_t key0 = 16u * partition;
+                    float max_score = -FLT_MAX / 2.0f;
+                    for (uint32_t key = key0; key < key0 + 16u; key++) {
+                        if (key <= row) {
+                            const float offset_score = __fadd_rn(
+                                score_sh[tid * max_keys + key],
+                                3.0f * 0.6931f);
+                            max_score = fmaxf(max_score, offset_score);
+                        }
+                    }
+                    float lane_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    for (uint32_t lane_id = 0; lane_id < 4u; lane_id++) {
+                        const uint32_t lane_keys[4] = {
+                            key0 + 2u * lane_id,
+                            key0 + 2u * lane_id + 1u,
+                            key0 + 2u * lane_id + 8u,
+                            key0 + 2u * lane_id + 9u,
+                        };
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            const uint32_t key = lane_keys[i];
+                            float weight = 0.0f;
+                            if (key <= row) {
+                                weight = expf(
+                                    score_sh[tid * max_keys + key] - max_score);
+                            }
+                            score_sh[tid * max_keys + key] = weight;
+                            p_sh[tid * max_keys + key] =
+                                __float2half_rn(weight);
+                            lane_sum[lane_id] = __fadd_rn(
+                                lane_sum[lane_id], weight);
+                        }
+                    }
+                    const float sum02 =
+                        __fadd_rn(lane_sum[0], lane_sum[2]);
+                    const float sum13 =
+                        __fadd_rn(lane_sum[1], lane_sum[3]);
+                    partition_max_sh[partition * tile_rows + tid] = max_score;
+                    partition_rowsum_sh[partition * tile_rows + tid] =
+                        __fadd_rn(sum02, sum13);
+                }
+            } else {
+                float max_score = -INFINITY;
+                for (uint32_t key = 0; key <= row; key++) {
+                    max_score = fmaxf(max_score,
+                                      score_sh[tid * max_keys + key]);
+                }
+                max_score += 3.0f * 0.6931f;
+                for (uint32_t key = 0; key < max_keys; key++) {
+                    float weight = 0.0f;
+                    if (key <= row) {
+                        weight = expf(
+                            score_sh[tid * max_keys + key] - max_score);
+                    }
+                    score_sh[tid * max_keys + key] = weight;
+                    p_sh[tid * max_keys + key] = __float2half_rn(weight);
+                }
+                /* Poolside's 16x16 MMA accumulator distributes each KQ row
+                 * over four lanes.  Each lane owns two-key chunks eight keys
+                 * apart; the final XOR reduction combines lanes 0+2, 1+3,
+                 * then both.  Preserve that association because its divisor
+                 * feeds a Q8 quantization boundary in the following O
+                 * projection. */
+                float lane_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (uint32_t key0 = 0; key0 < max_keys; key0 += 16u) {
+                    for (uint32_t lane_id = 0; lane_id < 4u; lane_id++) {
+                        const uint32_t key = key0 + 2u * lane_id;
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key]);
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key + 1u]);
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key + 8u]);
+                        lane_sum[lane_id] = __fadd_rn(
+                            lane_sum[lane_id],
+                            score_sh[tid * max_keys + key + 9u]);
+                    }
+                }
+                const float sum02 = __fadd_rn(lane_sum[0], lane_sum[2]);
+                const float sum13 = __fadd_rn(lane_sum[1], lane_sum[3]);
+                sum = __fadd_rn(sum02, sum13);
+            }
+        } else {
+            for (uint32_t key = 0; key < max_keys; key++) {
+                p_sh[tid * max_keys + key] = __float2half_rn(0.0f);
+            }
+        }
+        rowsum_sh[tid] = sum;
+    }
+    __syncthreads();
+
+    {
+        const uint32_t d0 = warp * 16u;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                       __half, wmma::row_major> p_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                       __half, wmma::col_major> v_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, __half> out_frag;
+        wmma::fill_fragment(out_frag, __float2half_rn(0.0f));
+        const uint32_t key_stop = partitioned_gqa9 ? 16u : max_keys;
+        for (uint32_t key0 = 0; key0 < key_stop; key0 += 16u) {
+            wmma::load_matrix_sync(p_frag, p_sh + key0, max_keys);
+            wmma::load_matrix_sync(
+                    v_frag, v_sh + (uint64_t)d0 * max_keys + key0,
+                    max_keys);
+            wmma::mma_sync(out_frag, p_frag, v_frag, out_frag);
+        }
+        wmma::store_matrix_sync(
+                out_sh + d0, out_frag, head_dim, wmma::mem_row_major);
+        if (partitioned_gqa9) {
+            wmma::fill_fragment(out_frag, __float2half_rn(0.0f));
+            wmma::load_matrix_sync(p_frag, p_sh + 16u, max_keys);
+            wmma::load_matrix_sync(
+                    v_frag, v_sh + (uint64_t)d0 * max_keys + 16u,
+                    max_keys);
+            wmma::mma_sync(out_frag, p_frag, v_frag, out_frag);
+            wmma::store_matrix_sync(
+                    q_sh + d0, out_frag, head_dim, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i < tile_rows * head_dim; i += 256u) {
+        const uint32_t local_row = i / head_dim;
+        const uint32_t row = row0 + local_row;
+        const uint32_t d = i % head_dim;
+        if (row < n_tokens) {
+            const float gate_value = gate[(uint64_t)row * n_head + head];
+            const float gate_scale = gate_value > 20.0f
+                ? gate_value : logf(1.0f + expf(gate_value));
+            float attention_value;
+            if (partitioned_gqa9) {
+                const float max0 = partition_max_sh[local_row];
+                const float max1 = partition_max_sh[tile_rows + local_row];
+                const float combined_max = fmaxf(max0, max1);
+                const float scale0 = expf(max0 - combined_max);
+                const float scale1 = expf(max1 - combined_max);
+                const float sum0 = __fmul_rn(
+                    scale0, partition_rowsum_sh[local_row]);
+                const float sum1 = __fmul_rn(
+                    scale1, partition_rowsum_sh[tile_rows + local_row]);
+                const float combined_sum = __fadd_rn(sum0, sum1);
+                float numerator = 0.0f;
+                numerator += __half2float(out_sh[i]) * scale0;
+                numerator += __half2float(q_sh[i]) * scale1;
+                attention_value = numerator / combined_sum;
+            } else {
+                attention_value =
+                    __half2float(out_sh[i]) / rowsum_sh[local_row];
+            }
+            heads[((uint64_t)row * n_head + head) * head_dim + d] =
+                attention_value * gate_scale;
+        }
+    }
+#else
+    (void)heads;
+    (void)q;
+    (void)staged_key;
+    (void)staged_value;
+    (void)gate;
+    (void)n_tokens;
+    (void)n_head;
+    (void)n_head_kv;
+    (void)scale;
+#endif
+}
+
+/* Poolside's long AUTO path uses one 64-key FATTN batch at a time for both
+ * Laguna GQA6 and GQA9.  Keep the fixed Laguna dimensions here rather than
+ * importing the generic llama.cpp template stack, but preserve its numerical
+ * boundaries: half Q after half scaling, float KQ, half softmax weights, and a
+ * half VKQ accumulator rescaled in half between key batches. */
+__global__ static void laguna_attention_prefill_auto_mma64_kernel(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const __half *staged_key,
+        const __half *staged_value, const float *gate, uint32_t pos0,
+        uint32_t n_tokens, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, float scale) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    constexpr uint32_t tile_rows = 16u;
+    constexpr uint32_t key_tile = 64u;
+    constexpr uint32_t head_dim = 128u;
+    const uint32_t row0 = blockIdx.x * tile_rows;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 128u || row0 >= n_tokens || head >= n_head) return;
+
+    __shared__ __align__(32) __half q_sh[tile_rows * head_dim];
+    __shared__ __align__(32) __half k_sh[key_tile * head_dim];
+    __shared__ __align__(32) __half p_sh[tile_rows * key_tile];
+    __shared__ __align__(32) __half v_sh[head_dim * key_tile];
+    __shared__ __align__(32) __half out_sh[tile_rows * head_dim];
+    __shared__ __align__(32) float score_sh[tile_rows * key_tile];
+    __shared__ float row_max_sh[tile_rows];
+    __shared__ float rowsum_lane_sh[tile_rows * 4u];
+    __shared__ __half max_scale_h_sh[tile_rows];
+
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const __half scale_h = __float2half_rn(scale);
+    const uint32_t rows =
+        n_tokens - row0 < tile_rows ? n_tokens - row0 : tile_rows;
+
+    for (uint32_t i = tid; i < tile_rows * head_dim; i += blockDim.x) {
+        const uint32_t local_row = i / head_dim;
+        const uint32_t d = i % head_dim;
+        const float value = local_row < rows
+            ? q[((uint64_t)(row0 + local_row) * n_head + head) *
+                head_dim + d]
+            : 0.0f;
+        q_sh[i] = __hmul(__float2half_rn(value), scale_h);
+        out_sh[i] = __float2half_rn(0.0f);
+    }
+    if (tid < tile_rows) {
+        row_max_sh[tid] = -FLT_MAX / 2.0f;
+        max_scale_h_sh[tid] = __float2half_rn(0.0f);
+        for (uint32_t lane = 0; lane < 4u; lane++) {
+            rowsum_lane_sh[tid * 4u + lane] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const uint64_t first_pos = (uint64_t)pos0 + row0;
+    const uint64_t last_pos = first_pos + rows - 1u;
+    const uint64_t first_key = first_pos + 1u > cache_cap
+        ? first_pos + 1u - cache_cap
+        : 0u;
+    uint64_t key_base = first_key & ~(uint64_t)(key_tile - 1u);
+    const uint64_t last_tile = last_pos & ~(uint64_t)(key_tile - 1u);
+
+    for (;;) {
+        for (uint32_t i = tid; i < key_tile * head_dim;
+             i += blockDim.x) {
+            const uint32_t key = i / head_dim;
+            const uint32_t d = i % head_dim;
+            const uint64_t logical = key_base + key;
+            __half key_value = __float2half_rn(0.0f);
+            __half value_value = __float2half_rn(0.0f);
+            if (logical <= last_pos) {
+                uint64_t source;
+                if (logical >= pos0) {
+                    source = (logical - pos0) * kv_width +
+                        (uint64_t)kv_head * head_dim + d;
+                    key_value = staged_key[source];
+                    value_value = staged_value[source];
+                } else {
+                    source = (logical % cache_cap) * kv_width +
+                        (uint64_t)kv_head * head_dim + d;
+                    key_value = key_cache[source];
+                    value_value = value_cache[source];
+                }
+            }
+            k_sh[i] = key_value;
+            v_sh[(uint64_t)d * key_tile + key] = value_value;
+        }
+        __syncthreads();
+
+        if (warp < 4u) {
+            const uint32_t key0 = warp * 16u;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                           __half, wmma::row_major> q_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                           __half, wmma::col_major> k_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+                score_frag;
+            wmma::fill_fragment(score_frag, 0.0f);
+            for (uint32_t d0 = 0; d0 < head_dim; d0 += 16u) {
+                wmma::load_matrix_sync(q_frag, q_sh + d0, head_dim);
+                wmma::load_matrix_sync(
+                    k_frag, k_sh + (uint64_t)key0 * head_dim + d0,
+                    head_dim);
+                wmma::mma_sync(score_frag, q_frag, k_frag, score_frag);
+            }
+            wmma::store_matrix_sync(
+                score_sh + key0, score_frag, key_tile,
+                wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        if (tid < tile_rows) {
+            if (tid < rows) {
+                const uint64_t pos = first_pos + tid;
+                const uint64_t key_start = pos + 1u > cache_cap
+                    ? pos + 1u - cache_cap
+                    : 0u;
+                const float old_max = row_max_sh[tid];
+                float new_max = old_max;
+                for (uint32_t key = 0; key < key_tile; key++) {
+                    const uint64_t logical = key_base + key;
+                    if (logical >= key_start && logical <= pos) {
+                        const float offset_score = __fadd_rn(
+                            score_sh[tid * key_tile + key],
+                            3.0f * 0.6931f);
+                        new_max = fmaxf(new_max, offset_score);
+                    }
+                }
+                const float max_diff = old_max - new_max;
+                float max_scale = max_diff < -20.0f
+                    ? 0.0f
+                    : expf(max_diff);
+                max_scale_h_sh[tid] = __float2half_rn(max_scale);
+
+                float lane_add[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (uint32_t key16 = 0; key16 < key_tile;
+                     key16 += 16u) {
+                    for (uint32_t lane = 0; lane < 4u; lane++) {
+                        const uint32_t lane_keys[4] = {
+                            key16 + 2u * lane,
+                            key16 + 2u * lane + 1u,
+                            key16 + 2u * lane + 8u,
+                            key16 + 2u * lane + 9u,
+                        };
+                        for (uint32_t j = 0; j < 4u; j++) {
+                            const uint32_t key = lane_keys[j];
+                            const uint64_t logical = key_base + key;
+                            const float weight =
+                                logical >= key_start && logical <= pos
+                                ? expf(
+                                    score_sh[tid * key_tile + key] -
+                                    new_max)
+                                : 0.0f;
+                            p_sh[tid * key_tile + key] =
+                                __float2half_rn(weight);
+                            lane_add[lane] = __fadd_rn(
+                                lane_add[lane], weight);
+                        }
+                    }
+                }
+                for (uint32_t lane = 0; lane < 4u; lane++) {
+                    float *sum = rowsum_lane_sh + tid * 4u + lane;
+                    *sum = __fmaf_rn(max_scale, *sum, lane_add[lane]);
+                }
+                row_max_sh[tid] = new_max;
+            } else {
+                max_scale_h_sh[tid] = __float2half_rn(0.0f);
+                for (uint32_t key = 0; key < key_tile; key++) {
+                    p_sh[tid * key_tile + key] =
+                        __float2half_rn(0.0f);
+                }
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t i = tid; i < tile_rows * head_dim;
+             i += blockDim.x) {
+            const uint32_t local_row = i / head_dim;
+            const __half max_scale_h = max_scale_h_sh[local_row];
+            out_sh[i] = __hmul(out_sh[i], max_scale_h);
+        }
+        __syncthreads();
+
+        for (uint32_t d0 = warp * 16u; d0 < head_dim; d0 += 64u) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                           __half, wmma::row_major> p_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                           __half, wmma::col_major> v_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, __half>
+                out_frag;
+            wmma::load_matrix_sync(
+                out_frag, out_sh + d0, head_dim, wmma::mem_row_major);
+            for (uint32_t key0 = 0; key0 < key_tile; key0 += 16u) {
+                wmma::load_matrix_sync(
+                    p_frag, p_sh + key0, key_tile);
+                wmma::load_matrix_sync(
+                    v_frag,
+                    v_sh + (uint64_t)d0 * key_tile + key0,
+                    key_tile);
+                wmma::mma_sync(out_frag, p_frag, v_frag, out_frag);
+            }
+            wmma::store_matrix_sync(
+                out_sh + d0, out_frag, head_dim, wmma::mem_row_major);
+        }
+        __syncthreads();
+        if (key_base == last_tile) break;
+        key_base += key_tile;
+    }
+
+    for (uint32_t i = tid; i < rows * head_dim; i += blockDim.x) {
+        const uint32_t local_row = i / head_dim;
+        const uint32_t d = i % head_dim;
+        const float sum02 = __fadd_rn(
+            rowsum_lane_sh[local_row * 4u],
+            rowsum_lane_sh[local_row * 4u + 2u]);
+        const float sum13 = __fadd_rn(
+            rowsum_lane_sh[local_row * 4u + 1u],
+            rowsum_lane_sh[local_row * 4u + 3u]);
+        const float rowsum = __fadd_rn(sum02, sum13);
+        const float gate_value =
+            gate[(uint64_t)(row0 + local_row) * n_head + head];
+        const float gate_scale = gate_value > 20.0f
+            ? gate_value
+            : logf(1.0f + expf(gate_value));
+        const float attention_value =
+            __half2float(out_sh[i]) / rowsum;
+        heads[((uint64_t)(row0 + local_row) * n_head + head) *
+              head_dim + d] = attention_value * gate_scale;
+    }
+#else
+    (void)heads;
+    (void)q;
+    (void)key_cache;
+    (void)value_cache;
+    (void)staged_key;
+    (void)staged_value;
+    (void)gate;
+    (void)pos0;
+    (void)n_tokens;
+    (void)cache_cap;
+    (void)n_head;
+    (void)n_head_kv;
+    (void)scale;
+#endif
+}
+
+__global__ static void laguna_attention_prefill_gqa_f16_kernel(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const __half *staged_key,
+        const __half *staged_value, const float *gate, uint32_t pos0,
+        uint32_t n_tokens, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, float scale) {
+    const uint32_t row = blockIdx.x / n_head;
+    const uint32_t head = blockIdx.x % n_head;
+    if (threadIdx.x != 0u || row >= n_tokens || head >= n_head) return;
+    const uint32_t pos = pos0 + row;
+    const uint32_t key_start = pos + 1u > cache_cap ? pos + 1u - cache_cap : 0u;
+    const uint32_t key_count = pos - key_start + 1u;
+    const uint32_t heads_per_kv = n_head / n_head_kv;
+    const uint32_t kv_head = head / heads_per_kv;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const float *query = q + ((uint64_t)row * n_head + head) * head_dim;
+    float acc[128] = {0.0f};
+    float max_score = -INFINITY;
+    float sum = 0.0f;
+    for (uint32_t r = 0; r < key_count; r++) {
+        const uint32_t logical = key_start + r;
+        const __half *key_row;
+        const __half *value_row;
+        if (logical >= pos0) {
+            const uint64_t staged_row = (uint64_t)(logical - pos0) * kv_width;
+            key_row = staged_key + staged_row + (uint64_t)kv_head * head_dim;
+            value_row = staged_value + staged_row + (uint64_t)kv_head * head_dim;
+        } else {
+            const uint64_t cache_row = (uint64_t)(logical % cache_cap) * kv_width;
+            key_row = key_cache + cache_row + (uint64_t)kv_head * head_dim;
+            value_row = value_cache + cache_row + (uint64_t)kv_head * head_dim;
+        }
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += query[d] * __half2float(key_row[d]);
+        const float score = scale * dot;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = max_score == -INFINITY ? 0.0f : expf(max_score - next_max);
+        const float value_scale = expf(score - next_max);
+        sum = sum * old_scale + value_scale;
+        for (uint32_t d = 0; d < head_dim; d++)
+            acc[d] = acc[d] * old_scale + value_scale * __half2float(value_row[d]);
+        max_score = next_max;
+    }
+    const float gate_value = gate[(uint64_t)row * n_head + head];
+    const float gate_scale = gate_value > 0.0f ? gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    float *out = heads + ((uint64_t)row * n_head + head) * head_dim;
+    for (uint32_t d = 0; d < head_dim; d++) out[d] = acc[d] / sum * gate_scale;
+}
+
+__global__ static void laguna_commit_kv_f16_kernel(
+        const __half *staged_key, const __half *staged_value,
+        __half *key_cache, __half *value_cache, uint32_t pos0,
+        uint32_t n_tokens, uint32_t cache_cap, uint64_t kv_width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t values = (uint64_t)n_tokens * kv_width;
+    if (i >= values) return;
+    const uint32_t token = (uint32_t)(i / kv_width);
+    /* Later staged rows own a wrapped cache slot.  Skipping older rows makes
+     * the commit race-free and leaves exactly the newest cache_cap rows. */
+    if (token + cache_cap < n_tokens) return;
+    const uint64_t column = i - (uint64_t)token * kv_width;
+    const uint64_t dst = (uint64_t)((pos0 + token) % cache_cap) * kv_width + column;
+    key_cache[dst] = staged_key[i];
+    value_cache[dst] = staged_value[i];
+}
+
+static int laguna_prefill_tensor_sizes(
+        uint32_t n_tokens, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim, uint64_t *q_values_out,
+        uint64_t *kv_values_out, uint64_t *cache_values_out,
+        uint64_t *gate_values_out) {
+    if (!q_values_out || !kv_values_out || !cache_values_out ||
+        !gate_values_out || n_tokens == 0u || cache_cap == 0u ||
+        n_head == 0u || n_head_kv == 0u || head_dim == 0u) {
+        return 0;
+    }
+    const uint64_t q_rows = (uint64_t)n_tokens * n_head;
+    const uint64_t kv_rows = (uint64_t)n_tokens * n_head_kv;
+    const uint64_t cache_rows = (uint64_t)cache_cap * n_head_kv;
+    if (q_rows > UINT64_MAX / head_dim ||
+        kv_rows > UINT64_MAX / head_dim ||
+        cache_rows > UINT64_MAX / head_dim) {
+        return 0;
+    }
+    const uint64_t q_values = q_rows * head_dim;
+    const uint64_t kv_values = kv_rows * head_dim;
+    const uint64_t cache_values = cache_rows * head_dim;
+    if (q_values > UINT_MAX || kv_values > UINT_MAX ||
+        q_values > UINT64_MAX / sizeof(float) ||
+        kv_values > UINT64_MAX / sizeof(float) ||
+        cache_values > UINT64_MAX / sizeof(__half) ||
+        q_rows > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    *q_values_out = q_values;
+    *kv_values_out = kv_values;
+    *cache_values_out = cache_values;
+    *gate_values_out = q_rows;
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
+        ds4_gpu_tensor *value_cache, ds4_gpu_tensor *staged_key,
+        ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
+        uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t head_dim, float scale) {
+    if (!heads || !key_cache || !value_cache || !staged_key || !staged_value ||
+        !q || !k || !v || !gate || !heads->ptr || !key_cache->ptr ||
+        !value_cache->ptr || !staged_key->ptr || !staged_value->ptr ||
+        !q->ptr || !k->ptr || !v->ptr || !gate->ptr || n_tokens == 0u ||
+        pos0 > UINT32_MAX - n_tokens || cache_cap == 0u || n_head == 0u ||
+        n_head_kv == 0u || n_head % n_head_kv != 0u || head_dim != 128u ||
+        !isfinite(scale) || scale <= 0.0f) return 0;
+    uint64_t q_values = 0u, kv_values = 0u, cache_values = 0u;
+    uint64_t gate_values = 0u;
+    if (!laguna_prefill_tensor_sizes(
+            n_tokens, cache_cap, n_head, n_head_kv, head_dim,
+            &q_values, &kv_values, &cache_values, &gate_values) ||
+        heads->bytes < q_values * sizeof(float) ||
+        q->bytes < q_values * sizeof(float) || k->bytes < kv_values * sizeof(float) ||
+        v->bytes < kv_values * sizeof(float) ||
+        gate->bytes < gate_values * sizeof(float) ||
+        key_cache->bytes < cache_values * sizeof(__half) || value_cache->bytes < cache_values * sizeof(__half) ||
+        staged_key->bytes < kv_values * sizeof(__half) || staged_value->bytes < kv_values * sizeof(__half)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(key_cache) != logical_tier || ds4_tensor_device_idx(value_cache) != logical_tier ||
+        ds4_tensor_device_idx(staged_key) != logical_tier || ds4_tensor_device_idx(staged_value) != logical_tier ||
+        ds4_tensor_device_idx(q) != logical_tier || ds4_tensor_device_idx(k) != logical_tier ||
+        ds4_tensor_device_idx(v) != logical_tier || ds4_tensor_device_idx(gate) != logical_tier) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        int compute_major = 0;
+        int compute_minor = 0;
+        cudaFuncAttributes auto_mma_attributes = {};
+        cudaFuncAttributes auto_mma64_attributes = {};
+        const bool auto_mma_eligible =
+            cudaDeviceGetAttribute(
+                &compute_major, cudaDevAttrComputeCapabilityMajor,
+                g_gpu[logical_tier].device_id) == cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &compute_minor, cudaDevAttrComputeCapabilityMinor,
+                g_gpu[logical_tier].device_id) == cudaSuccess &&
+            compute_major == 12 && compute_minor == 1 &&
+            cudaFuncGetAttributes(
+                &auto_mma_attributes,
+                laguna_attention_prefill_auto_mma32_kernel) == cudaSuccess &&
+            (auto_mma_attributes.binaryVersion >= 70 ||
+             auto_mma_attributes.ptxVersion >= 70);
+        const bool auto_mma64_eligible =
+            auto_mma_eligible &&
+            cudaFuncGetAttributes(
+                &auto_mma64_attributes,
+                laguna_attention_prefill_auto_mma64_kernel) == cudaSuccess &&
+            (auto_mma64_attributes.binaryVersion >= 70 ||
+             auto_mma64_attributes.ptxVersion >= 70);
+        laguna_stage_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
+                (const float *)k->ptr, (const float *)v->ptr,
+                (__half *)staged_key->ptr, (__half *)staged_value->ptr, kv_values);
+        ok = cuda_ok(cudaGetLastError(), "laguna KV stage launch");
+        if (ok) {
+            if (auto_mma_eligible && pos0 == 0u && n_tokens == 22u &&
+                cache_cap >= n_tokens && (n_head == 48u || n_head == 72u) &&
+                n_head_kv == 8u) {
+                const dim3 grid((n_tokens + 15u) / 16u, n_head, 1u);
+                laguna_attention_prefill_auto_mma32_kernel<<<grid, 256>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)staged_key->ptr,
+                        (const __half *)staged_value->ptr,
+                        (const float *)gate->ptr, n_tokens, n_head,
+                        n_head_kv, scale);
+            } else if (auto_mma64_eligible && n_tokens > 22u &&
+                       (n_head == 48u || n_head == 72u) &&
+                       n_head_kv == 8u) {
+                const dim3 grid((n_tokens + 15u) / 16u, n_head, 1u);
+                laguna_attention_prefill_auto_mma64_kernel<<<grid, 128>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)key_cache->ptr,
+                        (const __half *)value_cache->ptr,
+                        (const __half *)staged_key->ptr,
+                        (const __half *)staged_value->ptr,
+                        (const float *)gate->ptr, pos0, n_tokens, cache_cap,
+                        n_head, n_head_kv, scale);
+            } else {
+                laguna_attention_prefill_gqa_f16_kernel<<<(unsigned)((uint64_t)n_tokens * n_head), 1>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
+                        (const __half *)staged_key->ptr, (const __half *)staged_value->ptr,
+                        (const float *)gate->ptr, pos0, n_tokens, cache_cap, n_head,
+                        n_head_kv, head_dim, scale);
+            }
+            ok = cuda_ok(cudaGetLastError(), "laguna prefill attention launch");
+        }
+        if (ok) {
+            laguna_commit_kv_f16_kernel<<<(unsigned)((kv_values + 255u) / 256u), 256>>>(
+                    (const __half *)staged_key->ptr, (const __half *)staged_value->ptr,
+                    (__half *)key_cache->ptr, (__half *)value_cache->ptr,
+                    pos0, n_tokens, cache_cap, (uint64_t)n_head_kv * head_dim);
+            ok = cuda_ok(cudaGetLastError(), "laguna KV commit launch");
+        }
+    }
+    return ok;
 }
 #pragma GCC diagnostic pop

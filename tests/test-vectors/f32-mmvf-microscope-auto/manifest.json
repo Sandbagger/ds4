@@ -1,0 +1,40 @@
+{
+  "schema": "f32-mmvf-microscope-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "poolside_sources": {
+    "ggml/src/ggml-cuda/mmvf.cu": "23b580ce14a45e71cc9be31047301d502be74a832084c16662985f93f533ba1c",
+    "ggml/src/ggml-cuda/common.cuh": "a977b50f7479df092bf3c441ba88e4519803b5f0df5a640fd7fb0874e64b9b4c"
+  },
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "origin": {
+    "token": 513,
+    "layer": 1,
+    "stage": "router_logits",
+    "row": 0,
+    "expert": 0,
+    "tensor": "blk.1.ffn_gate_inp.weight",
+    "tensor_absolute_model_offset": 1802551136
+  },
+  "shape": {
+    "input_elements": 3072,
+    "row_bytes": 12288
+  },
+  "oracle": {
+    "poolside_float32_bits": "0xbea377ba",
+    "ds4_serial_float32_bits": "0xbea377b8",
+    "operands_fp64": -0.31927273880611085
+  },
+  "files": {
+    "../q4k-mmvq-microscope-auto/input.f32": {
+      "bytes": 12288,
+      "sha256": "eabe89d1d9a4bdc660e5759c2a20d347d4dedaec1e617a44f3244cfe7985ef0e"
+    },
+    "weight-row.f32": {
+      "bytes": 12288,
+      "sha256": "4b2e76f429c40ab67023a7500cd2eb25e0fd820de9d550025642b172452b16b1"
+    }
+  }
+}

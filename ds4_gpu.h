@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4_laguna_plan.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -92,11 +94,524 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Qualification-only process inventory.  Capture is self-contained and
+ * caller-owned: it dynamically queries NVML's process-scoped v2 API without
+ * initializing CUDA, then stores every returned PID in this flat value. */
+enum {
+    DS4_GPU_NVML_API_IDENTITY_CAPACITY = 64,
+    DS4_GPU_NVML_PROCESS_CAPACITY = 128,
+};
+
+struct ds4_gpu_nvml_inventory_snapshot {
+    uint32_t api_version;
+    char api_identity[DS4_GPU_NVML_API_IDENTITY_CAPACITY];
+    char library_version[DS4_RUNTIME_NVML_LIBRARY_VERSION_CAPACITY];
+    char device_uuid[DS4_RUNTIME_DEVICE_UUID_CAPACITY];
+    ds4_runtime_nvml_process_sample
+        processes[DS4_GPU_NVML_PROCESS_CAPACITY];
+    size_t process_count;
+};
+#ifndef DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+#define DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+typedef struct ds4_gpu_nvml_inventory_snapshot
+    ds4_gpu_nvml_inventory_snapshot;
+#endif
+
+struct ds4_engine_laguna_external_checkpoint_observation {
+    ds4_runtime_external_sample sample;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_before;
+    ds4_gpu_nvml_inventory_snapshot inside_ds4;
+    ds4_gpu_nvml_inventory_snapshot checkpoint_after;
+    ds4_laguna_file_identity model_identity;
+    uint64_t model_map_base;
+    uint64_t model_map_bytes;
+    uint64_t model_file_offset;
+    uint64_t model_source_page_size;
+    uint64_t model_source_resident_bytes;
+    uint64_t model_source_mapped_page_bytes;
+    uint8_t observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+};
+#ifndef DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+#define DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+typedef struct ds4_engine_laguna_external_checkpoint_observation
+    ds4_engine_laguna_external_checkpoint_observation;
+#endif
+
+int ds4_gpu_nvml_inventory_capture(
+        ds4_gpu_nvml_inventory_snapshot *out);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+
+/* One process may own one compact Laguna attachment at a time.  The context
+ * records the existing file mapping without registering it, owns the exact
+ * ledger-approved static CUDA slab, and resolves compact weights strictly. */
+typedef struct ds4_gpu_laguna_compact ds4_gpu_laguna_compact;
+typedef enum {
+    DS4_GPU_LAGUNA_DESTROY_OK = 0,
+    DS4_GPU_LAGUNA_DESTROY_RECOVERABLE = 1,
+    DS4_GPU_LAGUNA_DESTROY_UNSAFE = 2,
+} ds4_gpu_laguna_destroy_status;
+
+int ds4_gpu_laguna_compact_create(
+        ds4_gpu_laguna_compact **out,
+        int model_fd,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_laguna_file_identity *model_identity,
+        const ds4_laguna_ledger *ledger,
+        const ds4_laguna_allocation_plan *plan,
+        ds4_runtime_tracker *tracker);
+ds4_gpu_laguna_destroy_status ds4_gpu_laguna_compact_destroy(
+        ds4_gpu_laguna_compact *ctx);
+bool ds4_gpu_laguna_compact_ownership_pending(
+        const ds4_runtime_tracker *tracker);
+
+/* Qualification barriers execute synchronously while the compact CUDA
+ * execution mutex is held.  READY runs after device synchronization and
+ * before the external inventory captures; RESULT/ACK completes after those
+ * captures but before the attributed sample commits or progress resumes. */
+typedef bool (*ds4_gpu_laguna_external_checkpoint_barrier_fn)(
+        void *userdata);
+typedef struct {
+    void *userdata;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_ready;
+    ds4_gpu_laguna_external_checkpoint_barrier_fn sample_result;
+} ds4_gpu_laguna_external_checkpoint_barrier;
+
+ds4_runtime_status ds4_gpu_laguna_compact_external_checkpoint(
+        ds4_gpu_laguna_compact *ctx,
+        const ds4_gpu_nvml_inventory_snapshot *frozen_pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const uint8_t
+            observed_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        const ds4_gpu_laguna_external_checkpoint_barrier *barrier,
+        ds4_engine_laguna_external_checkpoint_observation *out);
+typedef bool (*ds4_gpu_laguna_runtime_snapshot_fn)(void *userdata);
+bool ds4_gpu_laguna_compact_runtime_snapshot(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_wire_counters *out,
+        bool *unsafe_out,
+        ds4_gpu_laguna_runtime_snapshot_fn capture,
+        void *userdata);
+
+/* Reserve one routed expert without performing SSD or CUDA work.  A cache hit
+ * is returned already pinned.  LOAD_OWNER returns a lifecycle-bound LOADING
+ * handle which must be passed to cache_complete() or cache_cancel(); exposing
+ * that handle before blocking I/O makes cooperative request cancellation
+ * reachable without racing on an acquire out-parameter. */
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome);
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_complete(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle *handle);
+
+/* Synchronous convenience wrapper around begin/complete.  Callers requiring
+ * externally reachable cancellation use the split API above.  A successful
+ * result is pinned for both HIT_RESERVED and LOAD_OWNER. */
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_acquire(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome);
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_unpin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle);
+ds4_laguna_cache_status ds4_gpu_laguna_compact_cache_cancel(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle);
+/* The returned pointer remains valid only while `handle` is IN_USE.  A caller
+ * must synchronize the last CUDA consumer before cache_unpin() permits slot
+ * reuse. */
+int ds4_gpu_laguna_compact_cache_view(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_cache_handle handle,
+        ds4_laguna_routed_projection projection,
+        const void **device_ptr,
+        uint64_t *bytes);
+
+/* Compact decode never falls back to resident model resolution.  A
+ * recoverable result is local to the request; UNSAFE means the compact
+ * runtime can no longer prove that cached bytes are safe to consume. */
+typedef enum {
+    DS4_GPU_LAGUNA_EXEC_SUCCESS = 0,
+    DS4_GPU_LAGUNA_EXEC_CANCELLED = 1,
+    DS4_GPU_LAGUNA_EXEC_RECOVERABLE = 2,
+    DS4_GPU_LAGUNA_EXEC_UNSAFE = 3,
+} ds4_gpu_laguna_exec_result;
+
+/* Internal adapter for ds4_session_cancel_fn; it inherits that callback's
+ * nonblocking, side-effect-free, no-CUDA/no-device-change contract. */
+typedef bool (*ds4_gpu_laguna_cancel_fn)(void *userdata);
+
+/* Borrow one request context for exactly one synchronous Laguna graph.  The
+ * compact executor holds its global execution lock until graph_end(), so page
+ * ranges and cache deltas cannot change owners between routed layers. */
+int ds4_gpu_laguna_compact_graph_begin(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+int ds4_gpu_laguna_compact_graph_end(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+
+/* Keep a bounded row-ordered set of independent graphs under one compact
+ * cache epoch.  Admission proves the fixed cache can retain the worst-case
+ * routed union for every row; callers must still bracket each row with the
+ * graph scope above. */
+int ds4_gpu_laguna_compact_request_group_begin(
+        ds4_gpu_laguna_compact *ctx,
+        uint32_t request_count);
+int ds4_gpu_laguna_compact_request_group_end(
+        ds4_gpu_laguna_compact *ctx);
+
+/* One-token Q4_K routed execution through ten pinned compact-cache slots.
+ * Scratch is caller-owned, preallocated, and live for the synchronous call:
+ * aux_scratch stores ten L2 floats at byte zero and the immutable ten-entry
+ * slot descriptor at byte offset 64. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_one_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata,
+        ds4_runtime_request_context *request);
+
+/* Batched Q4_K routed execution through the same fixed compact cache.  The
+ * selected/weight tensors are token-major with ten entries per token; all
+ * unique experts for one routed layer remain pinned through the synchronous
+ * shared batch-kernel launch. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_routed_moe_batch_tensor(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *input_q8_scratch,
+        ds4_gpu_tensor *mid_q8_scratch,
+        ds4_gpu_tensor *aux_scratch,
+        uint32_t layer_id,
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_laguna_cancel_fn cancel,
+        void *userdata,
+        ds4_runtime_request_context *request);
+
+/* Drain source-page disposal accumulated by routed layers after the caller's
+ * whole Laguna graph is quiescent.  This is mandatory even on a cancelled or
+ * recoverable graph result; an accounting or synchronization failure poisons
+ * the compact context and returns UNSAFE. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_finish_graph(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+
+/* Final request-owned CUDA/advice barrier.  It seals page-advice time only
+ * when this request observed physical advice; hit-only requests stay null. */
+ds4_gpu_laguna_exec_result
+ds4_gpu_laguna_compact_request_barrier(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_runtime_request_context *request);
+
+#ifdef DS4_TEST_HOOKS
+typedef enum {
+    DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
+    DS4_GPU_LAGUNA_LIFECYCLE_CREATING = 1,
+    DS4_GPU_LAGUNA_LIFECYCLE_ACTIVE = 2,
+    DS4_GPU_LAGUNA_LIFECYCLE_DESTROYING = 3,
+    DS4_GPU_LAGUNA_LIFECYCLE_RELEASING = 4,
+} ds4_gpu_laguna_lifecycle;
+
+typedef enum {
+    DS4_GPU_LAGUNA_CACHE_FAULT_NONE = 0,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EINTR = 1,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_EOF = 2,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_SHORT = 3,
+    DS4_GPU_LAGUNA_CACHE_FAULT_PREAD_ERROR = 4,
+    DS4_GPU_LAGUNA_CACHE_FAULT_CUDA_COPY = 5,
+    DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_RECORD = 6,
+    DS4_GPU_LAGUNA_CACHE_FAULT_EVENT_COMPLETION = 7,
+    DS4_GPU_LAGUNA_CACHE_FAULT_CANCELLATION = 8,
+} ds4_gpu_laguna_cache_test_fault;
+
+typedef struct {
+    ds4_gpu_laguna_lifecycle lifecycle;
+    int model_fd;
+    const void *model_map;
+    uint64_t model_size;
+    ds4_laguna_file_identity model_identity;
+    void *static_slab;
+    uint64_t *static_offsets;
+    void *cache_payload;
+    ds4_laguna_cache_slot *cache_slots;
+    uint32_t *device_entry_to_slot;
+    bool model_fd_live;
+    bool static_slab_live;
+    bool static_offsets_live;
+    bool cache_payload_live;
+    bool cache_policy_live;
+    bool device_entry_to_slot_live;
+    bool tracker_mapping_live;
+    bool tracker_static_live;
+    bool tracker_offsets_live;
+    uint64_t sync_attempt_count;
+    uint64_t release_attempt_count;
+    uint64_t rejection_count;
+    uint64_t static_slab_bytes;
+    uint64_t static_source_copied_bytes;
+    uint64_t static_range_count;
+    uint64_t static_offset_count;
+    uint64_t static_offset_bytes;
+    uint64_t cache_payload_bytes;
+    uint64_t cache_slot_count;
+    uint64_t cache_slot_stride_bytes;
+    uint64_t pinned_staging_live_count;
+    uint64_t pinned_staging_bytes;
+    uint64_t cache_payload_allocation_attempts;
+    uint64_t pinned_staging_allocation_attempts;
+    uint64_t cache_acquire_hits;
+    uint64_t cache_acquire_misses;
+    uint64_t cache_evictions;
+    uint64_t cache_load_successes;
+    uint64_t cache_load_failures;
+    uint64_t model_file_read_calls;
+    uint64_t model_file_read_bytes;
+    uint64_t pread_eintr_retries;
+    uint64_t pread_eof_failures;
+    uint64_t pread_short_failures;
+    uint64_t pread_error_failures;
+    uint64_t cuda_copy_failures;
+    uint64_t event_record_failures;
+    uint64_t event_completion_failures;
+    uint64_t cache_cancellations;
+    bool cache_unsafe;
+    uint64_t model_mapping_registered_bytes;
+    uint64_t whole_model_copied_bytes;
+    uint64_t routed_payload_bytes;
+    uint64_t opportunistic_range_allocated_bytes;
+    uint64_t legacy_model_range_count;
+    uint64_t legacy_model_arena_count;
+    void *page_advice_state;
+    bool page_advice_state_live;
+    uint64_t page_advice_state_bytes;
+    uint64_t page_advice_touched_eligible_unique_bytes;
+    uint64_t page_advice_touched_eligible_unique_pages;
+    uint64_t page_advice_mapping_touch_pages;
+    uint64_t page_advice_mapping_touch_bytes;
+    uint64_t page_advice_advised_unique_bytes;
+    uint64_t page_advice_advised_unique_pages;
+    uint64_t page_advice_attempted_calls;
+    uint64_t page_advice_attempted_bytes;
+    uint64_t page_advice_successful_calls;
+    uint64_t page_advice_successful_bytes;
+    uint64_t page_advice_failed_calls;
+    uint64_t page_advice_failed_bytes;
+    ds4_laguna_page_advice_errno_bucket
+        page_advice_errno_buckets[
+            DS4_LAGUNA_PAGE_ADVICE_ERRNO_BUCKET_CAPACITY];
+    size_t page_advice_errno_bucket_count;
+    uint64_t page_advice_errno_einval_calls;
+    uint64_t page_advice_errno_einval_bytes;
+    uint64_t page_advice_errno_eio_calls;
+    uint64_t page_advice_errno_eio_bytes;
+    uint64_t page_advice_fadvise_attempted_calls;
+    uint64_t page_advice_fadvise_attempted_bytes;
+    uint64_t page_advice_fadvise_successful_calls;
+    uint64_t page_advice_fadvise_successful_bytes;
+    uint64_t page_advice_fadvise_failed_calls;
+    uint64_t page_advice_fadvise_failed_bytes;
+    uint64_t page_advice_madvise_attempted_calls;
+    uint64_t page_advice_madvise_attempted_bytes;
+    uint64_t page_advice_madvise_successful_calls;
+    uint64_t page_advice_madvise_successful_bytes;
+    uint64_t page_advice_madvise_failed_calls;
+    uint64_t page_advice_madvise_failed_bytes;
+    uint64_t page_advice_precharge_source_resident_bytes;
+    uint64_t page_advice_post_source_resident_bytes;
+    uint64_t page_advice_upload_completed_sequence;
+    uint64_t page_advice_precharge_sequence;
+    uint64_t page_advice_mapping_touch_sequence;
+    uint64_t page_advice_attempt_sequence;
+    uint64_t page_advice_post_sample_sequence;
+    uint64_t page_advice_complete_sequence;
+    uint64_t page_advice_complete_monotonic_ns;
+} ds4_gpu_laguna_compact_test_snapshot;
+
+/* Test-only proof that every routed projection consumed by compact Laguna
+ * execution came from the fixed engine-lifetime cache payload.  Requests and
+ * classifications are both monotonic; a healthy run classifies every request
+ * as exactly one engine-slot resolution and never observes a fallback. */
+typedef struct {
+    uint64_t routed_projection_requests;
+    uint64_t engine_slot_resolutions;
+    uint64_t static_slab_resolutions;
+    uint64_t model_mapping_resolutions;
+    uint64_t managed_resolutions;
+    uint64_t per_request_resolutions;
+    uint64_t unknown_resolutions;
+} ds4_gpu_laguna_routed_origin_test_snapshot;
+
+int ds4_gpu_test_laguna_compact_snapshot(
+        const ds4_gpu_laguna_compact *ctx,
+        ds4_gpu_laguna_compact_test_snapshot *out);
+int ds4_gpu_test_laguna_compact_active_snapshot(
+        ds4_gpu_laguna_compact_test_snapshot *out);
+/* Return one only when the caller can acquire and immediately release the
+ * compact execution mutex.  Test barriers call this from a different thread
+ * to distinguish execution-lock ownership from compact-state locking. */
+int ds4_gpu_test_laguna_compact_exec_mutex_try_lock(void);
+int ds4_gpu_test_laguna_compact_routed_origin_snapshot(
+        ds4_gpu_laguna_routed_origin_test_snapshot *out);
+uint64_t ds4_gpu_test_laguna_compact_static_allocation_attempts(void);
+uint64_t ds4_gpu_test_generic_cleanup_attempts(void);
+void ds4_gpu_test_laguna_compact_fail_sync_once(void);
+void ds4_gpu_test_laguna_compact_fail_release_once(void);
+void ds4_gpu_test_laguna_compact_fail_after_identity_once(void);
+void ds4_gpu_test_laguna_compact_pause_creating_once(void);
+void ds4_gpu_test_laguna_compact_wait_creating_paused(void);
+void ds4_gpu_test_laguna_compact_resume_creating(void);
+void ds4_gpu_test_laguna_compact_fail_before_publish_once(void);
+void ds4_gpu_test_laguna_compact_cache_fault_once(
+        ds4_gpu_laguna_cache_test_fault fault);
+void ds4_gpu_test_laguna_compact_pause_cache_load_once(void);
+int ds4_gpu_test_laguna_compact_wait_cache_load_paused(
+        ds4_laguna_cache_handle *handle);
+void ds4_gpu_test_laguna_compact_resume_cache_load(void);
+void ds4_gpu_test_laguna_compact_pause_cache_begin_once(void);
+int ds4_gpu_test_laguna_compact_wait_cache_begin_paused(void);
+void ds4_gpu_test_laguna_compact_resume_cache_begin(void);
+void ds4_gpu_test_laguna_compact_page_advice_inject(
+        uint64_t page_size,
+        uint64_t exact_pre_resident_bytes,
+        uint64_t exact_post_resident_bytes,
+        int fadvise_errno,
+        int madvise_errno);
+int ds4_test_engine_laguna_external_checkpoint_inject_nvml_once(
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_before,
+        const ds4_gpu_nvml_inventory_snapshot *inside_ds4,
+        const ds4_gpu_nvml_inventory_snapshot *checkpoint_after);
+uint64_t ds4_gpu_test_laguna_compact_snapshot_size(void);
+ds4_laguna_cache_status ds4_gpu_test_laguna_compact_cache_reserve_loading(
+        ds4_gpu_laguna_compact *ctx,
+        ds4_laguna_expert_key key,
+        ds4_laguna_cache_handle *handle,
+        ds4_laguna_cache_acquire_outcome *outcome);
+int ds4_gpu_test_laguna_compact_nonidle_snapshot(
+        ds4_gpu_laguna_compact_test_snapshot *out);
+int ds4_gpu_test_laguna_compact_lookup(
+        const ds4_gpu_laguna_compact *ctx,
+        uint64_t source_offset,
+        uint64_t bytes,
+        int expected_device,
+        void **out_device_ptr);
+const void *ds4_gpu_test_laguna_compact_resolve_weight_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        int logical_tier,
+        const char *label);
+int ds4_gpu_test_glm_poolside_q4_mmq_gate_up_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *gate_row,
+        const ds4_gpu_tensor *up_row,
+        const ds4_gpu_tensor *input,
+        uint32_t input_elements);
+int ds4_gpu_test_f32_mmvf_microscope_tensor(
+        ds4_gpu_tensor *values,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements);
+int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
+        ds4_gpu_tensor *values,
+        ds4_gpu_tensor *quantized_input,
+        const ds4_gpu_tensor *weight_row,
+        const ds4_gpu_tensor *activation,
+        uint32_t input_elements);
+#ifndef DS4_GPU_GLM_MOE_CAPTURE_LAYOUT_DEFINED
+#define DS4_GPU_GLM_MOE_CAPTURE_LAYOUT_DEFINED
+enum {
+    DS4_GPU_GLM_MOE_CAPTURE_GATE_F32 = 0,
+    DS4_GPU_GLM_MOE_CAPTURE_UP_F32 = 10240,
+    DS4_GPU_GLM_MOE_CAPTURE_SWIGLU_F32 = 20480,
+    DS4_GPU_GLM_MOE_CAPTURE_COLUMN_L2_F32 = 30720,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_INPUT_F32 = 30730,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_F32 = 40970,
+    DS4_GPU_GLM_MOE_CAPTURE_WEIGHTED_F32 = 71690,
+    DS4_GPU_GLM_MOE_CAPTURE_F32_COUNT = 102410,
+    DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_OFFSET = 409640,
+    DS4_GPU_GLM_MOE_CAPTURE_INPUT_Q8_BYTES = 3456,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_OFFSET = 413096,
+    DS4_GPU_GLM_MOE_CAPTURE_DOWN_Q8_BYTES = 11520,
+    DS4_GPU_GLM_MOE_CAPTURE_BYTES = 424616,
+};
+#endif
+int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
+        ds4_gpu_tensor       *capture,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              up_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              up_expert_bytes,
+        uint64_t              up_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              layer_index,
+        const ds4_gpu_tensor *x,
+        bool                  force_resident);
+int ds4_gpu_test_glm_poolside_q4_l2_tensor(
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *column_l2,
+        uint32_t expert_mid_dim,
+        uint64_t pair_count,
+        uint64_t topology_pair_count);
+#endif
+
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
@@ -137,6 +652,7 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
                                      uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
@@ -146,6 +662,9 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
+/* Pre-init probe for the device used by ds4_gpu_init()'s single-tier path. */
+uint64_t ds4_gpu_default_device_working_set_size(
+        uint32_t *visible_devices_out);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {
@@ -514,6 +1033,19 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Poolside llama.cpp-compatible Q8_0 arithmetic for Laguna.  Backends that
+ * do not provide a distinct Poolside kernel may delegate to the generic
+ * Q8_0 implementation. */
+int ds4_gpu_matmul_q8_0_poolside_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -576,6 +1108,18 @@ int ds4_gpu_matmul_quant_rows_scalar_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* The original Laguna Q4_K_M recipe keeps selected down projections and the
+ * output head in Q6_K. */
+int ds4_gpu_matmul_q6_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
 
 /* Optional fused GPU operations.
  *
@@ -956,6 +1500,109 @@ int ds4_gpu_glm_rope_tail_tensor(
         float           attn_factor,
         float           beta_fast,
         float           beta_slow);
+
+int ds4_gpu_laguna_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
+
+int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *q,
+        ds4_gpu_tensor *k,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        q_weight_offset,
+        uint64_t        k_weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_q_head,
+        uint32_t        n_k_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
+
+int ds4_gpu_laguna_qkvg_f16_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint64_t              v_weight_offset,
+        uint64_t              gate_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              q_dim,
+        uint32_t              kv_dim,
+        uint32_t              gate_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_laguna_attn_output_residual_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual);
+
+int ds4_gpu_laguna_store_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate,
+        uint32_t              pos,
+        uint32_t              cache_cap,
+        uint32_t              key_start,
+        uint32_t              key_count,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale);
+
+int ds4_gpu_laguna_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        ds4_gpu_tensor       *staged_key,
+        ds4_gpu_tensor       *staged_value,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale);
 
 int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         ds4_gpu_tensor       *out,
@@ -2037,6 +2684,15 @@ int ds4_gpu_add3_tensor(
         const ds4_gpu_tensor *b,
         const ds4_gpu_tensor *c,
         uint32_t                n);
+
+static inline int ds4_gpu_laguna_moe_residual_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *moe,
+        const ds4_gpu_tensor *shared,
+        uint32_t                n) {
+    return ds4_gpu_add3_tensor(out, moe, shared, residual, n);
+}
 
 int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,

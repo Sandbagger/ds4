@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_ssd.h"
+#include "ds4_runtime.h"
 
 /* Public engine boundary.
  *
@@ -58,8 +59,21 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
+#ifndef DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+#define DS4_GPU_NVML_INVENTORY_SNAPSHOT_DECLARED
+typedef struct ds4_gpu_nvml_inventory_snapshot
+    ds4_gpu_nvml_inventory_snapshot;
+#endif
+#ifndef DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+#define DS4_ENGINE_LAGUNA_EXTERNAL_OBSERVATION_DECLARED
+typedef struct ds4_engine_laguna_external_checkpoint_observation
+    ds4_engine_laguna_external_checkpoint_observation;
+#endif
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
+/* Cancellation callbacks run inside synchronous backend work.  They must be
+ * nonblocking and side-effect-free: do not re-enter DS4, call CUDA, or change
+ * the calling thread's CUDA device. */
 typedef bool (*ds4_session_cancel_fn)(void *ud);
 
 #define DS4_SESSION_SYNC_INTERRUPTED 2
@@ -126,6 +140,7 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
+    const char *qualification_plan_path;
     const char *mtp_path;
     ds4_backend backend;
     int n_threads;
@@ -151,23 +166,38 @@ typedef struct {
     bool dspark;
     bool dspark_strict;
     bool dspark_confidence_threshold_set;
+    bool qualification_plan_path_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    /* The legacy NGB spelling also fills cache_bytes; retain its provenance. */
+    bool ssd_streaming_cache_experts_set;
+    bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
+    /* Declared simultaneously live sessions; zero preserves the one-slot
+     * default for existing callers. */
+    uint32_t session_slots;
     bool first_token_test;
     bool metal_graph_test;
     bool load_slice;
     uint32_t load_layer_start;
     uint32_t load_layer_end;
     bool load_output;
+    const ds4_runtime_build_info *runtime_build_info;
     ds4_distributed_options distributed;
     ds4_tp_options tp;
+    /* Qualification harness only: normal frontends never populate this. */
+    int qualification_model_fd;
+    bool qualification_model_fd_set;
+    /* When set, engine open consumes and closes this inherited endpoint after
+     * creating its private close-on-exec duplicate. */
+    int qualification_control_fd;
+    bool qualification_control_fd_set;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -194,7 +224,58 @@ typedef struct {
     uint64_t bytes;
 } ds4_session_payload_file;
 
+struct ds4_gpu_config;
+
+typedef enum {
+    DS4_QUALIFICATION_FRONTEND_STANDARD = 0,
+    DS4_QUALIFICATION_FRONTEND_SERVER = 1,
+    DS4_QUALIFICATION_FRONTEND_BENCH = 2,
+} ds4_qualification_frontend;
+
+/* Before a frontend parses files or changes process state, enforce the small
+ * harness-only argument vocabulary whenever --qualification-plan is present.
+ * Ordinary invocations are left untouched. */
+int ds4_qualification_args_preflight(
+        int argc,
+        char *const argv[],
+        ds4_qualification_frontend frontend,
+        char *err,
+        size_t errcap);
+
+/* Validate model-independent configuration before tokenizer/model access. */
+int ds4_engine_options_preflight(const ds4_engine_options *opt,
+                                 char *err,
+                                 size_t errcap);
+int ds4_engine_options_preflight_with_gpu_config(
+        const ds4_engine_options *opt,
+        const struct ds4_gpu_config *gpu_cfg,
+        char *err,
+        size_t errcap);
+/* Build and publish the harness-only compact Laguna qualification plan.
+ * This path parses the opened GGUF but never initializes an accelerator,
+ * acquires the process lock, warms model pages, or creates an engine. Calls
+ * are serialized and restore fixed-shape state before returning. Invoke this
+ * plan-only API before engine creation, never concurrently with a live engine. */
+int ds4_engine_write_qualification_plan(
+        const ds4_engine_options *opt,
+        char *err,
+        size_t errcap);
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+/* Capture one coherent ds4.runtime/v1 value.  Callers that share an engine
+ * with request execution must hold their quiescence boundary while calling. */
+bool ds4_engine_runtime_snapshot(
+        ds4_engine *engine,
+        ds4_runtime_wire_snapshot *out);
+/* Explicit qualification checkpoint.  The caller must freeze `pre_child`
+ * before launching or initializing CUDA.  Compact CUDA implementations
+ * synchronize, measure exact model pages/smaps/process-scoped NVML, and
+ * transactionally publish one de-duplicated runtime sample. */
+ds4_runtime_status ds4_engine_laguna_external_checkpoint(
+        ds4_engine *engine,
+        const ds4_gpu_nvml_inventory_snapshot *pre_child,
+        const uint8_t
+            expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        ds4_engine_laguna_external_checkpoint_observation *out);
 
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *
@@ -212,7 +293,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 /* ds4_gpu_config is declared in ds4_gpu_mgpu.h, which callers should
  * include separately. We forward-declare it here so this header can be
  * used as-is (callers passing NULL don't need the struct definition). */
-struct ds4_gpu_config;
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg);
@@ -247,6 +327,10 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_is_laguna(ds4_engine *e);
+const char *ds4_engine_default_system_prompt(ds4_engine *e);
+void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
+                                  int *top_k, float *top_p, float *min_p);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -284,7 +368,6 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
-bool ds4_engine_is_glm_dsa(ds4_engine *e);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -307,6 +390,7 @@ void ds4_encode_chat_prompt(
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
+void ds4_chat_append_assistant_end(ds4_engine *e, ds4_tokens *tokens);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
@@ -334,8 +418,9 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
-/* Optional cooperative cancellation.  ds4_session_sync() checks it only at
- * safe boundaries where the live checkpoint is either unchanged or represents a
+/* Optional cooperative cancellation.  The callback contract is documented at
+ * ds4_session_cancel_fn above.  ds4_session_sync() checks it only at safe
+ * boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
@@ -356,6 +441,18 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Operation-scoped request attribution.  The context is borrowed only for the
+ * synchronous call and is never retained by the session or backend. */
+int ds4_session_sync_attributed(
+        ds4_session *s, const ds4_tokens *prompt,
+        ds4_runtime_request_context *request,
+        char *err, size_t errlen);
+/* Synchronize a prompt for logits inspection. Prompts shorter than the
+ * context use ordinary sync. Exact-context success is restricted to local
+ * Laguna CUDA and permanently makes the session logits-only terminal. */
+int ds4_session_sync_logits_only(
+        ds4_session *s, const ds4_tokens *prompt,
+        char *err, size_t errlen);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -367,11 +464,250 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+typedef struct {
+    int pos;
+    int first_token;
+    bool checkpoint_valid;
+    bool logits_only_terminal;
+    uint64_t token_hash;
+    uint64_t logit_hash;
+    bool progress_set;
+    bool progress_ud_set;
+    bool display_progress_set;
+    bool display_progress_ud_set;
+    bool cancel_set;
+    bool cancel_ud_set;
+    bool progress_is_test_probe;
+    bool display_progress_is_test_probe;
+    bool cancel_is_test_probe;
+    /* Hook-only boundary counters advance after the future terminal guard. */
+    uint64_t progress_dispatches;
+    uint64_t warmup_dispatches;
+    uint64_t layer_payload_dispatches;
+} ds4_test_session_state;
+
+typedef enum {
+    DS4_TEST_GRAPH_FAMILY_FLASH,
+    DS4_TEST_GRAPH_FAMILY_PRO,
+    DS4_TEST_GRAPH_FAMILY_GLM,
+    DS4_TEST_GRAPH_FAMILY_LAGUNA,
+} ds4_test_graph_family;
+
+typedef struct {
+    int family;
+    int variant;
+    uint32_t layer_count;
+    uint64_t compress_ratios_hash;
+    uint64_t head_counts_hash;
+} ds4_test_model_shape_state;
+
+typedef struct {
+    uint64_t model_fd_entries;
+    uint64_t model_map_entries;
+    uint64_t model_range_entries;
+    uint64_t model_span_entries;
+    uint64_t model_cache_entries;
+    uint64_t model_warm_entries;
+} ds4_test_laguna_compact_bypass_snapshot;
+
+typedef struct {
+    int first_destroy_result;
+    int destroy_result;
+    uint64_t destroy_attempt_count;
+    bool engine_retained;
+    uint64_t gpu_cleanup_before;
+    uint64_t gpu_cleanup_after;
+} ds4_test_laguna_compact_close_observation;
+
+typedef struct {
+    uint64_t base;
+    uint64_t bytes;
+    uint32_t callsite_id;
+} ds4_test_laguna_live_owner;
+
+typedef void (*ds4_test_thread_sync_fn)(void *context);
+
+int ds4_test_logits_only_sync_mode(
+        bool native_cuda_build,
+        bool laguna, ds4_backend backend,
+        bool session_distributed, bool engine_distributed,
+        bool transport_tensor_parallel, bool cuda_tensor_parallel,
+        int prompt_len, int ctx_size);
+int ds4_test_session_create_policy(
+        ds4_session **out, int ctx_size, bool terminal);
+int ds4_test_session_state_get(
+        const ds4_session *s, ds4_test_session_state *out);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
 uint64_t ds4_test_mixed_native_count(void);
+uint64_t ds4_test_laguna_decode_fallback_count(void);
+uint64_t ds4_test_laguna_mixed_fallback_count(void);
+int ds4_test_exact_cache_options_preflight(
+        bool ssd_streaming,
+        bool exact_cache_bytes_set,
+        bool legacy_cache_experts_set,
+        uint64_t configured_cache_bytes,
+        bool safe_cache_bytes_known,
+        uint64_t safe_cache_bytes,
+        char *err,
+        size_t errcap);
+uint64_t ds4_test_graph_cache_safe_bytes(
+        uint64_t recommended_working_set_bytes,
+        uint64_t graph_context_bytes);
+uint64_t ds4_test_graph_context_bound(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk);
+uint64_t ds4_test_graph_context_max_bound(
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        ds4_test_graph_family *worst_family_out);
+bool ds4_test_exact_cache_plan_make(uint64_t configured_cache_bytes,
+                                    uint64_t slot_stride_bytes,
+                                    uint64_t *effective_cache_bytes_out,
+                                    uint32_t *slot_count_out);
+bool ds4_test_post_prefill_cache_budget(uint64_t current_cache_bytes,
+                                        uint64_t reclaimed_headroom_bytes,
+                                        bool exact_cache_bytes,
+                                        uint64_t *out);
+int ds4_test_engine_exact_cache_preflight(
+        bool recommended_known,
+        uint64_t recommended_bytes,
+        uint64_t configured_cache_bytes,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        uint32_t session_slots,
+        bool share_session_prefill_workspace,
+        char *err,
+        size_t errcap);
+bool ds4_test_laguna_compact_bypass_snapshot_get(
+        ds4_test_laguna_compact_bypass_snapshot *out);
+bool ds4_test_laguna_compact_close_observation_get(
+        ds4_test_laguna_compact_close_observation *out);
+/* Copy-only engine accounting views. `required` reports the exact live count;
+ * insufficient output capacity fails without returning a partial copy. */
+bool ds4_test_engine_laguna_runtime_snapshot(
+        const ds4_engine *engine,
+        ds4_runtime_snapshot *snapshot,
+        ds4_runtime_allocation_record *records,
+        size_t capacity,
+        size_t *required);
+bool ds4_test_laguna_last_close_snapshot(
+        ds4_runtime_snapshot *snapshot);
+bool ds4_test_laguna_close_snapshot_is_clean(
+        const ds4_runtime_snapshot *snapshot);
+bool ds4_test_engine_laguna_inventory_live_flag_clear(
+        ds4_engine *engine,
+        size_t index);
+bool ds4_test_engine_laguna_inventory_release_reject_once(
+        ds4_engine *engine,
+        size_t index);
+bool ds4_test_engine_laguna_live_owners(
+        const ds4_engine *engine,
+        ds4_test_laguna_live_owner *owners,
+        size_t capacity,
+        size_t *required);
+bool ds4_test_engine_laguna_ledger_owners(
+        const ds4_engine *engine,
+        ds4_test_laguna_live_owner *owners,
+        size_t capacity,
+        size_t *required);
+int ds4_test_session_limit_lifecycle(
+        bool exact_cache,
+        bool graph_backend,
+        int declared_context,
+        int requested_context,
+        int oversized_context,
+        int *oversized_rc,
+        int *first_rc,
+        int *second_rc,
+        int *reuse_rc);
+int ds4_test_direct_graph_limit_lifecycle(
+        int *oversized_rc,
+        int *concurrent_rc,
+        int *reuse_rc,
+        int *diagnostic_rc);
+int ds4_test_exact_cache_cuda_topology_preflight(
+        uint32_t device_count,
+        int device_index,
+        char *err,
+        size_t errcap);
+int ds4_test_qualification_plan_preflight(
+        const ds4_engine_options *opt,
+        bool gpu_config_requested,
+        char *err,
+        size_t errcap);
+bool ds4_test_failure_trap_thread_probe(
+        ds4_test_thread_sync_fn synchronize,
+        void *context);
+void ds4_test_model_shape_state_get(ds4_test_model_shape_state *out);
+void ds4_test_force_qualification_shape_failure(bool enabled);
+bool ds4_test_laguna_file_identity_capture(
+        int fd,
+        uint64_t *device,
+        uint64_t *inode,
+        uint64_t *size_bytes,
+        uint64_t *mtime_ns,
+        char *err,
+        size_t errcap);
+bool ds4_test_laguna_file_identity_matches(
+        int fd,
+        uint64_t device,
+        uint64_t inode,
+        uint64_t size_bytes,
+        uint64_t mtime_ns,
+        char *err,
+        size_t errcap);
+int ds4_test_model_source_open(
+        const char *path,
+        int qualification_fd,
+        bool qualification_fd_set);
+bool ds4_test_gpu_config_working_set_bytes(
+        const uint64_t *budgets,
+        size_t count,
+        uint64_t *out);
+bool ds4_test_default_single_tier_working_set_bytes(
+        uint64_t default_device_bytes,
+        uint32_t visible_devices,
+        uint64_t *out);
+uint64_t ds4_test_graph_context_memory_bytes(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk);
+/* Exact Laguna graph sizing seam. Rows must be nonzero and within context;
+ * callers resolve any legacy/default policy before entering this boundary.
+ * Failure leaves `out` unchanged. */
+bool ds4_test_laguna_prefill_plan(
+        uint32_t context_tokens,
+        uint32_t configured_prefill_rows,
+        ds4_context_memory *out);
+/* Checked rows * bytes_per_row + fixed_bytes arithmetic used by the Laguna
+ * plan, estimator, and allocator. Failure leaves `out` unchanged. */
+bool ds4_test_checked_affine_bytes(
+        uint64_t rows,
+        uint64_t bytes_per_row,
+        uint64_t fixed_bytes,
+        uint64_t *out);
+#ifndef DS4_NO_GPU
+#define DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT 48u
+typedef struct {
+    uint32_t context_tokens;
+    uint32_t graph_prefill_cap;
+    uint32_t session_prefill_cap;
+    uint32_t layer_count;
+    uint32_t cache_caps[DS4_TEST_LAGUNA_PREFILL_ALLOCATION_LAYER_COUNT];
+    uint64_t scratch_tensor_bytes;
+    uint64_t kv_tensor_bytes;
+    ds4_runtime_snapshot allocated;
+    ds4_runtime_snapshot released;
+} ds4_test_laguna_prefill_allocation_snapshot;
+bool ds4_test_laguna_prefill_allocation(
+        uint32_t context_tokens,
+        uint32_t prefill_rows,
+        ds4_test_laguna_prefill_allocation_snapshot *out);
+#endif
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
@@ -381,23 +717,46 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_attributed(
+        ds4_session *s, int token,
+        ds4_runtime_request_context *request,
+        char *err, size_t errlen);
 
 typedef struct {
     ds4_session *session;
     int token;
 } ds4_decode_item;
 
+typedef struct {
+    ds4_session *session;
+    int token;
+    ds4_runtime_request_context *request;
+} ds4_attributed_decode_item;
+
 /* Advance independent sessions by one token each. Batch size one is exactly
  * ds4_session_eval(). Backends without native batching use a correctness-first
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+int ds4_sessions_eval_batch_attributed(
+        ds4_attributed_decode_item *items, int count,
+        char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */
 int ds4_sessions_eval_batch_with_prefill(
         ds4_decode_item *items, int count,
         ds4_session *prefill_session, const ds4_tokens *prefill_prompt,
+        char *err, size_t errlen);
+int ds4_sessions_eval_batch_with_prefill_attributed(
+        ds4_attributed_decode_item *items, int count,
+        ds4_session *prefill_session, const ds4_tokens *prefill_prompt,
+        ds4_runtime_request_context *prefill_request,
+        char *err, size_t errlen);
+/* Complete any request-owned compact work and publish the request's final
+ * page-advice milestone.  No request pointer survives this call. */
+int ds4_session_request_barrier(
+        ds4_session *s, ds4_runtime_request_context *request,
         char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,

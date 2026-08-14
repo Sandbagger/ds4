@@ -3,6 +3,8 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
+LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
+LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -18,6 +20,7 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
+LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -26,6 +29,7 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
+HF_REVISION=
 
 usage() {
     cat <<EOF
@@ -45,6 +49,7 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
+  ./download_model.sh laguna-q4 [--token TOKEN]
 
 Targets:
 
@@ -102,6 +107,11 @@ Targets:
   glm-antirez-q4
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
+
+  laguna-q4
+       Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
+       About 68 GB on disk; currently supported by the Metal backend with
+       full model residency.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -179,6 +189,12 @@ case "$MODEL" in
         REPO=$GLM_ANTIREZ_REPO
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
+        ;;
+    laguna-q4)
+        REPO=$LAGUNA_REPO
+        MODEL_FILE=$LAGUNA_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        HF_REVISION=$LAGUNA_REVISION
         ;;
     -h|--help|help)
         usage
@@ -281,11 +297,18 @@ download_one_hf() {
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
+    if [ -n "$HF_REVISION" ]; then
+        echo "revision $HF_REVISION"
+    fi
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
-    if [ -n "$TOKEN" ]; then
+    if [ -n "$TOKEN" ] && [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    elif [ -n "$TOKEN" ]; then
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    elif [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR"
     else
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi

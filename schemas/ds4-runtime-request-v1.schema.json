@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ds4.runtime.request/v1",
+  "title": "DS4 per-request runtime metrics",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "request_id",
+    "instance_id",
+    "snapshot_seq",
+    "prompt_tokens",
+    "generated_tokens",
+    "ttft_ns",
+    "prefill_tokens_per_second",
+    "visible_decode_tokens_per_second",
+    "wall_time_ns",
+    "cache_hits",
+    "cache_misses",
+    "cache_evictions",
+    "model_file_read_operations",
+    "model_file_read_bytes",
+    "model_file_read_ns",
+    "host_to_device_bytes",
+    "host_to_device_ns",
+    "page_advice_attempts",
+    "page_advice_bytes",
+    "page_advice_failures",
+    "page_advice_complete_monotonic_ns",
+    "terminal_status"
+  ],
+  "properties": {
+    "schema": { "const": "ds4.runtime.request/v1" },
+    "request_id": { "$ref": "#/$defs/uuid" },
+    "instance_id": { "$ref": "#/$defs/uuid" },
+    "snapshot_seq": { "$ref": "#/$defs/uint64" },
+    "prompt_tokens": { "$ref": "#/$defs/positive_token_count" },
+    "generated_tokens": { "$ref": "#/$defs/token_count" },
+    "ttft_ns": { "$ref": "#/$defs/nullable_uint64" },
+    "prefill_tokens_per_second": { "$ref": "#/$defs/rate" },
+    "visible_decode_tokens_per_second": { "$ref": "#/$defs/rate" },
+    "wall_time_ns": { "$ref": "#/$defs/uint64" },
+    "cache_hits": { "$ref": "#/$defs/uint64" },
+    "cache_misses": { "$ref": "#/$defs/uint64" },
+    "cache_evictions": { "$ref": "#/$defs/uint64" },
+    "model_file_read_operations": { "$ref": "#/$defs/uint64" },
+    "model_file_read_bytes": { "$ref": "#/$defs/uint64" },
+    "model_file_read_ns": { "$ref": "#/$defs/uint64" },
+    "host_to_device_bytes": { "$ref": "#/$defs/uint64" },
+    "host_to_device_ns": { "$ref": "#/$defs/uint64" },
+    "page_advice_attempts": { "$ref": "#/$defs/uint64" },
+    "page_advice_bytes": { "$ref": "#/$defs/uint64" },
+    "page_advice_failures": { "$ref": "#/$defs/uint64" },
+    "page_advice_complete_monotonic_ns": {
+      "$ref": "#/$defs/nullable_uint64"
+    },
+    "terminal_status": { "$ref": "#/$defs/terminal_status" }
+  },
+  "$defs": {
+    "uint64": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])(?![\\s\\S])"
+    },
+    "nullable_uint64": {
+      "anyOf": [
+        { "$ref": "#/$defs/uint64" },
+        { "type": "null" }
+      ]
+    },
+    "token_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "positive_token_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "rate": {
+      "type": "number",
+      "minimum": 0,
+      "x-ds4-number-kind": "number"
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^(?!00000000-0000-0000-0000-000000000000(?![\\s\\S]))[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+    },
+    "terminal_status": {
+      "enum": [
+        "completed",
+        "cancelled",
+        "rejected",
+        "recoverable_error",
+        "unsafe_error"
+      ]
+    }
+  }
+}

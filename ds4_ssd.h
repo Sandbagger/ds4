@@ -17,6 +17,7 @@ typedef struct {
 } ds4_ssd_cache_plan;
 
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes);
+bool ds4_parse_positive_u64_decimal(const char *s, uint64_t *value);
 bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
                                            uint64_t   *bytes);

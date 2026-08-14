@@ -1,0 +1,458 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ds4.runtime/v1",
+  "title": "DS4 runtime snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "instance_id",
+    "snapshot_seq",
+    "state",
+    "build",
+    "executable",
+    "model",
+    "config",
+    "limits",
+    "allocations",
+    "counters",
+    "violations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ds4.runtime/v1"
+    },
+    "instance_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "snapshot_seq": {
+      "$ref": "#/$defs/uint64"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "ready",
+        "draining",
+        "unsafe"
+      ]
+    },
+    "build": {
+      "$ref": "#/$defs/build"
+    },
+    "executable": {
+      "$ref": "#/$defs/file_identity"
+    },
+    "model": {
+      "$ref": "#/$defs/model"
+    },
+    "config": {
+      "$ref": "#/$defs/config"
+    },
+    "limits": {
+      "$ref": "#/$defs/limits"
+    },
+    "allocations": {
+      "$ref": "#/$defs/allocations"
+    },
+    "counters": {
+      "$ref": "#/$defs/counters"
+    },
+    "violations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/violation"
+      }
+    }
+  },
+  "$defs": {
+    "uint64": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-4]|18446744073709551615)(?![\\s\\S])"
+    },
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^(?!0{40}(?![\\s\\S]))[0-9a-f]{40}(?![\\s\\S])"
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^(?!00000000-0000-0000-0000-000000000000(?![\\s\\S]))[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+    },
+    "backend": {
+      "type": "string",
+      "enum": [
+        "cpu",
+        "metal",
+        "cuda",
+        "rocm"
+      ]
+    },
+    "feature": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(?![\\s\\S])"
+    },
+    "features": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/feature"
+      },
+      "x-ds4-sorted-unique": true
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "dirty",
+        "backend",
+        "features"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "backend": {
+          "$ref": "#/$defs/backend"
+        },
+        "features": {
+          "$ref": "#/$defs/features"
+        }
+      }
+    },
+    "file_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns"
+      ],
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/uint64"
+        },
+        "inode": {
+          "$ref": "#/$defs/uint64"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "mtime_ns": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "family",
+        "device",
+        "inode",
+        "size_bytes",
+        "mtime_ns"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0020\\u007f]+(?![\\s\\S])",
+          "not": { "pattern": "[\\u0000-\\u0020\\u007f]" }
+        },
+        "family": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u0020\\u007f]+(?![\\s\\S])",
+          "not": { "pattern": "[\\u0000-\\u0020\\u007f]" }
+        },
+        "device": {
+          "$ref": "#/$defs/uint64"
+        },
+        "inode": {
+          "$ref": "#/$defs/uint64"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "mtime_ns": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context_tokens",
+        "prefill_chunk_tokens",
+        "session_slots",
+        "ssd_streaming",
+        "ssd_streaming_cache_bytes"
+      ],
+      "properties": {
+        "context_tokens": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "prefill_chunk_tokens": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "session_slots": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "ssd_streaming": {
+          "type": "boolean"
+        },
+        "ssd_streaming_cache_bytes": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effective_context_tokens",
+        "effective_prefill_chunk_tokens",
+        "effective_session_slots",
+        "expert_cache_limit_bytes"
+      ],
+      "properties": {
+        "effective_context_tokens": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "effective_prefill_chunk_tokens": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "effective_session_slots": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "expert_cache_limit_bytes": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "current_bytes",
+        "bound_bytes",
+        "peak_bytes"
+      ],
+      "properties": {
+        "current_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "bound_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "peak_bytes": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "categories": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "static_weights",
+        "expert_cache_payload",
+        "cache_metadata_address_tables",
+        "kv_state",
+        "graph_scratch",
+        "pinned_staging",
+        "other_host",
+        "other_cuda"
+      ],
+      "properties": {
+        "static_weights": {
+          "$ref": "#/$defs/measurement"
+        },
+        "expert_cache_payload": {
+          "$ref": "#/$defs/measurement"
+        },
+        "cache_metadata_address_tables": {
+          "$ref": "#/$defs/measurement"
+        },
+        "kv_state": {
+          "$ref": "#/$defs/measurement"
+        },
+        "graph_scratch": {
+          "$ref": "#/$defs/measurement"
+        },
+        "pinned_staging": {
+          "$ref": "#/$defs/measurement"
+        },
+        "other_host": {
+          "$ref": "#/$defs/measurement"
+        },
+        "other_cuda": {
+          "$ref": "#/$defs/measurement"
+        }
+      }
+    },
+    "reports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_mapped_virtual",
+        "model_mapping_registered",
+        "model_source_resident",
+        "host_library_unattributed",
+        "cuda_library_unattributed"
+      ],
+      "properties": {
+        "model_mapped_virtual": {
+          "$ref": "#/$defs/measurement"
+        },
+        "model_mapping_registered": {
+          "$ref": "#/$defs/measurement"
+        },
+        "model_source_resident": {
+          "$ref": "#/$defs/measurement"
+        },
+        "host_library_unattributed": {
+          "$ref": "#/$defs/measurement"
+        },
+        "cuda_library_unattributed": {
+          "$ref": "#/$defs/measurement"
+        }
+      }
+    },
+    "allocations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "categories",
+        "reports",
+        "owned_total",
+        "qualification_total",
+        "configured_prefill_rows",
+        "allocated_prefill_rows"
+      ],
+      "properties": {
+        "categories": {
+          "$ref": "#/$defs/categories"
+        },
+        "reports": {
+          "$ref": "#/$defs/reports"
+        },
+        "owned_total": {
+          "$ref": "#/$defs/measurement"
+        },
+        "qualification_total": {
+          "$ref": "#/$defs/measurement"
+        },
+        "configured_prefill_rows": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "allocated_prefill_rows": {
+          "$ref": "#/$defs/positive_integer"
+        }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cache_acquire_hits",
+        "cache_acquire_misses",
+        "cache_evictions",
+        "model_file_read_operations",
+        "model_file_read_bytes",
+        "model_file_read_ns",
+        "host_to_device_bytes",
+        "host_to_device_ns",
+        "page_advice_attempts",
+        "page_advice_bytes",
+        "page_advice_failures"
+      ],
+      "properties": {
+        "cache_acquire_hits": {
+          "$ref": "#/$defs/uint64"
+        },
+        "cache_acquire_misses": {
+          "$ref": "#/$defs/uint64"
+        },
+        "cache_evictions": {
+          "$ref": "#/$defs/uint64"
+        },
+        "model_file_read_operations": {
+          "$ref": "#/$defs/uint64"
+        },
+        "model_file_read_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "model_file_read_ns": {
+          "$ref": "#/$defs/uint64"
+        },
+        "host_to_device_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "host_to_device_ns": {
+          "$ref": "#/$defs/uint64"
+        },
+        "page_advice_attempts": {
+          "$ref": "#/$defs/uint64"
+        },
+        "page_advice_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "page_advice_failures": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "latched_snapshot_seq"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_config",
+            "overflow",
+            "unknown_callsite",
+            "duplicate_callsite",
+            "unclassified_callsite",
+            "capacity",
+            "duplicate_id",
+            "address_overflow",
+            "undercharge",
+            "overlap",
+            "callsite_bound",
+            "category_bound",
+            "owned_total_bound",
+            "report_bound",
+            "qualification_total_bound",
+            "relation",
+            "not_live",
+            "live_relation",
+            "external_attribution"
+          ]
+        },
+        "latched_snapshot_seq": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    }
+  }
+}

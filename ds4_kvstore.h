@@ -107,6 +107,20 @@ typedef struct {
     char *path;
 } ds4_kvstore_load_result;
 
+/* A read-only, request-local selection of one exact text-prefix checkpoint.
+ * state owns an open descriptor for the selected regular file.  Previewing
+ * never refreshes the cache index, touches hit counts, changes LRU state, or
+ * mutates a session.  ds4_kvstore_preview_text() initializes a fresh output;
+ * callers must free a successful preview before reusing the same object. */
+typedef struct {
+    int tokens;
+    int effective_tokens;
+    uint32_t text_bytes;
+    uint8_t quant_bits;
+    uint8_t ext_flags;
+    void *state;
+} ds4_kvstore_text_preview;
+
 ds4_kvstore_options ds4_kvstore_default_options(void);
 uint8_t ds4_kvstore_reason_code(const char *reason);
 const char *ds4_kvstore_key_kind(uint8_t ext_flags);
@@ -159,6 +173,26 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+
+int ds4_kvstore_preview_text(ds4_kvstore *kc,
+                             ds4_engine *engine,
+                             const char *prompt_text,
+                             int model_id,
+                             int quant_bits,
+                             int ctx_size,
+                             ds4_kvstore_text_preview *preview);
+/* Returns -1 when the selected path no longer names the exact open file, 0 on
+ * load failure, and the loaded token count on success. */
+int ds4_kvstore_load_text_preview(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        ds4_session *session,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_text_preview *preview,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol);
+void ds4_kvstore_text_preview_free(ds4_kvstore_text_preview *preview);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,

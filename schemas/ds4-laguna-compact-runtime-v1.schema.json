@@ -1,0 +1,566 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ds4.laguna.compact-runtime/v1",
+  "title": "DS4 Laguna compact-runtime qualification bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "created_at",
+    "status",
+    "subject",
+    "host",
+    "model",
+    "schemas",
+    "oracle",
+    "benchmark_manifest",
+    "global_gates",
+    "profiles",
+    "evidence_root_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "ds4.laguna.compact-runtime/v1" },
+    "created_at": { "$ref": "#/$defs/utc_timestamp" },
+    "status": { "$ref": "#/$defs/status" },
+    "subject": { "$ref": "#/$defs/subject" },
+    "host": { "$ref": "#/$defs/host" },
+    "model": { "$ref": "#/$defs/model" },
+    "schemas": { "$ref": "#/$defs/schema_records" },
+    "oracle": { "$ref": "#/$defs/oracle" },
+    "benchmark_manifest": { "$ref": "#/$defs/benchmark_manifest" },
+    "global_gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/gate" }
+    },
+    "profiles": { "$ref": "#/$defs/profiles" },
+    "evidence_root_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "uint64": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])(?![\\s\\S])"
+    },
+    "safe_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "positive_token_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "finite_nonnegative_number": {
+      "type": "number",
+      "minimum": 0,
+      "x-ds4-number-kind": "number"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^(?!0{64}(?![\\s\\S]))[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^(?!0{40}(?![\\s\\S]))[0-9a-f]{40}(?![\\s\\S])"
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^(?!00000000-0000-0000-0000-000000000000(?![\\s\\S]))[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+    },
+    "utc_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]{1,9})?Z(?![\\s\\S])"
+    },
+    "status": {
+      "enum": ["passed", "failed", "invalid"]
+    },
+    "stat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "inode", "size_bytes", "mtime_ns"],
+      "properties": {
+        "device": { "$ref": "#/$defs/uint64" },
+        "inode": { "$ref": "#/$defs/uint64" },
+        "size_bytes": { "$ref": "#/$defs/uint64" },
+        "mtime_ns": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "binary_sha256", "executable"],
+      "properties": {
+        "role": { "enum": ["server", "bench", "eval"] },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "executable": { "$ref": "#/$defs/stat" }
+      }
+    },
+    "binaries": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        { "$ref": "#/$defs/binary", "properties": { "role": { "const": "server" } } },
+        { "$ref": "#/$defs/binary", "properties": { "role": { "const": "bench" } } },
+        { "$ref": "#/$defs/binary", "properties": { "role": { "const": "eval" } } }
+      ],
+      "items": false
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "dirty", "version_sha256", "binaries"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/revision" },
+        "dirty": { "type": "boolean" },
+        "version_sha256": { "$ref": "#/$defs/sha256" },
+        "binaries": { "$ref": "#/$defs/binaries" }
+      }
+    },
+    "filesystem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mount_point", "type", "source", "device", "options"],
+      "properties": {
+        "mount_point": { "$ref": "#/$defs/identity" },
+        "type": { "$ref": "#/$defs/identity" },
+        "source": { "$ref": "#/$defs/identity" },
+        "device": { "type": "string", "pattern": "^[0-9]+:[0-9]+(?![\\s\\S])" },
+        "options": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "nvme": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "model", "serial", "firmware_revision"],
+      "properties": {
+        "device": { "$ref": "#/$defs/identity" },
+        "model": { "$ref": "#/$defs/identity" },
+        "serial": { "$ref": "#/$defs/identity" },
+        "firmware_revision": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "io": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direct_io", "cold_preparation_advice", "runtime_disposal_advice"],
+      "properties": {
+        "direct_io": { "type": "boolean" },
+        "cold_preparation_advice": { "$ref": "#/$defs/identity" },
+        "runtime_disposal_advice": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostname", "architecture", "kernel_release", "kernel_version", "cuda_driver_version", "cuda_runtime_version", "gpu_uuid", "filesystem", "nvme", "io"],
+      "properties": {
+        "hostname": { "$ref": "#/$defs/identity" },
+        "architecture": { "$ref": "#/$defs/identity" },
+        "kernel_release": { "$ref": "#/$defs/identity" },
+        "kernel_version": { "$ref": "#/$defs/identity" },
+        "cuda_driver_version": { "$ref": "#/$defs/identity" },
+        "cuda_runtime_version": { "$ref": "#/$defs/identity" },
+        "gpu_uuid": { "type": "string", "pattern": "^GPU-(?!00000000-0000-0000-0000-000000000000(?![\\s\\S]))[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![\\s\\S])" },
+        "filesystem": { "$ref": "#/$defs/filesystem" },
+        "nvme": { "$ref": "#/$defs/nvme" },
+        "io": { "$ref": "#/$defs/io" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "revision", "filename", "size_bytes", "sha256", "device", "inode", "mtime_ns", "served_model_id"],
+      "properties": {
+        "repository": { "const": "poolside/Laguna-S-2.1-GGUF" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "filename": { "const": "laguna-s-2.1-Q4_K_M.gguf" },
+        "size_bytes": { "$ref": "#/$defs/uint64" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "device": { "$ref": "#/$defs/uint64" },
+        "inode": { "$ref": "#/$defs/uint64" },
+        "mtime_ns": { "$ref": "#/$defs/uint64" },
+        "served_model_id": { "const": "laguna-s-2.1" }
+      }
+    },
+    "schema_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "sha256"],
+      "properties": {
+        "schema_id": { "$ref": "#/$defs/identity" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "schema_records": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        { "$ref": "#/$defs/schema_record", "properties": { "schema_id": { "const": "ds4.version/v1" } } },
+        { "$ref": "#/$defs/schema_record", "properties": { "schema_id": { "const": "ds4.runtime/v1" } } },
+        { "$ref": "#/$defs/schema_record", "properties": { "schema_id": { "const": "ds4.runtime.request/v1" } } },
+        { "$ref": "#/$defs/schema_record", "properties": { "schema_id": { "const": "ds4.token-admission/v1" } } },
+        { "$ref": "#/$defs/schema_record", "properties": { "schema_id": { "const": "ds4.laguna.compact-runtime/v1" } } },
+        { "$ref": "#/$defs/schema_record", "properties": { "schema_id": { "const": "ds4.compact-runtime-benchmark/v1" } } }
+      ],
+      "items": false
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "policy", "manifest_sha256", "tokenizer_runtime_revision", "llama_revision"],
+      "properties": {
+        "schema": { "const": "laguna-resident-promoted-v2" },
+        "policy": { "const": "single-poolside-v1" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "tokenizer_runtime_revision": { "$ref": "#/$defs/revision" },
+        "llama_revision": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "benchmark_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "sha256"],
+      "properties": {
+        "schema_id": { "const": "ds4.compact-runtime-benchmark/v1" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))[^\\u0000-\\u001F\\u007F]+(?![\\s\\S])" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidence_list": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "boolean_scalar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "const": "boolean" },
+        "value": { "type": "boolean" }
+      }
+    },
+    "uint64_scalar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "const": "uint64" },
+        "value": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "integer_scalar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "const": "integer" },
+        "value": { "$ref": "#/$defs/safe_integer" }
+      }
+    },
+    "number_scalar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "const": "number" },
+        "value": { "$ref": "#/$defs/finite_nonnegative_number" }
+      }
+    },
+    "scalar": {
+      "oneOf": [
+        { "$ref": "#/$defs/boolean_scalar" },
+        { "$ref": "#/$defs/uint64_scalar" },
+        { "$ref": "#/$defs/integer_scalar" },
+        { "$ref": "#/$defs/number_scalar" }
+      ]
+    },
+    "boolean_threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparison", "kind", "value"],
+      "properties": {
+        "comparison": { "enum": ["eq", "lt", "lte", "gt", "gte"] },
+        "kind": { "const": "boolean" },
+        "value": { "type": "boolean" }
+      }
+    },
+    "uint64_threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparison", "kind", "value"],
+      "properties": {
+        "comparison": { "enum": ["eq", "lt", "lte", "gt", "gte"] },
+        "kind": { "const": "uint64" },
+        "value": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "integer_threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparison", "kind", "value"],
+      "properties": {
+        "comparison": { "enum": ["eq", "lt", "lte", "gt", "gte"] },
+        "kind": { "const": "integer" },
+        "value": { "$ref": "#/$defs/safe_integer" }
+      }
+    },
+    "number_threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparison", "kind", "value"],
+      "properties": {
+        "comparison": { "enum": ["eq", "lt", "lte", "gt", "gte"] },
+        "kind": { "const": "number" },
+        "value": { "$ref": "#/$defs/finite_nonnegative_number" }
+      }
+    },
+    "threshold": {
+      "oneOf": [
+        { "$ref": "#/$defs/boolean_threshold" },
+        { "$ref": "#/$defs/uint64_threshold" },
+        { "$ref": "#/$defs/integer_threshold" },
+        { "$ref": "#/$defs/number_threshold" }
+      ]
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_id", "status", "measured", "threshold", "unit", "evidence"],
+      "properties": {
+        "gate_id": { "$ref": "#/$defs/identity" },
+        "status": { "$ref": "#/$defs/status" },
+        "measured": { "$ref": "#/$defs/scalar" },
+        "threshold": { "$ref": "#/$defs/threshold" },
+        "unit": { "enum": ["boolean", "bytes", "count", "ratio", "seconds"] },
+        "evidence": { "$ref": "#/$defs/evidence_list" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "unit": { "const": "boolean" } } },
+          "then": { "properties": { "measured": { "$ref": "#/$defs/boolean_scalar" }, "threshold": { "$ref": "#/$defs/boolean_threshold" } } }
+        },
+        {
+          "if": { "properties": { "unit": { "const": "bytes" } } },
+          "then": { "properties": { "measured": { "$ref": "#/$defs/uint64_scalar" }, "threshold": { "$ref": "#/$defs/uint64_threshold" } } }
+        },
+        {
+          "if": { "properties": { "unit": { "const": "count" } } },
+          "then": { "properties": { "measured": { "$ref": "#/$defs/integer_scalar" }, "threshold": { "$ref": "#/$defs/integer_threshold" } } }
+        },
+        {
+          "if": { "properties": { "unit": { "enum": ["ratio", "seconds"] } } },
+          "then": { "properties": { "measured": { "$ref": "#/$defs/number_scalar" }, "threshold": { "$ref": "#/$defs/number_threshold" } } }
+        }
+      ]
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context_tokens", "prefill_chunk_tokens", "session_slots", "ssd_streaming", "ssd_streaming_cache_bytes"],
+      "properties": {
+        "context_tokens": { "$ref": "#/$defs/positive_token_count" },
+        "prefill_chunk_tokens": { "$ref": "#/$defs/positive_token_count" },
+        "session_slots": { "$ref": "#/$defs/positive_token_count" },
+        "ssd_streaming": { "type": "boolean" },
+        "ssd_streaming_cache_bytes": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "category_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["static_weights", "expert_cache_payload", "cache_metadata_address_tables", "kv_state", "graph_scratch", "pinned_staging", "other_host", "other_cuda"],
+      "properties": {
+        "static_weights": { "$ref": "#/$defs/uint64" },
+        "expert_cache_payload": { "$ref": "#/$defs/uint64" },
+        "cache_metadata_address_tables": { "$ref": "#/$defs/uint64" },
+        "kv_state": { "$ref": "#/$defs/uint64" },
+        "graph_scratch": { "$ref": "#/$defs/uint64" },
+        "pinned_staging": { "$ref": "#/$defs/uint64" },
+        "other_host": { "$ref": "#/$defs/uint64" },
+        "other_cuda": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "report_bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_mapped_virtual", "model_mapping_registered", "model_source_resident", "host_library_unattributed", "cuda_library_unattributed"],
+      "properties": {
+        "model_mapped_virtual": { "$ref": "#/$defs/uint64" },
+        "model_mapping_registered": { "$ref": "#/$defs/uint64" },
+        "model_source_resident": { "$ref": "#/$defs/uint64" },
+        "host_library_unattributed": { "$ref": "#/$defs/uint64" },
+        "cuda_library_unattributed": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories", "reports", "owned_non_cache_bytes", "owned_total_bytes", "qualification_non_cache_bytes", "qualification_total_bytes"],
+      "properties": {
+        "categories": { "$ref": "#/$defs/category_bounds" },
+        "reports": { "$ref": "#/$defs/report_bounds" },
+        "owned_non_cache_bytes": { "$ref": "#/$defs/uint64" },
+        "owned_total_bytes": { "$ref": "#/$defs/uint64" },
+        "qualification_non_cache_bytes": { "$ref": "#/$defs/uint64" },
+        "qualification_total_bytes": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "benchmark_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_id", "prompt_tokens", "repetition", "mode", "request_id", "instance_id", "snapshot_seq", "ttft_ns", "wall_time_ns", "visible_decode_tokens_per_second", "qualification_total_peak_bytes", "model_inode_resident_bytes", "terminal_status", "request_metrics_sha256", "evidence"],
+      "properties": {
+        "prompt_id": { "enum": ["native-512", "native-2048", "native-8192", "native-28672"] },
+        "prompt_tokens": { "$ref": "#/$defs/positive_token_count" },
+        "repetition": { "enum": ["cold", "warm-1", "warm-2", "warm-3"] },
+        "mode": { "const": "streamed" },
+        "request_id": { "$ref": "#/$defs/uuid" },
+        "instance_id": { "$ref": "#/$defs/uuid" },
+        "snapshot_seq": { "$ref": "#/$defs/uint64" },
+        "ttft_ns": { "$ref": "#/$defs/uint64" },
+        "wall_time_ns": { "$ref": "#/$defs/uint64" },
+        "visible_decode_tokens_per_second": { "$ref": "#/$defs/finite_nonnegative_number" },
+        "qualification_total_peak_bytes": { "$ref": "#/$defs/uint64" },
+        "model_inode_resident_bytes": { "$ref": "#/$defs/uint64" },
+        "terminal_status": { "enum": ["completed", "cancelled", "rejected", "recoverable_error", "unsafe_error"] },
+        "request_metrics_sha256": { "$ref": "#/$defs/sha256" },
+        "evidence": { "$ref": "#/$defs/evidence_list" }
+      }
+    },
+    "sample_512_cold": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-512" }, "repetition": { "const": "cold" } } },
+    "sample_512_warm_1": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-512" }, "repetition": { "const": "warm-1" } } },
+    "sample_512_warm_2": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-512" }, "repetition": { "const": "warm-2" } } },
+    "sample_512_warm_3": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-512" }, "repetition": { "const": "warm-3" } } },
+    "sample_2048_cold": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-2048" }, "repetition": { "const": "cold" } } },
+    "sample_2048_warm_1": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-2048" }, "repetition": { "const": "warm-1" } } },
+    "sample_2048_warm_2": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-2048" }, "repetition": { "const": "warm-2" } } },
+    "sample_2048_warm_3": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-2048" }, "repetition": { "const": "warm-3" } } },
+    "sample_8192_cold": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-8192" }, "repetition": { "const": "cold" } } },
+    "sample_8192_warm_1": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-8192" }, "repetition": { "const": "warm-1" } } },
+    "sample_8192_warm_2": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-8192" }, "repetition": { "const": "warm-2" } } },
+    "sample_8192_warm_3": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-8192" }, "repetition": { "const": "warm-3" } } },
+    "sample_28672_cold": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-28672" }, "repetition": { "const": "cold" } } },
+    "sample_28672_warm_1": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-28672" }, "repetition": { "const": "warm-1" } } },
+    "sample_28672_warm_2": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-28672" }, "repetition": { "const": "warm-2" } } },
+    "sample_28672_warm_3": { "$ref": "#/$defs/benchmark_sample", "properties": { "prompt_id": { "const": "native-28672" }, "repetition": { "const": "warm-3" } } },
+    "samples_8": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "prefixItems": [
+        { "$ref": "#/$defs/sample_512_cold" }, { "$ref": "#/$defs/sample_512_warm_1" }, { "$ref": "#/$defs/sample_512_warm_2" }, { "$ref": "#/$defs/sample_512_warm_3" },
+        { "$ref": "#/$defs/sample_2048_cold" }, { "$ref": "#/$defs/sample_2048_warm_1" }, { "$ref": "#/$defs/sample_2048_warm_2" }, { "$ref": "#/$defs/sample_2048_warm_3" },
+        { "$ref": "#/$defs/sample_28672_cold" }, { "$ref": "#/$defs/sample_28672_warm_1" }, { "$ref": "#/$defs/sample_28672_warm_2" }, { "$ref": "#/$defs/sample_28672_warm_3" },
+        { "$ref": "#/$defs/sample_8192_cold" }, { "$ref": "#/$defs/sample_8192_warm_1" }, { "$ref": "#/$defs/sample_8192_warm_2" }, { "$ref": "#/$defs/sample_8192_warm_3" }
+      ],
+      "items": false
+    },
+    "samples_12": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "prefixItems": [
+        { "$ref": "#/$defs/sample_2048_cold" }, { "$ref": "#/$defs/sample_2048_warm_1" }, { "$ref": "#/$defs/sample_2048_warm_2" }, { "$ref": "#/$defs/sample_2048_warm_3" },
+        { "$ref": "#/$defs/sample_8192_cold" }, { "$ref": "#/$defs/sample_8192_warm_1" }, { "$ref": "#/$defs/sample_8192_warm_2" }, { "$ref": "#/$defs/sample_8192_warm_3" },
+        { "$ref": "#/$defs/sample_512_cold" }, { "$ref": "#/$defs/sample_512_warm_1" }, { "$ref": "#/$defs/sample_512_warm_2" }, { "$ref": "#/$defs/sample_512_warm_3" },
+        { "$ref": "#/$defs/sample_28672_cold" }, { "$ref": "#/$defs/sample_28672_warm_1" }, { "$ref": "#/$defs/sample_28672_warm_2" }, { "$ref": "#/$defs/sample_28672_warm_3" }
+      ],
+      "items": false
+    },
+    "samples_16": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "prefixItems": [
+        { "$ref": "#/$defs/sample_8192_cold" }, { "$ref": "#/$defs/sample_8192_warm_1" }, { "$ref": "#/$defs/sample_8192_warm_2" }, { "$ref": "#/$defs/sample_8192_warm_3" },
+        { "$ref": "#/$defs/sample_28672_cold" }, { "$ref": "#/$defs/sample_28672_warm_1" }, { "$ref": "#/$defs/sample_28672_warm_2" }, { "$ref": "#/$defs/sample_28672_warm_3" },
+        { "$ref": "#/$defs/sample_2048_cold" }, { "$ref": "#/$defs/sample_2048_warm_1" }, { "$ref": "#/$defs/sample_2048_warm_2" }, { "$ref": "#/$defs/sample_2048_warm_3" },
+        { "$ref": "#/$defs/sample_512_cold" }, { "$ref": "#/$defs/sample_512_warm_1" }, { "$ref": "#/$defs/sample_512_warm_2" }, { "$ref": "#/$defs/sample_512_warm_3" }
+      ],
+      "items": false
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resident_peak_bytes", "streamed_peak_bytes", "reduction_bytes", "reduction_ratio", "benchmark_samples", "model_inode_resident_bytes"],
+      "properties": {
+        "resident_peak_bytes": { "$ref": "#/$defs/uint64" },
+        "streamed_peak_bytes": { "$ref": "#/$defs/uint64" },
+        "reduction_bytes": { "$ref": "#/$defs/uint64" },
+        "reduction_ratio": { "$ref": "#/$defs/finite_nonnegative_number" },
+        "benchmark_samples": { "type": "array", "minItems": 16, "maxItems": 16, "items": { "$ref": "#/$defs/benchmark_sample" } },
+        "model_inode_resident_bytes": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "results_8": { "$ref": "#/$defs/results", "properties": { "benchmark_samples": { "$ref": "#/$defs/samples_8" } } },
+    "results_12": { "$ref": "#/$defs/results", "properties": { "benchmark_samples": { "$ref": "#/$defs/samples_12" } } },
+    "results_16": { "$ref": "#/$defs/results", "properties": { "benchmark_samples": { "$ref": "#/$defs/samples_16" } } },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "evidence"],
+      "properties": {
+        "code": { "enum": ["gate_failed", "infrastructure_invalid", "identity_mismatch", "evidence_invalid", "timeout", "process_failed"] },
+        "message": { "$ref": "#/$defs/identity" },
+        "evidence": { "$ref": "#/$defs/evidence_list" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_manifest_sha256", "config", "allocation_plan_sha256", "bounds", "status", "gates", "results", "failure"],
+      "properties": {
+        "profile_id": { "enum": ["cache-8gib", "cache-12gib", "cache-16gib"] },
+        "profile_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "config": { "$ref": "#/$defs/config" },
+        "allocation_plan_sha256": { "$ref": "#/$defs/sha256" },
+        "bounds": { "$ref": "#/$defs/bounds" },
+        "status": { "$ref": "#/$defs/status" },
+        "gates": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/gate" } },
+        "results": { "$ref": "#/$defs/results" },
+        "failure": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/failure" }] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "passed" } } },
+          "then": { "properties": { "failure": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["failed", "invalid"] } } },
+          "then": { "properties": { "failure": { "$ref": "#/$defs/failure" } } }
+        }
+      ]
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        { "$ref": "#/$defs/profile", "properties": { "profile_id": { "const": "cache-8gib" }, "results": { "$ref": "#/$defs/results_8" } } },
+        { "$ref": "#/$defs/profile", "properties": { "profile_id": { "const": "cache-12gib" }, "results": { "$ref": "#/$defs/results_12" } } },
+        { "$ref": "#/$defs/profile", "properties": { "profile_id": { "const": "cache-16gib" }, "results": { "$ref": "#/$defs/results_16" } } }
+      ],
+      "items": false
+    }
+  }
+}

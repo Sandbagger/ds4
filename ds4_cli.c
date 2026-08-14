@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -61,13 +62,16 @@ static bool cli_greedy_argmax_requested(bool speculative_requested) {
 typedef struct {
     const char *prompt;
     const char *system;
+    bool system_set;
     bool raw_prompt;
     int n_predict;
     int ctx_size;
     float temperature;
+    int top_k;
     float top_p;
     float min_p;
     bool temperature_set;
+    bool top_k_set;
     bool top_p_set;
     bool min_p_set;
     uint64_t seed;
@@ -356,6 +360,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
 static bool is_rendered_chat_prompt(const char *prompt) {
     static const char *prefixes[] = {
+        "〈|EOS|〉",
         "<｜begin▁of▁sentence｜>",
         "<｜User｜>",
         "[gMASK]",
@@ -511,11 +516,14 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
-
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!engine || !gen) return;
+    float temperature, top_p, min_p;
+    int top_k;
+    ds4_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!gen->temperature_set) gen->temperature = temperature;
+    if (!gen->top_k_set) gen->top_k = top_k;
+    if (!gen->top_p_set) gen->top_p = top_p;
+    if (!gen->min_p_set) gen->min_p = min_p;
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -590,7 +598,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(session, cfg->gen.temperature, 0,
+            token = ds4_session_sample(session, cfg->gen.temperature, cfg->gen.top_k,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
@@ -756,7 +764,7 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     ds4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+    if (ds4_session_sync_logits_only(session, prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
@@ -1344,7 +1352,7 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
-    } else if (mode == DS4_THINK_MAX) {
+    } else if (!ds4_engine_is_laguna(engine) && mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(engine, prefix);
     }
 }
@@ -1409,10 +1417,6 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
     chat->session = NULL;
     chat->ctx_size = 0;
     return repl_chat_create_session(engine, chat, ctx_size);
-}
-
-static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
-    return !ds4_engine_is_glm_dsa(engine);
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
@@ -1496,7 +1500,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         } else {
             token = ds4_session_sample(chat->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -1566,8 +1570,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
         ds4_session_invalidate(chat->session);
-    } else if (repl_chat_assistant_turn_uses_eos(engine)) {
-        ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
+    } else {
+        ds4_chat_append_assistant_end(engine, &chat->transcript);
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -1764,7 +1768,7 @@ static cli_config parse_options(int argc, char **argv) {
         },
         .gen = {
             .prompt = NULL,
-            .system = "You are a helpful assistant",
+            .system = NULL,
             .n_predict = 50000,
             .ctx_size = 32768,
             .temperature = DS4_DEFAULT_TEMPERATURE,
@@ -1833,10 +1837,34 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.prompt = c.prompt_owned;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
+            c.gen.system_set = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.engine.qualification_plan_path_set) {
+                fprintf(stderr,
+                        "ds4: --qualification-plan may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4: --qualification-plan requires a non-empty path\n");
+                exit(2);
+            }
+            c.engine.qualification_plan_path = path;
+            c.engine.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.engine.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.engine.qualification_control_fd =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -1865,6 +1893,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
@@ -1879,7 +1910,33 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes must be canonical positive decimal bytes\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_experts_set) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_bytes_set &&
+                c.engine.ssd_streaming_cache_bytes != bytes) {
+                fprintf(stderr,
+                        "ds4: conflicting --ssd-streaming-cache-bytes values\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.engine.ssd_streaming_cache_bytes_set) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -1890,6 +1947,7 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssd_streaming_full_layers = (uint32_t)v;
@@ -2056,7 +2114,73 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     cli_config cfg = parse_options(argc, argv);
+    cfg.engine.runtime_build_info = ds4_build_info_get();
+    cfg.engine.inspect_only = cfg.inspect;
+    cfg.engine.first_token_test = cfg.gen.first_token_test;
+    cfg.engine.metal_graph_test = cfg.gen.metal_graph_test ||
+                                  cfg.gen.metal_graph_full_test ||
+                                  cfg.gen.metal_graph_prompt_test;
+    cfg.engine.context_size = cfg.gen.ctx_size;
+    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    if (cfg.engine.qualification_plan_path_set) {
+        if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+            fprintf(stderr,
+                    "ds4: --qualification-plan cannot be combined with "
+                    "--gpu-vram or --gpu-devices\n");
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &cfg.engine, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) fprintf(stderr, "ds4: %s\n", plan_err);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return plan_rc;
+    }
+    ds4_gpu_config gpu_cfg = {0};
+    bool gpu_cfg_set = false;
+    bool skip_cuda = false;
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               errbuf, sizeof(errbuf)) != 0) {
+            fprintf(stderr, "ds4: %s\n", errbuf);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+        gpu_cfg_set = !skip_cuda;
+    }
+    char preflight_err[256];
+    const int preflight_rc =
+        ds4_engine_options_preflight_with_gpu_config(
+            &cfg.engine,
+            gpu_cfg_set ? &gpu_cfg : NULL,
+            preflight_err,
+            sizeof(preflight_err));
+    if (preflight_rc != 0) {
+        fprintf(stderr, "ds4: %s\n", preflight_err);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return preflight_rc;
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
@@ -2070,30 +2194,14 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    cfg.engine.inspect_only = cfg.inspect;
-    cfg.engine.first_token_test = cfg.gen.first_token_test;
-    cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
-    cfg.engine.context_size = cfg.gen.ctx_size;
-    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
-        ds4_gpu_config gpu_cfg = {0};
-        bool skip_cuda = false;
-        char errbuf[256];
-        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               errbuf, sizeof(errbuf)) != 0) {
-            fprintf(stderr, "ds4: %s\n", errbuf);
-            ds4_dist_options_free(cfg.dist);
-            free(cfg.prompt_owned);
-            return 2;
-        }
-        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+            const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+            if (open_rc != 0) {
                 ds4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
-                return 1;
+                return open_rc;
             }
         } else {
             const bool was_auto =
@@ -2105,19 +2213,26 @@ int main(int argc, char **argv) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
             }
-            if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
-                                                   &gpu_cfg) != 0) {
+            const int open_rc = ds4_engine_create_with_gpu_config(
+                    &engine, &cfg.engine, &gpu_cfg);
+            if (open_rc != 0) {
                 ds4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
-                return 1;
+                return open_rc;
             }
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        ds4_dist_options_free(cfg.dist);
-        free(cfg.prompt_owned);
-        return 1;
+    } else {
+        const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+        if (open_rc != 0) {
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return open_rc;
+        }
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (!cfg.gen.system_set) {
+        cfg.gen.system = ds4_engine_default_system_prompt(engine);
+    }
     if (cfg.engine.tp.role == DS4_TP_WORKER) {
         int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);

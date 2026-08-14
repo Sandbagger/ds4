@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -27,6 +28,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *qualification_plan_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -35,6 +37,7 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     ds4_backend backend;
+    int qualification_control_fd;
     int threads;
     int ctx_start;
     int ctx_max;
@@ -55,7 +58,11 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_cache_experts_set;
+    bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
+    bool qualification_plan_path_set;
+    bool qualification_control_fd_set;
     bool cuda_tensor_parallel;
     bool show_output;
 } bench_config;
@@ -236,6 +243,29 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.qualification_plan_path_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-plan may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-plan requires a non-empty path\n");
+                exit(2);
+            }
+            c.qualification_plan_path = path;
+            c.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.qualification_control_fd =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -287,7 +317,33 @@ static bench_config parse_options(int argc, char **argv) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4-bench: --ssd-streaming-cache-bytes must be canonical positive decimal bytes\n");
+                exit(2);
+            }
+            if (c.ssd_streaming_cache_experts_set) {
+                fprintf(stderr,
+                        "ds4-bench: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
+            if (c.ssd_streaming_cache_bytes_set &&
+                c.ssd_streaming_cache_bytes != bytes) {
+                fprintf(stderr,
+                        "ds4-bench: conflicting --ssd-streaming-cache-bytes values\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_bytes = bytes;
+            c.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.ssd_streaming_cache_bytes_set) {
+                fprintf(stderr,
+                        "ds4-bench: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -298,6 +354,7 @@ static bench_config parse_options(int argc, char **argv) {
             }
             c.ssd_streaming_cache_experts = experts;
             c.ssd_streaming_cache_bytes = bytes;
+            c.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.ssd_streaming_full_layers = (uint32_t)v;
@@ -334,6 +391,8 @@ static bench_config parse_options(int argc, char **argv) {
             exit(2);
         }
     }
+
+    if (c.qualification_plan_path_set) return c;
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
@@ -552,6 +611,18 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_BENCH,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4-bench: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     bench_config cfg = parse_options(argc, argv);
 
     /* Hint the packer at the largest ctx this bench run will exercise
@@ -560,22 +631,12 @@ int main(int argc, char **argv) {
     int placement_ctx_hint = cfg.ctx_max;
     if (cfg.ctx_alloc > placement_ctx_hint) placement_ctx_hint = cfg.ctx_alloc;
 
-    ds4_gpu_config gpu_cfg = {0};
-    bool skip_cuda = false;
-    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
-    if (have_gpu_config) {
-        char gpu_err[256];
-        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               gpu_err, sizeof(gpu_err)) != 0) {
-            fprintf(stderr, "ds4-bench: %s\n", gpu_err);
-            return 2;
-        }
-        cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
-    }
-
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .runtime_build_info = ds4_build_info_get(),
+        .qualification_plan_path = cfg.qualification_plan_path,
+        .qualification_control_fd = cfg.qualification_control_fd,
+        .qualification_control_fd_set = cfg.qualification_control_fd_set,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -591,10 +652,44 @@ int main(int argc, char **argv) {
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_cache_experts_set =
+            cfg.ssd_streaming_cache_experts_set,
+        .ssd_streaming_cache_bytes_set = cfg.ssd_streaming_cache_bytes_set,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .qualification_plan_path_set = cfg.qualification_plan_path_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
+
+    ds4_gpu_config gpu_cfg = {0};
+    bool skip_cuda = false;
+    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
+    if (cfg.qualification_plan_path_set) {
+        if (have_gpu_config) {
+            fprintf(stderr,
+                    "ds4-bench: --qualification-plan cannot be combined "
+                    "with --gpu-vram or --gpu-devices\n");
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &opt, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", plan_err);
+        }
+        return plan_rc;
+    }
+    if (have_gpu_config) {
+        char gpu_err[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               gpu_err, sizeof(gpu_err)) != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", gpu_err);
+            return 2;
+        }
+        cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+        opt.backend = cfg.backend;
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
@@ -611,10 +706,12 @@ int main(int argc, char **argv) {
             fprintf(stdout, "%s\n", layout);
             fflush(stdout);
         }
-        if (ds4_engine_create_with_gpu_config(
-                &engine, &opt, &gpu_cfg) != 0) return 1;
-    } else if (ds4_engine_open(&engine, &opt) != 0) {
-        return 1;
+        const int open_rc = ds4_engine_create_with_gpu_config(
+                &engine, &opt, &gpu_cfg);
+        if (open_rc != 0) return open_rc;
+    } else {
+        const int open_rc = ds4_engine_open(&engine, &opt);
+        if (open_rc != 0) return open_rc;
     }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,

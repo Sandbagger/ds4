@@ -12,6 +12,8 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1212,6 +1214,345 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
+typedef struct {
+    FILE *fp;
+    char *path;
+    char *suffix;
+    ds4_kvstore_entry hdr;
+    struct stat identity;
+    off_t payload_offset;
+} kv_text_preview_state;
+
+static FILE *kv_open_regular_nofollow(const char *path, struct stat *identity) {
+    struct stat before = {0};
+    if (!path || lstat(path, &before) != 0 || !S_ISREG(before.st_mode)) {
+        return NULL;
+    }
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) return NULL;
+    struct stat opened = {0};
+    if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) ||
+        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino)
+    {
+        close(fd);
+        return NULL;
+    }
+    FILE *fp = fdopen(fd, "rb");
+    if (!fp) {
+        close(fd);
+        return NULL;
+    }
+    if (identity) *identity = opened;
+    return fp;
+}
+
+static bool kv_stat_identity_matches(const struct stat *expected,
+                                     const struct stat *actual) {
+#if defined(__APPLE__)
+    const bool times_match =
+        expected->st_mtimespec.tv_sec == actual->st_mtimespec.tv_sec &&
+        expected->st_mtimespec.tv_nsec == actual->st_mtimespec.tv_nsec &&
+        expected->st_ctimespec.tv_sec == actual->st_ctimespec.tv_sec &&
+        expected->st_ctimespec.tv_nsec == actual->st_ctimespec.tv_nsec;
+#else
+    const bool times_match =
+        expected->st_mtim.tv_sec == actual->st_mtim.tv_sec &&
+        expected->st_mtim.tv_nsec == actual->st_mtim.tv_nsec &&
+        expected->st_ctim.tv_sec == actual->st_ctim.tv_sec &&
+        expected->st_ctim.tv_nsec == actual->st_ctim.tv_nsec;
+#endif
+    return expected->st_dev == actual->st_dev &&
+           expected->st_ino == actual->st_ino &&
+           expected->st_size == actual->st_size &&
+           times_match;
+}
+
+static bool kv_preview_path_matches(const kv_text_preview_state *state) {
+    if (!state || !state->fp || !state->path) return false;
+    struct stat named = {0};
+    struct stat opened = {0};
+    if (lstat(state->path, &named) != 0 || !S_ISREG(named.st_mode) ||
+        fstat(fileno(state->fp), &opened) != 0 || !S_ISREG(opened.st_mode))
+    {
+        return false;
+    }
+    return kv_stat_identity_matches(&state->identity, &named) &&
+           kv_stat_identity_matches(&state->identity, &opened);
+}
+
+static bool kv_touch_preview_file(const kv_text_preview_state *state,
+                                  uint32_t hits) {
+    if (!state || !state->path) return false;
+    int flags = O_RDWR;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(state->path, flags);
+    if (fd < 0) return false;
+    struct stat opened = {0};
+    bool ok = fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) &&
+        kv_stat_identity_matches(&state->identity, &opened);
+    if (ok) {
+        uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+        ds4_kvstore_fill_header(
+            h, state->hdr.model_id, state->hdr.quant_bits,
+            state->hdr.reason, state->hdr.ext_flags, state->hdr.tokens, hits,
+            state->hdr.ctx_size, state->hdr.created_at,
+            (uint64_t)time(NULL), state->hdr.payload_bytes);
+        ok = pwrite(fd, h, sizeof(h), 0) == (ssize_t)sizeof(h);
+    }
+    close(fd);
+    return ok;
+}
+
+void ds4_kvstore_text_preview_free(ds4_kvstore_text_preview *preview) {
+    if (!preview) return;
+    kv_text_preview_state *state = preview->state;
+    if (state) {
+        if (state->fp) fclose(state->fp);
+        free(state->path);
+        free(state->suffix);
+        free(state);
+    }
+    memset(preview, 0, sizeof(*preview));
+}
+
+int ds4_kvstore_preview_text(ds4_kvstore *kc,
+                             ds4_engine *engine,
+                             const char *prompt_text,
+                             int model_id,
+                             int quant_bits,
+                             int ctx_size,
+                             ds4_kvstore_text_preview *preview) {
+    if (!preview) return 0;
+    memset(preview, 0, sizeof(*preview));
+    if (!kc || !kc->enabled || !kc->dir || !prompt_text ||
+        model_id < 0 || model_id > UINT8_MAX ||
+        (quant_bits != 2 && quant_bits != 4) || ctx_size <= 0)
+    {
+        return 0;
+    }
+
+    const size_t prompt_bytes = strlen(prompt_text);
+    DIR *dir = opendir(kc->dir);
+    if (!dir) return 0;
+    kv_text_preview_state *best = NULL;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        char filename_sha[41];
+        if (!ds4_kvstore_sha_hex_name(de->d_name, filename_sha)) continue;
+        char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
+        struct stat identity = {0};
+        FILE *fp = kv_open_regular_nofollow(path, &identity);
+        if (!fp) {
+            free(path);
+            continue;
+        }
+
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        bool valid = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+            hdr.model_id == (uint8_t)model_id &&
+            hdr.tokens <= (uint32_t)INT_MAX &&
+            hdr.tokens >= (uint32_t)kc->opt.min_tokens &&
+            hdr.ctx_size <= (uint32_t)ctx_size &&
+            (!kc->reject_different_quant ||
+             hdr.quant_bits == (uint8_t)quant_bits) &&
+            (uint64_t)text_bytes <= (uint64_t)prompt_bytes;
+        const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
+        if (valid &&
+            (UINT64_MAX - fixed < (uint64_t)text_bytes ||
+             UINT64_MAX - fixed - (uint64_t)text_bytes < hdr.payload_bytes ||
+             fixed + (uint64_t)text_bytes + hdr.payload_bytes >
+                 (uint64_t)identity.st_size))
+        {
+            valid = false;
+        }
+
+        char *cached_text = NULL;
+        if (valid) {
+            cached_text = kv_xmalloc((size_t)text_bytes + 1);
+            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
+                valid = false;
+            } else {
+                cached_text[text_bytes] = '\0';
+                char text_sha[41];
+                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                valid = !strcmp(text_sha, filename_sha) &&
+                    ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
+                                                   cached_text, text_bytes);
+            }
+        }
+        free(cached_text);
+        struct stat verified = {0};
+        if (valid &&
+            (fstat(fileno(fp), &verified) != 0 ||
+             !kv_stat_identity_matches(&identity, &verified)))
+        {
+            valid = false;
+        }
+
+        if (valid && best &&
+            (hdr.text_bytes < best->hdr.text_bytes ||
+             (hdr.text_bytes == best->hdr.text_bytes &&
+              hdr.tokens <= best->hdr.tokens)))
+        {
+            valid = false;
+        }
+        if (!valid) {
+            fclose(fp);
+            free(path);
+            continue;
+        }
+
+        const char *suffix_text = prompt_text + text_bytes;
+        int effective_tokens = (int)hdr.tokens;
+        if (suffix_text[0]) {
+            if (!engine) {
+                fclose(fp);
+                free(path);
+                continue;
+            }
+            ds4_tokens suffix_tokens = {0};
+            ds4_tokenize_rendered_chat(engine, suffix_text, &suffix_tokens);
+            if (suffix_tokens.len < 0 ||
+                suffix_tokens.len > INT_MAX - effective_tokens)
+            {
+                ds4_tokens_free(&suffix_tokens);
+                fclose(fp);
+                free(path);
+                continue;
+            }
+            effective_tokens += suffix_tokens.len;
+            ds4_tokens_free(&suffix_tokens);
+        }
+
+        if (best) {
+            fclose(best->fp);
+            free(best->path);
+            free(best->suffix);
+            free(best);
+        }
+        best = kv_xmalloc(sizeof(*best));
+        memset(best, 0, sizeof(*best));
+        best->fp = fp;
+        best->path = path;
+        best->suffix = kv_xstrdup(suffix_text);
+        best->hdr = hdr;
+        memcpy(best->hdr.sha, filename_sha, sizeof(best->hdr.sha));
+        best->identity = identity;
+        best->payload_offset = (off_t)(fixed + (uint64_t)text_bytes);
+        preview->tokens = (int)hdr.tokens;
+        preview->effective_tokens = effective_tokens;
+        preview->text_bytes = text_bytes;
+        preview->quant_bits = hdr.quant_bits;
+        preview->ext_flags = hdr.ext_flags;
+    }
+    closedir(dir);
+    if (!best) return 0;
+    preview->state = best;
+    return preview->tokens;
+}
+
+int ds4_kvstore_load_text_preview(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        ds4_session *session,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_text_preview *preview,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol) {
+    if (result) memset(result, 0, sizeof(*result));
+    if (effective_prompt) effective_prompt->len = 0;
+    if (!kc || !preview || !preview->state) return 0;
+    kv_text_preview_state *state = preview->state;
+    if (!kv_preview_path_matches(state)) return -1;
+    if (!engine || !session ||
+        fseeko(state->fp, state->payload_offset, SEEK_SET) != 0)
+    {
+        return 0;
+    }
+
+    const double load_t0 = kv_now_sec();
+    char err[160] = {0};
+    if (ds4_session_load_payload(session, state->fp, state->hdr.payload_bytes,
+                                 err, sizeof(err)) != 0)
+    {
+        ds4_session_invalidate(session);
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
+                kv_log_name(kc),
+                responses_protocol ? " " : "",
+                responses_protocol ? "RESPPROTO" : "",
+                state->path, err[0] ? err : "invalid payload",
+                (kv_now_sec() - load_t0) * 1000.0);
+        return 0;
+    }
+
+    const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
+    if (!loaded_tokens || loaded_tokens->len != (int)state->hdr.tokens) {
+        ds4_session_invalidate(session);
+        return 0;
+    }
+    if (effective_prompt) {
+        ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+            engine, loaded_tokens, state->suffix, effective_prompt);
+        if (effective_prompt->len != preview->effective_tokens) {
+            ds4_tokens_free(effective_prompt);
+            ds4_session_invalidate(session);
+            return 0;
+        }
+    }
+    if (hooks && hooks->load && (state->hdr.ext_flags & hooks->ext_flag)) {
+        hooks->load(hooks->ud, state->fp, hooks->load_wanted);
+    }
+
+    const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
+    bool consumed = false;
+    /* Loading is bound to the preview's descriptor.  Only update cache policy
+     * state if the path still names that exact file after the payload load. */
+    if (kv_preview_path_matches(state)) {
+        kc->continued_last_store_tokens = (int)state->hdr.tokens;
+        if (!(kc->opt.cold_max_tokens > 0 &&
+              (int)state->hdr.tokens > kc->opt.cold_max_tokens)) {
+            (void)kv_touch_preview_file(state, state->hdr.hits + 1);
+        }
+        /* Do not unlink an oversized one-shot checkpoint by pathname after
+         * descriptor-bound selection: another process may replace that name.
+         * Leave consumed=false and let ordinary cache eviction clean it up. */
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache hit text%s%s tokens=%u text=%u quant=%u key=%s load=%.1f ms%s file=%s",
+                kv_log_name(kc),
+                responses_protocol ? " " : "",
+                responses_protocol ? "RESPPROTO" : "",
+                state->hdr.tokens, state->hdr.text_bytes,
+                state->hdr.quant_bits,
+                ds4_kvstore_key_kind(state->hdr.ext_flags), load_ms,
+                consumed ? " consumed" : "", state->path);
+    }
+    if (result) {
+        result->tokens = (int)state->hdr.tokens;
+        result->text_bytes = preview->text_bytes;
+        result->quant_bits = state->hdr.quant_bits;
+        result->ext_flags = state->hdr.ext_flags;
+        result->load_ms = load_ms;
+        result->consumed = consumed;
+        result->path = kv_xstrdup(state->path);
+    }
+    return (int)state->hdr.tokens;
+}
+
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
@@ -1222,134 +1563,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               bool responses_protocol) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
-    if (!kc->enabled || !prompt_text) return 0;
+    if (!kc || !engine || !session || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
-    const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
-    if (idx < 0) return 0;
-
-    ds4_kvstore_entry e = kc->entry[idx];
-    char *path = kv_xstrdup(e.path);
-    const double load_t0 = kv_now_sec();
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        free(path);
-        return 0;
-    }
-    uint32_t text_bytes = 0;
-    ds4_kvstore_entry hdr = {0};
-    const char *fail_reason = "invalid header";
-    bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
-    char *cached_text = NULL;
-    if (header_ok) {
-        if (hdr.model_id != (uint8_t)model_id) {
-            header_ok = false;
-            fail_reason = "cached checkpoint was written for a different model";
-        } else if ((uint64_t)text_bytes > prompt_bytes) {
-            header_ok = false;
-            fail_reason = "cached text is longer than prompt";
-        } else {
-            cached_text = kv_xmalloc((size_t)text_bytes + 1);
-            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
-                header_ok = false;
-                fail_reason = "truncated cached text";
-            } else {
-                cached_text[text_bytes] = '\0';
-                char text_sha[41];
-                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
-                if (strcmp(text_sha, e.sha)) {
-                    header_ok = false;
-                    fail_reason = "cached text hash mismatch";
-                } else if (!ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
-                                                          cached_text, text_bytes)) {
-                    header_ok = false;
-                    fail_reason = "cached text prefix mismatch";
-                }
-            }
-        }
-    }
-    char err[160] = {0};
-    int loaded = 0;
-    if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
-    {
-        const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
-        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
-            loaded = (int)hdr.tokens;
-            if (effective_prompt) {
-                /* The cache lookup was by bytes, but the graph state is still
-                 * the exact token history stored in the payload.  Build the
-                 * prompt from that exact history and tokenize only the text
-                 * suffix after the byte prefix. */
-                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-                    engine, loaded_tokens, prompt_text + text_bytes,
-                    effective_prompt);
-            }
-            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
-                hooks->load(hooks->ud, fp, hooks->load_wanted);
-            }
-        } else {
-            ds4_session_invalidate(session);
-            unlink(path);
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache discarded corrupt text-prefix payload%s%s %s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    path);
-        }
-    } else {
-        if (header_ok) ds4_session_invalidate(session);
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
-                kv_log_name(kc),
-                responses_protocol ? " " : "",
-                responses_protocol ? "RESPPROTO" : "",
-                path,
-                header_ok ? err : fail_reason,
-                (kv_now_sec() - load_t0) * 1000.0);
-    }
-    fclose(fp);
-
-    if (loaded > 0) {
-        const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
-        kc->continued_last_store_tokens = loaded;
-        const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
-        bool consumed = false;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
-            consumed = true;
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        } else {
-            ds4_kvstore_touch_file(path, hdr.hits + 1);
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        }
-        if (result) {
-            result->tokens = loaded;
-            result->text_bytes = text_bytes;
-            result->quant_bits = hdr.quant_bits;
-            result->ext_flags = hdr.ext_flags;
-            result->load_ms = load_ms;
-            result->consumed = consumed;
-            result->path = kv_xstrdup(path);
-        }
-    }
-    free(cached_text);
-    free(path);
-    return loaded;
+    ds4_kvstore_text_preview preview = {0};
+    int selected = ds4_kvstore_preview_text(
+        kc, engine, prompt_text, model_id, quant_bits,
+        ds4_session_ctx(session), &preview);
+    if (selected <= 0) return 0;
+    int loaded = ds4_kvstore_load_text_preview(
+        kc, engine, session, effective_prompt, &preview, result, hooks,
+        responses_protocol);
+    ds4_kvstore_text_preview_free(&preview);
+    return loaded > 0 ? loaded : 0;
 }
 
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {

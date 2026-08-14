@@ -152,6 +152,13 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b;
 }
 
+extern "C" uint64_t ds4_gpu_default_device_working_set_size(
+        uint32_t *visible_devices_out) {
+    const uint64_t bytes = ds4_gpu_recommended_working_set_size();
+    if (visible_devices_out) *visible_devices_out = bytes != 0 ? 1u : 0u;
+    return bytes;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return g_ssd_streaming_mode ? g_stream_expert_cache_budget : 0;
 }

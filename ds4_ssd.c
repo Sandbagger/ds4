@@ -15,6 +15,22 @@
 
 static const uint64_t DS4_GIB = 1024ull * 1024ull * 1024ull;
 
+bool ds4_parse_positive_u64_decimal(const char *s, uint64_t *value) {
+    if (value) *value = 0;
+    if (!s || !value || !s[0] || s[0] == '0') return false;
+
+    uint64_t parsed = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        const uint64_t digit = (uint64_t)(*p - '0');
+        if (parsed > (UINT64_MAX - digit) / 10u) return false;
+        parsed = parsed * 10u + digit;
+    }
+    if (parsed == 0) return false;
+    *value = parsed;
+    return true;
+}
+
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes) {
     if (bytes) *bytes = 0;
     if (!s || !s[0] || !bytes) return false;

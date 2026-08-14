@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -56,9 +57,11 @@ typedef struct {
     int n_predict;
     int ctx_size;
     float temperature;
+    int top_k;
     float top_p;
     float min_p;
     bool temperature_set;
+    bool top_k_set;
     bool top_p_set;
     bool min_p_set;
     uint64_t seed;
@@ -234,6 +237,7 @@ typedef struct {
 typedef enum {
     AGENT_TOOL_SYNTAX_DSML,
     AGENT_TOOL_SYNTAX_GLM,
+    AGENT_TOOL_SYNTAX_LAGUNA,
 } agent_tool_syntax;
 
 typedef enum {
@@ -347,18 +351,18 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 static int agent_read_default_lines(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
-                                         : AGENT_TOOL_SYNTAX_DSML;
+    if (ds4_engine_is_glm_dsa(engine)) return AGENT_TOOL_SYNTAX_GLM;
+    if (ds4_engine_is_laguna(engine)) return AGENT_TOOL_SYNTAX_LAGUNA;
+    return AGENT_TOOL_SYNTAX_DSML;
 }
 
-static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) {
-    return syntax != AGENT_TOOL_SYNTAX_GLM;
+static bool agent_tool_syntax_is_tagged(agent_tool_syntax syntax) {
+    return syntax == AGENT_TOOL_SYNTAX_GLM ||
+           syntax == AGENT_TOOL_SYNTAX_LAGUNA;
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
-    if (agent_tool_syntax_assistant_turn_uses_eos(
-            agent_tool_syntax_for_engine(w->engine)))
-        ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+    ds4_chat_append_assistant_end(w->engine, &w->transcript);
 }
 
 static int agent_worker_effective_ctx_size(const agent_worker *w) {
@@ -616,6 +620,29 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-plan")) {
+            if (c.engine.qualification_plan_path_set) {
+                fprintf(stderr,
+                        "ds4-agent: --qualification-plan may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-agent: --qualification-plan requires a non-empty path\n");
+                exit(2);
+            }
+            c.engine.qualification_plan_path = path;
+            c.engine.qualification_plan_path_set = true;
+        } else if (!strcmp(arg, "--qualification-control-fd")) {
+            if (c.engine.qualification_control_fd_set) {
+                fprintf(stderr,
+                        "ds4-agent: --qualification-control-fd may only be specified once\n");
+                exit(2);
+            }
+            c.engine.qualification_control_fd =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.qualification_control_fd_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -644,6 +671,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
@@ -682,7 +712,33 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-bytes")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_positive_u64_decimal(
+                    need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-bytes must be canonical positive decimal bytes\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_experts_set) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
+            if (c.engine.ssd_streaming_cache_bytes_set &&
+                c.engine.ssd_streaming_cache_bytes != bytes) {
+                fprintf(stderr,
+                        "ds4-agent: conflicting --ssd-streaming-cache-bytes values\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_bytes_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            if (c.engine.ssd_streaming_cache_bytes_set) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-bytes cannot be combined with --ssd-streaming-cache-experts\n");
+                exit(2);
+            }
             uint32_t experts = 0;
             uint64_t bytes = 0;
             if (!ds4_parse_streaming_cache_experts_arg(
@@ -693,6 +749,7 @@ static agent_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_experts_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssd_streaming_full_layers = (uint32_t)v;
@@ -766,11 +823,14 @@ static agent_config parse_options(int argc, char **argv) {
 static void agent_apply_model_sampling_defaults(
         ds4_engine               *engine,
         agent_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
-
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!engine || !gen) return;
+    float temperature, top_p, min_p;
+    int top_k;
+    ds4_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!gen->temperature_set) gen->temperature = temperature;
+    if (!gen->top_k_set) gen->top_k = top_k;
+    if (!gen->top_p_set) gen->top_p = top_p;
+    if (!gen->min_p_set) gen->min_p = min_p;
 }
 
 static ds4_think_mode effective_think_mode(const agent_config *cfg) {
@@ -1089,9 +1149,48 @@ static char *agent_build_glm_tools_prompt(void) {
     return out;
 }
 
+static const char agent_laguna_tools_prompt_intro[] =
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
+    "### Tools\n\n"
+    "You may call functions to assist with the user query.\n"
+    "All available function signatures are listed below:\n"
+    "<available_tools>\n";
+
+static const char agent_laguna_tools_prompt_after_schemas[] =
+    "</available_tools>\n\n"
+    "For a function call, use exactly this format:\n"
+    "<tool_call>{function-name}<arg_key>{argument-name}</arg_key>"
+    "<arg_value>{argument-value}</arg_value></tool_call>\n\n"
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.\n\n"
+    "# Rules\n\n"
+    "- Use Laguna's native <tool_call>, <arg_key>, and <arg_value> tags.\n"
+    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+    "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_EDIT_TARGET_RULE "\n"
+    "- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.\n"
+    "- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.\n"
+    "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
+
+static char *agent_build_laguna_tools_prompt(void) {
+    size_t a = strlen(agent_laguna_tools_prompt_intro);
+    size_t b = strlen(agent_glm_tool_schemas);
+    size_t c = strlen(agent_laguna_tools_prompt_after_schemas);
+    char *out = xmalloc(a + b + c + 1);
+    memcpy(out, agent_laguna_tools_prompt_intro, a);
+    memcpy(out + a, agent_glm_tool_schemas, b);
+    memcpy(out + a + b, agent_laguna_tools_prompt_after_schemas, c + 1);
+    return out;
+}
+
 static char *agent_build_tools_prompt(ds4_engine *engine) {
-    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
+    agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
+    if (syntax == AGENT_TOOL_SYNTAX_GLM)
         return agent_build_glm_tools_prompt();
+    if (syntax == AGENT_TOOL_SYNTAX_LAGUNA)
+        return agent_build_laguna_tools_prompt();
     return agent_build_dsml_tools_prompt();
 }
 
@@ -1129,7 +1228,7 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt(engine);
-    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
+    if (agent_tool_syntax_is_tagged(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else
         ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
@@ -1182,7 +1281,8 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
+    if (agent_tool_syntax_is_tagged(
+            agent_tool_syntax_for_engine(w->engine))) {
         ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
     } else {
         ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
@@ -1562,7 +1662,7 @@ static bool agent_glm_arg_value_close_tail(const char *tail, size_t len,
 static bool agent_tool_value_close_tail(agent_tool_syntax syntax,
                                         const char *tail, size_t len,
                                         bool *complete) {
-    if (syntax == AGENT_TOOL_SYNTAX_GLM)
+    if (agent_tool_syntax_is_tagged(syntax))
         return agent_glm_arg_value_close_tail(tail, len, complete);
     return agent_dsml_parameter_close_tail(tail, len, complete);
 }
@@ -1746,7 +1846,7 @@ static void agent_glm_tool_parse(agent_dsml_parser *p) {
 static void agent_dsml_finish(agent_dsml_parser *p) {
     if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
         return;
-    if (p->syntax != AGENT_TOOL_SYNTAX_GLM || !p->glm_after_call)
+    if (!agent_tool_syntax_is_tagged(p->syntax) || !p->glm_after_call)
         return;
 
     while (p->parse_pos < p->raw_len &&
@@ -1764,7 +1864,7 @@ static void agent_dsml_finish(agent_dsml_parser *p) {
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
 static void agent_dsml_parse(agent_dsml_parser *p) {
-    if (p->syntax == AGENT_TOOL_SYNTAX_GLM) {
+    if (agent_tool_syntax_is_tagged(p->syntax)) {
         agent_glm_tool_parse(p);
         return;
     }
@@ -1847,7 +1947,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
 }
 
 static void agent_dsml_start(agent_dsml_parser *p) {
-    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+    const char *start = agent_tool_syntax_is_tagged(p->syntax) ?
         "<tool_call>" : "<｜DSML｜tool_calls>";
     p->state = AGENT_DSML_STRUCTURAL;
     p->search_len = 0;
@@ -1856,7 +1956,7 @@ static void agent_dsml_start(agent_dsml_parser *p) {
 }
 
 static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
-    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+    const char *start = agent_tool_syntax_is_tagged(p->syntax) ?
         "<tool_call>" : "<｜DSML｜tool_calls>";
     const size_t start_len = strlen(start);
     if (p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR) return;
@@ -3574,7 +3674,8 @@ static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     sr->dsml_start_len = 0;
     sr->post_think_gap = false;
     agent_trace(sr->renderer->worker, "%s tool start detected%s",
-                sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml",
+                sr->syntax == AGENT_TOOL_SYNTAX_LAGUNA ? "laguna" :
+                (sr->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml"),
                 ignored ? " inside thinking" : "");
     agent_dsml_start(sr->parser);
     if (!ignored) {
@@ -3600,7 +3701,7 @@ static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
                                           const char *tail, size_t len,
                                           bool *complete,
                                           bool *implicit_invoke) {
-    if (syntax == AGENT_TOOL_SYNTAX_GLM) {
+    if (agent_tool_syntax_is_tagged(syntax)) {
         static const char glm_call[] = "<tool_call>";
         size_t form_len = sizeof(glm_call) - 1;
         *complete = false;
@@ -3693,7 +3794,7 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
  * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char canonical_invoke[] = "<｜DSML｜invoke";
-    const char *start = sr->syntax == AGENT_TOOL_SYNTAX_GLM ?
+    const char *start = agent_tool_syntax_is_tagged(sr->syntax) ?
         "<tool_call>" : "<｜DSML｜tool_calls>";
     if (sr->parser->state == AGENT_DSML_ERROR) return;
     agent_stream_note_thinking_dsml_byte(sr, c);
@@ -4381,7 +4482,8 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
-    } else if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
+    } else if (!ds4_engine_is_laguna(w->engine) &&
+               w->cfg->gen.think_mode == DS4_THINK_MAX &&
                think_mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(w->engine, out);
     }
@@ -6919,10 +7021,9 @@ static void test_agent_glm_tools_prompt_is_native(void) {
 }
 
 static void test_agent_glm_template_policy(void) {
-    AGENT_TEST_ASSERT(!agent_tool_syntax_assistant_turn_uses_eos(
-        AGENT_TOOL_SYNTAX_GLM));
-    AGENT_TEST_ASSERT(agent_tool_syntax_assistant_turn_uses_eos(
-        AGENT_TOOL_SYNTAX_DSML));
+    AGENT_TEST_ASSERT(agent_tool_syntax_is_tagged(AGENT_TOOL_SYNTAX_GLM));
+    AGENT_TEST_ASSERT(agent_tool_syntax_is_tagged(AGENT_TOOL_SYNTAX_LAGUNA));
+    AGENT_TEST_ASSERT(!agent_tool_syntax_is_tagged(AGENT_TOOL_SYNTAX_DSML));
     AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_HIGH),
                               "Reasoning Effort: High"));
     AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MAX),
@@ -8387,7 +8488,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return ds4_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
-                              0,
+                              greedy ? 0 : cfg->gen.top_k,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
                               rng);
@@ -8571,9 +8672,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
             if (ds4_token_is_stop_for_think_mode(w->engine, token, think_mode)) {
-                if (tool_syntax == AGENT_TOOL_SYNTAX_GLM &&
+                if (agent_tool_syntax_is_tagged(tool_syntax) &&
                     token != ds4_token_eos(w->engine)) {
-                    agent_trace(w, "glm assistant generation stopped before control token id=%d", token);
+                    agent_trace(w, "tagged assistant generation stopped before control token id=%d", token);
                 }
                 break;
             }
@@ -8656,8 +8757,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         {
             malformed_tool = true;
             snprintf(dsml.error, sizeof(dsml.error),
-                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                     "incomplete GLM tool call" :
+                     agent_tool_syntax_is_tagged(tool_syntax) ?
+                     "incomplete tagged tool call" :
                      "incomplete DSML tool call");
         }
 
@@ -8680,12 +8781,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             tool_result = agent_buf_take(&b);
         } else if (malformed_tool) {
             agent_buf b = {0};
-            agent_buf_puts(&b, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                           "Tool error: invalid GLM tool call: " :
+            agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
+                           "Tool error: invalid tagged tool call: " :
                            "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
-            agent_buf_puts(&b, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
+            agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
                            agent_glm_syntax_reminder :
                            agent_dsml_syntax_reminder);
             tool_result = agent_buf_take(&b);
@@ -8809,7 +8910,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
     while (generated < max_tokens && !worker_should_interrupt(w)) {
         int token = ds4_session_sample(w->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -11119,14 +11220,42 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+    int version_handled = 0;
+    const int version_rc = ds4_build_info_maybe_print_version(
+        argc, argv, "--version-json", &version_handled);
+    if (version_handled || version_rc != 0) return version_rc;
+    char qualification_argv_err[256];
+    const int qualification_argv_rc = ds4_qualification_args_preflight(
+        argc, argv, DS4_QUALIFICATION_FRONTEND_STANDARD,
+        qualification_argv_err, sizeof(qualification_argv_err));
+    if (qualification_argv_rc != 0) {
+        fprintf(stderr, "ds4-agent: %s\n", qualification_argv_err);
+        return qualification_argv_rc;
+    }
     agent_config cfg = parse_options(argc, argv);
+    cfg.engine.runtime_build_info = ds4_build_info_get();
+    cfg.engine.context_size = cfg.gen.ctx_size;
+    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    if (cfg.engine.qualification_plan_path_set) {
+        if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+            fprintf(stderr,
+                    "ds4-agent: --qualification-plan cannot be combined "
+                    "with --gpu-vram or --gpu-devices\n");
+            return 2;
+        }
+        char plan_err[512];
+        const int plan_rc = ds4_engine_write_qualification_plan(
+            &cfg.engine, plan_err, sizeof(plan_err));
+        if (plan_rc != 0) {
+            fprintf(stderr, "ds4-agent: %s\n", plan_err);
+        }
+        return plan_rc;
+    }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
-    cfg.engine.context_size = cfg.gen.ctx_size;
-    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         cfg.engine.backend = cfg.gpu_vram_arg &&
                              !strcmp(cfg.gpu_vram_arg, "0")
@@ -11146,7 +11275,8 @@ int main(int argc, char **argv) {
         }
         if (skip_cuda) {
             cfg.engine.backend = DS4_BACKEND_CPU;
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+            if (open_rc != 0) return open_rc;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -11158,11 +11288,13 @@ int main(int argc, char **argv) {
                 fflush(stdout);
             }
             cfg.engine.backend = DS4_BACKEND_CUDA;
-            if (ds4_engine_create_with_gpu_config(
-                    &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
+            const int open_rc = ds4_engine_create_with_gpu_config(
+                    &engine, &cfg.engine, &gpu_cfg);
+            if (open_rc != 0) return open_rc;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        return 1;
+    } else {
+        const int open_rc = ds4_engine_open(&engine, &cfg.engine);
+        if (open_rc != 0) return open_rc;
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 

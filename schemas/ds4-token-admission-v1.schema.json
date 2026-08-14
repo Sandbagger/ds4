@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ds4.token-admission/v1",
+  "title": "DS4 exact token-admission result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "model",
+    "template_revision",
+    "templated_input_tokens",
+    "requested_output_tokens",
+    "context_tokens",
+    "fits",
+    "rejection_code"
+  ],
+  "properties": {
+    "schema": { "const": "ds4.token-admission/v1" },
+    "model": { "const": "laguna-s-2.1" },
+    "template_revision": {
+      "const": "poolside-laguna-s-2.1-native-nothink-v1"
+    },
+    "templated_input_tokens": { "$ref": "#/$defs/token_count" },
+    "requested_output_tokens": { "$ref": "#/$defs/token_count" },
+    "context_tokens": { "$ref": "#/$defs/positive_token_count" },
+    "fits": { "type": "boolean" },
+    "rejection_code": { "$ref": "#/$defs/nullable_rejection_code" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "fits": { "const": true } },
+        "required": ["fits"]
+      },
+      "then": {
+        "properties": { "rejection_code": { "type": "null" } }
+      },
+      "else": {
+        "properties": {
+          "rejection_code": { "$ref": "#/$defs/rejection_code" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "token_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "positive_token_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "x-ds4-number-kind": "integer"
+    },
+    "rejection_code": {
+      "enum": [
+        "model_mismatch",
+        "invalid_request",
+        "invalid_output_tokens",
+        "unsupported_tool_choice",
+        "context_overflow"
+      ]
+    },
+    "nullable_rejection_code": {
+      "anyOf": [
+        { "$ref": "#/$defs/rejection_code" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "schema": "laguna-q4-mmq-auto-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "capture": {
+    "flash_attention": "AUTO",
+    "layer": 1,
+    "tokens": 22,
+    "token_index": 0,
+    "slot": 0,
+    "expert": 246,
+    "row": 0,
+    "probe_sha256": "43cfc41d0d5930e060ae7cb3536b13caca11ce505718913834970aee8533a67b",
+    "callbacks": {
+      "gate.f32": "ffn_moe_gate-1",
+      "up.f32": "ffn_moe_up-1",
+      "swiglu.f32": "ffn_moe_swiglu-1"
+    },
+    "non_perturbation": {
+      "selected_sha256": "8b5f9861cc02f4578fc07714a990426c0449cdf5997e4d0588ede0c262228183",
+      "weights_sha256": "ccff82b7b7f6f5550c010394ed859721c91e63a774e0ecd3b1dd9891693bd43c",
+      "routed_output_sha256": "32bbcc5fa2c03c566f8425585ab8153823b9db355001129c2f9698bf0931a083",
+      "layer_output_sha256": "ee837552616e9b6c535f03b9ac56b433af9fad274ab69f38462ad9075228cc2e",
+      "detail_capture_matches_endpoint_only": true
+    }
+  },
+  "cuda": {
+    "device": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "batch_mode": "MMQ",
+    "data_layout": "MMA",
+    "flags": [
+      "-std=c++17",
+      "-O3",
+      "-use_fast_math",
+      "--generate-code=arch=compute_121a,code=[sm_121a]",
+      "-extended-lambda",
+      "-compress-mode=size"
+    ]
+  },
+  "weights": {
+    "type": "Q4_K",
+    "input_elements": 3072,
+    "blocks_per_row": 12,
+    "block_bytes": 144,
+    "row_bytes": 1728,
+    "expert_bytes": 1769472,
+    "gate": {
+      "tensor": "blk.1.ffn_gate_exps.weight",
+      "tensor_absolute_model_offset": 1349566304,
+      "row_absolute_model_offset": 1784856416
+    },
+    "up": {
+      "tensor": "blk.1.ffn_up_exps.weight",
+      "tensor_absolute_model_offset": 1809051488,
+      "row_absolute_model_offset": 2244341600
+    }
+  },
+  "oracle": {
+    "gate_exact": true,
+    "up_exact": true,
+    "swiglu_exact": true
+  },
+  "files": {
+    "input-token-00.f32": {
+      "bytes": 12288,
+      "sha256": "fdf4b1ac532fc5775d1af92bcfeb37d942b64fef1a76d31ec8c0813795834605"
+    },
+    "expert-246-row-000-gate.q4k": {
+      "bytes": 1728,
+      "sha256": "9e20e5fe216f7738b2169a3f00eade92660274db11ab2ccb2fab6358d39a1e3a"
+    },
+    "expert-246-row-000-up.q4k": {
+      "bytes": 1728,
+      "sha256": "63c63676594b44ff20a5b6e78289202bbe16c0aff97594b391ca2b930b2f2a8f"
+    },
+    "gate.f32": {
+      "bytes": 4,
+      "sha256": "eb0bbc325acdcc0cd9ed7f16b6738a199f30b4f4267de9d6cf1edd983a533f3c"
+    },
+    "up.f32": {
+      "bytes": 4,
+      "sha256": "5d1643e77e5b23d36619b309cccfa933b7e84483ce75e742fbb86919b2c96bca"
+    },
+    "swiglu.f32": {
+      "bytes": 4,
+      "sha256": "f6ea0e74779aa61d39171891d49c64a373b41aa5f67facf23d7577be79cb5eb6"
+    }
+  }
+}

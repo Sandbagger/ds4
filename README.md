@@ -3,10 +3,11 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
-machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
-not a general GGUF runner. Model loading, prompt rendering, tool calls, KV
-state, the HTTP server, and the coding agent are built and tested together.
+**DeepSeek V4 Flash**. It also supports **GLM 5.2**, **Laguna S 2.1**, and, on
+very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
+deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
+tool calls, KV state, the HTTP server, and the coding agent are built and tested
+together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
 Supported backends:
@@ -88,11 +89,12 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 and GLM 5.2 GGUFs listed
-below. It is not a general GGUF loader, and arbitrary GGUF files will not have
-the tensor layout, quantization mix, metadata, or optional MTP state expected by
-the engine. The 2 bit quantizations provided here are verified to be actually
-high quality: they behave well, work under coding agents, call tools in a reliable way.
+This implementation only works with the DeepSeek V4, GLM 5.2, and Laguna S 2.1
+GGUFs listed below. It is not a general GGUF loader, and arbitrary GGUF files
+will not have the tensor layout, quantization mix, metadata, or optional MTP
+state expected by the engine. The 2 bit DeepSeek and GLM quantizations provided
+here are verified to be actually high quality: they behave well, work under
+coding agents, and call tools reliably.
 
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
@@ -106,6 +108,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
+./download_model.sh laguna-q4  # >= 96 GB Apple Silicon, official Poolside Q4_K_M
 ```
 
 For the full PRO Q4 distributed run, download one half on each machine:
@@ -169,6 +172,28 @@ and timing counters:
 GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
 `--power` below 100, an explicit `--prefill-chunk`, and the external `--mtp`
 file are not supported for GLM yet.
+
+Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
+The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
+weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
+attention and mixed Q4_K/Q6_K experts. Laguna runs on Metal or one-device CUDA
+with full model residency. SSD streaming, distributed inference, tensor
+parallelism, multi-GPU placement, ROCm, and the DFlash draft model are rejected
+explicitly. CLI, agent, and server use Laguna's native chat, interleaved
+reasoning, and tagged tool-call formats:
+
+```sh
+./download_model.sh laguna-q4
+./ds4 -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768 -p "Explain this repository"
+./ds4-agent -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
+./ds4-server -m gguf/laguna-s-2.1-Q4_K_M.gguf -c 32768
+```
+
+The shipped GGUF is configured for a 262144-token context. Laguna defaults to
+temperature 1.0, top-k 20, top-p 1.0, and min-p 0; explicit sampling options
+always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
+for direct replies, and preserve reasoning content between tool calls when
+building a client.
 
 Then build:
 

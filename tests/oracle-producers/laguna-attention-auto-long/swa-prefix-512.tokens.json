@@ -1,0 +1,22 @@
+{
+  "schema": "laguna-token-prefix/v1",
+  "encoding": "little-endian-signed-int32",
+  "tokens": 512,
+  "repeating_pattern": [
+    785,
+    10068,
+    3612,
+    8473,
+    1077,
+    1857,
+    606,
+    330,
+    2746,
+    22910,
+    1059,
+    4158,
+    7799,
+    83,
+    268
+  ]
+}

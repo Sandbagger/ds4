@@ -1,0 +1,171 @@
+{
+  "schema": "laguna-attention-long-auto-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "model": {
+    "bytes": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
+  },
+  "device": {
+    "name": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "multiprocessors": 48
+  },
+  "capture": {
+    "flash_attention": "AUTO",
+    "n_ctx": 1024,
+    "n_batch": 1024,
+    "n_ubatch": 512,
+    "base_probe": {
+      "path": "gguf-tools/quality-testing/probe_poolside_laguna_layers.cpp",
+      "bytes": 21085,
+      "sha256": "28825c8f2273ff5fef28d1250d2ec8bb82addbf5b736ec56a2bc99e1e07c9df6"
+    },
+    "producer": {
+      "script": {
+        "path": "tests/oracle-producers/laguna-attention-auto-long/derive_capture_inputs.py",
+        "bytes": 7897,
+        "sha256": "6615389271c0adc9d99a2ef1610ef5d1ece6eea44bdbc6cdf92d8c039c1cd44d"
+      },
+      "token_prefix": {
+        "path": "tests/oracle-producers/laguna-attention-auto-long/swa-prefix-512.tokens.json",
+        "bytes": 277,
+        "sha256": "564c74a60015d8afd82c17ef89da3ceabb39259f49ba3d210901815a068de1dc",
+        "schema": "laguna-token-prefix/v1",
+        "tokens": 512
+      }
+    },
+    "compiler": {
+      "command": "g++",
+      "flags": ["-std=c++17", "-O2"],
+      "libraries": ["llama", "ggml", "ggml-base"]
+    }
+  },
+  "cases": {
+    "layer0_gqa6_512": {
+      "layer": 0,
+      "tokens": 512,
+      "token_file": {
+        "bytes": 2048,
+        "sha256": "569aa6394783e0f17558db421ba26480d7a530d44dd2219bcc9aac2c09a3b559",
+        "derivation": "first 512 little-endian int32 IDs from pinned swa-513",
+        "prefix_tokens": 512
+      },
+      "capture_source": {
+        "bytes": 18662,
+        "sha256": "dc53f359313c2cad649d5ae6c4419d1f8b582dfd5ce731dd3bf0ad86cc13f9ba",
+        "producer_case": "layer0_gqa6_512"
+      },
+      "probe_binary": {
+        "bytes": 80032,
+        "sha256": "7d20a4ff12a7dfdf43e584314636062ec1017dc982da3d4dc827b3835aa08d20"
+      },
+      "topology": {
+        "query_heads": 48,
+        "kv_heads": 8,
+        "gqa_ratio": 6,
+        "ncols1": 32,
+        "ncols2": 2,
+        "nbatch_fa": 64,
+        "selected_query_heads": [41, 42],
+        "selected_kv_heads": [6, 7],
+        "query_position": 511,
+        "key_start": 0,
+        "key_count": 512
+      },
+      "raw": {
+        "layer-00-q-rope.f32": {"bytes": 12582912, "sha256": "8bfd668005de8d6dfeefffb4e439c3016c543d0a92004eee6d2c03a01fb756c6"},
+        "layer-00-k-rope.f32": {"bytes": 2097152, "sha256": "4a8ba50ae98ba70f7ef6cb5c94561064548f372c5d8fa14d53457590ef53ea5f"},
+        "layer-00-v-proj.f32": {"bytes": 2097152, "sha256": "936e5c87eb32238e336d150ff0c0ad95127ae18b3f142db9ab3aab46e3ae87aa"},
+        "layer-00-gate-proj.f32": {"bytes": 98304, "sha256": "942a05e8af1f32046e1816bbbd994da1da58c58941f966811b9f2d33f04d19aa"},
+        "layer-00-attn-gated.f32": {"bytes": 12582912, "sha256": "94c62183a1679fd7c3c2c056bc6539c9f9d5118943d4ad986eaaa7bfa28e396e"}
+      },
+      "extractions": {
+        "layer-00-q-t0-t511-h41-h42.f32": {"source": "layer-00-q-rope.f32", "offset": 20992, "stride": 24576, "segment_bytes": 1024, "segments": 512},
+        "layer-00-q-t511-h41-h42.f32": {"source": "layer-00-q-rope.f32", "offset": 12579328, "bytes": 1024},
+        "layer-00-k-t0-t511-kv6-kv7.f32": {"source": "layer-00-k-rope.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 512},
+        "layer-00-v-t0-t511-kv6-kv7.f32": {"source": "layer-00-v-proj.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 512},
+        "layer-00-gate-t0-t511-h41-h42.f32": {"source": "layer-00-gate-proj.f32", "offset": 164, "stride": 192, "segment_bytes": 8, "segments": 512},
+        "layer-00-gate-t511-h41-h42.f32": {"source": "layer-00-gate-proj.f32", "offset": 98276, "bytes": 8},
+        "layer-00-attn-gated-t0-t511-h41-h42.f32": {"source": "layer-00-attn-gated.f32", "offset": 20992, "stride": 24576, "segment_bytes": 1024, "segments": 512},
+        "layer-00-attn-gated-t511-h41-h42.f32": {"source": "layer-00-attn-gated.f32", "offset": 12579328, "bytes": 1024}
+      }
+    },
+    "layer1_gqa9_64": {
+      "layer": 1,
+      "tokens": 64,
+      "token_file": {
+        "bytes": 256,
+        "sha256": "cf4df9a692df0362683993b79a894a0b1763924a773e5b98f27f5c6ff5345557",
+        "derivation": "first 64 little-endian int32 IDs from pinned swa-513",
+        "prefix_tokens": 64
+      },
+      "capture_source": {
+        "bytes": 18660,
+        "sha256": "99571ba16b0f0aafe24c1e03da249d6956e20c903f79786d87380b682a7846a6",
+        "producer_case": "layer1_gqa9_64"
+      },
+      "probe_binary": {
+        "bytes": 80032,
+        "sha256": "3f7a73af934818311950213725cf6cddea1ed63eed93bb62b8a287ed11bf4fa7"
+      },
+      "topology": {
+        "query_heads": 72,
+        "kv_heads": 8,
+        "gqa_ratio": 9,
+        "ncols1": 64,
+        "ncols2": 1,
+        "nbatch_fa": 64,
+        "selected_query_heads": [62, 63],
+        "selected_kv_heads": [6, 7],
+        "query_position": 63,
+        "key_start": 0,
+        "key_count": 64
+      },
+      "raw": {
+        "layer-01-q-rope.f32": {"bytes": 2359296, "sha256": "b2829b3245f5e838cd2b88f71aede363b287b2fc5c939a772975c31d1fbde15d"},
+        "layer-01-k-rope.f32": {"bytes": 262144, "sha256": "3b0d9296e182247622e0380328bad8d3ca99f68f17741b4747a30616a936415b"},
+        "layer-01-v-proj.f32": {"bytes": 262144, "sha256": "a9b71f6592d7ea2dcf78fa127dda4d421aa8dd2581b9a3aaad89f1d3d91ea1ee"},
+        "layer-01-gate-proj.f32": {"bytes": 18432, "sha256": "775c6d9f204bb1c7222cc458873b079ce3997f75a8f22a26450fc1dd3145a592"},
+        "layer-01-attn-gated.f32": {"bytes": 2359296, "sha256": "6cda68c56a0489ef2654a77a5f8502da66fbb0e7d7103ae3ff2384ec94abe2e7"}
+      },
+      "extractions": {
+        "layer-01-q-t0-t63-h62-h63.f32": {"source": "layer-01-q-rope.f32", "offset": 31744, "stride": 36864, "segment_bytes": 1024, "segments": 64},
+        "layer-01-q-t63-h62-h63.f32": {"source": "layer-01-q-rope.f32", "offset": 2354176, "bytes": 1024},
+        "layer-01-k-t0-t63-kv6-kv7.f32": {"source": "layer-01-k-rope.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 64},
+        "layer-01-v-t0-t63-kv6-kv7.f32": {"source": "layer-01-v-proj.f32", "offset": 3072, "stride": 4096, "segment_bytes": 1024, "segments": 64},
+        "layer-01-gate-t0-t63-h62-h63.f32": {"source": "layer-01-gate-proj.f32", "offset": 248, "stride": 288, "segment_bytes": 8, "segments": 64},
+        "layer-01-gate-t63-h62-h63.f32": {"source": "layer-01-gate-proj.f32", "offset": 18392, "bytes": 8},
+        "layer-01-attn-gated-t0-t63-h62-h63.f32": {"source": "layer-01-attn-gated.f32", "offset": 31744, "stride": 36864, "segment_bytes": 1024, "segments": 64},
+        "layer-01-attn-gated-t63-h62-h63.f32": {"source": "layer-01-attn-gated.f32", "offset": 2354176, "bytes": 1024}
+      }
+    }
+  },
+  "files": {
+    "layer-00-q-t0-t511-h41-h42.f32": {"bytes": 524288, "sha256": "d98807d78d4e0d148aedd54f581ed7e81425b67b0f7b128dfdc98187c8bfe61d"},
+    "layer-00-q-t511-h41-h42.f32": {"bytes": 1024, "sha256": "b8a74804089bc9ec554522974f4ace3f9013fc9d9110f9e3d7f2fd784fb85b85"},
+    "layer-00-k-t0-t511-kv6-kv7.f32": {"bytes": 524288, "sha256": "55b783cd0b8f132cc48f78b66910a4de717f4943c218f5f912dfd36385a1df30"},
+    "layer-00-v-t0-t511-kv6-kv7.f32": {"bytes": 524288, "sha256": "1b4d52270e650a9c48b4e4a19a400248d69d2e9a882919d22a3bb488bcd5ef7d"},
+    "layer-00-gate-t0-t511-h41-h42.f32": {"bytes": 4096, "sha256": "a627e3e419998d4d6453864c832304890dd083e82874a27429876a04df2474b5"},
+    "layer-00-gate-t511-h41-h42.f32": {"bytes": 8, "sha256": "16e9f2ecdda135999a02c39a6c2842f8a67478ee0609ceb965882246ab3d7f8e"},
+    "layer-00-attn-gated-t0-t511-h41-h42.f32": {"bytes": 524288, "sha256": "4bb9707b803fe33ddccb819b166f64bed1ad769e2fe51fc09c54537e08ff09e1"},
+    "layer-00-attn-gated-t511-h41-h42.f32": {"bytes": 1024, "sha256": "d949848041eff77c39857e653d656a0afeda5b507b08a7b10fee9d66c5d64751"},
+    "layer-01-q-t0-t63-h62-h63.f32": {"bytes": 65536, "sha256": "5be4c0fd5e39a8fbf4a5d39ddd376a724b48f7b4362862a89d79ee3b0efcc386"},
+    "layer-01-q-t63-h62-h63.f32": {"bytes": 1024, "sha256": "9272174e440d9d2ab7e3ee496648dc1841d477a418b16aa522bfb48b2042e1d0"},
+    "layer-01-k-t0-t63-kv6-kv7.f32": {"bytes": 65536, "sha256": "047eb9e81fe7d25e28a04670425312057e5c12bfd9ec1859e59eb9a0c2a82e65"},
+    "layer-01-v-t0-t63-kv6-kv7.f32": {"bytes": 65536, "sha256": "f48f6c8e8edabc923a7de4916553dd2536e688495a71b35b7b4a3254441a8f38"},
+    "layer-01-gate-t0-t63-h62-h63.f32": {"bytes": 512, "sha256": "c558c7129e77cfc9fd09d8387809485e7bb6ad445d9589032df0690dd3b49b3e"},
+    "layer-01-gate-t63-h62-h63.f32": {"bytes": 8, "sha256": "187d640f9fcaf5160c0311923561acd794a1c918c505521b138d6661f5fbc106"},
+    "layer-01-attn-gated-t0-t63-h62-h63.f32": {"bytes": 65536, "sha256": "dc4e2ab8e7c9351c65b2d7d536124bc789f0702e2575723ac707267c00cdd9fa"},
+    "layer-01-attn-gated-t63-h62-h63.f32": {"bytes": 1024, "sha256": "8973614b1a3ef3b1ca8f9a2e8aa144462d2597f31f7f660f64a7c45114fefb3a"}
+  },
+  "comparison": {
+    "max_abs_limit": 0.0,
+    "rms_limit": 0.0,
+    "successful_capture_runs": 1
+  },
+  "limitations": [
+    "The compact fixtures begin at position zero and do not mix cached and staged KV.",
+    "The full-model swa-513 oracle qualifies ring eviction and the shifted 1..512 SWA window.",
+    "No two-run raw-capture determinism claim is made."
+  ]
+}

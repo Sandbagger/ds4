@@ -197,6 +197,15 @@ class Task18CudaFaultBuildContract(unittest.TestCase):
 
 
 class Task18CudaFaultSourceContract(unittest.TestCase):
+    def test_real_cuda_compact_context_owns_barrier_failure_counter(self) -> None:
+        body = _function_body(CUDA, "struct ds4_gpu_laguna_compact {")
+        self.assertTrue(body, "missing real internal CUDA compact context")
+        self.assertRegex(
+            body,
+            r"\buint64_t\s+request_barrier_unsafe_failures\s*;",
+            "real internal CUDA compact context lacks its barrier-failure counter",
+        )
+
     def test_cuda_snapshot_duplicate_matches_the_public_abi(self) -> None:
         name = "ds4_gpu_laguna_compact_test_snapshot"
         public = _typedef_struct_body(GPU_HEADER, name)

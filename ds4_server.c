@@ -16623,6 +16623,30 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* Process lifecycle is an explicit state machine.  These declarations are the
+ * minimal production seam exercised by the lifecycle contract tests below;
+ * the implementation belongs with signal handling and server admission. */
+typedef enum {
+    SERVER_LIFECYCLE_ACCEPTING = 0,
+    SERVER_LIFECYCLE_DRAINING,
+    SERVER_LIFECYCLE_UNSAFE_DRAINING,
+    SERVER_LIFECYCLE_FORCED_EXIT,
+} server_lifecycle_state;
+
+typedef enum {
+    SERVER_LIFECYCLE_EVENT_TERM = 0,
+    SERVER_LIFECYCLE_EVENT_INT,
+    SERVER_LIFECYCLE_EVENT_UNSAFE,
+} server_lifecycle_event;
+
+static server_lifecycle_state server_lifecycle_transition(
+    server_lifecycle_state state, server_lifecycle_event event);
+static bool server_lifecycle_allows_admission(server_lifecycle_state state);
+static int server_lifecycle_resolve_exit_status(
+    server_lifecycle_state state,
+    int originating_signal,
+    bool drain_reached_safe_point);
+
 /* Live request accounting is owned by the queued job, not by a test adapter
  * or a process-wide before/after snapshot.  These declarations define the
  * minimal server seam exercised below; production supplies the storage and
@@ -17148,6 +17172,60 @@ static bool test_laguna_fixed_tokenize(void *context,
     if (!rendered_prompt || count < 0 || !tokens) return false;
     for (int i = 0; i < count; i++) ds4_tokens_push(tokens, i);
     return true;
+}
+
+static void test_server_lifecycle_first_term_drains_and_closes_admission(void) {
+    server_lifecycle_state state = SERVER_LIFECYCLE_ACCEPTING;
+    TEST_ASSERT(server_lifecycle_allows_admission(state));
+
+    state = server_lifecycle_transition(
+        state, SERVER_LIFECYCLE_EVENT_TERM);
+    TEST_ASSERT(state == SERVER_LIFECYCLE_DRAINING);
+    TEST_ASSERT(!server_lifecycle_allows_admission(state));
+
+    /* With no admitted response left unsafe, the first TERM is graceful. */
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    state, SIGTERM, true) == 0);
+}
+
+static void test_server_lifecycle_preserves_signal_derived_exits(void) {
+    server_lifecycle_state interrupted = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_INT);
+    TEST_ASSERT(interrupted == SERVER_LIFECYCLE_DRAINING);
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    interrupted, SIGINT, true) == 130);
+
+    server_lifecycle_state forced = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_TERM);
+    forced = server_lifecycle_transition(
+        forced, SERVER_LIFECYCLE_EVENT_TERM);
+    TEST_ASSERT(forced == SERVER_LIFECYCLE_FORCED_EXIT);
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    forced, SIGTERM, true) == 143);
+
+    server_lifecycle_state incomplete = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_TERM);
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    incomplete, SIGTERM, false) == 143);
+}
+
+static void test_server_lifecycle_unsafe_exit_latches_and_dominates(void) {
+    server_lifecycle_state state = server_lifecycle_transition(
+        SERVER_LIFECYCLE_ACCEPTING, SERVER_LIFECYCLE_EVENT_INT);
+    state = server_lifecycle_transition(
+        state, SERVER_LIFECYCLE_EVENT_UNSAFE);
+    TEST_ASSERT(state == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    TEST_ASSERT(!server_lifecycle_allows_admission(state));
+
+    /* Unsafe is sticky and wins over the status of the signal/cancellation
+     * that interrupted an admitted response. */
+    state = server_lifecycle_transition(
+        state, SERVER_LIFECYCLE_EVENT_UNSAFE);
+    TEST_ASSERT(state == SERVER_LIFECYCLE_UNSAFE_DRAINING);
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    state, SIGTERM, false) == 1);
+    TEST_ASSERT(server_lifecycle_resolve_exit_status(
+                    state, SIGINT, false) == 1);
 }
 
 static void test_server_job_runtime_completed_lifecycle(void) {
@@ -22592,6 +22670,9 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_batched_live_continuation_slot_binding();
+    test_server_lifecycle_first_term_drains_and_closes_admission();
+    test_server_lifecycle_preserves_signal_derived_exits();
+    test_server_lifecycle_unsafe_exit_latches_and_dominates();
     test_server_job_runtime_completed_lifecycle();
     test_server_job_runtime_pre_token_terminals();
     test_server_runtime_separates_hidden_and_visible_tokens();

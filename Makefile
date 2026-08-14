@@ -685,6 +685,7 @@ endif
 
 test-cuda-build-contract:
 	python3 tests/test_cuda_build_contract.py -v
+	python3 tests/test_main_session_recovery_hardening_contract.py -v
 
 test-laguna-compact-python:
 	@command -v uv >/dev/null 2>&1 || { \

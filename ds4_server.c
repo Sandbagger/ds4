@@ -10295,9 +10295,6 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 struct server {
     ds4_engine *engine;
     bool runtime_snapshot_required;
-    /* Alias of slots[0].session. Kept for the legacy, non-batched path and
-     * parser-only context queries while slot-aware code is explicit. */
-    ds4_session *session;
     server_slot *slots;
     int slot_count;
     int ctx_size;
@@ -16466,8 +16463,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    s.session = s.slots[0].session;
-
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);

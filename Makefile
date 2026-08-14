@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -481,6 +481,29 @@ tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cud
 ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
+tests/ds4_server_test_hooks.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_args.h ds4_help.h ds4_kvstore.h ds4_laguna_plan.h rax.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ ds4_server.c
+
+ds4-server-test-hooks: tests/ds4_server_test_hooks.o ds4_cuda_test_hooks.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_stream_test_hooks.o ds4_layer_pack.o $(DS4_BUILD_INFO_OBJ)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# This is intentionally outside `make test`: it launches four fresh production
+# server processes against an explicit retained Laguna model descriptor.
+test-cuda-task18-server-failures: ds4-server-test-hooks
+	@if [ -z "$${DS4_TEST_MODEL:-}" ] || [ "$${DS4_TEST_MODEL}" = ds4flash.gguf ]; then \
+		echo "error: set DS4_TEST_MODEL to the explicit Laguna GGUF path" >&2; \
+		exit 2; \
+	fi
+	@if [ -z "$${DS4_TEST_MODEL_FD:-}" ]; then \
+		echo "error: set DS4_TEST_MODEL_FD to the retained open model descriptor" >&2; \
+		exit 2; \
+	fi
+	env -u DS4_LOCK_FILE DS4_TEST_MODEL="$${DS4_TEST_MODEL}" \
+		DS4_TEST_MODEL_FD="$${DS4_TEST_MODEL_FD}" \
+		timeout --kill-after=5s 7200s python3 \
+		tests/test_task18_cuda_failure_contract.py \
+		--server ./ds4-server-test-hooks -v
+
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
@@ -670,6 +693,9 @@ test-cuda-laguna-qualification-control:
 
 test-cuda-laguna-runtime-identity:
 	@echo "error: test-cuda-laguna-runtime-identity is unsupported; requires CUDA on Linux" >&2; exit 2
+
+test-cuda-task18-server-failures:
+	@echo "error: test-cuda-task18-server-failures is unsupported; requires CUDA on Linux" >&2; exit 2
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -689,6 +715,7 @@ endif
 test-cuda-build-contract:
 	python3 tests/test_cuda_build_contract.py -v
 	python3 tests/test_main_session_recovery_hardening_contract.py -v
+	python3 tests/test_task18_cuda_failure_source_contract.py -v
 
 test-laguna-compact-python:
 	@command -v uv >/dev/null 2>&1 || { \
@@ -798,4 +825,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link tests/test_qualification_control tests/test_plan_io tests/test_laguna_plan tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_q4k_mmvq_microscope tests/test_cuda_f32_mmvf_microscope tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/probe_ds4_laguna_moe tests/probe_ds4_laguna_moe.o tests/probe_ds4_laguna_moe_release tests/probe_ds4_laguna_moe_release.o tests/probe_ds4_laguna_behavior tests/probe_ds4_laguna_behavior.o tests/test_cuda_laguna_stream tests/test_cuda_laguna_stream.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-server-test-hooks ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link tests/test_qualification_control tests/test_plan_io tests/test_laguna_plan tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_q4k_mmvq_microscope tests/test_cuda_f32_mmvf_microscope tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/probe_ds4_laguna_moe tests/probe_ds4_laguna_moe.o tests/probe_ds4_laguna_moe_release tests/probe_ds4_laguna_moe_release.o tests/probe_ds4_laguna_behavior tests/probe_ds4_laguna_behavior.o tests/test_cuda_laguna_stream tests/test_cuda_laguna_stream.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

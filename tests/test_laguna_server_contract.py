@@ -88,6 +88,32 @@ PROTOCOL_VALIDATION_KEYS = {
     "mutation_fingerprint_before",
     "mutation_fingerprint_after",
 }
+PROTOCOL_FIXTURE_RESPONSE_KEYS = {
+    "http_status",
+    "code",
+    "semantic",
+    "mutation_fingerprint_before",
+    "mutation_fingerprint_after",
+}
+PROTOCOL_FIXTURE_SEMANTIC_KEYS = {
+    "visible_text",
+    "reasoning_text",
+    "tool_calls",
+    "finish",
+    "prompt_tokens",
+    "completion_tokens",
+    "protocol_id",
+    "protocol_ids_seen",
+    "request_metrics",
+    "request_metrics_occurrences",
+    "request_metrics_at_terminal",
+}
+PROTOCOL_FIXTURES = (
+    "reasoning_text",
+    "two_tools",
+    "continuation",
+    "malformed_client_history",
+)
 ACCEPTED_MODEL_ALIASES = (
     "laguna-s-2.1",
     "laguna-s-2.1-chat",
@@ -416,6 +442,46 @@ class Driver:
                 raise AssertionError(
                     f"protocol-validation {key} must be a non-empty string"
                 )
+        return response
+
+    def protocol_fixture(
+        self, protocol: str, *, stream: bool, fixture: str
+    ) -> dict[str, Any]:
+        if protocol not in ("openai_chat", "responses", "anthropic"):
+            raise AssertionError(f"unknown protocol fixture target: {protocol!r}")
+        if fixture not in PROTOCOL_FIXTURES:
+            raise AssertionError(f"unknown protocol fixture: {fixture!r}")
+        response = self.rpc(
+            {
+                "op": "protocol_fixture",
+                "protocol": protocol,
+                "stream": stream,
+                "fixture": fixture,
+            }
+        )
+        if set(response) != PROTOCOL_FIXTURE_RESPONSE_KEYS:
+            raise AssertionError(
+                "unexpected protocol-fixture driver response: "
+                + repr(response)
+            )
+        if type(response["http_status"]) is not int:
+            raise AssertionError("protocol-fixture status must be an integer")
+        if response["code"] is not None and not isinstance(response["code"], str):
+            raise AssertionError("protocol-fixture code must be null or a string")
+        for key in ("mutation_fingerprint_before", "mutation_fingerprint_after"):
+            if not isinstance(response[key], str) or not response[key]:
+                raise AssertionError(
+                    f"protocol-fixture {key} must be a non-empty string"
+                )
+        semantic = response["semantic"]
+        if semantic is not None and (
+            not isinstance(semantic, dict)
+            or set(semantic) != PROTOCOL_FIXTURE_SEMANTIC_KEYS
+        ):
+            raise AssertionError(
+                "unexpected protocol-fixture semantic result: "
+                + repr(semantic)
+            )
         return response
 
     def _raise_missing_seam(self) -> None:
@@ -1348,6 +1414,199 @@ class ProtocolValidationContract(unittest.TestCase):
                             ),
                             tools_enabled=True,
                         )
+
+
+class ProtocolOutputContract(unittest.TestCase):
+    """Freeze native wire output after production parsing/serialization.
+
+    ``protocol_fixture`` is a test-driver fixture table, not a second parser.
+    The driver must feed raw generated chunks through the production Laguna
+    output parser and each protocol's production serializer, then normalize
+    that wire back to this semantic result.  In particular, ``reasoning_text``
+    uses the raw text ``<think>private</think>visible``.  ``two_tools`` uses
+    canonical Laguna DSML for ``get_weather(city=Brussels)`` followed by
+    ``get_time(timezone=Europe/Brussels)``; its streamed chunks split inside
+    the opening marker, ``get_weather``, ``Europe/Brussels``, and the closing
+    marker.  ``continuation`` uses each protocol's native assistant tool-call
+    history plus a real result with the same call ID.  The malformed history
+    fixture changes that result ID and must be rejected before state mutation.
+    """
+
+    driver: Driver
+    protocols = ("openai_chat", "responses", "anthropic")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if SELECTED_CASES and "protocol" not in SELECTED_CASES:
+            raise unittest.SkipTest("protocol output contract not selected")
+        cls.driver = Driver(SERVER)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if hasattr(cls, "driver"):
+            cls.driver.close()
+
+    def assert_metric_and_id_contract(
+        self,
+        semantic: dict[str, Any],
+        identities: dict[str, set[str]],
+    ) -> None:
+        protocol_id = semantic["protocol_id"]
+        self.assertIsInstance(protocol_id, str)
+        self.assertTrue(protocol_id)
+        self.assertEqual(set(semantic["protocol_ids_seen"]), {protocol_id})
+        self.assertNotIn(protocol_id, identities["protocol"])
+        identities["protocol"].add(protocol_id)
+
+        metric = semantic["request_metrics"]
+        self.assertEqual(set(metric), REQUEST_METRICS_KEYS)
+        self.assertEqual(metric["schema"], REQUEST_METRICS_SCHEMA)
+        for key in ("request_id", "instance_id"):
+            self.assertIsInstance(metric[key], str, key)
+            parsed = uuid.UUID(metric[key])
+            self.assertEqual(str(parsed), metric[key].lower(), key)
+        self.assertNotEqual(metric["request_id"], metric["instance_id"])
+        self.assertNotEqual(metric["request_id"], protocol_id)
+        self.assertNotEqual(metric["instance_id"], protocol_id)
+        self.assertNotIn(metric["request_id"], identities["runtime"])
+        identities["runtime"].add(metric["request_id"])
+        if identities["instance"]:
+            self.assertEqual(identities["instance"], {metric["instance_id"]})
+        else:
+            identities["instance"].add(metric["instance_id"])
+
+        for key in ("prompt_tokens", "completion_tokens"):
+            self.assertIs(type(semantic[key]), int, key)
+            self.assertGreater(semantic[key], 0, key)
+        self.assertEqual(metric["prompt_tokens"], semantic["prompt_tokens"])
+        self.assertEqual(
+            metric["generated_tokens"], semantic["completion_tokens"]
+        )
+        self.assertEqual(metric["terminal_status"], "completed")
+        self.assertEqual(semantic["request_metrics_occurrences"], 1)
+        self.assertIs(semantic["request_metrics_at_terminal"], True)
+
+    def assert_no_raw_tag_leakage(self, semantic: dict[str, Any]) -> None:
+        normalized = (
+            semantic["visible_text"]
+            + semantic["reasoning_text"]
+            + json.dumps(semantic["tool_calls"], ensure_ascii=False)
+        )
+        for marker in ("<think>", "</think>", "DSML"):
+            self.assertNotIn(marker, normalized)
+
+    def stable_semantics(self, semantic: dict[str, Any]) -> dict[str, Any]:
+        metric = semantic["request_metrics"]
+        stable_metric = {
+            key: value
+            for key, value in metric.items()
+            if key not in {"request_id", "instance_id", "snapshot_seq"}
+            and not key.endswith("_ns")
+            and not key.endswith("_per_second")
+        }
+        return {
+            "visible_text": semantic["visible_text"],
+            "reasoning_text": semantic["reasoning_text"],
+            "tool_calls": semantic["tool_calls"],
+            "finish": semantic["finish"],
+            "prompt_tokens": semantic["prompt_tokens"],
+            "completion_tokens": semantic["completion_tokens"],
+            "request_metrics": stable_metric,
+            "request_metrics_occurrences": semantic[
+                "request_metrics_occurrences"
+            ],
+            "request_metrics_at_terminal": semantic[
+                "request_metrics_at_terminal"
+            ],
+        }
+
+    def accepted_pair(
+        self,
+        protocol: str,
+        fixture: str,
+        identities: dict[str, set[str]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        semantics: list[dict[str, Any]] = []
+        for stream in (False, True):
+            result = self.driver.protocol_fixture(
+                protocol, stream=stream, fixture=fixture
+            )
+            self.assertEqual(result["http_status"], 200)
+            self.assertIsNone(result["code"])
+            self.assertIsInstance(result["semantic"], dict)
+            semantic = result["semantic"]
+            self.assert_metric_and_id_contract(semantic, identities)
+            self.assert_no_raw_tag_leakage(semantic)
+            semantics.append(semantic)
+        self.assertEqual(
+            self.stable_semantics(semantics[0]),
+            self.stable_semantics(semantics[1]),
+            "streaming changed normalized semantics or stable runtime metrics",
+        )
+        return semantics[0], semantics[1]
+
+    def test_reasoning_is_separated_without_tag_leakage(self) -> None:
+        identities = {"protocol": set(), "runtime": set(), "instance": set()}
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                buffered, _streamed = self.accepted_pair(
+                    protocol, "reasoning_text", identities
+                )
+                self.assertEqual(buffered["visible_text"], "visible")
+                self.assertEqual(buffered["reasoning_text"], "private")
+                self.assertEqual(buffered["tool_calls"], [])
+                self.assertEqual(buffered["finish"], "stop")
+
+    def test_two_chunked_dsml_calls_preserve_order_and_arguments(self) -> None:
+        identities = {"protocol": set(), "runtime": set(), "instance": set()}
+        expected_calls = [
+            {"name": "get_weather", "arguments": {"city": "Brussels"}},
+            {
+                "name": "get_time",
+                "arguments": {"timezone": "Europe/Brussels"},
+            },
+        ]
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                buffered, _streamed = self.accepted_pair(
+                    protocol, "two_tools", identities
+                )
+                self.assertEqual(buffered["visible_text"], "")
+                self.assertEqual(buffered["reasoning_text"], "")
+                self.assertEqual(buffered["tool_calls"], expected_calls)
+                self.assertEqual(buffered["finish"], "tool_calls")
+
+    def test_matching_native_tool_results_allow_continuation(self) -> None:
+        identities = {"protocol": set(), "runtime": set(), "instance": set()}
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                buffered, _streamed = self.accepted_pair(
+                    protocol, "continuation", identities
+                )
+                self.assertTrue(buffered["visible_text"].strip())
+                self.assertEqual(buffered["reasoning_text"], "")
+                self.assertEqual(buffered["tool_calls"], [])
+                self.assertEqual(buffered["finish"], "stop")
+
+    def test_malformed_client_history_is_stably_rejected_before_mutation(
+        self,
+    ) -> None:
+        for protocol in self.protocols:
+            with self.subTest(protocol=protocol):
+                for stream in (False, True):
+                    result = self.driver.protocol_fixture(
+                        protocol,
+                        stream=stream,
+                        fixture="malformed_client_history",
+                    )
+                    self.assertEqual(result["http_status"], 400)
+                    self.assertEqual(result["code"], "invalid_request")
+                    self.assertIsNone(result["semantic"])
+                    self.assertEqual(
+                        result["mutation_fingerprint_after"],
+                        result["mutation_fingerprint_before"],
+                        "malformed history mutated state before rejection",
+                    )
 
 
 class MetricsContract(unittest.TestCase):

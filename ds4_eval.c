@@ -3778,7 +3778,7 @@ static bool write_qualification_result(FILE *result_jsonl,
     char runtime_json[32768];
     char digest_input[49152];
     char evidence_digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
-    char err[256];
+    char err[256] = {0};
     size_t request_length = 0;
     size_t runtime_length = 0;
     ds4_runtime_wire_snapshot runtime;

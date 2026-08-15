@@ -515,6 +515,15 @@ static bool json_flat_u32(const char *json, const char *key, uint32_t *out) {
     return true;
 }
 
+static bool sha256_hex_valid(const char *value) {
+    if (!value || strlen(value) != 64u) return false;
+    for (size_t i = 0; i < 64u; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') ||
+              (value[i] >= 'a' && value[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
 static bool sha256_file_path(const char *path,
                              char digest[DS4_PLAN_IO_SHA256_HEX_SIZE]) {
     int fd = open(path, O_RDONLY);
@@ -569,8 +578,16 @@ static bool validate_qualification_sequence(
         json_flat_u32(json, "requested_output_tokens",
                       &sequence->requested_output_tokens) &&
         json_flat_u32(json, "repetitions", &sequence->repetitions);
+    size_t field_count = 0;
+    for (const char *cursor = json; (cursor = strstr(cursor, "\":")) != NULL;
+         cursor += 2) {
+        field_count++;
+    }
     free(json);
-    if (!parsed || (strcmp(mode, "resident") && strcmp(mode, "streamed"))) {
+    if (!parsed || field_count != 8u ||
+        !sha256_hex_valid(sequence->prompt_sha256) ||
+        !sha256_hex_valid(sequence->manifest_sha256) ||
+        (strcmp(mode, "resident") && strcmp(mode, "streamed"))) {
         snprintf(err, errcap, "invalid closed qualification sequence");
         return false;
     }

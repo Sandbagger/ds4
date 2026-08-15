@@ -42,6 +42,12 @@ static uint16_t reference_f32_to_f16(float value) {
     return reference_f32_bits_to_f16(bits);
 }
 
+static uint32_t laguna_f32_bits(float value) {
+    uint32_t bits = 0u;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 static int run_f32_to_f16_reference_cases(void) {
     const struct {
         const char *name;
@@ -2084,6 +2090,25 @@ static int run_decode_attention_fattn_vec_frozen_case(void) {
         if (!rollback &&
             memcmp(selected_actual[arm], expected,
                    (size_t)selected_q_count * sizeof(float)) != 0) {
+            const uint32_t scale_bits = laguna_f32_bits(scale);
+            for (uint64_t i = 0u; i < selected_q_count; i++) {
+                const uint32_t actual_bits =
+                    laguna_f32_bits(selected_actual[arm][i]);
+                const uint32_t reference_bits = laguna_f32_bits(expected[i]);
+                if (actual_bits == reference_bits) continue;
+                fprintf(stderr,
+                        "decode-attention-fattn-vec-frozen: arm %u "
+                        "first-bit-mismatch index=%llu head=%u dim=%u "
+                        "actual=%a (0x%08x) reference=%a (0x%08x) "
+                        "scale=%a (0x%08x)\n",
+                        arm, (unsigned long long)i,
+                        selected_head + (uint32_t)(i / head_dim),
+                        (uint32_t)(i % head_dim),
+                        (double)selected_actual[arm][i], actual_bits,
+                        (double)expected[i], reference_bits,
+                        (double)scale, scale_bits);
+                break;
+            }
             const laguna_parity_span exact_diagnostic = {
                 "selected-h41-h42", selected_actual[arm], expected,
                 selected_q_count, selected_heads, head_dim, 0.0f, 0.0f,

@@ -1653,12 +1653,16 @@ benchmark prompt at 2K, 4K, 8K, 16K, and 28,672 tokens, with 256 generated
 tokens per frontier:
 
 ```sh
+LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(
+  python3 -c 'import json; print(json.load(open("tests/test-vectors/laguna-resident/manifest.json", encoding="utf-8"))["provenance"]["tokenizer_runtime_commit"])'
+)"
+test "${#LAGUNA_TOKENIZER_RUNTIME_COMMIT}" -eq 40
 env -i \
   PATH=/usr/bin:/bin \
   LD_LIBRARY_PATH=/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64 \
   LANG=C LC_ALL=C TZ=UTC \
   DS4_TEST_MODEL="$LAGUNA_MODEL" \
-  LAGUNA_TOKENIZER_RUNTIME_COMMIT=15c9b92502fed6bc26842e98d11a6347caadb08e \
+  LAGUNA_TOKENIZER_RUNTIME_COMMIT="$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
   /usr/bin/make -B -j1 test-cuda-laguna-resident CUDA_ARCH=native \
   CC=/usr/bin/cc CXX=/usr/bin/c++ CUDA_HOME=/usr/local/cuda \
   NVCC=/usr/local/cuda/bin/nvcc

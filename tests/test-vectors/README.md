@@ -94,19 +94,19 @@ recapture rather than reinterpreting these fixtures as dual-oracle evidence.
 
 The exact pins are:
 
-- contract commit: `a250e43722945e293f6044bc7254c4806d5a7912`;
+- contract commit: `c51af8bbf177e2448d6c4fa2c4396e5be038349e`;
 - capture directory:
-  `/home/will/artifacts/ds4/laguna-resident/a250e43/poolside-04b2b72`;
+  `/home/will/artifacts/ds4/laguna-resident/e2ccc0579fc18e6ea2362fa25fccbcd470f0e332/poolside-04b2b72`;
 - capture manifest SHA-256:
-  `cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e`;
+  `94c1cb43859c25e63799005a25d47a12cb414517d48268fd2938efe5472dd499`;
 - Poolside runtime commit: `04b2b72cb54048ead292884adbe11f284e3ec950`;
 - model repository and revision: `poolside/Laguna-S-2.1-GGUF` at
-  `706fa69799926b6afde1af9e24ca2a4923f110a1`;
-- model file: `laguna-s-2.1-Q4_K_M.gguf`, exactly `68248759648` bytes, with
+  `e2ccc0579fc18e6ea2362fa25fccbcd470f0e332`;
+- model file: `laguna-s-2.1-Q4_K_M.gguf`, exactly `68248760064` bytes, with
   SHA-256
-  `e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`;
+  `a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff`;
 - promoted tokenizer runtime commit:
-  `15c9b92502fed6bc26842e98d11a6347caadb08e`.
+  `c204ee02e9a68b69f80a7a830bdb05d0be8ab519`.
 
 The checked-in inputs are `cases.json`, `short.txt`, the deterministic prompt
 generator, and its generated `benchmark-32768.txt` seed. Regenerate the seed
@@ -128,23 +128,40 @@ failed provenance check or an explicit model/runtime change plus the external
 isolation attestation described by the design.
 
 Promotion consumes that capture and the pinned model through DS4's exact
-tokenizer. From the clean canonical DGX checkout used for promotion, run:
+tokenizer. Promotion is no-clobber, so never point it at the active fixture.
+From the clean canonical DGX checkout used for promotion, first create a
+fixed-input-only staging directory, then run:
 
 ```sh
-LAGUNA_LLAMA_OUT=/home/will/artifacts/ds4/laguna-resident/a250e43/poolside-04b2b72
-LAGUNA_MODEL=/home/will/models/poolside/Laguna-S-2.1-GGUF/706fa69799926b6afde1af9e24ca2a4923f110a1/laguna-s-2.1-Q4_K_M.gguf
+LAGUNA_LLAMA_OUT=/home/will/artifacts/ds4/laguna-resident/e2ccc0579fc18e6ea2362fa25fccbcd470f0e332/poolside-04b2b72
+LAGUNA_MODEL=/home/will/models/poolside/Laguna-S-2.1-GGUF/e2ccc0579fc18e6ea2362fa25fccbcd470f0e332/laguna-s-2.1-Q4_K_M.gguf
+LAGUNA_PROMOTION_STAGE=/private/tmp/laguna-resident-promote-c204ee0
+test ! -e "$LAGUNA_PROMOTION_STAGE"
+mkdir "$LAGUNA_PROMOTION_STAGE"
+cp tests/test-vectors/laguna-resident/cases.json \
+  tests/test-vectors/laguna-resident/short.txt \
+  tests/test-vectors/laguna-resident/generate_benchmark_prompt.py \
+  tests/test-vectors/laguna-resident/benchmark-32768.txt \
+  "$LAGUNA_PROMOTION_STAGE/"
 LAGUNA_MODEL="$LAGUNA_MODEL" \
 python3 gguf-tools/quality-testing/compare_laguna_logits.py \
   --ds4 ./ds4 \
   --llama "$LAGUNA_LLAMA_OUT" \
-  --promote tests/test-vectors/laguna-resident
+  --promote "$LAGUNA_PROMOTION_STAGE"
+sha256sum "$LAGUNA_PROMOTION_STAGE/manifest.json"
 ```
 
-Promotion writes exactly four little-endian Poolside float32 vectors,
-`short.llama.f32`, `swa-513.llama.f32`, `yarn-8193.llama.f32`, and
+Promotion materializes the three long prompts and writes exactly four
+little-endian Poolside float32 vectors, `short.llama.f32`,
+`swa-513.llama.f32`, `yarn-8193.llama.f32`, and
 `deep-32768.llama.f32`, plus one eight-ID little-endian continuation file,
 `yarn-8193.continuation.i32`, and the `laguna-resident-promoted-v2` manifest.
-It does not overwrite existing promoted artifacts.
+The corrected staged manifest SHA-256 is
+`b89233bbcd2eef9d6a82f296903a9cfe9f667d75feb925a5e4211fc275eac47b`.
+After independent verification, preserve the four fixed inputs byte-for-byte
+and replace only the three materialized prompts, four vectors, continuation,
+and manifest in the active fixture. Never modify `laguna-resident-history/`,
+C7 evidence, `*-auto` manifests, or historical qualification plans.
 
 Verification is non-mutating and supplies every provenance pin explicitly.
 Read the tokenizer runtime commit from the manifest, then run:
@@ -156,14 +173,14 @@ export LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(
 test "${#LAGUNA_TOKENIZER_RUNTIME_COMMIT}" -eq 40
 python3 gguf-tools/quality-testing/compare_laguna_logits.py \
   --verify-promoted tests/test-vectors/laguna-resident \
-  --contract-commit a250e43722945e293f6044bc7254c4806d5a7912 \
+  --contract-commit c51af8bbf177e2448d6c4fa2c4396e5be038349e \
   --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
   --llama-commit 04b2b72cb54048ead292884adbe11f284e3ec950 \
   --capture-manifest-sha256 \
-    cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e \
-  --gguf-size 68248759648 \
+    94c1cb43859c25e63799005a25d47a12cb414517d48268fd2938efe5472dd499 \
+  --gguf-size 68248760064 \
   --gguf-sha256 \
-    e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
+    a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff
 ```
 
 The aggregate target preserves the required gate order: promoted-fixture

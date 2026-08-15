@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
+GITIGNORE = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 CUDA_SOURCE = (ROOT / "ds4_cuda.cu").read_text(encoding="utf-8")
 DS4_HEADER = (ROOT / "ds4.h").read_text(encoding="utf-8")
 GPU_HEADER = (ROOT / "ds4_gpu.h").read_text(encoding="utf-8")
@@ -3630,6 +3631,9 @@ class CudaBuildContractTest(unittest.TestCase):
             "ds4_qualification_control.o",
             rule_prerequisites("tests/test_cuda_laguna_model"),
         )
+
+    def test_cuda_laguna_stream_build_artifact_is_ignored(self) -> None:
+        self.assertIn("/tests/test_cuda_laguna_stream", GITIGNORE)
 
     def test_resident_gate_has_one_runner_recipe_and_build_only_prerequisites(
         self,

@@ -2,7 +2,9 @@
 #include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
+#include "ds4_gpu.h"
 #include "ds4_help.h"
+#include "ds4_plan_io.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -15,6 +17,8 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -22,13 +26,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
 
 typedef struct {
     const char *model_path;
     const char *qualification_plan_path;
+    const char *qualification_sequence_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -62,6 +69,7 @@ typedef struct {
     bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool qualification_plan_path_set;
+    bool qualification_sequence_path_set;
     bool qualification_control_fd_set;
     bool cuda_tensor_parallel;
     bool show_output;
@@ -71,6 +79,12 @@ static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static uint64_t bench_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
 static uint64_t bench_snapshot_max_bytes(void) {
@@ -266,6 +280,14 @@ static bench_config parse_options(int argc, char **argv) {
             c.qualification_control_fd =
                 parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.qualification_control_fd_set = true;
+        } else if (!strcmp(arg, "--qualification-sequence")) {
+            if (c.qualification_sequence_path_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-sequence may only be specified once\n");
+                exit(2);
+            }
+            c.qualification_sequence_path = need_arg(&i, argc, argv, arg);
+            c.qualification_sequence_path_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -394,6 +416,16 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (c.qualification_plan_path_set) return c;
 
+    if (c.qualification_sequence_path_set) {
+        if (c.prompt_path || c.chat_prompt_path || c.csv_path ||
+            c.dump_frontier_logits_dir) {
+            fprintf(stderr,
+                    "ds4-bench: --qualification-sequence owns prompt and output selection\n");
+            exit(2);
+        }
+        return c;
+    }
+
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
@@ -429,6 +461,334 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     return c;
+}
+
+typedef struct {
+    char prompt_path[PATH_MAX];
+    char prompt_sha256[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    char manifest_sha256[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    uint32_t prompt_tokens;
+    uint32_t requested_output_tokens;
+    uint32_t repetitions;
+    bool resident_mode;
+} bench_qualification_sequence;
+
+typedef struct {
+    bool ready;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_nvml_inventory_snapshot pre_child;
+    uint8_t build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES];
+#endif
+} bench_qualification_external;
+
+static bool json_flat_string(const char *json, const char *key,
+                             char *out, size_t outcap) {
+    char needle[96];
+    if (snprintf(needle, sizeof(needle), "\"%s\":\"", key) <= 0) return false;
+    const char *p = strstr(json, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    size_t n = 0;
+    while (*p && *p != '"') {
+        if (*p == '\\' || (unsigned char)*p < 0x20 || n + 1 >= outcap) return false;
+        out[n++] = *p++;
+    }
+    if (*p != '"') return false;
+    out[n] = '\0';
+    return n > 0;
+}
+
+static bool json_flat_u32(const char *json, const char *key, uint32_t *out) {
+    char needle[96];
+    if (snprintf(needle, sizeof(needle), "\"%s\":", key) <= 0) return false;
+    const char *p = strstr(json, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    if (*p < '1' || *p > '9') return false;
+    uint64_t value = 0;
+    do {
+        value = value * 10u + (uint64_t)(*p++ - '0');
+        if (value > UINT32_MAX) return false;
+    } while (*p >= '0' && *p <= '9');
+    if (*p != ',' && *p != '}') return false;
+    *out = (uint32_t)value;
+    return true;
+}
+
+static bool sha256_file_path(const char *path,
+                             char digest[DS4_PLAN_IO_SHA256_HEX_SIZE]) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    char err[256];
+    const bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+        ds4_plan_io_sha256_fd(fd, (uint64_t)st.st_size, digest, err, sizeof(err));
+    close(fd);
+    return ok;
+}
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static int hexadecimal_nibble(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+static bool capture_running_build_identity(
+        uint8_t out[DS4_RUNTIME_BUILD_IDENTITY_BYTES]) {
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    if (!sha256_file_path("/proc/self/exe", digest)) return false;
+    for (size_t i = 0; i < DS4_RUNTIME_BUILD_IDENTITY_BYTES; i++) {
+        const int high = hexadecimal_nibble(digest[2u * i]);
+        const int low = hexadecimal_nibble(digest[2u * i + 1u]);
+        if (high < 0 || low < 0) return false;
+        out[i] = (uint8_t)((unsigned)high * 16u + (unsigned)low);
+    }
+    return true;
+}
+#endif
+
+static bool validate_qualification_sequence(
+        const char *path, bench_qualification_sequence *sequence,
+        char *err, size_t errcap) {
+    char *json = read_file(path);
+    char schema[64];
+    char mode[16];
+    memset(sequence, 0, sizeof(*sequence));
+    const bool parsed =
+        json_flat_string(json, "schema", schema, sizeof(schema)) &&
+        !strcmp(schema, "ds4.qualification-sequence/v1") &&
+        json_flat_string(json, "prompt_path", sequence->prompt_path,
+                         sizeof(sequence->prompt_path)) &&
+        json_flat_string(json, "prompt_sha256", sequence->prompt_sha256,
+                         sizeof(sequence->prompt_sha256)) &&
+        json_flat_string(json, "manifest_sha256", sequence->manifest_sha256,
+                         sizeof(sequence->manifest_sha256)) &&
+        json_flat_string(json, "mode", mode, sizeof(mode)) &&
+        json_flat_u32(json, "prompt_tokens", &sequence->prompt_tokens) &&
+        json_flat_u32(json, "requested_output_tokens",
+                      &sequence->requested_output_tokens) &&
+        json_flat_u32(json, "repetitions", &sequence->repetitions);
+    free(json);
+    if (!parsed || (strcmp(mode, "resident") && strcmp(mode, "streamed"))) {
+        snprintf(err, errcap, "invalid closed qualification sequence");
+        return false;
+    }
+    if (sequence->repetitions != 4) {
+        snprintf(err, errcap, "qualification sequence repetitions != 4");
+        return false;
+    }
+    if (sequence->prompt_tokens == 0 || sequence->requested_output_tokens == 0) {
+        snprintf(err, errcap, "qualification sequence token counts must be non-zero");
+        return false;
+    }
+    sequence->resident_mode = !strcmp(mode, "resident");
+    char observed[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    if (!sha256_file_path(sequence->prompt_path, observed) ||
+        strcmp(observed, sequence->prompt_sha256)) {
+        snprintf(err, errcap, "qualification prompt digest mismatch");
+        return false;
+    }
+    return true;
+}
+
+static bool bench_runtime_json(ds4_engine *engine,
+                               ds4_runtime_wire_snapshot *snapshot,
+                               char *json, size_t jsoncap) {
+    size_t length = 0;
+    return ds4_engine_runtime_snapshot(engine, snapshot) &&
+        ds4_runtime_wire_snapshot_json(snapshot, json, jsoncap, &length);
+}
+
+static void qualification_milestone(FILE *out, const char *milestone,
+                                    uint32_t repetition_index,
+                                    const char *request_id,
+                                    uint64_t accepted_monotonic_ns) {
+    fprintf(out,
+            "{\"schema\":\"ds4.bench.qualification-milestone/v1\","
+            "\"milestone\":\"%s\",\"repetition_index\":%u,"
+            "\"request_id\":\"%s\",\"accepted_monotonic_ns\":%" PRIu64
+            ",\"monotonic_ns\":%" PRIu64 "}\n",
+            milestone, repetition_index, request_id, accepted_monotonic_ns,
+            bench_now_ns());
+    fflush(out);
+}
+
+static int run_qualification_sequence(const bench_config *cfg,
+                                      ds4_engine *engine,
+                                      const bench_qualification_sequence *sequence,
+                                      const bench_qualification_external *external) {
+    char *rendered = read_file(sequence->prompt_path);
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, rendered, &prompt);
+    free(rendered);
+    if (prompt.len != (int)sequence->prompt_tokens) {
+        fprintf(stderr,
+                "ds4-bench: qualification prompt token count mismatch: got %d expected %u\n",
+                prompt.len, sequence->prompt_tokens);
+        ds4_tokens_free(&prompt);
+        return 1;
+    }
+    const uint32_t context = sequence->prompt_tokens +
+                             sequence->requested_output_tokens + 1u;
+    const int eos = ds4_token_eos(engine);
+    int rc = 0;
+    for (uint32_t repetition = 0; repetition < sequence->repetitions; repetition++) {
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, (int)context) != 0) {
+            rc = 1;
+            break;
+        }
+        ds4_runtime_request_context request = {0};
+        ds4_runtime_request_metrics metrics = {0};
+        const uint64_t accepted = bench_now_ns();
+        char err[256] = {0};
+        if (!ds4_runtime_request_begin(&request, accepted) ||
+            !ds4_runtime_request_set_prompt_tokens(&request, prompt.len) ||
+            !ds4_runtime_request_mark_prefill_started(&request, bench_now_ns())) {
+            fprintf(stderr, "ds4-bench: cannot initialize qualification request\n");
+            ds4_session_free(session);
+            rc = 1;
+            break;
+        }
+        qualification_milestone(stdout, "request_accepted", repetition,
+                                request.request_id, accepted);
+        if (ds4_session_sync_attributed(session, &prompt, &request,
+                                        err, sizeof(err)) != 0 ||
+            !ds4_runtime_request_mark_prefill_complete(&request, bench_now_ns())) {
+            fprintf(stderr, "ds4-bench: qualification prefill failed: %s\n", err);
+            ds4_session_free(session);
+            rc = 1;
+            break;
+        }
+        uint32_t generated = 0;
+        for (; generated < sequence->requested_output_tokens; generated++) {
+            const int token = ds4_session_argmax_excluding(session, eos);
+            if (token < 0 ||
+                ds4_session_eval_attributed(session, token, &request,
+                                            err, sizeof(err)) != 0 ||
+                !ds4_runtime_request_add_generated_tokens(&request, 1) ||
+                !ds4_runtime_request_record_visible_decoded(
+                    &request, 1, bench_now_ns())) {
+                fprintf(stderr, "ds4-bench: qualification decode failed: %s\n", err);
+                rc = 1;
+                break;
+            }
+            if (generated == 0) {
+                if (!ds4_runtime_request_mark_first_visible_emitted(
+                        &request, bench_now_ns())) {
+                    rc = 1;
+                    break;
+                }
+                qualification_milestone(stdout, "first_token", repetition,
+                                        request.request_id, accepted);
+            }
+        }
+        if (rc == 0 &&
+            ds4_session_request_barrier(session, &request, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: qualification request barrier failed: %s\n", err);
+            rc = 1;
+        }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        ds4_engine_laguna_external_checkpoint_observation observation;
+        if (rc == 0 && !sequence->resident_mode &&
+            (!external || !external->ready ||
+             ds4_engine_laguna_external_checkpoint(
+                 engine, &external->pre_child, external->build_identity,
+                 &observation) != DS4_RUNTIME_STATUS_OK)) {
+            fprintf(stderr, "ds4-bench: qualification external checkpoint failed\n");
+            rc = 1;
+        }
+#else
+        (void)external;
+#endif
+        if (rc == 0 &&
+            !ds4_runtime_request_finish(&request, DS4_RUNTIME_REQUEST_COMPLETED,
+                                        bench_now_ns(), &metrics)) {
+            fprintf(stderr, "ds4-bench: qualification request finalization failed\n");
+            rc = 1;
+        }
+        if (rc == 0) {
+            char request_json[16384];
+            char runtime_json[65536];
+            size_t request_length = 0;
+            ds4_runtime_wire_snapshot snapshot;
+            if (!ds4_runtime_request_metrics_json(
+                    &metrics, request_json, sizeof(request_json), &request_length) ||
+                !bench_runtime_json(engine, &snapshot,
+                                    runtime_json, sizeof(runtime_json))) {
+                fprintf(stderr, "ds4-bench: qualification evidence serialization failed\n");
+                rc = 1;
+            } else {
+                const ds4_runtime_snapshot *a = &snapshot.allocations;
+                qualification_milestone(stdout, "request_complete", repetition,
+                                        request.request_id, accepted);
+                fprintf(stdout,
+                        "{\"schema\":\"ds4.bench.qualification-sample/v1\","
+                        "\"milestone\":\"request_complete\","
+                        "\"repetition_index\":%u,\"request_id\":\"%s\","
+                        "\"accepted_monotonic_ns\":%" PRIu64 ","
+                        "\"monotonic_ns\":%" PRIu64 ","
+                        "\"manifest_sha256\":\"%s\","
+                        "\"resident_mode\":%s,"
+                        "\"session_payload_bytes\":%" PRIu64 ","
+                        "\"kv_allocated_bytes\":%" PRIu64 ","
+                        "\"configured_prefill_rows\":%u,"
+                        "\"allocated_prefill_rows\":%u,"
+                        "\"expert_cache_bound_bytes\":%" PRIu64 ","
+                        "\"expert_cache_current_bytes\":%" PRIu64 ","
+                        "\"expert_cache_peak_bytes\":%" PRIu64 ","
+                        "\"qualification_total_current_bytes\":%" PRIu64 ","
+                        "\"qualification_total_peak_bytes\":%" PRIu64 ","
+                        "\"model_source_resident_bytes\":%" PRIu64 ","
+                        "\"external_attribution\":{"
+                        "\"valid\":%s,\"generation\":%" PRIu64 ","
+                        "\"checkpoint_sequence\":%" PRIu64 ","
+                        "\"model_device_major\":%u,\"model_device_minor\":%u,"
+                        "\"model_inode\":%" PRIu64 ","
+                        "\"model_pss_bytes\":%" PRIu64 ","
+                        "\"host_library_unattributed_bytes\":%" PRIu64 ","
+                        "\"nvml_process_bytes\":%" PRIu64 ","
+                        "\"tracked_cuda_physical_bytes\":%" PRIu64 ","
+                        "\"cuda_library_unattributed_bytes\":%" PRIu64 ","
+                        "\"unrelated_process_inventory_stable\":%s},"
+                        "\"request_metrics\":%s,\"runtime_snapshot\":%s}\n",
+                        repetition, metrics.request_id, accepted, bench_now_ns(),
+                        sequence->manifest_sha256,
+                        sequence->resident_mode ? "true" : "false",
+                        ds4_session_payload_bytes(session),
+                        a->category_current[DS4_RUNTIME_CATEGORY_KV_STATE],
+                        snapshot.configured_prefill_rows,
+                        snapshot.allocated_prefill_rows,
+                        snapshot.expert_cache_limit_bytes,
+                        a->category_current[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD],
+                        a->category_peak[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD],
+                        a->qualification_total_current,
+                        a->qualification_total_peak,
+                        a->report_current[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT],
+                        a->external_sample.attributed_valid ? "true" : "false",
+                        a->external_sample.attributed_generation,
+                        a->external_sample.checkpoint_sequence,
+                        a->external_sample.smaps_model_device_major,
+                        a->external_sample.smaps_model_device_minor,
+                        a->external_sample.smaps_model_inode,
+                        a->external_sample.smaps_model_pss_bytes,
+                        a->external_sample.host_library_unattributed_bytes,
+                        a->external_sample.nvml_process_bytes,
+                        a->external_sample.tracked_cuda_physical_bytes,
+                        a->external_sample.cuda_library_unattributed_bytes,
+                        a->external_sample.unrelated_process_inventory_stable
+                            ? "true" : "false",
+                        request_json, runtime_json);
+                fflush(stdout);
+            }
+        }
+        ds4_session_free(session);
+        if (rc != 0) break;
+    }
+    ds4_tokens_free(&prompt);
+    (void)cfg;
+    return rc;
 }
 
 static void json_write_string(FILE *fp, const char *s) {
@@ -624,6 +984,54 @@ int main(int argc, char **argv) {
         return qualification_argv_rc;
     }
     bench_config cfg = parse_options(argc, argv);
+    bench_qualification_sequence qualification_sequence = {0};
+    bench_qualification_external qualification_external = {0};
+    if (cfg.qualification_sequence_path_set) {
+        char sequence_err[256];
+        if (!validate_qualification_sequence(cfg.qualification_sequence_path,
+                                             &qualification_sequence,
+                                             sequence_err,
+                                             sizeof(sequence_err))) {
+            fprintf(stderr, "ds4-bench: %s\n", sequence_err);
+            return 2;
+        }
+        if (qualification_sequence.resident_mode == cfg.ssd_streaming) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence mode does not match runtime mode\n");
+            return 2;
+        }
+        const uint64_t required_context =
+            (uint64_t)qualification_sequence.prompt_tokens +
+            (uint64_t)qualification_sequence.requested_output_tokens + 1u;
+        if (required_context > INT_MAX) {
+            fprintf(stderr, "ds4-bench: qualification sequence context is too large\n");
+            return 2;
+        }
+        cfg.ctx_start = (int)qualification_sequence.prompt_tokens;
+        cfg.ctx_max = cfg.ctx_start;
+        cfg.ctx_alloc = (int)required_context;
+        cfg.gen_tokens = (int)qualification_sequence.requested_output_tokens;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (!qualification_sequence.resident_mode) {
+            qualification_external.ready =
+                ds4_gpu_nvml_inventory_capture(
+                    &qualification_external.pre_child) != 0 &&
+                capture_running_build_identity(
+                    qualification_external.build_identity);
+            if (!qualification_external.ready) {
+                fprintf(stderr,
+                        "ds4-bench: cannot capture pre-allocation qualification identity\n");
+                return 2;
+            }
+        }
+#else
+        if (!qualification_sequence.resident_mode) {
+            fprintf(stderr,
+                    "ds4-bench: streamed qualification evidence requires CUDA on Linux\n");
+            return 2;
+        }
+#endif
+    }
 
     /* Hint the packer at the largest ctx this bench run will exercise
      * so per-layer KV bytes are priced for the real session size, not
@@ -718,6 +1126,14 @@ int main(int argc, char **argv) {
                        ds4_engine_prefill_chunk(engine),
                        cfg.ssd_streaming);
 
+    if (cfg.qualification_sequence_path_set) {
+        const int qualification_rc =
+            run_qualification_sequence(&cfg, engine, &qualification_sequence,
+                                       &qualification_external);
+        ds4_engine_close(engine);
+        return qualification_rc;
+    }
+
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
@@ -765,7 +1181,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,session_payload_bytes,kv_allocated_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -893,8 +1309,16 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        ds4_runtime_wire_snapshot allocation_snapshot;
+        char allocation_json[4096];
+        uint64_t kv_allocated_bytes = 0;
+        if (bench_runtime_json(engine, &allocation_snapshot,
+                               allocation_json, sizeof(allocation_json))) {
+            kv_allocated_bytes = allocation_snapshot.allocations.category_current[
+                DS4_RUNTIME_CATEGORY_KV_STATE];
+        }
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -903,7 +1327,8 @@ int main(int argc, char **argv) {
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
-                (unsigned long long)(have_snapshot ? snap.len : 0));
+                (unsigned long long)ds4_session_payload_bytes(session),
+                (unsigned long long)kv_allocated_bytes);
         fflush(out);
 
         previous = frontier;

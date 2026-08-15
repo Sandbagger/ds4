@@ -3575,6 +3575,8 @@ def run_qualification_schedule(
     manifest: Mapping[str, Any],
     evidence_dir: Path | str,
     execute: Callable[[str, str | None, str | None, int], Mapping[str, Any]],
+    *,
+    initialize: Callable[[Path], None] | None = None,
 ) -> dict[str, Any]:
     if not callable(execute):
         raise ValueError("qualification attempt executor must be callable")
@@ -3586,6 +3588,10 @@ def run_qualification_schedule(
         directory.mkdir(mode=0o700, parents=False, exist_ok=False)
     except OSError as exc:
         raise ValueError(f"cannot create immutable evidence directory: {exc}") from exc
+    if initialize is not None:
+        if not callable(initialize):
+            raise ValueError("qualification evidence initializer must be callable")
+        initialize(directory)
     results: list[dict[str, Any]] = []
     for sequence, (mode, profile, prompt) in enumerate(schedule):
         final: dict[str, Any] | None = None
@@ -4073,6 +4079,261 @@ def run_qualification_benchmark_slice(
             "prompt": prompt_path.name,
         },
     }
+
+
+def generate_profile_qualification_plan(
+    *,
+    model: Path,
+    bench_bin: Path,
+    cache_bytes: int,
+    directory: Path,
+) -> tuple[Path, str, Mapping[str, Any]]:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    plan_path = directory / "plan.json"
+    result = run_foreground_process(
+        [
+            str(bench_bin), "--model", str(model), "--backend", "cuda",
+            "--ctx-alloc", "32768", "--prefill-chunk", "4096",
+            "--ssd-streaming", "--ssd-streaming-cache-bytes", str(cache_bytes),
+            "--qualification-plan", str(plan_path.resolve()),
+        ],
+        stdout_path=directory / "stdout.log",
+        stderr_path=directory / "stderr.log",
+        timeout_seconds=15 * 60,
+    )
+    if result["timed_out"] or result["returncode"] != 0:
+        raise ValueError(
+            f"qualification plan child failed: returncode={result['returncode']} "
+            f"timed_out={result['timed_out']}"
+        )
+    digest = _sha256_file(plan_path)
+    loaded = _load_cold_preparation_plan(plan_path, digest)
+    return plan_path, digest, loaded[0]
+
+
+def run_qualification_eval_mode(
+    *,
+    mode: str,
+    model: Path,
+    eval_bin: Path,
+    directory: Path,
+    cache_bytes: int | None,
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    if mode not in {"resident", "streamed"} or (mode == "resident") != (cache_bytes is None):
+        raise ValueError("qualification eval mode/cache mismatch")
+    result_path = directory / "results.jsonl"
+    argv = [
+        str(eval_bin), "--model", str(model), "--backend", "cuda",
+        "--ctx", "32768", "--prefill-chunk", "4096", "--plain",
+        "--seed", "1", "--result-jsonl", str(result_path.resolve()),
+    ]
+    if mode == "streamed":
+        argv.extend((
+            "--ssd-streaming", "--ssd-streaming-cache-bytes", str(cache_bytes),
+        ))
+    for case_id in EVAL_CASE_IDS:
+        argv.extend(("--case-id", case_id))
+    result = run_foreground_process(
+        argv,
+        stdout_path=directory / "eval.stdout.log",
+        stderr_path=directory / "eval.stderr.log",
+        timeout_seconds=timeout_seconds,
+    )
+    if result["timed_out"] or result["returncode"] not in (0, 1):
+        raise ValueError(
+            f"{mode} qualification eval failed: returncode={result['returncode']} "
+            f"timed_out={result['timed_out']}"
+        )
+    return _load_smoke_eval_records(result_path, EVAL_CASE_IDS)
+
+
+def _eval_vector(records: Sequence[Mapping[str, Any]]) -> list[list[str]]:
+    return [
+        [record["answer"], record["grade"], record["terminal_status"]]
+        for record in records
+    ]
+
+
+def run_canonical_qualification(
+    *,
+    manifest_path: Path,
+    model: Path,
+    server_bin: Path,
+    bench_bin: Path,
+    eval_bin: Path,
+    evidence_dir: Path,
+) -> dict[str, Any]:
+    """Validate identities, then run the frozen resident/profile schedule."""
+    manifest = load_manifest(manifest_path)
+    manifest_digest = manifest_sha256(manifest)
+    observed_model = bind_model_identity(model)
+    verify_manifest_bindings(manifest, model_identity=observed_model)
+    schemas = bind_qualification_schemas()
+    subject = bind_qualification_binaries(server_bin, bench_bin, eval_bin)
+    if evidence_dir.exists():
+        raise ValueError("immutable qualification evidence directory already exists")
+    admitted = {
+        record["role"]: record["binary_sha256"] for record in subject["binaries"]
+    }
+    frozen_nvml = manifest["qualification_preflight"]["nvml_pre_child"]["inventory"]
+    plans: dict[str, tuple[Path, str, Mapping[str, Any]]] = {}
+    resident_vector: list[list[str]] | None = None
+
+    def ensure_plan(profile_id: str, cache_bytes: int) -> tuple[Path, str, Mapping[str, Any]]:
+        if profile_id not in plans:
+            plans[profile_id] = generate_profile_qualification_plan(
+                model=model,
+                bench_bin=bench_bin,
+                cache_bytes=cache_bytes,
+                directory=evidence_dir / "plans" / profile_id,
+            )
+        return plans[profile_id]
+
+    def execute(
+        mode: str, profile_id: str | None, prompt_id: str | None, attempt: int
+    ) -> Mapping[str, Any]:
+        nonlocal resident_vector
+        sequence = qualification_schedule(manifest).index((mode, profile_id, prompt_id))
+        attempt_dir = evidence_dir / f"slice-{sequence:02d}-attempt-{attempt}"
+        attempt_dir.mkdir(mode=0o700)
+        try:
+            if mode == "resident":
+                first_profile = manifest["profiles"][0]
+                plan_path, plan_digest, _ = ensure_plan(
+                    first_profile["profile_id"], int(first_profile["cache_bytes"])
+                )
+                all_samples: list[dict[str, Any]] = []
+                for prompt in manifest["prompts"]:
+                    prompt_dir = attempt_dir / prompt["id"]
+                    prompt_dir.mkdir(mode=0o700)
+                    result = run_qualification_benchmark_slice(
+                        manifest,
+                        model=model,
+                        bench_bin=bench_bin,
+                        prompt=prompt,
+                        directory=prompt_dir,
+                        plan_path=plan_path,
+                        plan_sha256=plan_digest,
+                        resident_mode=True,
+                        cache_bytes=None,
+                        admitted_binary_sha256=admitted["bench"],
+                        frozen_nvml_inventory=frozen_nvml,
+                    )
+                    all_samples.extend(result["samples"])
+                eval_dir = attempt_dir / "eval"
+                eval_dir.mkdir(mode=0o700)
+                resident_eval = run_qualification_eval_mode(
+                    mode="resident", model=model, eval_bin=eval_bin,
+                    directory=eval_dir, cache_bytes=None,
+                    timeout_seconds=4 * 60 * 60,
+                )
+                resident_vector = _eval_vector(resident_eval)
+                _write_new_json(attempt_dir / "eval-vector.json", resident_vector)
+                return {"status": "passed", "samples": all_samples, "reason": None}
+
+            if profile_id is None or prompt_id is None:
+                raise ValueError("streamed qualification slice lacks profile or prompt")
+            profile = next(item for item in manifest["profiles"] if item["profile_id"] == profile_id)
+            prompt = next(item for item in manifest["prompts"] if item["id"] == prompt_id)
+            plan_path, plan_digest, _ = ensure_plan(profile_id, int(profile["cache_bytes"]))
+            result = run_qualification_benchmark_slice(
+                manifest,
+                model=model,
+                bench_bin=bench_bin,
+                prompt=prompt,
+                directory=attempt_dir,
+                plan_path=plan_path,
+                plan_sha256=plan_digest,
+                resident_mode=False,
+                cache_bytes=int(profile["cache_bytes"]),
+                admitted_binary_sha256=admitted["bench"],
+                frozen_nvml_inventory=frozen_nvml,
+            )
+            if prompt_id == f"native-{profile['prompt_order'][-1]}":
+                eval_dir = attempt_dir / "eval"
+                eval_dir.mkdir(mode=0o700)
+                streamed_eval = run_qualification_eval_mode(
+                    mode="streamed", model=model, eval_bin=eval_bin,
+                    directory=eval_dir, cache_bytes=int(profile["cache_bytes"]),
+                    timeout_seconds=4 * 60 * 60,
+                )
+                vector = _eval_vector(streamed_eval)
+                _write_new_json(attempt_dir / "eval-vector.json", vector)
+                if resident_vector is None or vector != resident_vector:
+                    return {
+                        "status": "failed", "samples": result["samples"],
+                        "reason": "resident and streamed eval vectors differ",
+                    }
+            return {
+                "status": result["status"],
+                "samples": result["samples"],
+                "reason": result["reason"],
+            }
+        except (OSError, TimeoutError, ValueError) as exc:
+            return {"status": "invalid", "samples": [], "reason": str(exc)}
+
+    admission = {
+        "schema": "ds4.qualification.admission/v1",
+        "manifest_sha256": manifest_digest,
+        "subject": subject,
+        "schemas": schemas,
+        "model": observed_model,
+    }
+    status = run_qualification_schedule(
+        manifest,
+        evidence_dir,
+        execute,
+        initialize=lambda directory: _write_new_json(
+            directory / "admission.json", admission
+        ),
+    )
+    return status
+
+
+def verify_qualification_run(
+    manifest_path: Path | str, evidence_dir: Path | str
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    directory = Path(evidence_dir)
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("qualification evidence directory is missing or unsafe")
+    try:
+        status = loads_strict((directory / "run-status.json").read_text(encoding="utf-8"))
+        admission = loads_strict((directory / "admission.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read qualification run evidence: {exc}") from exc
+    if not isinstance(status, dict) or set(status) != {
+        "schema", "manifest_sha256", "status", "attempts"
+    } or status["schema"] != "ds4.qualification.run-status/v1" or \
+       status["manifest_sha256"] != manifest_sha256(manifest) or \
+       status["status"] not in {"passed", "failed", "invalid"} or \
+       not isinstance(status["attempts"], list):
+        raise ValueError("qualification run status is invalid")
+    if not isinstance(admission, dict) or admission.get("manifest_sha256") != manifest_sha256(manifest):
+        raise ValueError("qualification admission does not bind the manifest")
+    expected_schedule = qualification_schedule(manifest)
+    if len(status["attempts"]) != len(expected_schedule):
+        raise ValueError("qualification run does not cover the frozen schedule")
+    for record, (mode, profile_id, prompt_id) in zip(
+        status["attempts"], expected_schedule, strict=True
+    ):
+        if not isinstance(record, dict) or \
+           (record.get("mode"), record.get("profile_id"), record.get("prompt_id")) != \
+           (mode, profile_id, prompt_id):
+            raise ValueError("qualification attempt order differs from the manifest")
+        sequence = record.get("sequence")
+        attempt = record.get("attempt")
+        if type(sequence) is not int or type(attempt) is not int:
+            raise ValueError("qualification attempt identity is invalid")
+        path = directory / f"attempt-{sequence:02d}-{attempt}.json"
+        try:
+            observed = loads_strict(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"cannot read qualification attempt evidence: {exc}") from exc
+        if observed != record:
+            raise ValueError("qualification attempt evidence differs from run status")
+    return status
 
 
 def _qualification_evidence_claims(value: Any) -> dict[str, str]:
@@ -4573,6 +4834,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if args.command == "run":
+            result = run_canonical_qualification(
+                manifest_path=args.manifest,
+                model=args.model,
+                server_bin=args.server_bin,
+                bench_bin=args.bench_bin,
+                eval_bin=args.eval_bin,
+                evidence_dir=args.evidence_dir,
+            )
+            print(canonical_json_bytes(result).decode("utf-8"))
+            return 0 if result["status"] == "passed" else 1
+        if args.command == "verify":
+            result = verify_qualification_run(args.manifest, args.evidence_dir)
+            print(
+                f"manifest_sha256={result['manifest_sha256']} "
+                f"status={result['status']} attempts={len(result['attempts'])}"
+            )
+            return 0 if result["status"] == "passed" else 1
+        if args.command == "verify-bundle":
+            result = verify_qualification_bundle(args.bundle)
+            print(
+                f"bundle_sha256={_sha256_file(args.bundle)} "
+                f"status={result['status']} profiles={len(result['profiles'])}"
+            )
+            return 0
+        if args.command == "publish":
+            raise ValueError(
+                "qualification bundle assembly is unavailable until gate evaluation completes"
+            )
         if args.command == "smoke-eval":
             result = run_smoke_eval(
                 args.model, args.eval_bin, args.case_id,

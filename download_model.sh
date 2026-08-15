@@ -4,7 +4,9 @@ set -e
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
-LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
+LAGUNA_REVISION="e2ccc0579fc18e6ea2362fa25fccbcd470f0e332"
+LAGUNA_Q4_SIZE_BYTES="68248760064"
+LAGUNA_Q4_SHA256="a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -110,8 +112,8 @@ Targets:
 
   laguna-q4
        Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
-       About 68 GB on disk; currently supported by the Metal backend with
-       full model residency.
+       Staged under a revision-qualified immutable path and verified by exact
+       size and SHA-256. This staging target does not update ./ds4flash.gguf.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -121,8 +123,10 @@ Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
 
-After main-model downloads the script updates:
+After main-model downloads except laguna-q4, the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
+
+laguna-q4 prints its verified immutable path without changing the active link.
 
 Then the default commands work:
   ./ds4 -p "Hello"
@@ -151,6 +155,7 @@ MODEL_FILES=
 LINK_MODEL=1
 FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
+LAGUNA_STAGE_MODEL=
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
@@ -195,6 +200,7 @@ case "$MODEL" in
         MODEL_FILE=$LAGUNA_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         HF_REVISION=$LAGUNA_REVISION
+        LINK_MODEL=0
         ;;
     -h|--help|help)
         usage
@@ -266,6 +272,120 @@ local_download_name() {
     fi
 }
 
+file_size_bytes() {
+    size=
+    if size=$(LC_ALL=C stat -f '%z' "$1" 2>/dev/null); then
+        :
+    elif size=$(LC_ALL=C stat -c '%s' "$1" 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+    case "$size" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$size"
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        output=$(sha256sum "$1") || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        output=$(shasum -a 256 "$1") || return 1
+    else
+        echo "Cannot verify Laguna artifact: sha256sum or shasum is required." >&2
+        return 1
+    fi
+    digest=${output%% *}
+    case "$digest" in
+        ''|*[!0-9a-fA-F]*) return 1 ;;
+    esac
+    printf '%s\n' "$digest" | tr 'A-F' 'a-f'
+}
+
+verify_laguna_q4() {
+    artifact=$1
+    if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
+        echo "Laguna artifact is not a regular, non-symlink file: $artifact" >&2
+        return 1
+    fi
+    observed_size=$(file_size_bytes "$artifact") || {
+        echo "Cannot determine Laguna artifact size: $artifact" >&2
+        return 1
+    }
+    if [ "$observed_size" != "$LAGUNA_Q4_SIZE_BYTES" ]; then
+        echo "Laguna artifact size mismatch: $artifact" >&2
+        echo "Expected $LAGUNA_Q4_SIZE_BYTES bytes, observed $observed_size." >&2
+        return 1
+    fi
+    observed_sha256=$(sha256_file "$artifact") || {
+        echo "Cannot calculate Laguna artifact SHA-256: $artifact" >&2
+        return 1
+    }
+    if [ "$observed_sha256" != "$LAGUNA_Q4_SHA256" ]; then
+        echo "Laguna artifact SHA-256 mismatch: $artifact" >&2
+        echo "Expected $LAGUNA_Q4_SHA256, observed $observed_sha256." >&2
+        return 1
+    fi
+}
+
+download_laguna_q4_hf() {
+    file=$1
+    revision_dir="$OUT_DIR/$LAGUNA_REPO/$LAGUNA_REVISION"
+    incoming_dir="$revision_dir/.incoming"
+    incoming="$incoming_dir/$file"
+    out="$revision_dir/$file"
+    flat="$OUT_DIR/$file"
+    LAGUNA_STAGE_MODEL=$out
+
+    mkdir -p "$revision_dir"
+    if [ -e "$flat" ] || [ -L "$flat" ]; then
+        echo "Preserving unqualified Laguna artifact; it is not eligible for reuse: $flat" >&2
+    fi
+
+    if [ -e "$out" ] || [ -L "$out" ]; then
+        if verify_laguna_q4 "$out"; then
+            echo "Reusing verified Laguna Q4 artifact: $out"
+            return
+        fi
+        echo "Refusing to replace invalid artifact at immutable Laguna path: $out" >&2
+        exit 1
+    fi
+
+    HF_CMD=$(find_hf_command || true)
+    if [ -z "$HF_CMD" ]; then
+        echo "Laguna GGUF downloads require the official Hugging Face CLI." >&2
+        echo "Install it with:" >&2
+        echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
+        exit 1
+    fi
+
+    mkdir -p "$incoming_dir"
+    echo "Downloading $file"
+    echo "from https://huggingface.co/$REPO"
+    echo "revision $HF_REVISION"
+    echo "into unpublished staging directory $incoming_dir"
+    echo "using $HF_CMD download"
+    echo "If the download stops, run the same command again to resume it."
+
+    if [ -n "$TOKEN" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$incoming_dir" --token "$TOKEN"
+    else
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$incoming_dir"
+    fi
+
+    if ! verify_laguna_q4 "$incoming"; then
+        echo "Downloaded Laguna artifact was not published; inspect or remove: $incoming" >&2
+        exit 1
+    fi
+    if ! ln "$incoming" "$out"; then
+        echo "Cannot publish Laguna artifact without replacing an existing path: $out" >&2
+        exit 1
+    fi
+    rm -f "$incoming"
+    echo "Verified and staged Laguna Q4 artifact: $out"
+}
+
 download_one_hf() {
     file=$1
     local_file=$(local_download_name "$file")
@@ -332,6 +452,11 @@ download_one() {
     aria2_part="$out.aria2"
     url="https://huggingface.co/$REPO/resolve/main/$file"
 
+    if [ "$MODEL" = "laguna-q4" ]; then
+        download_laguna_q4_hf "$file"
+        return
+    fi
+
     if needs_hf_download "$file"; then
         download_one_hf "$file"
         return
@@ -380,6 +505,10 @@ elif [ "$MODEL" = "dspark-support" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
     echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DSPARK_SUPPORT_FILE --temp 0"
+elif [ "$MODEL" = "laguna-q4" ]; then
+    echo
+    echo "Verified immutable Laguna Q4 path: $LAGUNA_STAGE_MODEL"
+    echo "Staged only; ./ds4flash.gguf was not changed."
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

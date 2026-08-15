@@ -15,6 +15,7 @@ import math
 import mmap
 import os
 import platform
+import posixpath
 import re
 import select
 import socket
@@ -24,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 
@@ -3427,6 +3428,207 @@ def write_manifest_atomic(path: Path | str, value: Mapping[str, Any]) -> None:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+
+def validate_evidence_path(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("evidence path must be a nonempty string")
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise ValueError("evidence path must be valid UTF-8") from exc
+    if not encoded or value.startswith("/") or "\\" in value:
+        raise ValueError("evidence path must be relative canonical POSIX")
+    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in value):
+        raise ValueError("evidence path contains a control character")
+    parts = PurePosixPath(value).parts
+    if not parts or any(part in ("", ".", "..") for part in value.split("/")):
+        raise ValueError("evidence path contains an empty, dot, or dot-dot component")
+    if posixpath.normpath(value) != value or "/".join(parts) != value:
+        raise ValueError("evidence path is not normalized POSIX")
+    return value
+
+
+def _evidence_files(root: Path) -> set[str]:
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("evidence root must be a real directory")
+    files: set[str] = set()
+    for entry in root.rglob("*"):
+        relative = entry.relative_to(root).as_posix()
+        validate_evidence_path(relative)
+        if entry.is_symlink():
+            raise ValueError(f"evidence path is a symlink: {relative}")
+        if entry.is_dir():
+            continue
+        if not entry.is_file():
+            raise ValueError(f"evidence path is not a regular file: {relative}")
+        files.add(relative)
+    return files
+
+
+def build_evidence_index(
+    root: Path | str,
+    references: Sequence[str],
+) -> tuple[list[dict[str, str]], str]:
+    directory = Path(root)
+    normalized = [validate_evidence_path(path) for path in references]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("evidence references contain a duplicate path")
+    referenced = set(normalized)
+    observed = _evidence_files(directory)
+    if observed != referenced:
+        missing = sorted(referenced - observed)
+        extra = sorted(observed - referenced)
+        raise ValueError(
+            f"evidence files are not the exact union: missing={missing} extra={extra}"
+        )
+    index: list[dict[str, str]] = []
+    for relative in sorted(referenced, key=lambda item: item.encode("utf-8")):
+        path = directory / relative
+        before = path.stat(follow_symlinks=False)
+        digest = _sha256_file(path)
+        after = path.stat(follow_symlinks=False)
+        if before != after:
+            raise ValueError(f"evidence changed while hashing: {relative}")
+        index.append({
+            "path": relative,
+            "size_bytes": str(before.st_size),
+            "sha256": digest,
+        })
+    return index, _sha256_bytes(canonical_json_bytes(index))
+
+
+def verify_evidence_index(
+    root: Path | str,
+    index: Sequence[Mapping[str, Any]],
+    expected_digest: str,
+) -> None:
+    if not isinstance(expected_digest, str) or not SHA256_RE.fullmatch(expected_digest):
+        raise ValueError("evidence index digest is invalid")
+    paths: list[str] = []
+    normalized_index: list[dict[str, str]] = []
+    for position, raw in enumerate(index):
+        if not isinstance(raw, Mapping) or set(raw) != {"path", "size_bytes", "sha256"}:
+            raise ValueError(f"evidence index entry {position} is not closed")
+        path = validate_evidence_path(raw["path"])
+        size = raw["size_bytes"]
+        digest = raw["sha256"]
+        if not isinstance(size, str) or not DECIMAL_RE.fullmatch(size):
+            raise ValueError(f"evidence index entry {position} has invalid size")
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ValueError(f"evidence index entry {position} has invalid digest")
+        paths.append(path)
+        normalized_index.append({"path": path, "size_bytes": size, "sha256": digest})
+    if paths != sorted(set(paths), key=lambda item: item.encode("utf-8")):
+        raise ValueError("evidence index paths are duplicated or not byte-sorted")
+    observed_index, observed_digest = build_evidence_index(Path(root), paths)
+    if observed_index != normalized_index or observed_digest != expected_digest:
+        raise ValueError("evidence digest or size changed")
+
+
+def qualification_schedule(manifest: Mapping[str, Any]) -> list[tuple[str, str | None, str | None]]:
+    validate_manifest(manifest)
+    schedule: list[tuple[str, str | None, str | None]] = [("resident", None, None)]
+    for profile in manifest["profiles"]:
+        for prompt_tokens in profile["prompt_order"]:
+            schedule.append((
+                "streamed", profile["profile_id"], f"native-{prompt_tokens}"
+            ))
+    return schedule
+
+
+def _write_new_json(path: Path, value: Any) -> None:
+    payload = canonical_json_bytes(value) + b"\n"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def run_qualification_schedule(
+    manifest: Mapping[str, Any],
+    evidence_dir: Path | str,
+    execute: Callable[[str, str | None, str | None, int], Mapping[str, Any]],
+) -> dict[str, Any]:
+    if not callable(execute):
+        raise ValueError("qualification attempt executor must be callable")
+    frozen = canonical_json_bytes(manifest)
+    schedule = qualification_schedule(manifest)
+    manifest_digest = manifest_sha256(manifest)
+    directory = Path(evidence_dir)
+    try:
+        directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+    except OSError as exc:
+        raise ValueError(f"cannot create immutable evidence directory: {exc}") from exc
+    results: list[dict[str, Any]] = []
+    for sequence, (mode, profile, prompt) in enumerate(schedule):
+        final: dict[str, Any] | None = None
+        for attempt in (1, 2):
+            raw = execute(mode, profile, prompt, attempt)
+            if not isinstance(raw, Mapping):
+                raise ValueError("qualification executor returned a non-object")
+            result = dict(raw)
+            if set(result) != {"status", "samples", "reason"} or result["status"] not in {
+                "passed", "failed", "invalid"
+            } or not isinstance(result["samples"], list):
+                raise ValueError("qualification executor returned an invalid attempt")
+            if mode == "streamed" and result["status"] != "invalid" and len(result["samples"]) != 4:
+                raise ValueError("streamed slice requires exactly four consecutive samples")
+            record = {
+                "schema": "ds4.qualification.attempt/v1",
+                "sequence": sequence,
+                "mode": mode,
+                "profile_id": profile,
+                "prompt_id": prompt,
+                "attempt": attempt,
+                **result,
+            }
+            filename = f"attempt-{sequence:02d}-{attempt}.json"
+            _write_new_json(directory / filename, record)
+            final = record
+            if result["status"] != "invalid" or attempt == 2:
+                break
+        if final is None:
+            raise ValueError("qualification attempt did not produce evidence")
+        results.append(final)
+    if canonical_json_bytes(manifest) != frozen:
+        raise ValueError("qualification mutated the immutable manifest")
+    statuses = [result["status"] for result in results]
+    status = "invalid" if "invalid" in statuses else (
+        "failed" if "failed" in statuses else "passed"
+    )
+    summary = {
+        "schema": "ds4.qualification.run-status/v1",
+        "manifest_sha256": manifest_digest,
+        "status": status,
+        "attempts": results,
+    }
+    _write_new_json(directory / "run-status.json", summary)
+    return summary
+
+
+def qualification_bundle_status(
+    global_gates: Sequence[Mapping[str, Any]],
+    profiles: Sequence[Mapping[str, Any]],
+) -> str:
+    global_statuses = [gate.get("status") for gate in global_gates]
+    profile_statuses = [profile.get("status") for profile in profiles]
+    if not global_statuses or not profile_statuses or any(
+        status not in {"passed", "failed", "invalid"}
+        for status in (*global_statuses, *profile_statuses)
+    ):
+        raise ValueError("qualification statuses are missing or invalid")
+    if "invalid" in global_statuses:
+        return "invalid"
+    if any(status != "passed" for status in global_statuses):
+        return "failed"
+    return "passed" if "passed" in profile_statuses else "failed"
 
 
 def _load_smoke_eval_records(path: Path, expected_ids: Sequence[str]) -> list[dict[str, Any]]:

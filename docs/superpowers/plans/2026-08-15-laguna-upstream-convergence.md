@@ -25,15 +25,20 @@ may be called canonical or published. First promote the corrected artifact,
 rebuild every model-bound oracle and manifest, reconfirm the already-correct
 CUDA KV-ring invariant, and rerun the existing qualification stack.
 
-After that truthful compact-runtime bundle exists, converge performance and
-upstreamability in a separate worktree. Prefer PR #594's eventual upstream-main
-merge commit as the integration base. While it remains open, treat exact head
-`7005761d1e4a53ff50c8e2b033d33c375fdb6297` as an immutable patch and
-performance reference, not as a literal merge/rebase base; manually port the
-narrow Q4 CUDA primitives onto the chosen current-upstream integration branch.
-Replay the compact layers additively and keep the qualified current branch as
-the differential oracle. Q2/Q3, DFlash, and mixed-precision target expansion
-remain separate follow-ups.
+Before spending a maintenance window on the bounded-memory curve, establish an
+efficient resident Q4 baseline. Treat exact PR #594 head
+`7005761d1e4a53ff50c8e2b033d33c375fdb6297` as an immutable same-host
+performance reference, not as a literal merge/rebase base. The current branch
+must first pass the corrected Poolside oracle and then remain within the frozen
+resident-performance margin at every context frontier. If it does not, adapt
+only narrow, oracle-gated Q4 CUDA primitives before running SSD streaming.
+
+After the truthful compact-runtime bundle exists, converge upstreamability in
+a separate worktree. Prefer PR #594's eventual upstream-main merge commit as
+the integration base; while it remains open, manually port the selected narrow
+primitives onto a chosen current-upstream branch. Replay the compact layers
+additively and keep the qualified current branch as the differential oracle.
+Q2/Q3, DFlash, and mixed-precision target expansion remain separate follow-ups.
 
 ## Prior-art audit
 
@@ -43,7 +48,7 @@ pull requests is merged:
 | Upstream work | State | What it contributes | Disposition here |
 | --- | --- | --- | --- |
 | `laguna-s2.1` (`448d569`) | branch | Antirez's native model, Metal graph, protocol/template support, revised Q4 layout, and later Q2/Q3 work | Already the ancestry of the local resident work through `7e3dbef`; do not reimplement |
-| [PR #594](https://github.com/antirez/ds4/pull/594), head `7005761` | open draft | Full-resident, one-GPU CUDA; mature Q4/Q2/Q3 kernels, Blackwell paths, DFlash, and GB10 measurements; explicitly no SSD streaming | Performance/upstream convergence source after corrected Q4 qualification |
+| [PR #594](https://github.com/antirez/ds4/pull/594), head `7005761` | open draft | Full-resident, one-GPU CUDA; mature Q4/Q2/Q3 kernels, Blackwell paths, DFlash, and GB10 measurements; explicitly no SSD streaming | Same-host resident performance reference after corrected Q4 oracle promotion; later upstream convergence source |
 | [PR #613](https://github.com/antirez/ds4/pull/613), head `ceb4685` | open | Corrected official Poolside GGUF revision | Immediate blocking input |
 | [PR #614](https://github.com/antirez/ds4/pull/614), head `b388b8c` | open | Metal oversized-prefill KV-ring correction, exact 1024/512 regression, checkpoint payload ABI v3 | No GB10 implementation work; local CUDA was race-free from its first commit |
 | [PR #633](https://github.com/antirez/ds4/pull/633), head `4f4c724` | open | APEX IQ4_XS/Q6_K and official BF16 mixed-precision targets plus metadata-driven RoPE | Defer until corrected Q4 compact qualification passes |
@@ -183,7 +188,32 @@ keep the current qualified candidate recoverable throughout.
 - [ ] Keep checkpoint payload ABI v2. Do not port Metal code or invalidate
   checkpoints produced by the already-correct GB10 path.
 
-### Phase 4 — rerun Tasks 19 and 20 on corrected provenance
+### Phase 4 — establish the efficient resident-Q4 gate
+
+- [ ] In isolated clean exports, build exact PR #594 head and the current
+  candidate against the same corrected Q4 file. Bind the two binary hashes,
+  exact source revisions, model identity, host identity, and pre-child GPU
+  inventory in a no-clobber evidence directory.
+- [ ] Immediately before timing, require the current candidate to pass the
+  corrected resident CUDA oracle. Correctness is an admission prerequisite,
+  never a trade for speed.
+- [ ] Run the implementations serially through the stable normal
+  `ds4-bench` CSV interface: fresh resident-CUDA process per implementation,
+  the pinned `speed-bench/promessi_sposi.txt` prompt, 32K allocation, 4096-row
+  prefill chunks, 256 generated tokens, and exact 2048, 4096, 8192, 16384, and
+  28672-token frontiers. Do not use compact/streaming flags in this gate.
+- [ ] Reject the reference run unless its 2K/4K/8K prefill and steady-decode
+  values are at least 80% of PR #594's recorded Q4 numbers. Require candidate
+  prefill and steady decode to reach at least 90% of the same-run reference at
+  every frontier; a mean or median must not hide one red context length.
+- [ ] If the unchanged candidate fails, stop before compact measurement. First
+  adapt PR #594's split-history decode attention (`bdf47ff`, `021ca4e`,
+  `8984bcc`) behind a rollback switch and rerun the corrected oracle plus the
+  entire resident gate. Consider a Poolside-preserving equivalent of its fused
+  Q8 projections only if profiling still identifies launch overhead. Do not
+  import its contiguous-expert routed-MoE path.
+
+### Phase 5 — rerun Tasks 19 and 20 on corrected provenance
 
 - [ ] Run model-independent source, schema, qualifier, and fake-child suites
   before the maintenance window.
@@ -193,16 +223,16 @@ keep the current qualified candidate recoverable throughout.
   corrected Laguna resident and streamed gates, then run the immutable Task 20
   schedule. Only one model-bearing process may run at a time.
 - [ ] Before freezing the long curve, run a short corrected-artifact
-  28K-context steady-decode preflight in resident and streamed modes. If the
-  existing exact path clears the normative 0.5 visible tok/s gate, keep it. If
-  it misses, stop before the 12 streamed slices and adapt only PR #594's
-  split-history decode attention (`bdf47ff`, `021ca4e`, `8984bcc`) behind a
-  rollback switch; rerun resident/streamed oracle parity before continuing.
+  28K-context streamed steady-decode preflight against the already-admitted
+  efficient resident candidate. The existing 0.5 visible tok/s threshold is a
+  compact-mode viability floor, not a resident-efficiency target. If it misses,
+  stop before the 12 streamed slices and profile the streaming/cache path; do
+  not weaken the resident gate or conflate the failure with core CUDA speed.
 - [ ] Restore production in an idempotent cleanup path and verify identity,
   generation liveness, peer inventory, and kernel logs before accepting any
   result.
 
-### Phase 5 — complete Task 21
+### Phase 6 — complete Task 21
 
 - [ ] Freeze a new benchmark manifest only after the corrected oracle and
   clean CUDA binaries pass.
@@ -213,11 +243,8 @@ keep the current qualified candidate recoverable throughout.
 - [ ] Checkpoint F closes only if all global gates and at least one profile
   pass on `e2ccc057…`.
 
-### Phase 6 — converge PR #594 after the compact proof
+### Phase 7 — converge upstream after the compact proof
 
-- [ ] In a separate worktree, build exact PR #594 head (or its eventual merge
-  commit) against the corrected Q4 file and capture a same-host resident
-  baseline using the same prompts, context, sampling, and clocks as local.
 - [ ] If PR #594 has merged, create the upstreaming branch from that merge
   commit. If it remains open, create the branch from the selected current
   upstream main and manually port its narrow Q4 primitives using `7005761` as
@@ -251,8 +278,9 @@ keep the current qualified candidate recoverable throughout.
 
 ## Acceptance boundary
 
-This amendment is complete when a canonical corrected-Q4 compact bundle exists
-and the separate PR #594 convergence branch reproduces its correctness and
-capacity gates. The first milestone proves the existing substrate capability;
-the second harvests upstream kernel maturity without discarding the locally
-validated streaming and verification layers.
+This amendment is complete when the corrected-Q4 candidate first clears the
+same-host resident performance gate, then produces a canonical compact bundle,
+and finally the separate upstream-convergence branch reproduces its correctness
+and capacity gates. This order prevents bounded-memory machinery from masking
+an inefficient core implementation while preserving streaming as an additive
+capacity mode.

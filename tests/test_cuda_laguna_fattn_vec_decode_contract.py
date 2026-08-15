@@ -136,6 +136,16 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
             self.assertIn(required, HEADER)
             self.assertIn(required, CUDA)
 
+    def test_frozen_cuda_exact_failure_reports_bits_and_passed_scale(self) -> None:
+        for required in (
+            "first-bit-mismatch",
+            "actual=%a (0x%08x)",
+            "reference=%a (0x%08x)",
+            "scale=%a (0x%08x)",
+            "laguna_f32_bits(scale)",
+        ):
+            self.assertIn(required, KERNEL_TEST)
+
 
 if __name__ == "__main__":
     unittest.main()

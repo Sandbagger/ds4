@@ -1413,6 +1413,51 @@ class QualificationRunnerContractTest(unittest.TestCase):
             "invalid",
         )
 
+    def test_binary_admission_hashes_three_clean_matching_cuda_builds(self) -> None:
+        version = {
+            "schema": "ds4.version/v1",
+            "revision": "1234567890abcdef1234567890abcdef12345678",
+            "dirty": False,
+            "backend": "cuda",
+            "features": ["laguna", "ssd_streaming"],
+        }
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            paths = []
+            for role in ("server", "bench", "eval"):
+                path = root / role
+                path.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' '" + json.dumps(version, separators=(",", ":")) + "'\n",
+                    encoding="utf-8",
+                )
+                path.chmod(0o700)
+                paths.append(path)
+            subject = TOOL.bind_qualification_binaries(*paths)
+            self.assertEqual(subject["revision"], version["revision"])
+            self.assertFalse(subject["dirty"])
+            self.assertEqual([item["role"] for item in subject["binaries"]], ["server", "bench", "eval"])
+            self.assertTrue(all(len(item["binary_sha256"]) == 64 for item in subject["binaries"]))
+            version["dirty"] = True
+            paths[2].write_text(
+                "#!/bin/sh\nprintf '%s\\n' '" + json.dumps(version, separators=(",", ":")) + "'\n",
+                encoding="utf-8",
+            )
+            paths[2].chmod(0o700)
+            with self.assertRaisesRegex(ValueError, "dirty|match"):
+                TOOL.bind_qualification_binaries(*paths)
+
+    def test_schema_records_hash_every_closed_wire_schema_in_order(self) -> None:
+        records = TOOL.bind_qualification_schemas()
+        self.assertEqual(
+            [record["schema_id"] for record in records],
+            [
+                "ds4.version/v1", "ds4.runtime/v1", "ds4.runtime.request/v1",
+                "ds4.token-admission/v1", "ds4.laguna.compact-runtime/v1",
+                "ds4.compact-runtime-benchmark/v1",
+            ],
+        )
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) for record in records))
+
     @staticmethod
     def _bundle_fixture() -> dict[str, object]:
         path = ROOT / "tests/test_runtime_contract.py"

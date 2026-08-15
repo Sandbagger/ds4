@@ -922,6 +922,10 @@ static float reference_softplus(float value) {
     return value > 0.0f ? value + log1pf(expf(-value)) : log1pf(expf(value));
 }
 
+static float reference_decode_softplus_poolside(float value) {
+    return (value > 20.0f) ? value : logf(1.0f + expf(value));
+}
+
 static int run_decode_attention_case(const laguna_decode_attention_case *c) {
     const uint32_t head_dim = 128u;
     const uint64_t q_count = (uint64_t)c->n_head * head_dim;
@@ -1016,7 +1020,8 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
             (void)base;
             sum += expf(scores[r] - max_score);
         }
-        const float gate_scale = reference_softplus(gate_host[h]);
+        const float gate_scale =
+            reference_decode_softplus_poolside(gate_host[h]);
         for (uint32_t d = 0; d < head_dim; d++) {
             float weighted_value = 0.0f;
             for (uint32_t r = 0; r < c->key_count; r++) {

@@ -36432,8 +36432,8 @@ __global__ static void laguna_attention_decode_gqa_f16_kernel(
         max_score = next_max;
     }
     const float gate_value = gate[head];
-    const float gate_scale = gate_value > 0.0f ?
-        gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    const float gate_scale = (gate_value > 20.0f) ? gate_value :
+        logf(1.0f + expf(gate_value));
     float *out = heads + (uint64_t)head * head_dim;
     for (uint32_t d = 0u; d < head_dim; d++) {
         out[d] = acc[d] / sum * gate_scale;

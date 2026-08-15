@@ -733,6 +733,46 @@ class CudaBuildContractTest(unittest.TestCase):
             rf"{attributes}\.ptxVersion\s*>=\s*70\s*\)",
         )
 
+    def test_laguna_decode_softplus_matches_poolside_operation_order(self) -> None:
+        decode = function_body(
+            "__global__ static void laguna_attention_decode_gqa_f16_kernel("
+        )
+        poolside_formula = (
+            r"const float gate_scale\s*=\s*"
+            r"\(gate_value > 20\.0f\)\s*\?\s*gate_value\s*:\s*"
+            r"logf\(1\.0f \+ expf\(gate_value\)\);"
+        )
+        self.assertRegex(decode, poolside_formula)
+        self.assertNotIn("log1pf", decode)
+        self.assertNotIn("gate_value > 0.0f", decode)
+
+        decode_reference = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static float reference_decode_softplus_poolside(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertRegex(
+            decode_reference,
+            r"return \(value > 20\.0f\)\s*\?\s*value\s*:\s*"
+            r"logf\(1\.0f \+ expf\(value\)\);",
+        )
+        self.assertNotIn("log1pf", decode_reference)
+        decode_case = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_decode_attention_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn(
+            "reference_decode_softplus_poolside(gate_host[h])",
+            decode_case,
+        )
+
+        scalar_prefill = function_body(
+            "__global__ static void laguna_attention_prefill_gqa_f16_kernel("
+        )
+        self.assertIn("gate_value > 0.0f", scalar_prefill)
+        self.assertIn("log1pf", scalar_prefill)
+
     def test_laguna_router_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_ROUTER_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

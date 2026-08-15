@@ -1263,7 +1263,7 @@ class CudaBuildContractTest(unittest.TestCase):
         )
 
         poolside_kernel = function_body(
-            "__global__ static void f32_mmvf_poolside_microscope_kernel("
+            "__global__ static void matmul_f32_poolside_mmvf_kernel("
         )
         self.assertIn("const float2 *weight2", poolside_kernel)
         self.assertIn("const float2 *activation2", poolside_kernel)
@@ -1278,8 +1278,56 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertIn("matmul_f32_kernel<<<1, 256>>>", hook)
         self.assertIn(
-            "f32_mmvf_poolside_microscope_kernel<<<1, 256, ", hook
+            "matmul_f32_poolside_mmvf_kernel<<<1, 256, ", hook
         )
+
+    def test_laguna_decode_poolside_f32_mmvf_is_opt_in_and_narrow(self) -> None:
+        selector = function_body(
+            "static bool cuda_poolside_f32_mmvf_requested("
+        )
+        self.assertIn("return g_cuda_poolside_f32_mmvf != 0", selector)
+        self.assertIn("in_dim == 3072u", selector)
+        self.assertIn("out_dim == 256u", selector)
+        self.assertIn("n_tok == 1u", selector)
+        self.assertNotIn("getenv", selector)
+
+        refresh = function_body(
+            "static void cuda_decode_dispatch_env_refresh(void)"
+        )
+        self.assertIn(
+            'getenv("DS4_F32_MMVF_REDUCTION")', refresh
+        )
+        self.assertIn(
+            'strcmp(f32_mmvf_reduction, "poolside") == 0', refresh
+        )
+        self.assertEqual(refresh.count('getenv("DS4_MM_VQ_REDUCTION")'), 1)
+        init = function_body('extern "C" int ds4_gpu_init_multi(')
+        self.assertIn("cuda_decode_dispatch_env_refresh();", init)
+
+        kernel_signature = (
+            "__global__ static void matmul_f32_poolside_mmvf_kernel("
+        )
+        kernel_offset = CUDA_SOURCE.index(kernel_signature)
+        preceding_guard = CUDA_SOURCE.rfind(
+            "#ifdef DS4_TEST_HOOKS", 0, kernel_offset
+        )
+        if preceding_guard >= 0:
+            self.assertLess(
+                CUDA_SOURCE.find("#endif", preceding_guard), kernel_offset,
+                "the production Poolside F32 MMVF kernel cannot be test-only",
+            )
+
+        matmul = function_body(
+            'extern "C" int ds4_gpu_matmul_f32_tensor('
+        )
+        self.assertIn(
+            "cuda_poolside_f32_mmvf_requested(in_dim, out_dim, n_tok)",
+            matmul,
+        )
+        self.assertIn(
+            "matmul_f32_poolside_mmvf_kernel<<<grid, 256, ", matmul
+        )
+        self.assertIn("matmul_f32_kernel<<<grid, 256>>>", matmul)
 
     def test_laguna_decode_poolside_mmvq_is_opt_in_and_narrow(self) -> None:
         selector = function_body(

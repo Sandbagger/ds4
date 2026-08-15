@@ -137,6 +137,7 @@ static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_cuda_poolside_mmvq;
+static int g_cuda_poolside_f32_mmvf;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
@@ -312,10 +313,23 @@ static void cuda_decode_dispatch_env_refresh(void) {
     const char *reduction = getenv("DS4_MM_VQ_REDUCTION");
     g_cuda_poolside_mmvq =
         reduction && strcmp(reduction, "poolside") == 0;
+    const char *f32_mmvf_reduction =
+        getenv("DS4_F32_MMVF_REDUCTION");
+    g_cuda_poolside_f32_mmvf =
+        f32_mmvf_reduction &&
+        strcmp(f32_mmvf_reduction, "poolside") == 0;
 }
 
 static bool cuda_poolside_mmvq_requested(void) {
     return g_cuda_poolside_mmvq != 0;
+}
+
+static bool cuda_poolside_f32_mmvf_requested(
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    return g_cuda_poolside_f32_mmvf != 0 &&
+           in_dim == 3072u && out_dim == 256u && n_tok == 1u;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -9295,6 +9309,48 @@ __global__ static void matmul_f32_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+__global__ static void matmul_f32_poolside_mmvf_kernel(
+        float *out,
+        const float *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok || (in_dim & 1u) != 0u) return;
+
+    const uint32_t tid = threadIdx.x;
+    const float2 *weight2 = (const float2 *)(w + row * in_dim);
+    const float2 *activation2 = (const float2 *)(x + tok * in_dim);
+    const uint64_t input_pairs = in_dim / 2u;
+    float sum = 0.0f;
+    for (uint64_t col2 = tid; col2 < input_pairs; col2 += 256u) {
+        const float2 weight_pair = weight2[col2];
+        const float2 activation_pair = activation2[col2];
+        sum += weight_pair.x * activation_pair.x;
+        sum += weight_pair.y * activation_pair.y;
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    }
+
+    extern __shared__ float warp_sums[];
+    if (tid < 32u) warp_sums[tid] = 0.0f;
+    __syncthreads();
+    if ((tid & 31u) == 0u) warp_sums[tid / 32u] = sum;
+    __syncthreads();
+    if (tid < 32u) {
+        sum = warp_sums[tid];
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+        }
+        if (tid == 0u) out[tok * out_dim + row] = sum;
+    }
 }
 
 __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {
@@ -19076,6 +19132,13 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+    if (cuda_poolside_f32_mmvf_requested(in_dim, out_dim, n_tok)) {
+        matmul_f32_poolside_mmvf_kernel<<<grid, 256, 32u * sizeof(float)>>>(
+            (float *)out->ptr, w, (const float *)x->ptr,
+            in_dim, out_dim, n_tok);
+        return cuda_ok(cudaGetLastError(),
+                       "f32 Poolside MMVF launch");
+    }
     matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
@@ -31148,42 +31211,6 @@ dev_dot_q4_K_q8_1_poolside_mmvq_fragment(
 }
 
 #ifdef DS4_TEST_HOOKS
-__global__ static void f32_mmvf_poolside_microscope_kernel(
-        float *value,
-        const float *weight,
-        const float *activation,
-        uint32_t input_elements) {
-    const uint32_t tid = threadIdx.x;
-    const float2 *weight2 = (const float2 *)weight;
-    const float2 *activation2 = (const float2 *)activation;
-    const uint32_t input_pairs = input_elements / 2u;
-    float sum = 0.0f;
-    for (uint32_t col2 = tid; col2 < input_pairs; col2 += 256u) {
-        const float2 w = weight2[col2];
-        const float2 x = activation2[col2];
-        sum += w.x * x.x;
-        sum += w.y * x.y;
-    }
-#pragma unroll
-    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
-        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
-    }
-
-    extern __shared__ float warp_sums[];
-    if (tid < 32u) warp_sums[tid] = 0.0f;
-    __syncthreads();
-    if ((tid & 31u) == 0u) warp_sums[tid / 32u] = sum;
-    __syncthreads();
-    if (tid < 32u) {
-        sum = warp_sums[tid];
-#pragma unroll
-        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
-            sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
-        }
-        if (tid == 0u) value[0] = sum;
-    }
-}
-
 extern "C" int ds4_gpu_test_f32_mmvf_microscope_tensor(
         ds4_gpu_tensor *values,
         const ds4_gpu_tensor *weight_row,
@@ -31218,11 +31245,11 @@ extern "C" int ds4_gpu_test_f32_mmvf_microscope_tensor(
                  "F32 MMVF microscope serial launch")) {
         return 0;
     }
-    f32_mmvf_poolside_microscope_kernel<<<1, 256, 32u * sizeof(float)>>>(
+    matmul_f32_poolside_mmvf_kernel<<<1, 256, 32u * sizeof(float)>>>(
         (float *)values->ptr + 1u,
         (const float *)weight_row->ptr,
         (const float *)activation->ptr,
-        input_elements);
+        input_elements, 1u, 1u);
     return cuda_ok(cudaGetLastError(),
                    "F32 MMVF microscope Poolside launch");
 }

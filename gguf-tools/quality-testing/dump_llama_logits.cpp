@@ -18,9 +18,12 @@
 
 namespace fs = std::filesystem;
 
-// Output format (laguna-resident-capture-v1):
+// Output format (laguna-resident-capture-v2):
 //
 //   OUT/capture.json
+//   OUT/tokenizer.chat_template.jinja
+//   OUT/chat-template-think.prompt
+//   OUT/chat-template-nothink.prompt
 //   OUT/<case-id>.prompt
 //   OUT/<case-id>.tokens.i32
 //   OUT/<case-id>.logits.f32
@@ -31,7 +34,11 @@ namespace fs = std::filesystem;
 // eight-ID .continuation.i32 file and eight .step-NN.logits.f32 files, one full
 // vocabulary row for each greedy, teacher-forced step. capture.json names all
 // files and records their shapes through token_count, vocab_size, and the fixed
-// continuation length.
+// continuation length. The chat-template file is the exact byte sequence
+// exposed by llama_model_chat_template. The two chat-template prompt files
+// record the explicit Laguna DS4 think/no-think bytes reconciled against the
+// pinned template's generation branch. The pinned Poolside C API has no Jinja
+// evaluator, so capture-v2 labels this as source semantics, not runtime render.
 
 [[noreturn]] static void fail(const std::string &message) {
     throw std::runtime_error(message);
@@ -461,9 +468,16 @@ static std::string detokenize(
     return std::string(text.data(), (size_t)got);
 }
 
-static std::string render_laguna_ds4_prompt(const std::string &prompt) {
-    return std::string("\xE3\x80\x88|EOS|\xE3\x80\x89<user>") + prompt +
-           "</user>\n<assistant></think>";
+static std::string render_laguna_ds4_prompt(
+        const std::string &prompt,
+        bool think = false,
+        const std::string &system = "") {
+    std::string rendered("\xE3\x80\x88|EOS|\xE3\x80\x89");
+    if (!system.empty()) {
+        rendered += "<system>" + system + "</system>\n";
+    }
+    return rendered + "<user>" + prompt + "</user>\n<assistant>" +
+           (think ? "<think>" : "</think>");
 }
 
 static uint32_t little_u32(uint32_t value) {
@@ -853,12 +867,31 @@ static void write_capture(
         const std::string &continuation_case,
         int continuation_tokens,
         size_t seed_token_count,
-        const std::vector<DumpResult> &results) {
+        const std::vector<DumpResult> &results,
+        const std::string &chat_template,
+        const std::string &template_probe) {
     if (seed_token_count < 32768) {
         fail("benchmark seed has fewer than 32768 Poolside tokens");
     }
+    if (chat_template.empty()) fail("model tokenizer.chat_template is empty");
+    static const std::string template_file = "tokenizer.chat_template.jinja";
+    static const std::string think_file = "chat-template-think.prompt";
+    static const std::string nothink_file = "chat-template-nothink.prompt";
+    static const std::string reconciliation_system =
+        "Laguna template reconciliation probe.";
+    const std::string think_prompt = render_laguna_ds4_prompt(
+        template_probe, true, reconciliation_system);
+    const std::string nothink_prompt = render_laguna_ds4_prompt(
+        template_probe, false, reconciliation_system);
+    write_file(out_root / template_file, chat_template);
+    write_file(out_root / think_file, think_prompt);
+    write_file(out_root / nothink_file, nothink_prompt);
+
     const DumpResult *continuation = nullptr;
     std::vector<std::string> files;
+    files.push_back(template_file);
+    files.push_back(think_file);
+    files.push_back(nothink_file);
     for (const DumpResult &result : results) {
         files.insert(files.end(), result.files.begin(), result.files.end());
         if (result.test_case.id == continuation_case) continuation = &result;
@@ -867,17 +900,29 @@ static void write_capture(
 
     std::ostringstream capture;
     capture << "{\n"
-            << "  \"schema\": \"laguna-resident-capture-v1\",\n"
+            << "  \"schema\": \"laguna-resident-capture-v2\",\n"
             << "  \"oracle\": \"llama\",\n"
             << "  \"runtime_commit\": \"04b2b72cb54048ead292884adbe11f284e3ec950\",\n"
             << "  \"seed_token_count\": " << seed_token_count << ",\n"
             << "  \"vocab_size\": " << n_vocab << ",\n"
             << "  \"model\": {\n"
             << "    \"repository\": \"poolside/Laguna-S-2.1-GGUF\",\n"
-            << "    \"revision\": \"706fa69799926b6afde1af9e24ca2a4923f110a1\",\n"
+            << "    \"revision\": \"e2ccc0579fc18e6ea2362fa25fccbcd470f0e332\",\n"
             << "    \"file\": \"laguna-s-2.1-Q4_K_M.gguf\",\n"
-            << "    \"size\": 68248759648,\n"
-            << "    \"sha256\": \"e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a\"\n"
+            << "    \"size\": 68248760064,\n"
+            << "    \"sha256\": \"a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff\"\n"
+            << "  },\n"
+            << "  \"chat_template\": {\n"
+            << "    \"file\": \"" << template_file << "\",\n"
+            << "    \"bytes\": " << chat_template.size() << ",\n"
+            << "    \"sha256\": \"" << sha256_file(out_root / template_file) << "\",\n"
+            << "    \"render_contract\": \"pinned-template-semantics-v1\",\n"
+            << "    \"reconciliation_system\": \""
+            << reconciliation_system << "\",\n"
+            << "    \"think_prompt_file\": \"" << think_file << "\",\n"
+            << "    \"think_prompt_sha256\": \"" << sha256_file(out_root / think_file) << "\",\n"
+            << "    \"nothink_prompt_file\": \"" << nothink_file << "\",\n"
+            << "    \"nothink_prompt_sha256\": \"" << sha256_file(out_root / nothink_file) << "\"\n"
             << "  },\n"
             << "  \"cases\": [\n";
     for (size_t i = 0; i < results.size(); i++) {
@@ -928,7 +973,7 @@ static void usage(const char *program) {
         "usage: %s --model MODEL --cases cases.json "
         "--seed-prompt benchmark-32768.txt --materialize-prompts DIR --out DIR\n"
         "\n"
-        "Writes a laguna-resident-capture-v1 capture.json and flat artifacts.\n"
+        "Writes a laguna-resident-capture-v2 capture.json and flat artifacts.\n"
         "Binary token IDs are int32-le; logits are IEEE-754 float32-le in\n"
         "vocab-ID order. Every emitted artifact is SHA-256 listed in capture.json.\n"
         "See the source-file format comment for the complete file layout.\n",
@@ -959,12 +1004,12 @@ int main(int argc, char **argv) {
             fail("internal SHA-256 self-test failed");
         }
         uintmax_t model_size = fs::file_size(argv[2]);
-        if (model_size != UINT64_C(68248759648)) {
+        if (model_size != UINT64_C(68248760064)) {
             fail("model size " + std::to_string(model_size) +
-                 " does not match pinned size 68248759648");
+                 " does not match pinned size 68248760064");
         }
         if (sha256_file(argv[2]) !=
-            "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a") {
+            "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff") {
             fail("model SHA-256 does not match the pinned artifact");
         }
         fs::path out_root = argv[10];
@@ -983,6 +1028,12 @@ int main(int argc, char **argv) {
             ModelGuard model;
             model.value = llama_model_load_from_file(argv[2], params);
             if (!model.value) fail("failed to open model");
+            const char *embedded_template =
+                llama_model_chat_template(model.value, nullptr);
+            if (!embedded_template || embedded_template[0] == '\0') {
+                fail("model tokenizer.chat_template is missing or empty");
+            }
+            const std::string chat_template(embedded_template);
             const llama_vocab *vocab = llama_model_get_vocab(model.value);
             int n_vocab = llama_vocab_n_tokens(vocab);
 
@@ -1001,7 +1052,8 @@ int main(int argc, char **argv) {
                     cases.continuation_case, cases.continuation_tokens, argv[10]));
             }
             write_capture(argv[10], n_vocab, cases.continuation_case,
-                          cases.continuation_tokens, seed_token_count, results);
+                          cases.continuation_tokens, seed_token_count, results,
+                          chat_template, read_file(cases.cases[0].prompt));
         }
         llama_backend_free();
         backend_initialized = false;

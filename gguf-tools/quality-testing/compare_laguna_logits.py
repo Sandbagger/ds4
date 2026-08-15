@@ -33,12 +33,19 @@ CAPTURE_MANIFEST_SHA256 = (
 GENERATOR_SHA256 = "118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d"
 BENCHMARK_SHA256 = "aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206"
 
-CAPTURE_MODEL = {
+LEGACY_CAPTURE_MODEL = {
     "repository": "poolside/Laguna-S-2.1-GGUF",
     "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
     "file": "laguna-s-2.1-Q4_K_M.gguf",
     "size": 68248759648,
     "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+}
+CAPTURE_MODEL = {
+    "repository": "poolside/Laguna-S-2.1-GGUF",
+    "revision": "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332",
+    "file": "laguna-s-2.1-Q4_K_M.gguf",
+    "size": 68248760064,
+    "sha256": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff",
 }
 PROMOTED_MODEL = {
     "repository": CAPTURE_MODEL["repository"],
@@ -46,6 +53,13 @@ PROMOTED_MODEL = {
     "filename": CAPTURE_MODEL["file"],
     "size": CAPTURE_MODEL["size"],
     "sha256": CAPTURE_MODEL["sha256"],
+}
+LEGACY_PROMOTED_MODEL = {
+    "repository": LEGACY_CAPTURE_MODEL["repository"],
+    "revision": LEGACY_CAPTURE_MODEL["revision"],
+    "filename": LEGACY_CAPTURE_MODEL["file"],
+    "size": LEGACY_CAPTURE_MODEL["size"],
+    "sha256": LEGACY_CAPTURE_MODEL["sha256"],
 }
 
 CASE_SPECS = (
@@ -87,6 +101,15 @@ CAPTURE_ARTIFACT_FILES = (
     | {f"yarn-8193.step-{step:02d}.logits.f32" for step in range(8)}
     | {"yarn-8193.continuation.i32"}
 )
+CAPTURE_TEMPLATE_FILES = {
+    "tokenizer.chat_template.jinja",
+    "chat-template-think.prompt",
+    "chat-template-nothink.prompt",
+}
+# Exact tokenizer.chat_template metadata bytes embedded in the corrected GGUF.
+CHAT_TEMPLATE_BYTES = 3961
+CHAT_TEMPLATE_SHA256 = "444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+CHAT_TEMPLATE_RECONCILIATION_SYSTEM = b"Laguna template reconciliation probe."
 CUDA_LIMITS = {
     "centered_rms": 0.04,
     "centered_max_abs": 0.20,
@@ -97,6 +120,7 @@ CUDA_LIMITS = {
 SHORT_BYTES = b"Explain why a ring buffer wraps, in two sentences.\n"
 SHORT_PREFIX = b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
 SHORT_SUFFIX = b"</user>\n<assistant></think>"
+SHORT_THINK_SUFFIX = b"</user>\n<assistant><think>"
 
 
 class ContractError(RuntimeError):
@@ -491,12 +515,12 @@ def verify_promoted(
 
     model = require_object(manifest["model"], "manifest.model")
     require_exact_keys(model, set(PROMOTED_MODEL), "manifest.model")
-    if model != PROMOTED_MODEL:
+    if model not in (LEGACY_PROMOTED_MODEL, PROMOTED_MODEL):
         fail("manifest model identity mismatch")
-    if type(gguf_size) is not int or gguf_size != PROMOTED_MODEL["size"]:
-        fail("supplied GGUF size does not match the pinned model")
-    if require_hex(gguf_sha256, 64, "supplied GGUF SHA-256") != PROMOTED_MODEL["sha256"]:
-        fail("supplied GGUF SHA-256 does not match the pinned model")
+    if type(gguf_size) is not int or gguf_size != model["size"]:
+        fail("supplied GGUF size does not match the manifest model")
+    if require_hex(gguf_sha256, 64, "supplied GGUF SHA-256") != model["sha256"]:
+        fail("supplied GGUF SHA-256 does not match the manifest model")
 
     supplied_contract = require_hex(contract_commit, 40, "supplied contract commit")
     supplied_tokenizer = require_hex(
@@ -655,17 +679,12 @@ def validate_capture(root: Path, expected_capture_sha256: str) -> dict[str, Any]
     capture_payload = read_bytes(root / "capture.json")
     if sha256_bytes(capture_payload) != expected_capture_sha256:
         fail("Poolside capture.json trust-anchor SHA-256 mismatch")
-    capture = load_json_bytes(capture_payload, "capture.json")
-    found = actual_files(root)
-    expected_files = CAPTURE_ARTIFACT_FILES | {"capture.json"}
-    if found != expected_files:
-        fail(
-            f"capture file set mismatch: missing={sorted(expected_files - found)} "
-            f"extra={sorted(found - expected_files)}"
-        )
-    require_exact_keys(
-        capture,
-        {
+    capture = require_object(load_json_bytes(capture_payload, "capture.json"), "capture")
+    schema = require_string(capture.get("schema"), "capture.schema")
+    if schema == "laguna-resident-capture-v1":
+        expected_model = LEGACY_CAPTURE_MODEL
+        artifact_files = CAPTURE_ARTIFACT_FILES
+        capture_keys = {
             "schema",
             "oracle",
             "runtime_commit",
@@ -675,11 +694,32 @@ def validate_capture(root: Path, expected_capture_sha256: str) -> dict[str, Any]
             "cases",
             "continuation",
             "files",
-        },
-        "capture",
-    )
-    if capture["schema"] != "laguna-resident-capture-v1":
+        }
+    elif schema == "laguna-resident-capture-v2":
+        expected_model = CAPTURE_MODEL
+        artifact_files = CAPTURE_ARTIFACT_FILES | CAPTURE_TEMPLATE_FILES
+        capture_keys = {
+            "schema",
+            "oracle",
+            "runtime_commit",
+            "vocab_size",
+            "seed_token_count",
+            "model",
+            "chat_template",
+            "cases",
+            "continuation",
+            "files",
+        }
+    else:
         fail("capture schema mismatch")
+    found = actual_files(root)
+    expected_files = artifact_files | {"capture.json"}
+    if found != expected_files:
+        fail(
+            f"capture file set mismatch: missing={sorted(expected_files - found)} "
+            f"extra={sorted(found - expected_files)}"
+        )
+    require_exact_keys(capture, capture_keys, "capture")
     if capture["oracle"] != "llama":
         fail("capture oracle mismatch")
     if require_hex(capture["runtime_commit"], 40, "capture.runtime_commit") != LLAMA_COMMIT:
@@ -689,19 +729,125 @@ def validate_capture(root: Path, expected_capture_sha256: str) -> dict[str, Any]
     if require_int(capture["seed_token_count"], "capture.seed_token_count") != 61440:
         fail("capture seed token count mismatch")
     model = require_object(capture["model"], "capture.model")
-    require_exact_keys(model, set(CAPTURE_MODEL), "capture.model")
-    if model != CAPTURE_MODEL:
+    require_exact_keys(model, set(expected_model), "capture.model")
+    if model != expected_model:
         fail("capture model identity mismatch")
 
     file_hashes = require_object(capture["files"], "capture.files")
-    require_exact_keys(file_hashes, set(CAPTURE_ARTIFACT_FILES), "capture.files")
+    require_exact_keys(file_hashes, set(artifact_files), "capture.files")
     retained: dict[str, bytes] = {}
-    for name in sorted(CAPTURE_ARTIFACT_FILES):
+    for name in sorted(artifact_files):
         expected_sha = require_hex(file_hashes[name], 64, f"capture.files.{name}")
         payload = read_bytes(root / name)
         if sha256_bytes(payload) != expected_sha:
             fail(f"capture artifact SHA-256 mismatch: {name}")
         retained[name] = payload
+
+    chat_template_data: dict[str, bytes] | None = None
+    if schema == "laguna-resident-capture-v2":
+        chat_template = require_object(capture["chat_template"], "capture.chat_template")
+        require_exact_keys(
+            chat_template,
+            {
+                "file",
+                "bytes",
+                "sha256",
+                "render_contract",
+                "reconciliation_system",
+                "think_prompt_file",
+                "think_prompt_sha256",
+                "nothink_prompt_file",
+                "nothink_prompt_sha256",
+            },
+            "capture.chat_template",
+        )
+        template_name = require_safe_name(
+            chat_template["file"],
+            "tokenizer.chat_template.jinja",
+            "capture.chat_template.file",
+        )
+        think_name = require_safe_name(
+            chat_template["think_prompt_file"],
+            "chat-template-think.prompt",
+            "capture.chat_template.think_prompt_file",
+        )
+        nothink_name = require_safe_name(
+            chat_template["nothink_prompt_file"],
+            "chat-template-nothink.prompt",
+            "capture.chat_template.nothink_prompt_file",
+        )
+        if chat_template["render_contract"] != "pinned-template-semantics-v1":
+            fail("capture chat-template render contract mismatch")
+        if require_string(
+            chat_template["reconciliation_system"],
+            "capture.chat_template.reconciliation_system",
+        ) != CHAT_TEMPLATE_RECONCILIATION_SYSTEM.decode("ascii"):
+            fail("capture chat-template reconciliation system mismatch")
+        template_payload = retained[template_name]
+        think_prompt = retained[think_name]
+        nothink_prompt = retained[nothink_name]
+        require_utf8(template_payload, template_name)
+        require_utf8(think_prompt, think_name)
+        require_utf8(nothink_prompt, nothink_name)
+        expected_hashes = (
+            ("sha256", template_name, template_payload),
+            ("think_prompt_sha256", think_name, think_prompt),
+            ("nothink_prompt_sha256", nothink_name, nothink_prompt),
+        )
+        for field, name, payload in expected_hashes:
+            recorded = require_hex(
+                chat_template[field], 64, f"capture.chat_template.{field}"
+            )
+            if recorded != file_hashes[name] or recorded != sha256_bytes(payload):
+                fail(f"capture chat-template SHA-256 mismatch: {name}")
+        if (
+            require_int(chat_template["bytes"], "capture.chat_template.bytes")
+            != len(template_payload)
+            or len(template_payload) != CHAT_TEMPLATE_BYTES
+        ):
+            fail("capture embedded chat template byte length mismatch")
+        if sha256_bytes(template_payload) != CHAT_TEMPLATE_SHA256:
+            fail("capture embedded chat template identity mismatch")
+        if (
+            b"set enable_thinking = enable_thinking | default(true)"
+            not in template_payload
+        ):
+            fail("capture embedded chat template thinking default mismatch")
+        generation_start = template_payload.rfind(b"{%- if add_generation_prompt -%}")
+        if generation_start < 0:
+            fail("capture embedded chat template lacks a generation branch")
+        generation_branch = template_payload[generation_start:]
+        semantic_markers = (
+            b'{{- "<assistant>" -}}',
+            b"{%- if enable_thinking -%}",
+            b"{{- '<think>' -}}",
+            b"{%- else -%}",
+            b"{{- '</think>' -}}",
+            b"{%- endif -%}",
+        )
+        marker_offset = 0
+        for marker in semantic_markers:
+            marker_offset = generation_branch.find(marker, marker_offset)
+            if marker_offset < 0:
+                fail("capture embedded chat template generation semantics mismatch")
+            marker_offset += len(marker)
+        template_prefix = (
+            b"\xe3\x80\x88|EOS|\xe3\x80\x89<system>"
+            + CHAT_TEMPLATE_RECONCILIATION_SYSTEM
+            + b"</system>\n<user>"
+            + SHORT_BYTES
+        )
+        expected_think = template_prefix + SHORT_THINK_SUFFIX
+        expected_nothink = template_prefix + SHORT_SUFFIX
+        if think_prompt != expected_think:
+            fail("capture explicit think prompt mismatch")
+        if nothink_prompt != expected_nothink:
+            fail("capture explicit no-think prompt mismatch")
+        chat_template_data = {
+            "embedded": template_payload,
+            "think_prompt": think_prompt,
+            "nothink_prompt": nothink_prompt,
+        }
 
     cases_value = require_list(capture["cases"], "capture.cases")
     if len(cases_value) != len(CASE_SPECS):
@@ -801,10 +947,12 @@ def validate_capture(root: Path, expected_capture_sha256: str) -> dict[str, Any]
         fail("capture continuation step zero differs from the yarn terminal argmax")
     return {
         "manifest": capture,
+        "model": dict(model),
         "files": retained,
         "cases": retained_cases,
         "continuation": continuation_ids,
         "continuation_payload": retained[tokens_name],
+        "chat_template": chat_template_data,
     }
 
 
@@ -1006,6 +1154,14 @@ def build_manifest(
     tokenizer_runtime_commit: str,
     ds4_seed_token_count: int,
 ) -> dict[str, Any]:
+    captured_model = capture_data["model"]
+    promoted_model = {
+        "repository": captured_model["repository"],
+        "revision": captured_model["revision"],
+        "filename": captured_model["file"],
+        "size": captured_model["size"],
+        "sha256": captured_model["sha256"],
+    }
     cases: list[dict[str, Any]] = []
     for case in capture_data["cases"]:
         case_id = case["id"]
@@ -1035,7 +1191,7 @@ def build_manifest(
         "vocab_size": VOCAB_SIZE,
         "continuation_case": "yarn-8193",
         "continuation_tokens": CONTINUATION_TOKENS,
-        "model": dict(PROMOTED_MODEL),
+        "model": promoted_model,
         "oracle": {
             "name": "poolside-llama",
             "runtime_commit": LLAMA_COMMIT,
@@ -1106,6 +1262,8 @@ def promote(
 ) -> None:
     destination = Path(destination)
     capture_data = validate_capture(Path(llama_root), expected_capture_sha256)
+    if capture_data["manifest"]["schema"] != "laguna-resident-capture-v2":
+        fail("new promotion requires a corrected laguna-resident-capture-v2 capture")
     fixed = validate_destination(destination, capture_data, reject_outputs=False)
     validate_capture_relationships(capture_data, fixed)
     executable, repository, head = discover_repository(Path(ds4))
@@ -1139,8 +1297,8 @@ def promote(
             head,
             LLAMA_COMMIT,
             expected_capture_sha256,
-            int(PROMOTED_MODEL["size"]),
-            str(PROMOTED_MODEL["sha256"]),
+            int(manifest["model"]["size"]),
+            str(manifest["model"]["sha256"]),
         )
         recheck_repository(repository, head)
 

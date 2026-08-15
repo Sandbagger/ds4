@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -22,6 +23,20 @@ LLAMA_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
 
 
 class DumpLlamaContractTest(unittest.TestCase):
+    def test_new_capture_pin_excludes_the_historical_artifact(self) -> None:
+        source = DUMPER.read_text(encoding="utf-8")
+        self.assertIn("e2ccc0579fc18e6ea2362fa25fccbcd470f0e332", source)
+        self.assertIn("68248760064", source)
+        self.assertIn(
+            "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff",
+            source,
+        )
+        self.assertNotIn("706fa69799926b6afde1af9e24ca2a4923f110a1", source)
+        self.assertNotIn(
+            "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+            source,
+        )
+
     def test_checked_in_cases_use_exact_ctx_schema(self) -> None:
         self.assertEqual(
             json.loads(CASES.read_text(encoding="utf-8")),
@@ -62,7 +77,7 @@ class DumpLlamaContractTest(unittest.TestCase):
             },
         )
 
-    def test_capture_records_materialized_seed_token_count(self) -> None:
+    def test_capture_v2_records_template_bytes_and_explicit_renderings(self) -> None:
         compiler = shutil.which("c++")
         if compiler is None:
             self.skipTest("c++ compiler is unavailable")
@@ -130,6 +145,8 @@ class DumpLlamaContractTest(unittest.TestCase):
                         const char *, llama_model_params) { return nullptr; }
                     inline const llama_vocab *llama_model_get_vocab(const llama_model *) { return nullptr; }
                     inline int32_t llama_vocab_n_tokens(const llama_vocab *) { return 0; }
+                    inline const char *llama_model_chat_template(
+                        const llama_model *, const char *) { return nullptr; }
                     """
                 ),
                 encoding="utf-8",
@@ -155,8 +172,13 @@ class DumpLlamaContractTest(unittest.TestCase):
                         yarn.test_case.context = 8202;
                         yarn.continuation_argmax.assign(8, 7);
                         std::vector<DumpResult> results = {{yarn}};
+                        const std::string chat_template =
+                            "{{% if enable_thinking %}}<think>"
+                            "{{% else %}}</think>{{% endif %}}";
+                        const std::string probe = "template probe\\n";
                         write_capture(
-                            output, 100352, "yarn-8193", 8, 40001, results);
+                            output, 100352, "yarn-8193", 8, 40001, results,
+                            chat_template, probe);
                         return 0;
                     }}
                     """
@@ -184,7 +206,51 @@ class DumpLlamaContractTest(unittest.TestCase):
             output = root / "capture"
             subprocess.run([str(binary), str(output)], check=True)
             capture = json.loads((output / "capture.json").read_text(encoding="utf-8"))
+            template = b"{% if enable_thinking %}<think>{% else %}</think>{% endif %}"
+            prefix = (
+                "\u3008|EOS|\u3009<system>Laguna template reconciliation probe."
+                "</system>\n<user>template probe\n</user>\n<assistant>"
+            ).encode()
+            think = prefix + b"<think>"
+            nothink = prefix + b"</think>"
+            self.assertEqual(capture["schema"], "laguna-resident-capture-v2")
             self.assertEqual(capture["seed_token_count"], 40001)
+            self.assertEqual(
+                capture["model"],
+                {
+                    "repository": "poolside/Laguna-S-2.1-GGUF",
+                    "revision": "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332",
+                    "file": "laguna-s-2.1-Q4_K_M.gguf",
+                    "size": 68248760064,
+                    "sha256": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff",
+                },
+            )
+            self.assertEqual(
+                capture["chat_template"],
+                {
+                    "file": "tokenizer.chat_template.jinja",
+                    "bytes": len(template),
+                    "sha256": hashlib.sha256(template).hexdigest(),
+                    "render_contract": "pinned-template-semantics-v1",
+                    "reconciliation_system": "Laguna template reconciliation probe.",
+                    "think_prompt_file": "chat-template-think.prompt",
+                    "think_prompt_sha256": hashlib.sha256(think).hexdigest(),
+                    "nothink_prompt_file": "chat-template-nothink.prompt",
+                    "nothink_prompt_sha256": hashlib.sha256(nothink).hexdigest(),
+                },
+            )
+            self.assertEqual((output / "tokenizer.chat_template.jinja").read_bytes(), template)
+            self.assertEqual((output / "chat-template-think.prompt").read_bytes(), think)
+            self.assertEqual((output / "chat-template-nothink.prompt").read_bytes(), nothink)
+            for name in (
+                "tokenizer.chat_template.jinja",
+                "chat-template-think.prompt",
+                "chat-template-nothink.prompt",
+            ):
+                self.assertEqual(
+                    capture["files"][name],
+                    hashlib.sha256((output / name).read_bytes()).hexdigest(),
+                )
 
     def test_make_target_rejects_wrong_or_dirty_llama_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

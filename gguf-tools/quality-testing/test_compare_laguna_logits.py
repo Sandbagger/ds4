@@ -55,6 +55,21 @@ GGUF_REVISION = "706fa69799926b6afde1af9e24ca2a4923f110a1"
 GGUF_SIZE = 68248759648
 GGUF_SHA256 = "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a"
 GGUF_FILENAME = "laguna-s-2.1-Q4_K_M.gguf"
+CORRECTED_GGUF_REVISION = "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332"
+CORRECTED_GGUF_SIZE = 68248760064
+CORRECTED_GGUF_SHA256 = "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
+TEST_CHAT_TEMPLATE = b"""{%- set enable_thinking = enable_thinking | default(true) -%}
+{%- if add_generation_prompt -%}
+{{- "<assistant>" -}}
+{%- if enable_thinking -%}
+{{- '<think>' -}}
+{%- else -%}
+{{- '</think>' -}}
+{%- endif -%}
+{%- endif -%}
+"""
+TEST_CHAT_TEMPLATE_BYTES = len(TEST_CHAT_TEMPLATE)
+TEST_CHAT_TEMPLATE_SHA256 = hashlib.sha256(TEST_CHAT_TEMPLATE).hexdigest()
 GENERATOR_SHA256 = "118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d"
 BENCHMARK_SHA256 = "aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206"
 
@@ -225,6 +240,16 @@ def short_rendered_prompt() -> bytes:
         b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
         + (FIXTURE_SOURCE / "short.txt").read_bytes()
         + b"</user>\n<assistant></think>"
+    )
+
+
+def template_reconciliation_prompt(*, think: bool) -> bytes:
+    return (
+        b"\xe3\x80\x88|EOS|\xe3\x80\x89"
+        b"<system>Laguna template reconciliation probe.</system>\n<user>"
+        + (FIXTURE_SOURCE / "short.txt").read_bytes()
+        + b"</user>\n<assistant>"
+        + (b"<think>" if think else b"</think>")
     )
 
 
@@ -419,6 +444,43 @@ def rewrite_capture(root: Path, change: Callable[[dict[str, Any]], None]) -> str
     return sha256(payload)
 
 
+def upgrade_capture_to_v2(root: Path) -> str:
+    template = TEST_CHAT_TEMPLATE
+    artifacts = {
+        "tokenizer.chat_template.jinja": template,
+        "chat-template-think.prompt": template_reconciliation_prompt(think=True),
+        "chat-template-nothink.prompt": template_reconciliation_prompt(think=False),
+    }
+    for name, payload in artifacts.items():
+        (root / name).write_bytes(payload)
+
+    def upgrade(capture: dict[str, Any]) -> None:
+        capture["schema"] = "laguna-resident-capture-v2"
+        capture["model"] = {
+            "repository": "poolside/Laguna-S-2.1-GGUF",
+            "revision": CORRECTED_GGUF_REVISION,
+            "file": GGUF_FILENAME,
+            "size": CORRECTED_GGUF_SIZE,
+            "sha256": CORRECTED_GGUF_SHA256,
+        }
+        capture["chat_template"] = {
+            "file": "tokenizer.chat_template.jinja",
+            "bytes": len(template),
+            "sha256": sha256(template),
+            "render_contract": "pinned-template-semantics-v1",
+            "reconciliation_system": "Laguna template reconciliation probe.",
+            "think_prompt_file": "chat-template-think.prompt",
+            "think_prompt_sha256": sha256(artifacts["chat-template-think.prompt"]),
+            "nothink_prompt_file": "chat-template-nothink.prompt",
+            "nothink_prompt_sha256": sha256(artifacts["chat-template-nothink.prompt"]),
+        }
+        capture["files"].update(
+            {name: sha256(payload) for name, payload in artifacts.items()}
+        )
+
+    return rewrite_capture(root, upgrade)
+
+
 def fake_ds4_source() -> str:
     token_map = {
         sha256(short_rendered_prompt()): ["tokens", case_tokens("short", 3)],
@@ -482,6 +544,10 @@ def call_promote(
             "LAGUNA_MODEL": model_argument,
             "FAKE_DS4_EXPECTED_MODEL": model_argument,
         },
+    ), mock.patch.object(
+        module, "CHAT_TEMPLATE_BYTES", TEST_CHAT_TEMPLATE_BYTES
+    ), mock.patch.object(
+        module, "CHAT_TEMPLATE_SHA256", TEST_CHAT_TEMPLATE_SHA256
     ):
         module.promote(
             ds4,
@@ -519,6 +585,8 @@ def run_promote_cli(
         environment["FAKE_DS4_LOG"] = str(token_log)
     with (
         mock.patch.object(module, "CAPTURE_MANIFEST_SHA256", capture_digest, create=True),
+        mock.patch.object(module, "CHAT_TEMPLATE_BYTES", TEST_CHAT_TEMPLATE_BYTES),
+        mock.patch.object(module, "CHAT_TEMPLATE_SHA256", TEST_CHAT_TEMPLATE_SHA256),
         mock.patch.object(sys, "argv", argv),
         mock.patch.dict(os.environ, environment),
         contextlib.redirect_stdout(stdout),
@@ -536,7 +604,8 @@ def make_promotion_workspace(
 ) -> tuple[Path, str, Path, Path, str, Path]:
     capture = root / "capture"
     capture.mkdir()
-    capture_digest = write_capture(capture)
+    write_capture(capture)
+    capture_digest = upgrade_capture_to_v2(capture)
     repo, ds4, head = clean_ds4_repository(root)
     destination = root / "promoted"
     destination.mkdir()
@@ -669,6 +738,8 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         fixture: Path,
         tokenizer_commit: str = TOKENIZER_RUNTIME_COMMIT,
         capture_digest: str = CAPTURE_MANIFEST_SHA256,
+        gguf_size: int = GGUF_SIZE,
+        gguf_sha256: str = GGUF_SHA256,
     ) -> list[str]:
         return [
             sys.executable,
@@ -684,9 +755,9 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             "--capture-manifest-sha256",
             capture_digest,
             "--gguf-size",
-            str(GGUF_SIZE),
+            str(gguf_size),
             "--gguf-sha256",
-            GGUF_SHA256,
+            gguf_sha256,
         ]
 
     def run_verify(
@@ -694,9 +765,17 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         fixture: Path,
         tokenizer_commit: str = TOKENIZER_RUNTIME_COMMIT,
         capture_digest: str = CAPTURE_MANIFEST_SHA256,
+        gguf_size: int = GGUF_SIZE,
+        gguf_sha256: str = GGUF_SHA256,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            self.verify_command(fixture, tokenizer_commit, capture_digest),
+            self.verify_command(
+                fixture,
+                tokenizer_commit,
+                capture_digest,
+                gguf_size,
+                gguf_sha256,
+            ),
             check=False,
             capture_output=True,
             text=True,
@@ -721,6 +800,159 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             self.tool_module.parse_tokenizer_output(output, "short prompt"),
             [2, 97, 1437],
         )
+
+    def test_capture_v2_binds_corrected_model_template_and_explicit_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "capture"
+            capture.mkdir()
+            write_capture(capture)
+            digest = upgrade_capture_to_v2(capture)
+
+            with mock.patch.object(
+                self.tool_module,
+                "CHAT_TEMPLATE_BYTES",
+                TEST_CHAT_TEMPLATE_BYTES,
+            ), mock.patch.object(
+                self.tool_module,
+                "CHAT_TEMPLATE_SHA256",
+                TEST_CHAT_TEMPLATE_SHA256,
+            ):
+                validated = self.tool_module.validate_capture(capture, digest)
+            fixed_root = root / "fixed"
+            fixed_root.mkdir()
+            populate_fixed_inputs(fixed_root)
+            self.tool_module.validate_capture_relationships(
+                validated, self.tool_module.validate_fixture_inputs(fixed_root)
+            )
+            promoted = self.tool_module.build_manifest(
+                validated, digest, TOKENIZER_RUNTIME_COMMIT, 61440
+            )
+
+            self.assertEqual(validated["manifest"]["model"]["revision"], CORRECTED_GGUF_REVISION)
+            self.assertEqual(promoted["model"]["revision"], CORRECTED_GGUF_REVISION)
+            self.assertEqual(
+                validated["chat_template"]["embedded"],
+                (capture / "tokenizer.chat_template.jinja").read_bytes(),
+            )
+            self.assertEqual(
+                validated["chat_template"]["nothink_prompt"],
+                template_reconciliation_prompt(think=False),
+            )
+            self.assertEqual(
+                validated["chat_template"]["think_prompt"],
+                template_reconciliation_prompt(think=True),
+            )
+
+    def test_capture_v2_rejects_legacy_identity_and_semantic_mode_tamper(self) -> None:
+        mutations: tuple[tuple[str, Callable[[Path], str]], ...] = (
+            (
+                "legacy model",
+                lambda capture: rewrite_capture(
+                    capture,
+                    lambda data: data.__setitem__("model", capture_model()),
+                ),
+            ),
+            (
+                "think rendering",
+                lambda capture: self._rewrite_v2_prompt(
+                    capture, "chat-template-think.prompt", b"wrong think prompt"
+                ),
+            ),
+            (
+                "no-think rendering",
+                lambda capture: self._rewrite_v2_prompt(
+                    capture, "chat-template-nothink.prompt", b"wrong no-think prompt"
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                capture = Path(tmp)
+                write_capture(capture)
+                upgrade_capture_to_v2(capture)
+                digest = mutate(capture)
+
+                with (
+                    mock.patch.object(
+                        self.tool_module,
+                        "CHAT_TEMPLATE_BYTES",
+                        TEST_CHAT_TEMPLATE_BYTES,
+                    ),
+                    mock.patch.object(
+                        self.tool_module,
+                        "CHAT_TEMPLATE_SHA256",
+                        TEST_CHAT_TEMPLATE_SHA256,
+                    ),
+                    self.assertRaises(self.tool_module.ContractError),
+                ):
+                    self.tool_module.validate_capture(capture, digest)
+
+    def test_capture_v2_rejects_self_consistent_unpinned_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp)
+            write_capture(capture)
+            upgrade_capture_to_v2(capture)
+            wrong = TEST_CHAT_TEMPLATE + b" " * (
+                self.tool_module.CHAT_TEMPLATE_BYTES - len(TEST_CHAT_TEMPLATE)
+            )
+            digest = self._rewrite_v2_template(capture, wrong)
+
+            with self.assertRaises(self.tool_module.ContractError) as raised:
+                self.tool_module.validate_capture(capture, digest)
+
+            self.assertIn("identity", str(raised.exception))
+
+    def test_capture_v1_is_historical_only_and_cannot_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "capture-v1"
+            destination = root / "destination"
+            capture.mkdir()
+            destination.mkdir()
+            digest = write_capture(capture)
+            before = tree_digest(destination)
+
+            with self.assertRaises(self.tool_module.ContractError) as raised:
+                call_promote(
+                    self.tool_module,
+                    root / "unused-ds4",
+                    capture,
+                    destination,
+                    digest,
+                )
+
+            self.assertIn("capture-v2", str(raised.exception))
+            self.assertEqual(tree_digest(destination), before)
+
+    @staticmethod
+    def _rewrite_v2_prompt(capture: Path, name: str, payload: bytes) -> str:
+        (capture / name).write_bytes(payload)
+        field = (
+            "think_prompt_sha256"
+            if name == "chat-template-think.prompt"
+            else "nothink_prompt_sha256"
+        )
+
+        def update(data: dict[str, Any]) -> None:
+            digest = sha256(payload)
+            data["files"][name] = digest
+            data["chat_template"][field] = digest
+
+        return rewrite_capture(capture, update)
+
+    @staticmethod
+    def _rewrite_v2_template(capture: Path, payload: bytes) -> str:
+        name = "tokenizer.chat_template.jinja"
+        (capture / name).write_bytes(payload)
+
+        def update(data: dict[str, Any]) -> None:
+            digest = sha256(payload)
+            data["files"][name] = digest
+            data["chat_template"]["bytes"] = len(payload)
+            data["chat_template"]["sha256"] = digest
+
+        return rewrite_capture(capture, update)
 
     def test_valid_fixture_verifies_without_mutation_and_has_exact_file_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -954,7 +1186,13 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 self.assertEqual(Path(argv[5]).name, record["filename"])
 
             before = tree_digest(destination)
-            verified = self.run_verify(destination, head, digest)
+            verified = self.run_verify(
+                destination,
+                head,
+                digest,
+                CORRECTED_GGUF_SIZE,
+                CORRECTED_GGUF_SHA256,
+            )
             self.assertEqual(verified.returncode, 0, verified.stderr)
             self.assertEqual(
                 verified.stdout,
@@ -1000,7 +1238,13 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["cases"][0]["frontier"], len(short_tokens))
             self.assertEqual(manifest["cases"][0]["poolside_tokens"], short_tokens)
-            verified = self.run_verify(destination, head, digest)
+            verified = self.run_verify(
+                destination,
+                head,
+                digest,
+                CORRECTED_GGUF_SIZE,
+                CORRECTED_GGUF_SHA256,
+            )
             self.assertEqual(verified.returncode, 0, verified.stderr)
 
     def test_promotion_rejects_surplus_ds4_tokens_for_an_exact_prompt(self) -> None:
@@ -1209,7 +1453,13 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 self.assertEqual(
                     (destination / "swa-513.llama.f32").read_bytes(), original_vector
                 )
-                verified = self.run_verify(destination, head, digest)
+                verified = self.run_verify(
+                    destination,
+                    head,
+                    digest,
+                    CORRECTED_GGUF_SIZE,
+                    CORRECTED_GGUF_SHA256,
+                )
                 self.assertEqual(verified.returncode, 0, verified.stderr)
                 self.assertFalse(destination.with_name(f".{destination.name}.lock").exists())
                 self.assertFalse(
@@ -1398,7 +1648,13 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             loser_message = next(message for result, message in results if result == "loser")
             self.assertIn("lock", loser_message.lower())
             self.assertEqual({path.name for path in destination.iterdir()}, PROMOTED_FILES)
-            verified = self.run_verify(destination, head, digest)
+            verified = self.run_verify(
+                destination,
+                head,
+                digest,
+                CORRECTED_GGUF_SIZE,
+                CORRECTED_GGUF_SHA256,
+            )
             self.assertEqual(verified.returncode, 0, verified.stderr)
 
     def test_link_failure_cleans_only_invocation_outputs(self) -> None:

@@ -1305,6 +1305,115 @@ class SmokeEvalContractTest(unittest.TestCase):
             TOOL.run_smoke_eval("/model", "/eval", reversed(TOOL.EVAL_CASE_IDS))
 
 
+class QualificationRunnerContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.manifest = build_fixture()
+
+    def test_schedule_is_resident_then_frozen_profile_and_prompt_order(self) -> None:
+        schedule = TOOL.qualification_schedule(self.manifest)
+        self.assertEqual(schedule[0], ("resident", None, None))
+        expected = [("resident", None, None)]
+        for profile in self.manifest["profiles"]:
+            for prompt_tokens in profile["prompt_order"]:
+                expected.append((
+                    "streamed", profile["profile_id"], f"native-{prompt_tokens}"
+                ))
+        self.assertEqual(schedule, expected)
+
+    def test_runner_retries_invalid_once_but_never_retries_failed_gate(self) -> None:
+        calls: list[tuple[str, str | None, str | None, int]] = []
+        invalid_once = ("streamed", "cache-8gib", "native-512")
+        failed_once = ("streamed", "cache-12gib", "native-2048")
+
+        def execute(mode: str, profile: str | None, prompt: str | None, attempt: int) -> dict:
+            calls.append((mode, profile, prompt, attempt))
+            key = (mode, profile, prompt)
+            if key == invalid_once and attempt == 1:
+                return {"status": "invalid", "samples": [], "reason": "infrastructure"}
+            if key == failed_once:
+                return {"status": "failed", "samples": [1, 2, 3, 4], "reason": "gate"}
+            return {"status": "passed", "samples": [1, 2, 3, 4], "reason": None}
+
+        original = copy.deepcopy(self.manifest)
+        with tempfile.TemporaryDirectory() as name:
+            evidence = Path(name) / "evidence"
+            result = TOOL.run_qualification_schedule(self.manifest, evidence, execute)
+            self.assertTrue((evidence / "run-status.json").is_file())
+        self.assertEqual(self.manifest, original)
+        self.assertEqual(calls.count((*invalid_once, 1)), 1)
+        self.assertEqual(calls.count((*invalid_once, 2)), 1)
+        self.assertEqual(calls.count((*failed_once, 1)), 1)
+        self.assertNotIn((*failed_once, 2), calls)
+        self.assertEqual(result["status"], "failed")
+
+    def test_runner_requires_exactly_four_same_process_samples(self) -> None:
+        def execute(mode: str, profile: str | None, prompt: str | None, attempt: int) -> dict:
+            del profile, prompt, attempt
+            return {
+                "status": "passed",
+                "samples": [] if mode == "resident" else [1, 2, 3],
+                "reason": None,
+            }
+
+        with tempfile.TemporaryDirectory() as name, self.assertRaisesRegex(
+            ValueError, "exactly four consecutive"
+        ):
+            TOOL.run_qualification_schedule(
+                self.manifest, Path(name) / "evidence", execute
+            )
+
+    def test_evidence_index_is_exact_sorted_and_tamper_evident(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "z.json").write_bytes(b"z")
+            (root / "nested").mkdir()
+            (root / "nested" / "a.json").write_bytes(b"a")
+            references = ["z.json", "nested/a.json"]
+            index, digest = TOOL.build_evidence_index(root, references)
+            self.assertEqual([item["path"] for item in index], ["nested/a.json", "z.json"])
+            self.assertEqual(digest, TOOL._sha256_bytes(TOOL.canonical_json_bytes(index)))
+            (root / "z.json").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "digest|changed"):
+                TOOL.verify_evidence_index(root, index, digest)
+            (root / "extra.json").write_bytes(b"extra")
+            with self.assertRaisesRegex(ValueError, "exact union"):
+                TOOL.build_evidence_index(root, references)
+
+    def test_evidence_paths_reject_noncanonical_and_symlink_forms(self) -> None:
+        bad = ("", ".", "..", "/absolute", "a/../b", "a//b", "a/./b", "a\nfile")
+        for path in bad:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                TOOL.validate_evidence_path(path)
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "target").write_bytes(b"x")
+            (root / "link").symlink_to("target")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                TOOL.build_evidence_index(root, ["link", "target"])
+
+    def test_bundle_status_requires_all_globals_and_one_profile(self) -> None:
+        passed = {"status": "passed"}
+        failed = {"status": "failed"}
+        invalid = {"status": "invalid"}
+        self.assertEqual(
+            TOOL.qualification_bundle_status([passed], [failed, passed, failed]),
+            "passed",
+        )
+        self.assertEqual(
+            TOOL.qualification_bundle_status([failed], [passed, passed, passed]),
+            "failed",
+        )
+        self.assertEqual(
+            TOOL.qualification_bundle_status([passed], [failed, failed, failed]),
+            "failed",
+        )
+        self.assertEqual(
+            TOOL.qualification_bundle_status([invalid], [passed, passed, passed]),
+            "invalid",
+        )
+
+
 class WarmStabilityContractTest(unittest.TestCase):
     def test_freezes_warm_stability_constants_and_accepts_boundary_evidence(self) -> None:
         self.assertEqual(TOOL.WARM_STABILITY_REPETITIONS, 3)

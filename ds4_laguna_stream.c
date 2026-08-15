@@ -1354,7 +1354,7 @@ bool ds4_laguna_allocation_plan_make(
 
     const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
     const uint64_t mib = UINT64_C(1024) * 1024u;
-    const uint64_t expected_file_size = UINT64_C(68248759648);
+    const uint64_t expected_file_size = UINT64_C(68248760064);
     const uint64_t expected_static_bytes = UINT64_C(4374164480);
     const uint64_t expected_slot_stride = UINT64_C(5308416);
     const uint64_t expected_expert_entries = UINT64_C(12032);

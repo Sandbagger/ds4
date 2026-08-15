@@ -2357,7 +2357,7 @@ static void test_allocation_profiles(void) {
     };
     ds4_laguna_ledger ledger;
     memset(&ledger, 0, sizeof(ledger));
-    ledger.file_size = UINT64_C(68248759648);
+    ledger.file_size = UINT64_C(68248760064);
     ledger.tensor_count = tensor_range_count;
     ledger.static_parent_count = UINT64_C(673);
     ledger.routed_parent_count = UINT64_C(141);
@@ -2563,6 +2563,12 @@ static void test_allocation_profiles(void) {
               &plan, &ledger, &invalid, err, sizeof(err)),
           "unqualified cache profile is rejected");
     invalid.configured_cache_bytes = 8u * gib;
+    ledger.file_size = UINT64_C(68248759648);
+    CHECK(!ds4_laguna_allocation_plan_make(
+              &plan, &ledger, &invalid, err, sizeof(err)) &&
+              strstr(err, "ledger") != NULL,
+          "old active model size is rejected by the exact Laguna ledger gate");
+    ledger.file_size = UINT64_C(68248760064);
     ledger.static_aligned_device_bytes = UINT64_MAX;
     CHECK(!ds4_laguna_allocation_plan_make(
               &plan, &ledger, &invalid, err, sizeof(err)) &&

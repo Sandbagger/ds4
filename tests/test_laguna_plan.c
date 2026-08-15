@@ -16,6 +16,8 @@ static int g_failed;
 static int g_total;
 
 static const char pinned_model_sha256[] =
+    "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff";
+static const char old_model_sha256[] =
     "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a";
 
 #define CHECK(cond, msg) do {                                                  \
@@ -494,9 +496,9 @@ static void test_serialize(void) {
               strstr(json, "\"report\":\"MODEL_SOURCE_RESIDENT\"") != NULL,
           "allocation enums use their fixed qualification names");
     CHECK(strstr(json, "\"repository\":\"poolside/Laguna-S-2.1-GGUF\"") != NULL &&
-              strstr(json, "706fa69799926b6afde1af9e24ca2a4923f110a1") != NULL &&
+              strstr(json, "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332") != NULL &&
               strstr(json,
-                     "\"sha256\":\"e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a\"") != NULL &&
+                     "\"sha256\":\"a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff\"") != NULL &&
               strstr(json, "\"expected_sha256\"") == NULL &&
               strstr(json, "path") == NULL,
           "model identity publishes the observed pinned digest without a path");
@@ -505,8 +507,8 @@ static void test_serialize(void) {
         "\"filename\":\"laguna-s-2.1-Q4_K_M.gguf\","
         "\"inode\":\"99\",\"mtime_ns\":\"123456789\","
         "\"repository\":\"poolside/Laguna-S-2.1-GGUF\","
-        "\"revision\":\"706fa69799926b6afde1af9e24ca2a4923f110a1\","
-        "\"sha256\":\"e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a\","
+        "\"revision\":\"e2ccc0579fc18e6ea2362fa25fccbcd470f0e332\","
+        "\"sha256\":\"a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff\","
         "\"size_bytes\":\"28673\"}";
     CHECK(strstr(json, canonical_model) != NULL,
           "model keys retain exact canonical lexical order");
@@ -843,8 +845,10 @@ static void test_rejections(void) {
 
     fixture.input.model_sha256 = NULL;
     expect_serialize_rejected(&fixture, "missing observed model digest rejected");
-    fixture.input.model_sha256 = "E163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a";
+    fixture.input.model_sha256 = "A34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff";
     expect_serialize_rejected(&fixture, "malformed observed model digest rejected");
+    fixture.input.model_sha256 = old_model_sha256;
+    expect_serialize_rejected(&fixture, "old active model digest rejected");
     fixture.input.model_sha256 =
         "0000000000000000000000000000000000000000000000000000000000000000";
     expect_serialize_rejected(&fixture, "non-pinned observed model digest rejected");

@@ -3625,6 +3625,12 @@ class CudaBuildContractTest(unittest.TestCase):
                     r"\.qualification_model_fd_set\s*=\s*model_fd_set\s*,",
                 )
 
+    def test_laguna_model_harness_links_qualification_control(self) -> None:
+        self.assertIn(
+            "ds4_qualification_control.o",
+            rule_prerequisites("tests/test_cuda_laguna_model"),
+        )
+
     def test_resident_gate_has_one_runner_recipe_and_build_only_prerequisites(
         self,
     ) -> None:

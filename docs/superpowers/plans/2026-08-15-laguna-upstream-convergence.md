@@ -150,7 +150,7 @@ keep the current qualified candidate recoverable throughout.
 - [ ] Download `e2ccc057…` into a new immutable path. Do not overwrite or
   relabel the old file.
 - [ ] Verify the exact size and SHA-256 above before DS4 opens it.
-- [ ] Add a GGUF comparison test/tool that records metadata, tensor name/type/
+- [x] Add a GGUF comparison test/tool that records metadata, tensor name/type/
   shape, offsets and lengths, plus a per-tensor payload digest for both files.
 - [ ] Prove whether tensor payload bytes are identical. Offset equality is not
   assumed because the metadata prefix changed. If any tensor payload differs,
@@ -191,21 +191,26 @@ keep the current qualified candidate recoverable throughout.
 ### Phase 4 — establish the efficient resident-Q4 gate
 
 - [ ] In isolated clean exports, build exact PR #594 head and the current
-  candidate against the same corrected Q4 file. Bind the two binary hashes,
-  exact source revisions, model identity, host identity, and pre-child GPU
-  inventory in a no-clobber evidence directory.
+  candidate against the same corrected Q4 file. Use the identical fixed GB10
+  build `/usr/bin/make -B -j1 ds4-bench CUDA_ARCH=native` for both; this is also
+  the production `make cuda-spark` architecture policy. Bind the two binary
+  hashes, exact source revisions and trees, build logs, allowlisted build and
+  benchmark environments, make/C/C++/NVCC identities, model identity, host
+  identity, and pre-child GPU inventory in a no-clobber evidence directory.
 - [ ] Immediately before timing, require the current candidate to pass the
   corrected resident CUDA oracle. Correctness is an admission prerequisite,
   never a trade for speed.
 - [ ] Run the implementations serially through the stable normal
-  `ds4-bench` CSV interface: fresh resident-CUDA process per implementation,
-  the pinned `speed-bench/promessi_sposi.txt` prompt, 32K allocation, 4096-row
-  prefill chunks, 256 generated tokens, and exact 2048, 4096, 8192, 16384, and
-  28672-token frontiers. Do not use compact/streaming flags in this gate.
-- [ ] Reject the reference run unless its 2K/4K/8K prefill and steady-decode
-  values are at least 80% of PR #594's recorded Q4 numbers. Require candidate
-  prefill and steady decode to reach at least 90% of the same-run reference at
-  every frontier; a mean or median must not hide one red context length.
+  `ds4-bench` CSV interface as two counterbalanced pairs in ABBA order: four
+  fresh resident-CUDA processes, the pinned `speed-bench/promessi_sposi.txt`
+  prompt, 32K allocation, 4096-row prefill chunks, 256 generated tokens, and
+  exact 2048, 4096, 8192, 16384, and 28672-token frontiers. Do not use
+  compact/streaming flags in this gate.
+- [ ] Reject either reference run unless its 2K/4K/8K prefill and steady-decode
+  values are at least 80% of PR #594's recorded Q4 numbers. In each ABBA pair,
+  require candidate prefill and steady decode to reach at least 90% of its
+  paired same-run reference at every frontier; a mean or median must not hide
+  one red context length or one red pair.
 - [ ] If the unchanged candidate fails, stop before compact measurement. First
   adapt PR #594's split-history decode attention (`bdf47ff`, `021ca4e`,
   `8984bcc`) behind a rollback switch and rerun the corrected oracle plus the

@@ -1495,10 +1495,11 @@ The default graph backend is Metal on macOS and CUDA in CUDA builds:
 ```
 
 On Linux, plain `make` prints the available build targets instead of selecting a
-CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It omits an
-explicit `nvcc -arch` because that is currently the fastest path on GB10. Use
-`make cuda-generic` for a normal local CUDA build, or set `CUDA_ARCH` explicitly
-when cross-building or when you need a known target:
+CUDA target implicitly. Use `make cuda-spark` for DGX Spark / GB10. It uses
+`nvcc -arch=native`, which resolves SM 12.1 on GB10 and keeps compile-time CUDA
+fast paths aligned with the qualified resident binary. Use `make cuda-generic`
+for a normal local CUDA build, or set `CUDA_ARCH` explicitly when cross-building
+or when you need a known target:
 
 ```sh
 make cuda CUDA_ARCH=sm_120
@@ -1633,6 +1634,53 @@ python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
   --manifest "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json"
 test ! -e "$QUALIFICATION_ROOT/compact-runtime-evidence"
 ```
+
+Before invoking the compact runner, compare the corrected-Q4 candidate with an
+exact build of antirez/ds4 PR #594 head `7005761d1e4a53ff50c8e2b033d33c375fdb6297`.
+Run the corrected resident oracle first. The performance gate requires clean
+Git checkouts at the declared revisions. It removes only each checkout's ignored
+`ds4-bench` output and causally rebuilds both with the identical fixed command
+`/usr/bin/make -B -j1 ds4-bench CUDA_ARCH=native` under a recorded allowlisted
+environment. On GB10 with CUDA 13, `native` resolves SM 12.1 and prevents the
+comparison from silently exercising lower-architecture fallback kernels. The
+gate runs absolute-path Git inspection with global and system configuration
+disabled, and hashes/stats the exact make, C/C++, and NVCC tools before and
+across both builds. It binds each new binary to its source root, tree, build
+logs, toolchain, and SHA-256, then starts four fresh resident processes under a
+recorded environment whitelist in counterbalanced ABBA order:
+reference, candidate, candidate, reference. Each process sweeps the pinned
+benchmark prompt at 2K, 4K, 8K, 16K, and 28,672 tokens, with 256 generated
+tokens per frontier:
+
+```sh
+env -i \
+  PATH=/usr/bin:/bin \
+  LD_LIBRARY_PATH=/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64 \
+  LANG=C LC_ALL=C TZ=UTC \
+  DS4_TEST_MODEL="$LAGUNA_MODEL" \
+  LAGUNA_TOKENIZER_RUNTIME_COMMIT=15c9b92502fed6bc26842e98d11a6347caadb08e \
+  /usr/bin/make -B -j1 test-cuda-laguna-resident CUDA_ARCH=native \
+  CC=/usr/bin/cc CXX=/usr/bin/c++ CUDA_HOME=/usr/local/cuda \
+  NVCC=/usr/local/cuda/bin/nvcc
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py resident-gate \
+  --manifest "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json" \
+  --model "$LAGUNA_MODEL" \
+  --reference-source-dir /absolute/path/to/pr594 \
+  --reference-revision 7005761d1e4a53ff50c8e2b033d33c375fdb6297 \
+  --candidate-source-dir "$(pwd)" \
+  --candidate-revision "$(git rev-parse HEAD)" \
+  --evidence-dir "$QUALIFICATION_ROOT/resident-q4-performance"
+```
+
+Both reference runs must independently clear a loose 80% historical sanity
+floor derived from the published GB10 Q4 measurements. Those published numbers
+used snapshots and did not freeze the exact context allocation, so they are not
+the comparison baseline. The actual baseline is the fresh, same-host,
+same-protocol reference in each ABBA pair: each candidate must reach at least
+90% of its paired reference for both prefill and steady decode at every
+frontier. One red point in either pair blocks the compact curve. A build, child,
+or evidence error closes `result.json` as `status=invalid` before the CLI exits
+2. This is distinct from the compact path's 0.5 visible token/s viability floor.
 
 Run, verify, publish, and independently reproduce the bundle/sidecar hashes:
 

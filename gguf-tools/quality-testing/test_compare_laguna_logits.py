@@ -42,7 +42,8 @@ CASES = (
 )
 CONTINUATION = [5, 42, 43, 44, 45, 46, 47, 48]
 
-CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
+LEGACY_CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
+CONTRACT_COMMIT = "c51af8bbf177e2448d6c4fa2c4396e5be038349e"
 TOKENIZER_RUNTIME_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 LLAMA_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
 CAPTURE_MANIFEST_SHA256 = (
@@ -342,7 +343,7 @@ def write_promoted_fixture(root: Path) -> None:
             "capture_manifest_sha256": CAPTURE_MANIFEST_SHA256,
         },
         "provenance": {
-            "contract_commit": CONTRACT_COMMIT,
+            "contract_commit": LEGACY_CONTRACT_COMMIT,
             "tokenizer_runtime_commit": TOKENIZER_RUNTIME_COMMIT,
             "generator_sha256": GENERATOR_SHA256,
             "benchmark_sha256": BENCHMARK_SHA256,
@@ -740,6 +741,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         capture_digest: str = CAPTURE_MANIFEST_SHA256,
         gguf_size: int = GGUF_SIZE,
         gguf_sha256: str = GGUF_SHA256,
+        contract_commit: str = LEGACY_CONTRACT_COMMIT,
     ) -> list[str]:
         return [
             sys.executable,
@@ -747,7 +749,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             "--verify-promoted",
             str(fixture),
             "--contract-commit",
-            CONTRACT_COMMIT,
+            contract_commit,
             "--tokenizer-runtime-commit",
             tokenizer_commit,
             "--llama-commit",
@@ -767,6 +769,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         capture_digest: str = CAPTURE_MANIFEST_SHA256,
         gguf_size: int = GGUF_SIZE,
         gguf_sha256: str = GGUF_SHA256,
+        contract_commit: str = LEGACY_CONTRACT_COMMIT,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.verify_command(
@@ -775,6 +778,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 capture_digest,
                 gguf_size,
                 gguf_sha256,
+                contract_commit,
             ),
             check=False,
             capture_output=True,
@@ -1159,6 +1163,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 self.assertEqual((destination / name).read_bytes(), (capture / name).read_bytes())
             manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["provenance"]["tokenizer_runtime_commit"], head)
+            self.assertEqual(manifest["provenance"]["contract_commit"], CONTRACT_COMMIT)
             invocations = [
                 json.loads(line)
                 for line in token_log.read_text(encoding="utf-8").splitlines()
@@ -1192,6 +1197,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 digest,
                 CORRECTED_GGUF_SIZE,
                 CORRECTED_GGUF_SHA256,
+                contract_commit=CONTRACT_COMMIT,
             )
             self.assertEqual(verified.returncode, 0, verified.stderr)
             self.assertEqual(
@@ -1244,6 +1250,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 digest,
                 CORRECTED_GGUF_SIZE,
                 CORRECTED_GGUF_SHA256,
+                contract_commit=CONTRACT_COMMIT,
             )
             self.assertEqual(verified.returncode, 0, verified.stderr)
 
@@ -1459,6 +1466,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                     digest,
                     CORRECTED_GGUF_SIZE,
                     CORRECTED_GGUF_SHA256,
+                    contract_commit=CONTRACT_COMMIT,
                 )
                 self.assertEqual(verified.returncode, 0, verified.stderr)
                 self.assertFalse(destination.with_name(f".{destination.name}.lock").exists())
@@ -1654,6 +1662,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
                 digest,
                 CORRECTED_GGUF_SIZE,
                 CORRECTED_GGUF_SHA256,
+                contract_commit=CONTRACT_COMMIT,
             )
             self.assertEqual(verified.returncode, 0, verified.stderr)
 

@@ -25,7 +25,8 @@ VECTOR_BYTES = VOCAB_SIZE * 4
 CONTINUATION_TOKENS = 8
 CONTINUATION_BYTES = CONTINUATION_TOKENS * 4
 
-CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
+LEGACY_CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
+CONTRACT_COMMIT = "c51af8bbf177e2448d6c4fa2c4396e5be038349e"
 LLAMA_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
 CAPTURE_MANIFEST_SHA256 = (
     "cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e"
@@ -530,8 +531,11 @@ def verify_promoted(
     supplied_capture = require_hex(
         capture_manifest_sha256, 64, "supplied capture manifest SHA-256"
     )
-    if supplied_contract != CONTRACT_COMMIT:
-        fail("supplied contract commit does not match the pinned contract")
+    expected_contract = (
+        LEGACY_CONTRACT_COMMIT if model == LEGACY_PROMOTED_MODEL else CONTRACT_COMMIT
+    )
+    if supplied_contract != expected_contract:
+        fail("supplied contract commit does not match the model-generation contract")
     if supplied_llama != LLAMA_COMMIT:
         fail("supplied Poolside runtime commit does not match the pinned runtime")
 

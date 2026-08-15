@@ -282,12 +282,23 @@ def _tensor_nbytes(dimensions: tuple[int, ...], ggml_type: int, name: str) -> tu
 
 
 def _parse_gguf(
-    stream: BinaryIO, path: Path, identity: FileIdentity
+    stream: BinaryIO,
+    path: Path,
+    identity: FileIdentity,
+    tensor_extent_size: int | None = None,
 ) -> ArtifactInfo:
     if not stat.S_ISREG(identity.mode):
         raise ComparisonError(f"artifact is not a regular file: {path}")
     if identity.size < GGUF_HEADER_BYTES:
         raise ComparisonError(f"artifact is too small to be GGUF: {path}")
+
+    if tensor_extent_size is None:
+        tensor_extent_size = identity.size
+    if type(tensor_extent_size) is not int or tensor_extent_size < identity.size:
+        raise ComparisonError(
+            "logical GGUF size must be an integer at least as large as the "
+            "available prefix"
+        )
 
     stream.seek(0)
     if _read_exact(stream, 4, "GGUF magic") != b"GGUF":
@@ -379,7 +390,10 @@ def _parse_gguf(
     tensors: list[TensorInfo] = []
     for name, dimensions, ggml_type, relative_offset, nbytes, type_name in raw_tensors:
         absolute_offset = tensor_data_offset + relative_offset
-        if absolute_offset > identity.size or nbytes > identity.size - absolute_offset:
+        if (
+            absolute_offset > tensor_extent_size
+            or nbytes > tensor_extent_size - absolute_offset
+        ):
             raise ComparisonError(f"tensor {name!r} extends beyond the GGUF file")
         tensors.append(
             TensorInfo(
@@ -411,6 +425,22 @@ def _parse_gguf(
         metadata=tuple(metadata),
         tensors=tuple(tensors),
     )
+
+
+def parse_gguf_layout(
+    stream: BinaryIO,
+    path: Path,
+    logical_size: int | None = None,
+) -> ArtifactInfo:
+    """Parse a complete GGUF header/directory from a file or prefix.
+
+    ``logical_size`` permits a prefix ending at or after ``tensor_data_offset``
+    to validate tensor extents against the intended complete-file size.  All
+    metadata and directory reads remain bounded by the bytes physically present.
+    """
+
+    identity = _file_identity(stream)
+    return _parse_gguf(stream, path, identity, logical_size)
 
 
 def _hash_range(
@@ -524,8 +554,7 @@ def _hash_artifact(
 def _load_artifact(path: Path, chunk_bytes: int) -> ArtifactInfo:
     try:
         with path.open("rb") as stream:
-            identity = _file_identity(stream)
-            artifact = _parse_gguf(stream, path, identity)
+            artifact = parse_gguf_layout(stream, path)
             return _hash_artifact(stream, artifact, chunk_bytes)
     except OSError as exc:
         raise ComparisonError(f"cannot read artifact {path}: {exc}") from exc

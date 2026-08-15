@@ -513,7 +513,7 @@ tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_gpu_args.o 
 tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
+tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h
@@ -525,7 +525,7 @@ tests/test_engine_correctness: tests/test_engine_correctness.o ds4_gpu_args.o ds
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_cuda_session_batch.o: tests/test_cuda_session_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
@@ -555,7 +555,7 @@ tests/test_cuda_laguna_model: tests/test_cuda_laguna_model.o ds4_cuda_test_hooks
 tests/probe_ds4_laguna_moe.o: tests/oracle-producers/laguna-c7/probe_ds4_laguna_moe.c ds4.h ds4_gpu_args.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/probe_ds4_laguna_moe: tests/probe_ds4_laguna_moe.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
+tests/probe_ds4_laguna_moe: tests/probe_ds4_laguna_moe.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/probe_ds4_laguna_moe_release.o: tests/oracle-producers/laguna-c7/probe_ds4_laguna_moe.c ds4.h ds4_gpu_args.h

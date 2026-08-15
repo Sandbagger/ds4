@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
@@ -4186,6 +4187,66 @@ def validate_benchmark_transcript(
     if position != len(records):
         raise ValueError("qualification transcript has trailing or duplicate records")
     return samples
+
+
+def qualification_sequence_document(
+    manifest: Mapping[str, Any],
+    prompt: Mapping[str, Any],
+    prompt_path: Path | str,
+    *,
+    resident_mode: bool,
+) -> dict[str, Any]:
+    validate_manifest(manifest)
+    if not isinstance(prompt, Mapping) or prompt not in manifest["prompts"]:
+        raise ValueError("qualification prompt is not frozen in the manifest")
+    if type(resident_mode) is not bool:
+        raise ValueError("qualification sequence resident mode must be boolean")
+    rendered = base64.b64decode(prompt["rendered_base64"], validate=True)
+    if _sha256_bytes(rendered) != prompt["sha256"]:
+        raise ValueError("qualification prompt digest changed")
+    path = Path(prompt_path)
+    if not path.is_absolute():
+        raise ValueError("qualification prompt evidence path must be absolute")
+    return {
+        "schema": "ds4.qualification-sequence/v1",
+        "prompt_path": str(path),
+        "prompt_sha256": prompt["sha256"],
+        "manifest_sha256": manifest_sha256(manifest),
+        "mode": "resident" if resident_mode else "streamed",
+        "prompt_tokens": prompt["token_count"],
+        "requested_output_tokens": manifest["sampling"]["max_generated_tokens"],
+        "repetitions": 1 + manifest["execution"]["same_process_warm_repetitions"],
+    }
+
+
+def qualification_bench_argv(
+    bench_bin: Path | str,
+    model: Path | str,
+    sequence_path: Path | str,
+    control_fd: int,
+    *,
+    resident_mode: bool,
+    cache_bytes: int | None,
+) -> list[str]:
+    if type(control_fd) is not int or control_fd < 0:
+        raise ValueError("qualification control descriptor is invalid")
+    if type(resident_mode) is not bool:
+        raise ValueError("qualification bench mode must be boolean")
+    if resident_mode != (cache_bytes is None):
+        raise ValueError("qualification cache bytes do not match bench mode")
+    argv = [
+        str(bench_bin), "--model", str(model), "--backend", "cuda",
+        "--ctx-alloc", "32768", "--prefill-chunk", "4096",
+        "--qualification-control-fd", str(control_fd),
+        "--qualification-sequence", str(sequence_path),
+    ]
+    if not resident_mode:
+        if type(cache_bytes) is not int or cache_bytes <= 0:
+            raise ValueError("qualification cache bytes must be positive")
+        argv.extend((
+            "--ssd-streaming", "--ssd-streaming-cache-bytes", str(cache_bytes),
+        ))
+    return argv
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

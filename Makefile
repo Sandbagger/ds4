@@ -193,7 +193,8 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 
 cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_laguna_kernels tests/test_cuda_laguna_stream
 	./tests/cuda_long_context_smoke
-	env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
+	env -u DS4_CUDA_MOE_DECODE_GRAPH -u DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE ./tests/test_cuda_laguna_kernels --case all
+	DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE=1 ./tests/test_cuda_laguna_kernels --case decode-attention-fattn-vec-frozen
 	./tests/test_cuda_laguna_stream --case nvml-fd-stability
 	./tests/test_cuda_laguna_stream --case startup
 endif
@@ -317,7 +318,8 @@ tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o tests/ds4_cuda_
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-laguna-kernels: tests/test_cuda_laguna_kernels
-	env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
+	env -u DS4_CUDA_MOE_DECODE_GRAPH -u DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE ./tests/test_cuda_laguna_kernels --case all
+	DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE=1 ./tests/test_cuda_laguna_kernels --case decode-attention-fattn-vec-frozen
 
 tests/test_cuda_q4k_mmvq_microscope.o: tests/test_cuda_q4k_mmvq_microscope.c ds4_gpu.h ds4_laguna_plan.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<

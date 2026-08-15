@@ -8,7 +8,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CUDA = (ROOT / "ds4_cuda.cu").read_text()
+HEADER = (ROOT / "ds4_gpu.h").read_text()
 MAKEFILE = (ROOT / "Makefile").read_text()
+KERNEL_TEST = (ROOT / "tests/test_cuda_laguna_kernels.c").read_text()
 
 
 def function_body(name: str) -> str:
@@ -106,6 +108,33 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
         self.assertNotIn("cudaOccupancy", launch)
         self.assertNotIn("laguna_stage_fattn_vec_kv_f16_kernel", CUDA)
         self.assertIn("scratch_bytes = partial_bytes + meta_bytes", launch)
+
+    def test_frozen_cuda_case_owns_exact_oracle_poison_and_fresh_rollback(self) -> None:
+        for required in (
+            "decode-attention-fattn-vec-frozen",
+            "layer-00-k-t0-t511-kv6-kv7.f32",
+            "layer-00-v-t0-t511-kv6-kv7.f32",
+            "layer-00-q-t512-h41-h42.f32",
+            "layer-00-attn-gated-t512-h41-h42.f32",
+            "memcmp(selected_actual[arm], expected",
+            "masked poison changed",
+            "rollback-approximate",
+            "ds4_gpu_test_laguna_fattn_vec_snapshot",
+        ):
+            self.assertIn(required, KERNEL_TEST)
+        self.assertIn(
+            "DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE=1 "
+            "./tests/test_cuda_laguna_kernels --case "
+            "decode-attention-fattn-vec-frozen",
+            MAKEFILE,
+        )
+        for required in (
+            "ds4_gpu_laguna_fattn_vec_test_snapshot",
+            "ds4_gpu_test_laguna_fattn_vec_reset",
+            "ds4_gpu_test_laguna_fattn_vec_snapshot",
+        ):
+            self.assertIn(required, HEADER)
+            self.assertIn(required, CUDA)
 
 
 if __name__ == "__main__":

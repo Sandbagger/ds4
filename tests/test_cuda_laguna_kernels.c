@@ -1884,6 +1884,309 @@ static float *laguna_read_long_frozen_f32(
     return values;
 }
 
+static int run_decode_attention_fattn_vec_frozen_case(void) {
+    enum {
+        n_head = 48u,
+        n_head_kv = 8u,
+        head_dim = 128u,
+        cache_cap = 768u,
+        pos = 512u,
+        key_count = 513u,
+        selected_head = 41u,
+        selected_kv_head = 6u,
+        selected_heads = 2u,
+        selected_kv_heads = 2u,
+    };
+    const uint64_t q_count = (uint64_t)n_head * head_dim;
+    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const uint64_t cache_count = (uint64_t)cache_cap * kv_width;
+    const uint64_t selected_q_count =
+        (uint64_t)selected_heads * head_dim;
+    const uint64_t selected_kv_count =
+        (uint64_t)selected_kv_heads * head_dim;
+    const uint64_t prefix_selected_kv_count =
+        (uint64_t)pos * selected_kv_count;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const int rollback =
+        getenv("DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE") != NULL;
+    float *prefix_k = laguna_read_long_frozen_f32(
+        "layer-00-k-t0-t511-kv6-kv7.f32", prefix_selected_kv_count);
+    float *prefix_v = laguna_read_long_frozen_f32(
+        "layer-00-v-t0-t511-kv6-kv7.f32", prefix_selected_kv_count);
+    float *selected_q = laguna_read_long_frozen_f32(
+        "layer-00-q-t512-h41-h42.f32", selected_q_count);
+    float *selected_k = laguna_read_long_frozen_f32(
+        "layer-00-k-t512-kv6-kv7.f32", selected_kv_count);
+    float *selected_v = laguna_read_long_frozen_f32(
+        "layer-00-v-t512-kv6-kv7.f32", selected_kv_count);
+    float *selected_gate = laguna_read_long_frozen_f32(
+        "layer-00-gate-t512-h41-h42.f32", selected_heads);
+    float *expected = laguna_read_long_frozen_f32(
+        "layer-00-attn-gated-t512-h41-h42.f32", selected_q_count);
+    float *q_host = (float *)calloc((size_t)q_count, sizeof(*q_host));
+    float *k_host = (float *)calloc((size_t)kv_width, sizeof(*k_host));
+    float *v_host = (float *)calloc((size_t)kv_width, sizeof(*v_host));
+    float *gate_host = (float *)calloc(n_head, sizeof(*gate_host));
+    float *heads_host = (float *)malloc((size_t)q_count * sizeof(*heads_host));
+    float *selected_actual[2] = {NULL, NULL};
+    uint16_t *key_initial =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*key_initial));
+    uint16_t *value_initial =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*value_initial));
+    uint16_t *key_expected =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*key_expected));
+    uint16_t *value_expected =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*value_expected));
+    uint16_t *key_actual =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*key_actual));
+    uint16_t *value_actual =
+        (uint16_t *)malloc((size_t)cache_count * sizeof(*value_actual));
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *key_cache = NULL;
+    ds4_gpu_tensor *value_cache = NULL;
+    ds4_gpu_tensor *q = NULL;
+    ds4_gpu_tensor *k = NULL;
+    ds4_gpu_tensor *v = NULL;
+    ds4_gpu_tensor *gate = NULL;
+    int rc = 1;
+
+    if (!prefix_k || !prefix_v || !selected_q || !selected_k ||
+        !selected_v || !selected_gate || !expected || !q_host || !k_host ||
+        !v_host || !gate_host || !heads_host || !key_initial ||
+        !value_initial || !key_expected || !value_expected || !key_actual ||
+        !value_actual) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-frozen: fixture setup failed\n");
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < selected_q_count; i++) {
+        if (!isfinite(selected_q[i]) || !isfinite(expected[i])) {
+            fprintf(stderr,
+                    "decode-attention-fattn-vec-frozen: non-finite Q/oracle\n");
+            goto cleanup;
+        }
+    }
+    memcpy(q_host + (uint64_t)selected_head * head_dim, selected_q,
+           (size_t)selected_q_count * sizeof(*selected_q));
+    memcpy(k_host + (uint64_t)selected_kv_head * head_dim, selected_k,
+           (size_t)selected_kv_count * sizeof(*selected_k));
+    memcpy(v_host + (uint64_t)selected_kv_head * head_dim, selected_v,
+           (size_t)selected_kv_count * sizeof(*selected_v));
+    memcpy(gate_host + selected_head, selected_gate,
+           selected_heads * sizeof(*selected_gate));
+
+    heads = ds4_gpu_tensor_alloc(q_count * sizeof(*heads_host));
+    key_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(*key_initial));
+    value_cache = ds4_gpu_tensor_alloc(cache_count * sizeof(*value_initial));
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(*q_host));
+    k = ds4_gpu_tensor_alloc(kv_width * sizeof(*k_host));
+    v = ds4_gpu_tensor_alloc(kv_width * sizeof(*v_host));
+    gate = ds4_gpu_tensor_alloc((uint64_t)n_head * sizeof(*gate_host));
+    if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(*q_host)) ||
+        !ds4_gpu_tensor_write(k, 0, k_host, kv_width * sizeof(*k_host)) ||
+        !ds4_gpu_tensor_write(v, 0, v_host, kv_width * sizeof(*v_host)) ||
+        !ds4_gpu_tensor_write(gate, 0, gate_host,
+                              (uint64_t)n_head * sizeof(*gate_host))) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-frozen: tensor setup failed\n");
+        goto cleanup;
+    }
+
+    ds4_gpu_test_laguna_fattn_vec_reset();
+    for (uint32_t arm = 0u; arm < 2u; arm++) {
+        memset(key_initial, 0, (size_t)cache_count * sizeof(*key_initial));
+        memset(value_initial, 0,
+               (size_t)cache_count * sizeof(*value_initial));
+        const uint16_t key_poison = reference_f32_to_f16(
+            arm == 0u ? 0.3125f : -0.4375f);
+        const uint16_t value_poison = reference_f32_to_f16(
+            arm == 0u ? -0.6875f : 0.8125f);
+        for (uint32_t row = key_count; row < cache_cap; row++) {
+            const uint64_t base = (uint64_t)row * kv_width;
+            for (uint64_t i = 0; i < kv_width; i++) {
+                key_initial[base + i] = key_poison;
+                value_initial[base + i] = value_poison;
+            }
+        }
+        for (uint32_t row = 0u; row < pos; row++) {
+            const uint64_t source = (uint64_t)row * selected_kv_count;
+            const uint64_t target = (uint64_t)row * kv_width +
+                (uint64_t)selected_kv_head * head_dim;
+            for (uint64_t i = 0; i < selected_kv_count; i++) {
+                key_initial[target + i] =
+                    reference_f32_to_f16(prefix_k[source + i]);
+                value_initial[target + i] =
+                    reference_f32_to_f16(prefix_v[source + i]);
+            }
+        }
+        memcpy(key_expected, key_initial,
+               (size_t)cache_count * sizeof(*key_expected));
+        memcpy(value_expected, value_initial,
+               (size_t)cache_count * sizeof(*value_expected));
+        const uint64_t current = (uint64_t)pos * kv_width;
+        for (uint64_t i = 0; i < kv_width; i++) {
+            key_expected[current + i] = reference_f32_to_f16(k_host[i]);
+            value_expected[current + i] = reference_f32_to_f16(v_host[i]);
+        }
+        memset(heads_host, 0xa5, (size_t)q_count * sizeof(*heads_host));
+        if (!ds4_gpu_tensor_write(heads, 0, heads_host,
+                                  q_count * sizeof(*heads_host)) ||
+            !ds4_gpu_tensor_write(key_cache, 0, key_initial,
+                                  cache_count * sizeof(*key_initial)) ||
+            !ds4_gpu_tensor_write(value_cache, 0, value_initial,
+                                  cache_count * sizeof(*value_initial))) {
+            fprintf(stderr,
+                    "decode-attention-fattn-vec-frozen: arm %u reset failed\n",
+                    arm);
+            goto cleanup;
+        }
+        (void)cudaGetLastError();
+        const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
+            heads, key_cache, value_cache, q, k, v, gate, pos, cache_cap,
+            0u, key_count, n_head, n_head_kv, head_dim, scale);
+        const cudaError_t sync = cudaDeviceSynchronize();
+        const cudaError_t pending = cudaGetLastError();
+        if (!wrapper_ok || sync != cudaSuccess || pending != cudaSuccess) {
+            fprintf(stderr,
+                    "decode-attention-fattn-vec-frozen: arm %u wrapper=%d "
+                    "sync=%s pending=%s\n",
+                    arm, wrapper_ok, cudaGetErrorString(sync),
+                    cudaGetErrorString(pending));
+            goto cleanup;
+        }
+        if (!ds4_gpu_tensor_read(heads, 0, heads_host,
+                                 q_count * sizeof(*heads_host)) ||
+            !ds4_gpu_tensor_read(key_cache, 0, key_actual,
+                                 cache_count * sizeof(*key_actual)) ||
+            !ds4_gpu_tensor_read(value_cache, 0, value_actual,
+                                 cache_count * sizeof(*value_actual))) {
+            fprintf(stderr,
+                    "decode-attention-fattn-vec-frozen: arm %u read failed\n",
+                    arm);
+            goto cleanup;
+        }
+        if (memcmp(key_actual, key_expected,
+                   (size_t)cache_count * sizeof(*key_actual)) != 0 ||
+            memcmp(value_actual, value_expected,
+                   (size_t)cache_count * sizeof(*value_actual)) != 0) {
+            fprintf(stderr,
+                    "decode-attention-fattn-vec-frozen: arm %u cache store "
+                    "differs\n", arm);
+            goto cleanup;
+        }
+        selected_actual[arm] =
+            (float *)malloc((size_t)selected_q_count * sizeof(float));
+        if (!selected_actual[arm]) goto cleanup;
+        memcpy(selected_actual[arm],
+               heads_host + (uint64_t)selected_head * head_dim,
+               (size_t)selected_q_count * sizeof(float));
+        if (!rollback &&
+            memcmp(selected_actual[arm], expected,
+                   (size_t)selected_q_count * sizeof(float)) != 0) {
+            const laguna_parity_span exact_diagnostic = {
+                "selected-h41-h42", selected_actual[arm], expected,
+                selected_q_count, selected_heads, head_dim, 0.0f, 0.0f,
+            };
+            (void)laguna_parity_spans_within_limits(
+                "decode-attention-fattn-vec-frozen",
+                &exact_diagnostic, 1u, 1);
+            goto cleanup;
+        }
+        if (rollback) {
+            /* The rollback is the existing scalar safety path.  It is only
+             * required to remain numerically close to the frozen oracle; it
+             * deliberately makes no bit-exact Poolside claim. */
+            const laguna_parity_span approximate = {
+                "rollback-approximate", selected_actual[arm], expected,
+                selected_q_count, selected_heads, head_dim,
+                1.0e-3f, 2.0e-4f,
+            };
+            if (!laguna_parity_spans_within_limits(
+                    "decode-attention-fattn-vec-frozen",
+                    &approximate, 1u, 1)) {
+                goto cleanup;
+            }
+        }
+    }
+    if (memcmp(selected_actual[0], selected_actual[1],
+               (size_t)selected_q_count * sizeof(float)) != 0) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-frozen: masked poison changed "
+                "selected output\n");
+        goto cleanup;
+    }
+
+    ds4_gpu_laguna_fattn_vec_test_snapshot launches = {0};
+    if (!ds4_gpu_test_laguna_fattn_vec_snapshot(&launches)) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-frozen: counter snapshot failed\n");
+        goto cleanup;
+    }
+    const ds4_gpu_laguna_fattn_vec_test_snapshot expected_launches = rollback
+        ? (ds4_gpu_laguna_fattn_vec_test_snapshot) {
+              0u, 0u, 0u, 0u, 2u, 0u,
+          }
+        : (ds4_gpu_laguna_fattn_vec_test_snapshot) {
+              2u, 2u, 2u, 2u, 0u, 3u,
+          };
+    if (launches.optimized_launches != expected_launches.optimized_launches ||
+        launches.combine_launches != expected_launches.combine_launches ||
+        launches.softplus_launches != expected_launches.softplus_launches ||
+        launches.mul_launches != expected_launches.mul_launches ||
+        launches.scalar_launches != expected_launches.scalar_launches ||
+        launches.partitions != expected_launches.partitions) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-frozen: launches="
+                "%llu/%llu/%llu/%llu scalar=%llu p=%u expected="
+                "%llu/%llu/%llu/%llu scalar=%llu p=%u\n",
+                (unsigned long long)launches.optimized_launches,
+                (unsigned long long)launches.combine_launches,
+                (unsigned long long)launches.softplus_launches,
+                (unsigned long long)launches.mul_launches,
+                (unsigned long long)launches.scalar_launches,
+                launches.partitions,
+                (unsigned long long)expected_launches.optimized_launches,
+                (unsigned long long)expected_launches.combine_launches,
+                (unsigned long long)expected_launches.softplus_launches,
+                (unsigned long long)expected_launches.mul_launches,
+                (unsigned long long)expected_launches.scalar_launches,
+                expected_launches.partitions);
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    free(selected_actual[1]);
+    free(selected_actual[0]);
+    free(value_actual);
+    free(key_actual);
+    free(value_expected);
+    free(key_expected);
+    free(value_initial);
+    free(key_initial);
+    free(heads_host);
+    free(gate_host);
+    free(v_host);
+    free(k_host);
+    free(q_host);
+    free(expected);
+    free(selected_gate);
+    free(selected_v);
+    free(selected_k);
+    free(selected_q);
+    free(prefix_v);
+    free(prefix_k);
+    return rc;
+}
+
 static float *laguna_frozen_qk_model_map;
 
 static int laguna_frozen_qk_exact(
@@ -3732,13 +4035,14 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8-selector|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|decode-attention-fattn-vec-frozen|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8-selector|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(argv[1], "--case") != 0 ||
         (strcmp(argv[2], "norm-rope") != 0 &&
          strcmp(argv[2], "decode-attention") != 0 &&
+         strcmp(argv[2], "decode-attention-fattn-vec-frozen") != 0 &&
          strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "prefill-attention-frozen") != 0 &&
          strcmp(argv[2], "prefill-attention-long-frozen") != 0 &&
@@ -3756,6 +4060,9 @@ int main(int argc, char **argv) {
     const bool run_norm = strcmp(argv[2], "norm-rope") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_decode = strcmp(argv[2], "decode-attention") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_decode_fattn_vec_frozen =
+        strcmp(argv[2], "decode-attention-fattn-vec-frozen") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_prefill = strcmp(argv[2], "prefill-attention") == 0 ||
         strcmp(argv[2], "all") == 0;
@@ -3786,7 +4093,8 @@ int main(int argc, char **argv) {
     if (run_poolside_q8_selector &&
         run_poolside_q8_selector_cases() != 0) return 1;
     if (strcmp(argv[2], "poolside-q8-selector") == 0) return 0;
-    if ((run_decode || run_prefill || run_prefill_frozen ||
+    if ((run_decode || run_decode_fattn_vec_frozen || run_prefill ||
+         run_prefill_frozen ||
          run_prefill_long_frozen || run_routed_moe || run_poolside_q8) &&
         run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
@@ -3857,6 +4165,10 @@ int main(int argc, char **argv) {
         if (run_qk_norm_rope_frozen_t21_case() != 0) rc = 1;
     }
     if (run_decode && run_decode_attention_cases() != 0) {
+        rc = 1;
+    }
+    if (run_decode_fattn_vec_frozen &&
+        run_decode_attention_fattn_vec_frozen_case() != 0) {
         rc = 1;
     }
     if (run_prefill && run_prefill_attention_cases() != 0) {

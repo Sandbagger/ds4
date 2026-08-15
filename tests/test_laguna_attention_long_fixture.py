@@ -155,6 +155,10 @@ class LagunaAttentionLongFixtureTest(unittest.TestCase):
                 },
             },
         )
+        for reused in prefix["reused_files"].values():
+            tracked = self.manifest["files"][reused["file"]]
+            self.assertEqual(reused["bytes"], tracked["bytes"])
+            self.assertEqual(reused["sha256"], tracked["sha256"])
         attestation = prefix["tensor_payload_attestation"]
         self.assertEqual(attestation["tensor_count"], 814)
         self.assertTrue(attestation["tensor_layout_equal"])

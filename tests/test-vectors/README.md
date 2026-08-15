@@ -183,3 +183,24 @@ Verification rejects missing or extra files, bad sizes or hashes, stale pins,
 token disagreement, or widened gates without modifying the fixture tree. The
 legacy dual-runtime CLI is intentionally unsupported: do not pass the removed
 Metal, DwarfStar-commit, or DS4-commit options.
+
+## Compact-runtime benchmark manifest
+
+The canonical DGX qualification derives four immutable native-template prompts
+from `laguna-resident/benchmark-32768.txt`: 512, 2,048, 8,192, and 28,672
+tokens. The benchmark manifest freezes their bytes, token counts, hashes, the
+8/12/16-GiB counterbalanced profile order, 32,768-token context, 4,096-token
+prefill, one session slot, greedy 512-token generation, and the one cold plus
+exactly three warm repetition rule before any result directory is created.
+
+The stable eval slice is exactly `recNu3MXkvWUzHZr9`,
+`001b51d76b4d422988f2c11f104a2c6c`, `aime2025-01`, and `compsec-076`.
+Qualification requires normal termination and exact resident/streamed
+answer-grade-terminal-vector equality; it does not require all four answers to
+be correct. The promoted resident oracle remains the numerical authority.
+
+The manifest, raw evidence, RFC 8785 bundle, evidence index, and sidecar live
+outside the worktree. They are immutable outputs of the clean revision and are
+not checked-in test vectors. `drop_caches`, legacy whole-map tuning, the
+deprecated expert-count qualification path, daemonization, port selection,
+peer eviction, and co-residency claims must not be inferred from them.

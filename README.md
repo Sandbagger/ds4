@@ -1586,6 +1586,82 @@ quality scorers, two-Mac TCP/RDMA tests, CUDA matrix, and manual agent checks ar
 release gates rather than quick local tests; follow
 [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md).
 
+### Canonical compact Laguna qualification on DGX Spark
+
+The reference compact-runtime run is a CUDA-only evidence run for the pinned
+Poolside `laguna-s-2.1-Q4_K_M.gguf`. Start from a clean committed revision and
+build on DGX Spark/GB10 with a 32,768-token context, 4,096-token prefill, and
+one session slot. The immutable curve is 8/12/16-GiB in that order. Within
+those profiles the prompt orders are respectively `512,2048,28672,8192`,
+`2048,8192,512,28672`, and `8192,28672,2048,512`. Every slice uses a new
+foreground child and records one cold plus exactly three same-process warm
+repetitions. The runner enforces a 45-minute whole-request deadline and a
+15-minute first-token deadline.
+
+The four deterministic eval IDs are `recNu3MXkvWUzHZr9`,
+`001b51d76b4d422988f2c11f104a2c6c`, `aime2025-01`, and `compsec-076`.
+Their resident and streamed answer/grade/terminal vectors must match; the full
+92-case eval remains optional and nonblocking.
+
+Prepare an absolute artifact directory and freeze the manifest before the
+evidence directory exists. The bootstrap plan is descriptor-bound input to
+manifest construction; the runner regenerates and binds every profile plan.
+
+```sh
+test -z "$(git status --short)"
+make clean
+make CUDA=1 ds4 ds4-server ds4-bench ds4-eval \
+  tests/test_cuda_laguna_model tests/test_cuda_laguna_stream
+./ds4-server --version-json
+
+QUALIFICATION_ROOT=/absolute/path/to/laguna-qualification
+LAGUNA_MODEL=/absolute/path/to/laguna-s-2.1-Q4_K_M.gguf
+mkdir "$QUALIFICATION_ROOT"
+./ds4-bench --model "$LAGUNA_MODEL" --backend cuda \
+  --ctx-alloc 32768 --prefill-chunk 4096 --ssd-streaming \
+  --ssd-streaming-cache-bytes 8589934592 \
+  --qualification-plan "$QUALIFICATION_ROOT/bootstrap-plan.json"
+BOOTSTRAP_PLAN_SHA256="$(sha256sum "$QUALIFICATION_ROOT/bootstrap-plan.json" | cut -d' ' -f1)"
+
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
+  manifest build --model "$LAGUNA_MODEL" \
+  --output "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json" \
+  --qualification-plan "$QUALIFICATION_ROOT/bootstrap-plan.json" \
+  --trusted-qualification-plan-sha256 "$BOOTSTRAP_PLAN_SHA256"
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
+  manifest verify \
+  --manifest "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json"
+test ! -e "$QUALIFICATION_ROOT/compact-runtime-evidence"
+```
+
+Run, verify, publish, and independently reproduce the bundle/sidecar hashes:
+
+```sh
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
+  run \
+  --manifest "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json" \
+  --model "$LAGUNA_MODEL" --server-bin ./ds4-server \
+  --bench-bin ./ds4-bench --eval-bin ./ds4-eval \
+  --evidence-dir "$QUALIFICATION_ROOT/compact-runtime-evidence"
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
+  verify \
+  --manifest "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json" \
+  --evidence-dir "$QUALIFICATION_ROOT/compact-runtime-evidence"
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
+  publish \
+  --manifest "$QUALIFICATION_ROOT/compact-runtime-benchmark-v1.json" \
+  --evidence-dir "$QUALIFICATION_ROOT/compact-runtime-evidence" \
+  --output "$QUALIFICATION_ROOT/ds4-laguna-compact-runtime-v1.json"
+python3 gguf-tools/quality-testing/compact_runtime_qualify.py \
+  verify-bundle \
+  "$QUALIFICATION_ROOT/ds4-laguna-compact-runtime-v1.json"
+```
+
+The evidence bundle is not service policy. `drop_caches`, legacy whole-map
+options, the deprecated expert-count qualification option, daemonization, port
+selection, peer eviction, and co-residency claims are outside DS4's canonical
+qualification. Do not start or stop unrelated services to make a run pass.
+
 ## Debugging Notes
 
 When a generation looks wrong, three small tools are usually enough to get a

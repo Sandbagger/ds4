@@ -123,7 +123,7 @@ class QualificationHarnessContractTests(unittest.TestCase):
         ):
             self.assertIn(value, combined, value)
         for command in ("run", "verify", "publish", "verify-bundle"):
-            self.assertIn(f"compact_runtime_qualify.py \\\n+  {command}", README)
+            self.assertIn(f"compact_runtime_qualify.py \\\n  {command}", README)
         for excluded in (
             "drop_caches", "legacy whole-map", "deprecated expert-count",
             "daemonization", "port selection", "peer eviction", "co-residency",

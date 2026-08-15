@@ -76,6 +76,27 @@ The CPU backend is a reference/debug path, not the production performance
 target. Remember that executing the CPU path on Metal can crash the system
 because of a kernel bug in macOS.
 
+## Compact Laguna qualification changes
+
+Changes to Laguna CUDA streaming, runtime evidence, qualification control, or
+the compact-runtime schemas require the canonical DGX Spark run described in
+the README. Land the runbook first, make the worktree clean, then build the
+exact committed CUDA revision. Record the clean `--version-json`, manifest
+digest, final bundle sidecar digest, and every passed profile in the change
+notes; never report results from a dirty binary.
+
+The reference shape is fixed: 32,768 total context tokens, 4,096 prefill rows,
+one session slot, 8/12/16-GiB profile order, and the frozen counterbalanced
+512/2K/8K/28K prompt orders. Each profile/prompt slice is a fresh foreground
+process with one cold plus exactly three warm repetitions. Valid gate misses
+are failures, not infrastructure retries; only an evidenced invalid attempt may
+be retried once.
+
+Keep deployment concerns out of qualification reviews. In particular,
+`drop_caches`, legacy whole-map behavior, the deprecated expert-count option,
+daemonization, port selection, peer eviction, and co-residency are neither
+inputs nor conclusions of the DS4 evidence bundle.
+
 ## Quality Checks For Quantization Changes
 
 For GGUF or quantization work, use the official-continuation scorer in

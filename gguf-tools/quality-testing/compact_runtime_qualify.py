@@ -3651,6 +3651,86 @@ def qualification_bundle_status(
     return "invalid" if all(status == "invalid" for status in profile_statuses) else "failed"
 
 
+QUALIFICATION_SCHEMA_FILES = (
+    ("ds4.version/v1", "ds4-version-v1.schema.json"),
+    ("ds4.runtime/v1", "ds4-runtime-v1.schema.json"),
+    ("ds4.runtime.request/v1", "ds4-runtime-request-v1.schema.json"),
+    ("ds4.token-admission/v1", "ds4-token-admission-v1.schema.json"),
+    ("ds4.laguna.compact-runtime/v1", "ds4-laguna-compact-runtime-v1.schema.json"),
+    ("ds4.compact-runtime-benchmark/v1", "compact-runtime-benchmark-v1.schema.json"),
+)
+
+
+def bind_qualification_schemas() -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for schema_id, filename in QUALIFICATION_SCHEMA_FILES:
+        path = ROOT / "schemas" / filename
+        try:
+            payload = path.read_bytes()
+            value = loads_strict(payload.decode("utf-8"))
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"cannot read qualification schema {filename}: {exc}") from exc
+        if not isinstance(value, dict) or value.get("$id") != schema_id:
+            raise ValueError(f"qualification schema identity mismatch: {filename}")
+        records.append({"schema_id": schema_id, "sha256": _sha256_bytes(payload)})
+    return records
+
+
+def bind_qualification_binaries(
+    server_bin: Path | str,
+    bench_bin: Path | str,
+    eval_bin: Path | str,
+) -> dict[str, Any]:
+    binaries: list[dict[str, Any]] = []
+    admitted_versions: list[dict[str, Any]] = []
+    for role, raw_path in zip(
+        ("server", "bench", "eval"),
+        (server_bin, bench_bin, eval_bin),
+        strict=True,
+    ):
+        path = Path(raw_path)
+        if path.is_symlink() or not os.access(path, os.X_OK):
+            raise ValueError(f"qualification {role} binary must be a nonsymlink executable")
+        before, identity = _stat_identity(path)
+        digest = _sha256_file(path)
+        try:
+            completed = subprocess.run(
+                [str(path), "--version-json"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(f"cannot query qualification {role} version: {exc}") from exc
+        if completed.returncode != 0:
+            raise ValueError(
+                f"qualification {role} version exited {completed.returncode}: "
+                f"{completed.stderr.strip()}"
+            )
+        version = validate_qualification_version(loads_strict(completed.stdout.strip()))
+        after, _ = _stat_identity(path)
+        if not _same_stat(before, after) or _sha256_file(path) != digest:
+            raise ValueError(f"qualification {role} binary changed during admission")
+        admitted_versions.append(version)
+        binaries.append({
+            "role": role,
+            "binary_sha256": digest,
+            "executable": identity,
+        })
+    if any(version != admitted_versions[0] for version in admitted_versions[1:]):
+        raise ValueError("qualification binary version identities do not match")
+    version = admitted_versions[0]
+    return {
+        "revision": version["revision"],
+        "dirty": False,
+        "version_sha256": _sha256_bytes(canonical_json_bytes(version)),
+        "binaries": binaries,
+    }
+
+
 def _qualification_evidence_claims(value: Any) -> dict[str, str]:
     claims: dict[str, str] = {}
 

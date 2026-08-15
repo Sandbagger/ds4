@@ -3658,6 +3658,12 @@ class CudaBuildContractTest(unittest.TestCase):
         for path in (
             "/tests/test_cuda_laguna_stream",
             "/tests/cuda_long_context_smoke",
+            "/tests/test_laguna_plan",
+            "/tests/test_laguna_stream",
+            "/tests/test_plan_io",
+            "/tests/test_runtime",
+            "/tests/test_runtime_cpp_link",
+            "/tests/test_session_logits_only",
             "/tests/test-vectors/laguna-resident/swa-513.prompt",
             "/tests/test-vectors/laguna-resident/yarn-8193.prompt",
             "/tests/test-vectors/laguna-resident/deep-32768.prompt",

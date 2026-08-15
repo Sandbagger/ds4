@@ -193,10 +193,10 @@
           ]
         },
         "repository": { "const": "poolside/Laguna-S-2.1-GGUF" },
-        "revision": { "const": "706fa69799926b6afde1af9e24ca2a4923f110a1" },
+        "revision": { "const": "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332" },
         "filename": { "const": "laguna-s-2.1-Q4_K_M.gguf" },
-        "size_bytes": { "const": "68248759648" },
-        "sha256": { "const": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a" },
+        "size_bytes": { "const": "68248760064" },
+        "sha256": { "const": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff" },
         "device": { "$ref": "#/$defs/positive_uint64" },
         "inode": { "$ref": "#/$defs/positive_uint64" },
         "mtime_ns": { "$ref": "#/$defs/positive_uint64" }
@@ -262,7 +262,7 @@
         "inode": { "$ref": "#/$defs/positive_uint64" },
         "mtime_ns": { "$ref": "#/$defs/positive_uint64" },
         "repository": { "const": "poolside/Laguna-S-2.1-GGUF" },
-        "revision": { "const": "706fa69799926b6afde1af9e24ca2a4923f110a1" },
+        "revision": { "const": "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "size_bytes": { "$ref": "#/$defs/positive_uint64" }
       }

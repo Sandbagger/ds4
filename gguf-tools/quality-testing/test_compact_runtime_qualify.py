@@ -48,13 +48,24 @@ SEED = (
     * 4096
 )
 
+CORRECTED_MODEL_REVISION = "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332"
+CORRECTED_MODEL_SIZE = "68248760064"
+CORRECTED_MODEL_SHA256 = (
+    "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
+)
+OLD_MODEL_IDENTITY = {
+    "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
+    "size_bytes": "68248759648",
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+}
+
 MODEL_IDENTITY = {
     "path": "/models/laguna-s-2.1-Q4_K_M.gguf",
     "repository": "poolside/Laguna-S-2.1-GGUF",
-    "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
+    "revision": CORRECTED_MODEL_REVISION,
     "filename": "laguna-s-2.1-Q4_K_M.gguf",
-    "size_bytes": "68248759648",
-    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+    "size_bytes": CORRECTED_MODEL_SIZE,
+    "sha256": CORRECTED_MODEL_SHA256,
     "device": "259",
     "inode": "9001",
     "mtime_ns": "1785600000000000000",
@@ -282,7 +293,7 @@ def _write_cold_preparation_fixture(
             "inode": str(identity.st_ino),
             "mtime_ns": str(identity.st_mtime_ns),
             "repository": "poolside/Laguna-S-2.1-GGUF",
-            "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
+            "revision": CORRECTED_MODEL_REVISION,
             "sha256": _file_sha256(model),
             "size_bytes": str(identity.st_size),
         },
@@ -603,6 +614,23 @@ class CompactRuntimeManifestContractTest(unittest.TestCase):
         assert_closed(schema, "schema")
         self.assertIn("?!0{64}", schema["$defs"]["sha256"]["pattern"])
         self.assertIn("?!0{40}", schema["$defs"]["revision"]["pattern"])
+        model_properties = schema["$defs"]["model"]["properties"]
+        self.assertEqual(
+            model_properties["revision"]["const"], CORRECTED_MODEL_REVISION
+        )
+        self.assertEqual(
+            model_properties["size_bytes"]["const"], CORRECTED_MODEL_SIZE
+        )
+        self.assertEqual(
+            model_properties["sha256"]["const"], CORRECTED_MODEL_SHA256
+        )
+        qualification_properties = schema["$defs"][
+            "qualification_model_identity"
+        ]["properties"]
+        self.assertEqual(
+            qualification_properties["revision"]["const"],
+            CORRECTED_MODEL_REVISION,
+        )
 
     def test_identity_schema_rejects_mixed_case_runtime_placeholders(self) -> None:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -731,8 +759,38 @@ class CompactRuntimeManifestContractTest(unittest.TestCase):
 
     def test_binds_complete_model_host_and_runtime_identity(self) -> None:
         self.assertEqual(self.manifest["model"], MODEL_IDENTITY)
+        self.assertEqual(TOOL.MODEL_REVISION, CORRECTED_MODEL_REVISION)
+        self.assertEqual(str(TOOL.MODEL_SIZE), CORRECTED_MODEL_SIZE)
+        self.assertEqual(TOOL.MODEL_SHA256, CORRECTED_MODEL_SHA256)
         self.assertEqual(self.manifest["host"], HOST_IDENTITY)
         TOOL.validate_manifest(self.manifest)
+
+    def test_rejects_prior_active_model_identity_everywhere(self) -> None:
+        cases = {
+            "manifest model": ("model",),
+            "qualification plan model": (
+                "qualification_preflight",
+                "cold_preparation",
+                "model_identity",
+            ),
+        }
+        for label, path in cases.items():
+            with self.subTest(label=label):
+                changed = copy.deepcopy(self.manifest)
+                node = changed
+                for key in path:
+                    node = node[key]
+                node.update(OLD_MODEL_IDENTITY)
+                self.assertFalse(self.schema_validator.is_valid(changed))
+                with self.assertRaises(ValueError):
+                    TOOL.validate_manifest(changed)
+
+        old_plan_model = {
+            key: value for key, value in MODEL_IDENTITY.items() if key != "path"
+        }
+        old_plan_model.update(OLD_MODEL_IDENTITY)
+        with self.assertRaisesRegex(ValueError, "revision is not pinned"):
+            TOOL._qualification_model(old_plan_model)
 
     def test_rejects_placeholders_missing_bytes_reordering_and_stale_hashes(self) -> None:
         cases: list[tuple[str, callable]] = [

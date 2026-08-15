@@ -1413,6 +1413,65 @@ class QualificationRunnerContractTest(unittest.TestCase):
             "invalid",
         )
 
+    @staticmethod
+    def _bundle_fixture() -> dict[str, object]:
+        path = ROOT / "tests/test_runtime_contract.py"
+        spec = importlib.util.spec_from_file_location("task20_runtime_contract_fixture", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load bundle fixture")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        value = module.bundle()
+        digest = hashlib.sha256(b"gate evidence\n").hexdigest()
+
+        def rewrite(node: object) -> None:
+            if isinstance(node, dict):
+                if set(node) == {"path", "sha256"}:
+                    node["path"] = "raw/gate.json"
+                    node["sha256"] = digest
+                else:
+                    for child in node.values():
+                        rewrite(child)
+            elif isinstance(node, list):
+                for child in node:
+                    rewrite(child)
+
+        rewrite(value)
+        return value
+
+    def test_publish_and_verify_reproduce_bundle_index_and_sidecar(self) -> None:
+        value = self._bundle_fixture()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            evidence = root / "evidence"
+            (evidence / "raw").mkdir(parents=True)
+            (evidence / "raw" / "gate.json").write_bytes(b"gate evidence\n")
+            output = root / "bundle.json"
+            published = TOOL.publish_qualification_bundle(value, evidence, output)
+            self.assertEqual(TOOL.verify_qualification_bundle(output), published)
+            sidecar = Path(str(output) + ".sha256")
+            self.assertEqual(sidecar.read_text(encoding="ascii"), f"{TOOL._sha256_file(output)}  {output.name}\n")
+            index = TOOL.loads_strict((evidence / "evidence-index.json").read_text(encoding="utf-8"))
+            self.assertEqual([entry["path"] for entry in index], ["raw/gate.json"])
+
+    def test_publish_rejects_claim_mismatch_and_verify_rejects_tamper(self) -> None:
+        value = self._bundle_fixture()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            evidence = root / "evidence"
+            (evidence / "raw").mkdir(parents=True)
+            raw = evidence / "raw" / "gate.json"
+            raw.write_bytes(b"gate evidence\n")
+            output = root / "bundle.json"
+            changed = copy.deepcopy(value)
+            changed["global_gates"][0]["evidence"][0]["sha256"] = "b" * 64
+            with self.assertRaisesRegex(ValueError, "claimed|digest"):
+                TOOL.publish_qualification_bundle(changed, evidence, output)
+            TOOL.publish_qualification_bundle(value, evidence, output)
+            raw.write_bytes(b"tampered\n")
+            with self.assertRaisesRegex(ValueError, "digest|changed|union"):
+                TOOL.verify_qualification_bundle(output)
+
 
 class WarmStabilityContractTest(unittest.TestCase):
     def test_freezes_warm_stability_constants_and_accepts_boundary_evidence(self) -> None:

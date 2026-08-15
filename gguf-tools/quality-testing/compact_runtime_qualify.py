@@ -7,6 +7,7 @@ import argparse
 import array
 import ast
 import base64
+import csv
 import ctypes
 import errno
 import hashlib
@@ -37,6 +38,7 @@ SEED_PATH = ROOT / "tests/test-vectors/laguna-resident/benchmark-32768.txt"
 GENERATOR_PATH = ROOT / "tests/test-vectors/laguna-resident/generate_benchmark_prompt.py"
 ORACLE_MANIFEST_PATH = ROOT / "tests/test-vectors/laguna-resident/manifest.json"
 SCHEMA_PATH = ROOT / "schemas/compact-runtime-benchmark-v1.schema.json"
+RESIDENT_GATE_PROMPT_PATH = ROOT / "speed-bench/promessi_sposi.txt"
 
 SCHEMA_ID = "ds4.compact-runtime-benchmark/v1"
 MODEL_REPOSITORY = "poolside/Laguna-S-2.1-GGUF"
@@ -49,6 +51,71 @@ SEED_SHA256 = "aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206"
 GENERATOR_SHA256 = "118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d"
 ORACLE_TOKENIZER_REVISION = "15c9b92502fed6bc26842e98d11a6347caadb08e"
 LAGUNA_VOCAB_SIZE = 100_352
+
+RESIDENT_GATE_SCHEMA = "ds4.laguna-resident-performance/v1"
+RESIDENT_GATE_REFERENCE_REVISION = "7005761d1e4a53ff50c8e2b033d33c375fdb6297"
+RESIDENT_GATE_PROMPT_SHA256 = "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f"
+RESIDENT_GATE_FRONTIERS = (2048, 4096, 8192, 16384, 28672)
+RESIDENT_GATE_GENERATED_TOKENS = 256
+RESIDENT_GATE_CONTEXT_ALLOC = 32768
+RESIDENT_GATE_PREFILL_CHUNK = 4096
+RESIDENT_GATE_CANDIDATE_RATIO = 0.90
+RESIDENT_GATE_REFERENCE_SANITY_RATIO = 0.80
+RESIDENT_GATE_EXECUTION_ORDER = (
+    ("pair-a", "reference"),
+    ("pair-a", "candidate"),
+    ("pair-b", "candidate"),
+    ("pair-b", "reference"),
+)
+RESIDENT_GATE_TOOL_PATHS = {
+    "make": "/usr/bin/make",
+    "cc": "/usr/bin/cc",
+    "cxx": "/usr/bin/c++",
+    "nvcc": "/usr/local/cuda/bin/nvcc",
+}
+RESIDENT_GATE_BUILD_ARGV = {
+    role: (
+        RESIDENT_GATE_TOOL_PATHS["make"],
+        "-B", "-j1", "ds4-bench", "CUDA_ARCH=native",
+    )
+    for role in ("reference", "candidate")
+}
+RESIDENT_GATE_BUILD_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "CC": RESIDENT_GATE_TOOL_PATHS["cc"],
+    "CXX": RESIDENT_GATE_TOOL_PATHS["cxx"],
+    "CUDA_HOME": "/usr/local/cuda",
+    "NVCC": RESIDENT_GATE_TOOL_PATHS["nvcc"],
+    "LANG": "C",
+    "LC_ALL": "C",
+    "TZ": "UTC",
+}
+RESIDENT_GATE_BENCH_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LD_LIBRARY_PATH": (
+        "/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64"
+    ),
+    "LANG": "C",
+    "LC_ALL": "C",
+    "TZ": "UTC",
+    "DS4_BENCH_DISABLE_SNAPSHOT": "1",
+}
+RESIDENT_GATE_GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "TZ": "UTC",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+RESIDENT_GATE_PUBLISHED_REFERENCE = {
+    2048: {"prefill": 201.87, "steady_decode": 22.49},
+    4096: {"prefill": 160.93, "steady_decode": 21.77},
+    8192: {"prefill": 132.42, "steady_decode": 20.44},
+}
 
 LAGUNA_TEMPLATE_REVISION = "poolside-laguna-s-2.1-native-nothink-v1"
 LAGUNA_TEMPLATE_PREFIX = b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
@@ -3769,6 +3836,7 @@ def run_foreground_process(
     terminate_grace_seconds: float = 10.0,
     pass_fds: Sequence[int] = (),
     env: Mapping[str, str] | None = None,
+    cwd: Path | str | None = None,
 ) -> dict[str, Any]:
     if not argv or any(not isinstance(item, str) or not item for item in argv):
         raise ValueError("foreground argv must contain nonempty strings")
@@ -3782,6 +3850,14 @@ def run_foreground_process(
     err_path = Path(stderr_path)
     if out_path == err_path:
         raise ValueError("foreground stdout and stderr evidence paths must differ")
+    working_directory: Path | None = None
+    if cwd is not None:
+        try:
+            working_directory = Path(cwd).resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve foreground working directory: {exc}") from exc
+        if not working_directory.is_dir():
+            raise ValueError("foreground working directory is not a directory")
     process: subprocess.Popen[bytes] | None = None
     timed_out = False
     with out_path.open("xb") as stdout, err_path.open("xb") as stderr:
@@ -3794,6 +3870,7 @@ def run_foreground_process(
                 start_new_session=True,
                 pass_fds=tuple(pass_fds),
                 env=None if env is None else dict(env),
+                cwd=working_directory,
             )
             try:
                 process.wait(timeout=float(timeout_seconds))
@@ -4451,6 +4528,726 @@ def _gate(
         "unit": unit,
         "evidence": [dict(item) for item in evidence],
     }
+
+
+_RESIDENT_GATE_COMMON_CSV_HEADER = (
+    "ctx_tokens", "prefill_tokens", "prefill_tps", "gen_tokens", "gen_tps",
+    "gen_first_ms", "gen_steady_tokens", "gen_steady_tps",
+)
+_RESIDENT_GATE_LEGACY_CSV_HEADER = (
+    *_RESIDENT_GATE_COMMON_CSV_HEADER, "kvcache_bytes",
+)
+_RESIDENT_GATE_CURRENT_CSV_HEADER = (
+    *_RESIDENT_GATE_COMMON_CSV_HEADER, "session_payload_bytes", "kv_allocated_bytes",
+)
+_RESIDENT_GATE_ROW_FIELDS = {
+    "context_tokens", "prefill_tokens", "prefill_tokens_per_second",
+    "generated_tokens", "generation_tokens_per_second",
+    "first_token_milliseconds", "steady_generated_tokens",
+    "steady_decode_tokens_per_second",
+}
+
+
+def resident_gate_benchmark_argv(
+    bench_bin: Path | str,
+    model: Path | str,
+    prompt: Path | str,
+    csv_path: Path | str,
+) -> list[str]:
+    """Return the cross-revision, full-residency GB10 benchmark protocol."""
+    return [
+        str(bench_bin), "--model", str(model), "--backend", "cuda",
+        "--prompt-file", str(prompt),
+        "--ctx-start", str(RESIDENT_GATE_FRONTIERS[0]),
+        "--ctx-max", str(RESIDENT_GATE_FRONTIERS[-1]),
+        "--step-mul", "2",
+        "--ctx-alloc", str(RESIDENT_GATE_CONTEXT_ALLOC),
+        "--prefill-chunk", str(RESIDENT_GATE_PREFILL_CHUNK),
+        "--gen-tokens", str(RESIDENT_GATE_GENERATED_TOKENS),
+        "--csv", str(csv_path),
+    ]
+
+
+def _resident_gate_csv_uint(value: str, label: str) -> int:
+    if not DECIMAL_RE.fullmatch(value):
+        raise ValueError(f"resident gate {label} is not a canonical integer")
+    result = int(value)
+    if result > UINT64_MAX:
+        raise ValueError(f"resident gate {label} exceeds uint64")
+    return result
+
+
+def _resident_gate_csv_number(value: str, label: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise ValueError(f"resident gate {label} is not numeric") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"resident gate {label} must be finite and positive")
+    return result
+
+
+def _validate_resident_gate_rows(
+    rows: Sequence[Mapping[str, Any]], label: str
+) -> list[dict[str, Any]]:
+    if len(rows) != len(RESIDENT_GATE_FRONTIERS):
+        raise ValueError(f"resident gate {label} does not contain the complete frontier sweep")
+    normalized: list[dict[str, Any]] = []
+    previous = 0
+    for index, (raw, frontier) in enumerate(
+        zip(rows, RESIDENT_GATE_FRONTIERS, strict=True)
+    ):
+        if not isinstance(raw, Mapping) or set(raw) != _RESIDENT_GATE_ROW_FIELDS:
+            raise ValueError(f"resident gate {label} row {index} is not closed")
+        integer_fields = {
+            "context_tokens": frontier,
+            "prefill_tokens": frontier - previous,
+            "generated_tokens": RESIDENT_GATE_GENERATED_TOKENS,
+            "steady_generated_tokens": RESIDENT_GATE_GENERATED_TOKENS - 1,
+        }
+        for key, expected in integer_fields.items():
+            value = raw[key]
+            if type(value) is not int or value != expected:
+                raise ValueError(
+                    f"resident gate {label} row {index} has invalid {key}"
+                )
+        number_fields: dict[str, float] = {}
+        for key in (
+            "prefill_tokens_per_second", "generation_tokens_per_second",
+            "first_token_milliseconds", "steady_decode_tokens_per_second",
+        ):
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+               not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(
+                    f"resident gate {label} row {index} has invalid {key}"
+                )
+            number_fields[key] = float(value)
+        normalized.append({
+            **integer_fields,
+            **number_fields,
+        })
+        previous = frontier
+    return normalized
+
+
+def parse_resident_gate_csv(path: Path | str) -> list[dict[str, Any]]:
+    """Parse the exact common CSV contract shared with PR #594's benchmark."""
+    source = Path(path)
+    try:
+        with source.open("r", encoding="ascii", errors="strict", newline="") as handle:
+            records = list(csv.reader(handle))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ValueError(f"cannot read resident gate CSV {source}: {exc}") from exc
+    if not records:
+        raise ValueError("resident gate CSV is empty")
+    header = tuple(records[0])
+    if header not in {
+        _RESIDENT_GATE_LEGACY_CSV_HEADER,
+        _RESIDENT_GATE_CURRENT_CSV_HEADER,
+    }:
+        raise ValueError("resident gate CSV header is not a supported closed contract")
+    rows: list[dict[str, Any]] = []
+    for index, values in enumerate(records[1:]):
+        if len(values) != len(header):
+            raise ValueError(f"resident gate CSV row {index} has the wrong field count")
+        record = dict(zip(header, values, strict=True))
+        for memory_field in header[len(_RESIDENT_GATE_COMMON_CSV_HEADER):]:
+            _resident_gate_csv_uint(record[memory_field], memory_field)
+        rows.append({
+            "context_tokens": _resident_gate_csv_uint(
+                record["ctx_tokens"], "ctx_tokens"
+            ),
+            "prefill_tokens": _resident_gate_csv_uint(
+                record["prefill_tokens"], "prefill_tokens"
+            ),
+            "prefill_tokens_per_second": _resident_gate_csv_number(
+                record["prefill_tps"], "prefill_tps"
+            ),
+            "generated_tokens": _resident_gate_csv_uint(
+                record["gen_tokens"], "gen_tokens"
+            ),
+            "generation_tokens_per_second": _resident_gate_csv_number(
+                record["gen_tps"], "gen_tps"
+            ),
+            "first_token_milliseconds": _resident_gate_csv_number(
+                record["gen_first_ms"], "gen_first_ms"
+            ),
+            "steady_generated_tokens": _resident_gate_csv_uint(
+                record["gen_steady_tokens"], "gen_steady_tokens"
+            ),
+            "steady_decode_tokens_per_second": _resident_gate_csv_number(
+                record["gen_steady_tps"], "gen_steady_tps"
+            ),
+        })
+    return _validate_resident_gate_rows(rows, source.name)
+
+
+def evaluate_resident_gate(
+    pairs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Require both counterbalanced pairs to pass every independent gate."""
+    if len(pairs) != 2:
+        raise ValueError("resident gate requires exactly two comparison pairs")
+    gates: list[dict[str, Any]] = []
+    for pair_index, raw_pair in enumerate(pairs):
+        allowed = {
+            "pair_id", "reference_rows", "candidate_rows",
+            "reference_evidence", "candidate_evidence",
+        }
+        if not isinstance(raw_pair, Mapping) or \
+           not {"pair_id", "reference_rows", "candidate_rows"}.issubset(raw_pair) or \
+           not set(raw_pair).issubset(allowed):
+            raise ValueError(f"resident gate pair {pair_index} is not closed")
+        pair_id = raw_pair["pair_id"]
+        if pair_id != ("pair-a", "pair-b")[pair_index]:
+            raise ValueError("resident gate pair order or identity is invalid")
+        reference = _validate_resident_gate_rows(
+            raw_pair["reference_rows"], f"{pair_id} reference"
+        )
+        candidate = _validate_resident_gate_rows(
+            raw_pair["candidate_rows"], f"{pair_id} candidate"
+        )
+        reference_evidence = raw_pair.get("reference_evidence", ())
+        candidate_evidence = raw_pair.get("candidate_evidence", ())
+        if not isinstance(reference_evidence, Sequence) or \
+           not isinstance(candidate_evidence, Sequence):
+            raise ValueError(f"resident gate {pair_id} evidence is invalid")
+        by_context = {row["context_tokens"]: row for row in reference}
+        for context, published in RESIDENT_GATE_PUBLISHED_REFERENCE.items():
+            row = by_context[context]
+            for metric, row_key in (
+                ("prefill", "prefill_tokens_per_second"),
+                ("steady-decode", "steady_decode_tokens_per_second"),
+            ):
+                threshold = published[metric.replace("-", "_")] * \
+                    RESIDENT_GATE_REFERENCE_SANITY_RATIO
+                measured = row[row_key]
+                gates.append(_gate(
+                    f"{pair_id}-reference-{context}-{metric}-sanity",
+                    measured >= threshold,
+                    measured,
+                    threshold,
+                    kind="number",
+                    unit="tokens_per_second",
+                    comparison="gte",
+                    evidence=reference_evidence,
+                ))
+        for reference_row, candidate_row in zip(reference, candidate, strict=True):
+            context = reference_row["context_tokens"]
+            for metric, row_key in (
+                ("prefill", "prefill_tokens_per_second"),
+                ("steady-decode", "steady_decode_tokens_per_second"),
+            ):
+                threshold = reference_row[row_key] * RESIDENT_GATE_CANDIDATE_RATIO
+                measured = candidate_row[row_key]
+                gates.append(_gate(
+                    f"{pair_id}-candidate-{context}-{metric}-relative",
+                    measured >= threshold,
+                    measured,
+                    threshold,
+                    kind="number",
+                    unit="tokens_per_second",
+                    comparison="gte",
+                    evidence=(*reference_evidence, *candidate_evidence),
+                ))
+    return {
+        "status": "passed" if all(gate["status"] == "passed" for gate in gates)
+        else "failed",
+        "gates": gates,
+    }
+
+
+def _bind_resident_gate_executable(
+    path: Path | str, *, role: str, revision: str
+) -> tuple[os.stat_result, dict[str, Any]]:
+    if role not in {"reference", "candidate"}:
+        raise ValueError("resident gate executable role is invalid")
+    bound_revision = _revision(revision, f"resident gate {role} revision")
+    if role == "reference" and bound_revision != RESIDENT_GATE_REFERENCE_REVISION:
+        raise ValueError("resident gate reference revision is not the pinned PR #594 head")
+    source = Path(path)
+    if source.is_symlink():
+        raise ValueError(f"resident gate {role} executable must not be a symlink")
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve resident gate {role} executable: {exc}") from exc
+    if not os.access(resolved, os.X_OK):
+        raise ValueError(f"resident gate {role} executable is not executable")
+    before, identity = _stat_identity(resolved)
+    digest = _sha256_file(resolved)
+    after, _ = _stat_identity(resolved)
+    if not _same_stat(before, after):
+        raise ValueError(f"resident gate {role} executable changed while hashing")
+    return before, {
+        "role": role,
+        "revision": bound_revision,
+        "path": str(resolved),
+        "binary_sha256": digest,
+        "executable": identity,
+    }
+
+
+def _run_git_checkout(
+    source_root: Path, arguments: tuple[str, ...], label: str
+) -> str:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=RESIDENT_GATE_GIT_ENV,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot inspect resident gate {label}: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise ValueError(f"resident gate {label} failed: {detail}")
+    return completed.stdout.strip()
+
+
+def _bind_resident_gate_source(
+    source_dir: Path | str,
+    *,
+    role: str,
+    revision: str,
+) -> dict[str, Any]:
+    if role not in RESIDENT_GATE_BUILD_ARGV:
+        raise ValueError("resident gate source role is invalid")
+    source = Path(source_dir)
+    if source.is_symlink():
+        raise ValueError(f"resident gate {role} source must not be a symlink")
+    try:
+        root = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve resident gate {role} source: {exc}") from exc
+    if not root.is_dir():
+        raise ValueError(f"resident gate {role} source is not a directory")
+    declared = _revision(revision, f"resident gate {role} revision")
+    if role == "reference" and declared != RESIDENT_GATE_REFERENCE_REVISION:
+        raise ValueError("resident gate reference revision is not the pinned PR #594 head")
+    top_level = _run_git_checkout(
+        root, ("rev-parse", "--show-toplevel"), f"{role} source root"
+    )
+    try:
+        observed_root = Path(top_level).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"resident gate {role} Git root is invalid: {exc}") from exc
+    if observed_root != root:
+        raise ValueError(f"resident gate {role} source is not the Git checkout root")
+    observed_revision = _revision(
+        _run_git_checkout(root, ("rev-parse", "HEAD"), f"{role} source revision"),
+        f"resident gate {role} observed revision",
+    )
+    if observed_revision != declared:
+        raise ValueError(f"resident gate {role} source revision does not match declaration")
+    tree = _revision(
+        _run_git_checkout(root, ("rev-parse", "HEAD^{tree}"), f"{role} source tree"),
+        f"resident gate {role} source tree",
+    )
+    status = _run_git_checkout(
+        root,
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+        f"{role} source cleanliness",
+    )
+    if status:
+        raise ValueError(f"resident gate {role} source must be clean; dirty checkout")
+    tracked_output = _run_git_checkout(
+        root, ("ls-files", "--", "ds4-bench"), f"{role} build output tracking"
+    )
+    if tracked_output:
+        raise ValueError(f"resident gate {role} ds4-bench output must not be tracked")
+    ignored_output = _run_git_checkout(
+        root,
+        ("check-ignore", "--no-index", "--", "ds4-bench"),
+        f"{role} build output ignore rule",
+    )
+    if ignored_output not in {"ds4-bench", "./ds4-bench"}:
+        raise ValueError(f"resident gate {role} ds4-bench output is not ignored")
+    bench = root / "ds4-bench"
+    return {
+        "role": role,
+        "revision": declared,
+        "source_root": str(root),
+        "source_tree": tree,
+        "bench_relative_path": "ds4-bench",
+        "path": str(bench),
+    }
+
+
+def _resident_gate_source_equal(
+    expected: Mapping[str, Any], observed: Mapping[str, Any]
+) -> bool:
+    keys = (
+        "role", "revision", "source_root", "source_tree",
+        "bench_relative_path", "path",
+    )
+    return all(expected.get(key) == observed.get(key) for key in keys)
+
+
+def _bind_resident_gate_toolchain() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for tool, raw_path in RESIDENT_GATE_TOOL_PATHS.items():
+        declared = Path(raw_path)
+        try:
+            resolved = declared.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve resident gate {tool} tool: {exc}") from exc
+        if not os.access(resolved, os.X_OK):
+            raise ValueError(f"resident gate {tool} tool is not executable")
+        before, identity = _stat_identity(resolved)
+        digest = _sha256_file(resolved)
+        after, _ = _stat_identity(resolved)
+        if not _same_stat(before, after):
+            raise ValueError(f"resident gate {tool} tool changed while hashing")
+        records.append({
+            "tool": tool,
+            "path": str(declared),
+            "resolved_path": str(resolved),
+            "sha256": digest,
+            "executable": identity,
+        })
+    return records
+
+
+def _verify_resident_gate_toolchain(expected: Sequence[Mapping[str, Any]]) -> None:
+    if list(expected) != _bind_resident_gate_toolchain():
+        raise ValueError("resident gate toolchain changed during execution")
+
+
+def _build_resident_gate_subject(
+    source_binding: Mapping[str, Any],
+    evidence_dir: Path,
+    *,
+    toolchain: Sequence[Mapping[str, Any]],
+    timeout_seconds: float,
+) -> tuple[os.stat_result, dict[str, Any]]:
+    role = source_binding.get("role")
+    if role not in RESIDENT_GATE_BUILD_ARGV:
+        raise ValueError("resident gate build role is invalid")
+    if not toolchain or any(not isinstance(item, Mapping) for item in toolchain):
+        raise ValueError("resident gate build toolchain binding is invalid")
+    root = Path(str(source_binding.get("source_root")))
+    bench = root / "ds4-bench"
+    if source_binding.get("path") != str(bench) or \
+       source_binding.get("bench_relative_path") != "ds4-bench":
+        raise ValueError(f"resident gate {role} build output binding is invalid")
+    output_existed = bench.exists() or bench.is_symlink()
+    if output_existed:
+        if bench.is_dir() and not bench.is_symlink():
+            raise ValueError(f"resident gate {role} stale build output is a directory")
+        try:
+            bench.unlink()
+        except OSError as exc:
+            raise ValueError(
+                f"cannot remove resident gate {role} stale build output: {exc}"
+            ) from exc
+    if bench.exists() or bench.is_symlink():
+        raise ValueError(f"resident gate {role} stale build output survived removal")
+
+    stdout_path = evidence_dir / f"{role}-build.stdout.log"
+    stderr_path = evidence_dir / f"{role}-build.stderr.log"
+    argv = RESIDENT_GATE_BUILD_ARGV[role]
+    outcome = run_foreground_process(
+        argv,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        timeout_seconds=float(timeout_seconds),
+        env=RESIDENT_GATE_BUILD_ENV,
+        cwd=root,
+    )
+    if not isinstance(outcome, Mapping) or \
+       "timed_out" not in outcome or "returncode" not in outcome:
+        raise ValueError(f"resident gate {role} build outcome is invalid")
+    if outcome["timed_out"] or outcome["returncode"] != 0:
+        raise ValueError(
+            f"resident gate {role} build failed: "
+            f"returncode={outcome['returncode']} timed_out={outcome['timed_out']}"
+        )
+    if not bench.exists() or bench.is_symlink() or not bench.is_file():
+        raise ValueError(f"resident gate {role} build did not create a new executable")
+    before, executable_binding = _bind_resident_gate_executable(
+        bench,
+        role=role,
+        revision=str(source_binding.get("revision")),
+    )
+    revalidated = _bind_resident_gate_source(
+        root,
+        role=role,
+        revision=str(source_binding.get("revision")),
+    )
+    if not _resident_gate_source_equal(source_binding, revalidated):
+        raise ValueError(f"resident gate {role} source changed during build")
+    binding = {
+        **revalidated,
+        "binary_sha256": executable_binding["binary_sha256"],
+        "executable": executable_binding["executable"],
+        "build": {
+            "argv": list(argv),
+            "cwd": str(root),
+            "environment": dict(RESIDENT_GATE_BUILD_ENV),
+            "toolchain": list(toolchain),
+            "removed_preexisting_output": output_existed,
+            "evidence": {
+                "stdout": _evidence_reference(evidence_dir, stdout_path.name),
+                "stderr": _evidence_reference(evidence_dir, stderr_path.name),
+            },
+        },
+    }
+    return before, binding
+
+
+def _resident_gate_nvml_empty(gpu_uuid: str, label: str) -> dict[str, Any]:
+    capture = collect_nvml_pre_child(gpu_uuid)
+    if not isinstance(capture, Mapping) or set(capture) != {
+        "library_version", "inventory"
+    }:
+        raise ValueError(f"resident gate {label} NVML capture is invalid")
+    library_version = _string(
+        capture["library_version"], f"resident gate {label} NVML library version"
+    )
+    inventory = _canonical_nvml_inventory(
+        capture["inventory"], f"resident gate {label} NVML inventory",
+        gpu_uuid=gpu_uuid,
+    )
+    if inventory["processes"]:
+        raise ValueError(f"resident gate {label} found another GPU compute process")
+    return {"library_version": library_version, "inventory": inventory}
+
+
+def run_resident_gate(
+    *,
+    manifest_path: Path,
+    model: Path,
+    reference_source_dir: Path,
+    reference_revision: str,
+    candidate_source_dir: Path,
+    candidate_revision: str,
+    evidence_dir: Path,
+    timeout_seconds: float = 2 * 60 * 60,
+) -> dict[str, Any]:
+    """Causally build and compare PR #594 and the candidate resident binaries."""
+    if evidence_dir.exists():
+        raise ValueError("resident gate evidence directory already exists")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or \
+       not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValueError("resident gate timeout must be finite and positive")
+    manifest = load_manifest(manifest_path)
+    observed_model = bind_model_identity(model)
+    verify_manifest_bindings(manifest, model_identity=observed_model)
+    observed_host = collect_host_identity(model)
+    _require_identity_match(manifest["host"], observed_host, "resident gate host")
+    model_path = model.resolve(strict=True)
+    model_before = model_path.stat()
+    prompt_before, _ = _stat_identity(RESIDENT_GATE_PROMPT_PATH)
+    if _sha256_file(RESIDENT_GATE_PROMPT_PATH) != RESIDENT_GATE_PROMPT_SHA256:
+        raise ValueError("resident gate prompt does not match its pinned SHA-256")
+    reference_source = _bind_resident_gate_source(
+        reference_source_dir,
+        role="reference",
+        revision=reference_revision,
+    )
+    candidate_source = _bind_resident_gate_source(
+        candidate_source_dir,
+        role="candidate",
+        revision=candidate_revision,
+    )
+    if reference_source["source_root"] == candidate_source["source_root"]:
+        raise ValueError("resident gate reference and candidate sources must differ")
+    if reference_source["revision"] == candidate_source["revision"]:
+        raise ValueError("resident gate reference and candidate revisions must differ")
+
+    protocol = {
+        "prompt_path": str(RESIDENT_GATE_PROMPT_PATH.resolve()),
+        "prompt_sha256": RESIDENT_GATE_PROMPT_SHA256,
+        "frontiers": list(RESIDENT_GATE_FRONTIERS),
+        "generated_tokens": RESIDENT_GATE_GENERATED_TOKENS,
+        "context_allocation_tokens": RESIDENT_GATE_CONTEXT_ALLOC,
+        "prefill_chunk_tokens": RESIDENT_GATE_PREFILL_CHUNK,
+        "candidate_ratio": RESIDENT_GATE_CANDIDATE_RATIO,
+        "reference_sanity_ratio": RESIDENT_GATE_REFERENCE_SANITY_RATIO,
+        "snapshot_policy": "disabled-replay-between-frontiers",
+        "build_commands": {
+            role: list(argv) for role, argv in RESIDENT_GATE_BUILD_ARGV.items()
+        },
+        "build_environment": dict(RESIDENT_GATE_BUILD_ENV),
+        "benchmark_environment": dict(RESIDENT_GATE_BENCH_ENV),
+        "git_environment": dict(RESIDENT_GATE_GIT_ENV),
+        "toolchain": [],
+        "execution_order": [
+            f"{pair_id}:{role}" for pair_id, role in RESIDENT_GATE_EXECUTION_ORDER
+        ],
+    }
+    subjects = [reference_source, candidate_source]
+    manifest_digest = manifest_sha256(manifest)
+    evidence_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+    gpu_uuid = manifest["host"]["gpu_uuid"]
+
+    def safe_evidence() -> list[dict[str, str]]:
+        records: list[dict[str, str]] = []
+        try:
+            paths = sorted(
+                evidence_dir.iterdir(), key=lambda item: item.name.encode("utf-8")
+            )
+        except OSError:
+            return records
+        for path in paths:
+            if path.name == "result.json" or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                before = path.stat(follow_symlinks=False)
+                reference = _evidence_reference(evidence_dir, path.name)
+                after = path.stat(follow_symlinks=False)
+            except (OSError, ValueError):
+                continue
+            if _same_stat(before, after):
+                records.append(reference)
+        return records
+
+    runs: list[dict[str, Any]] = []
+
+    def execute(
+        sequence: int, pair_id: str, role: str, binding: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        prefix = f"{pair_id}-{role}"
+        csv_path = evidence_dir / f"{prefix}.csv"
+        stdout_path = evidence_dir / f"{prefix}.stdout.log"
+        stderr_path = evidence_dir / f"{prefix}.stderr.log"
+        before_nvml = _resident_gate_nvml_empty(gpu_uuid, f"before {prefix}")
+        outcome = run_foreground_process(
+            resident_gate_benchmark_argv(
+                Path(binding["path"]), model_path, RESIDENT_GATE_PROMPT_PATH, csv_path
+            ),
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=float(timeout_seconds),
+            env=RESIDENT_GATE_BENCH_ENV,
+        )
+        after_nvml = _resident_gate_nvml_empty(gpu_uuid, f"after {prefix}")
+        if outcome["timed_out"] or outcome["returncode"] != 0:
+            raise ValueError(
+                f"resident gate {pair_id} {role} benchmark failed: "
+                f"returncode={outcome['returncode']} timed_out={outcome['timed_out']}"
+            )
+        rows = parse_resident_gate_csv(csv_path)
+        return {
+            "sequence": sequence,
+            "pair_id": pair_id,
+            "role": role,
+            "nvml_before": before_nvml,
+            "nvml_after": after_nvml,
+            "rows": rows,
+            "evidence": {
+                "csv": _evidence_reference(evidence_dir, csv_path.name),
+                "stdout": _evidence_reference(evidence_dir, stdout_path.name),
+                "stderr": _evidence_reference(evidence_dir, stderr_path.name),
+            },
+        }
+
+    try:
+        toolchain = _bind_resident_gate_toolchain()
+        protocol["toolchain"] = toolchain
+        reference_before, reference_binding = _build_resident_gate_subject(
+            reference_source, evidence_dir, toolchain=toolchain,
+            timeout_seconds=float(timeout_seconds),
+        )
+        _verify_resident_gate_toolchain(toolchain)
+        subjects[0] = reference_binding
+        candidate_before, candidate_binding = _build_resident_gate_subject(
+            candidate_source, evidence_dir, toolchain=toolchain,
+            timeout_seconds=float(timeout_seconds),
+        )
+        _verify_resident_gate_toolchain(toolchain)
+        subjects[1] = candidate_binding
+        if reference_binding["binary_sha256"] == candidate_binding["binary_sha256"] or \
+           reference_binding["path"] == candidate_binding["path"]:
+            raise ValueError(
+                "resident gate reference and candidate must be distinct binaries"
+            )
+        bindings = {"reference": reference_binding, "candidate": candidate_binding}
+        original_stats = {"reference": reference_before, "candidate": candidate_before}
+        for sequence, (pair_id, role) in enumerate(RESIDENT_GATE_EXECUTION_ORDER):
+            runs.append(execute(sequence, pair_id, role, bindings[role]))
+            current, _ = _stat_identity(Path(bindings[role]["path"]))
+            if not _same_stat(original_stats[role], current) or \
+               _sha256_file(Path(bindings[role]["path"])) != \
+               bindings[role]["binary_sha256"]:
+                raise ValueError(
+                    f"resident gate {role} executable changed during execution"
+                )
+        for role, original in (
+            ("reference", reference_source), ("candidate", candidate_source)
+        ):
+            observed = _bind_resident_gate_source(
+                Path(str(original["source_root"])),
+                role=role,
+                revision=str(original["revision"]),
+            )
+            if not _resident_gate_source_equal(original, observed):
+                raise ValueError(f"resident gate {role} source changed during execution")
+        _verify_resident_gate_toolchain(toolchain)
+        if not _same_stat(model_before, model_path.stat()):
+            raise ValueError("resident gate model changed during execution")
+        prompt_after, _ = _stat_identity(RESIDENT_GATE_PROMPT_PATH)
+        if not _same_stat(prompt_before, prompt_after) or \
+           _sha256_file(RESIDENT_GATE_PROMPT_PATH) != RESIDENT_GATE_PROMPT_SHA256:
+            raise ValueError("resident gate prompt changed during execution")
+        by_key = {(run["pair_id"], run["role"]): run for run in runs}
+        comparison_pairs = []
+        for pair_id in ("pair-a", "pair-b"):
+            reference = by_key[(pair_id, "reference")]
+            candidate = by_key[(pair_id, "candidate")]
+            comparison_pairs.append({
+                "pair_id": pair_id,
+                "reference_rows": reference["rows"],
+                "candidate_rows": candidate["rows"],
+                "reference_evidence": (reference["evidence"]["csv"],),
+                "candidate_evidence": (candidate["evidence"]["csv"],),
+            })
+        evaluation = evaluate_resident_gate(comparison_pairs)
+    except (OSError, TimeoutError, ValueError) as exc:
+        invalid = {
+            "schema": RESIDENT_GATE_SCHEMA,
+            "status": "invalid",
+            "reason": str(exc) or type(exc).__name__,
+            "created_at": _utc_timestamp_ns(time.time_ns()),
+            "manifest_sha256": manifest_digest,
+            "model": observed_model,
+            "host": observed_host,
+            "protocol": protocol,
+            "subjects": subjects,
+            "runs": runs,
+            "gates": [],
+            "evidence": safe_evidence(),
+        }
+        _write_new_bytes(
+            evidence_dir / "result.json",
+            canonical_bundle_json_bytes(invalid) + b"\n",
+        )
+        raise
+
+    result = {
+        "schema": RESIDENT_GATE_SCHEMA,
+        "status": evaluation["status"],
+        "reason": None,
+        "created_at": _utc_timestamp_ns(time.time_ns()),
+        "manifest_sha256": manifest_digest,
+        "model": observed_model,
+        "host": observed_host,
+        "protocol": protocol,
+        "subjects": subjects,
+        "runs": runs,
+        "gates": evaluation["gates"],
+        "evidence": safe_evidence(),
+    }
+    _write_new_bytes(
+        evidence_dir / "result.json", canonical_bundle_json_bytes(result) + b"\n"
+    )
+    return result
 
 
 def _plan_profile_fields(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5272,6 +6069,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     smoke_eval.add_argument("--eval-bin", required=True, type=Path)
     smoke_eval.add_argument("--case-id", action="append", required=True)
     smoke_eval.add_argument("--timeout-seconds", type=float, default=4 * 60 * 60)
+    resident_gate = commands.add_parser(
+        "resident-gate",
+        help="compare corrected-Q4 resident performance with pinned PR #594",
+    )
+    resident_gate.add_argument("--manifest", required=True, type=Path)
+    resident_gate.add_argument("--model", required=True, type=Path)
+    resident_gate.add_argument("--reference-source-dir", required=True, type=Path)
+    resident_gate.add_argument("--reference-revision", required=True)
+    resident_gate.add_argument("--candidate-source-dir", required=True, type=Path)
+    resident_gate.add_argument("--candidate-revision", required=True)
+    resident_gate.add_argument("--evidence-dir", required=True, type=Path)
+    resident_gate.add_argument("--timeout-seconds", type=float, default=2 * 60 * 60)
     run = commands.add_parser("run", help="run the immutable Laguna qualification")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--model", required=True, type=Path)
@@ -5296,6 +6105,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if args.command == "resident-gate":
+            result = run_resident_gate(
+                manifest_path=args.manifest,
+                model=args.model,
+                reference_source_dir=args.reference_source_dir,
+                reference_revision=args.reference_revision,
+                candidate_source_dir=args.candidate_source_dir,
+                candidate_revision=args.candidate_revision,
+                evidence_dir=args.evidence_dir,
+                timeout_seconds=args.timeout_seconds,
+            )
+            print(canonical_bundle_json_bytes(result).decode("utf-8"))
+            return 0 if result["status"] == "passed" else 1
         if args.command == "run":
             result = run_canonical_qualification(
                 manifest_path=args.manifest,
@@ -5367,9 +6189,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"prompts={len(value['prompts'])} profiles={len(value['profiles'])}"
         )
         return 0
-    except ValueError as exc:
+    except (OSError, TimeoutError, ValueError) as exc:
+        if args.command != "resident-gate" and not isinstance(exc, ValueError):
+            raise
         print(f"compact-runtime-qualify: {exc}", file=sys.stderr)
-        return 1
+        return 2 if args.command == "resident-gate" else 1
 
 
 if __name__ == "__main__":

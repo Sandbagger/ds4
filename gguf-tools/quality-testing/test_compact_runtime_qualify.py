@@ -1722,6 +1722,694 @@ class QualificationRunnerContractTest(unittest.TestCase):
                 TOOL.verify_qualification_bundle(output)
 
 
+class ResidentPerformanceGateTest(unittest.TestCase):
+    @staticmethod
+    def _rows(*, factor: float = 1.0) -> list[dict[str, object]]:
+        published = {
+            2048: (201.87, 22.49),
+            4096: (160.93, 21.77),
+            8192: (132.42, 20.44),
+            16384: (110.0, 18.0),
+            28672: (90.0, 15.0),
+        }
+        previous = 0
+        rows: list[dict[str, object]] = []
+        for context in TOOL.RESIDENT_GATE_FRONTIERS:
+            prefill, decode = published[context]
+            rows.append({
+                "context_tokens": context,
+                "prefill_tokens": context - previous,
+                "prefill_tokens_per_second": prefill * factor,
+                "generated_tokens": TOOL.RESIDENT_GATE_GENERATED_TOKENS,
+                "generation_tokens_per_second": decode * factor,
+                "first_token_milliseconds": 50.0,
+                "steady_generated_tokens": TOOL.RESIDENT_GATE_GENERATED_TOKENS - 1,
+                "steady_decode_tokens_per_second": decode * factor,
+            })
+            previous = context
+        return rows
+
+    @staticmethod
+    def _write_csv(path: Path, rows: list[dict[str, object]], *, legacy: bool) -> None:
+        common = (
+            "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,"
+            "gen_first_ms,gen_steady_tokens,gen_steady_tps"
+        )
+        suffix = ",kvcache_bytes\n" if legacy else \
+            ",session_payload_bytes,kv_allocated_bytes\n"
+        lines = [common + suffix]
+        for row in rows:
+            values = [
+                row["context_tokens"], row["prefill_tokens"],
+                row["prefill_tokens_per_second"], row["generated_tokens"],
+                row["generation_tokens_per_second"],
+                row["first_token_milliseconds"], row["steady_generated_tokens"],
+                row["steady_decode_tokens_per_second"], 1024,
+            ]
+            if not legacy:
+                values.append(2048)
+            lines.append(",".join(str(value) for value in values) + "\n")
+        path.write_text("".join(lines), encoding="ascii")
+
+    @staticmethod
+    def _toolchain() -> list[dict[str, object]]:
+        return [
+            {
+                "tool": tool,
+                "path": path,
+                "resolved_path": path,
+                "sha256": hashlib.sha256(tool.encode()).hexdigest(),
+                "executable": {
+                    "device": "1", "inode": str(index + 1),
+                    "size_bytes": str(len(tool)), "mtime_ns": "1",
+                },
+            }
+            for index, (tool, path) in enumerate(TOOL.RESIDENT_GATE_TOOL_PATHS.items())
+        ]
+
+    def test_benchmark_argv_is_fixed_resident_protocol(self) -> None:
+        argv = TOOL.resident_gate_benchmark_argv(
+            Path("/bench"), Path("/model.gguf"), Path("/prompt.txt"),
+            Path("/result.csv"),
+        )
+        self.assertEqual(argv[0], "/bench")
+        self.assertEqual(argv[argv.index("--ctx-start") + 1], "2048")
+        self.assertEqual(argv[argv.index("--ctx-max") + 1], "28672")
+        self.assertEqual(argv[argv.index("--step-mul") + 1], "2")
+        self.assertEqual(argv[argv.index("--ctx-alloc") + 1], "32768")
+        self.assertEqual(argv[argv.index("--prefill-chunk") + 1], "4096")
+        self.assertEqual(argv[argv.index("--gen-tokens") + 1], "256")
+        self.assertNotIn("--ssd-streaming", argv)
+        self.assertNotIn("--qualification-sequence", argv)
+
+    def test_parser_accepts_both_known_csv_tails_and_normalizes_rows(self) -> None:
+        rows = self._rows()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for legacy in (True, False):
+                with self.subTest(legacy=legacy):
+                    path = root / f"{'legacy' if legacy else 'current'}.csv"
+                    self._write_csv(path, rows, legacy=legacy)
+                    observed = TOOL.parse_resident_gate_csv(path)
+                    self.assertEqual(observed, rows)
+
+    def test_parser_rejects_nonfinite_partial_or_reordered_sweeps(self) -> None:
+        cases = {
+            "frontier": lambda rows: rows.reverse(),
+            "generated": lambda rows: rows[0].__setitem__("generated_tokens", 255),
+            "steady": lambda rows: rows[0].__setitem__("steady_generated_tokens", 256),
+            "nonfinite": lambda rows: rows[0].__setitem__(
+                "steady_decode_tokens_per_second", "nan"
+            ),
+            "nonpositive": lambda rows: rows[0].__setitem__(
+                "prefill_tokens_per_second", 0
+            ),
+        }
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for label, mutate in cases.items():
+                with self.subTest(label=label):
+                    rows = self._rows()
+                    mutate(rows)
+                    path = root / f"{label}.csv"
+                    self._write_csv(path, rows, legacy=False)
+                    with self.assertRaises(ValueError):
+                        TOOL.parse_resident_gate_csv(path)
+
+    def test_gate_requires_reference_sanity_and_every_candidate_ratio(self) -> None:
+        reference = self._rows()
+        candidate = self._rows(factor=TOOL.RESIDENT_GATE_CANDIDATE_RATIO)
+        pairs = [
+            {
+                "pair_id": "pair-a",
+                "reference_rows": reference,
+                "candidate_rows": candidate,
+            },
+            {
+                "pair_id": "pair-b",
+                "reference_rows": reference,
+                "candidate_rows": candidate,
+            },
+        ]
+        passed = TOOL.evaluate_resident_gate(pairs)
+        self.assertEqual(passed["status"], "passed")
+        self.assertTrue(all(gate["status"] == "passed" for gate in passed["gates"]))
+
+        one_miss = copy.deepcopy(candidate)
+        one_miss[-1]["steady_decode_tokens_per_second"] = \
+            float(reference[-1]["steady_decode_tokens_per_second"]) * 0.899
+        changed = copy.deepcopy(pairs)
+        changed[1]["candidate_rows"] = one_miss
+        failed = TOOL.evaluate_resident_gate(changed)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(
+            [gate["gate_id"] for gate in failed["gates"] if gate["status"] == "failed"],
+            ["pair-b-candidate-28672-steady-decode-relative"],
+        )
+
+        weak_reference = copy.deepcopy(reference)
+        weak_reference[0]["prefill_tokens_per_second"] = 1.0
+        changed = copy.deepcopy(pairs)
+        changed[0]["reference_rows"] = weak_reference
+        failed = TOOL.evaluate_resident_gate(changed)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn(
+            "pair-a-reference-2048-prefill-sanity",
+            [gate["gate_id"] for gate in failed["gates"] if gate["status"] == "failed"],
+        )
+
+    def test_source_binding_requires_clean_exact_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            source = Path(name).resolve()
+            revision = TOOL.RESIDENT_GATE_REFERENCE_REVISION
+            tree = "2" * 40
+
+            def clean_git(_root: Path, arguments: tuple[str, ...], _label: str) -> str:
+                return {
+                    ("rev-parse", "--show-toplevel"): str(source),
+                    ("rev-parse", "HEAD"): revision,
+                    ("rev-parse", "HEAD^{tree}"): tree,
+                    ("status", "--porcelain=v1", "--untracked-files=all"): "",
+                    ("ls-files", "--", "ds4-bench"): "",
+                    ("check-ignore", "--no-index", "--", "ds4-bench"):
+                        "ds4-bench",
+                }[arguments]
+
+            with mock.patch.object(TOOL, "_run_git_checkout", side_effect=clean_git):
+                binding = TOOL._bind_resident_gate_source(
+                    source, role="reference", revision=revision
+                )
+            self.assertEqual(binding["source_root"], str(source))
+            self.assertEqual(binding["source_tree"], tree)
+            self.assertEqual(binding["bench_relative_path"], "ds4-bench")
+            self.assertEqual(binding["path"], str(source / "ds4-bench"))
+
+            def dirty_git(root: Path, arguments: tuple[str, ...], label: str) -> str:
+                if arguments[0] == "status":
+                    return " M ds4.c"
+                return clean_git(root, arguments, label)
+
+            with mock.patch.object(TOOL, "_run_git_checkout", side_effect=dirty_git), \
+                 self.assertRaisesRegex(ValueError, "clean|dirty"):
+                TOOL._bind_resident_gate_source(
+                    source, role="reference", revision=revision
+                )
+
+    def test_git_inspection_uses_absolute_tool_and_controlled_environment(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="abc123\n", stderr=""
+        )
+        with mock.patch.object(
+            TOOL.subprocess, "run", return_value=completed
+        ) as run:
+            observed = TOOL._run_git_checkout(
+                Path("/source"), ("rev-parse", "HEAD"), "test source"
+            )
+        self.assertEqual(observed, "abc123")
+        run.assert_called_once_with(
+            ["/usr/bin/git", "-C", "/source", "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=dict(TOOL.RESIDENT_GATE_GIT_ENV),
+        )
+        self.assertFalse(any(
+            key.startswith("GIT_DIR") or key in {"GIT_WORK_TREE", "HOME"}
+            for key in TOOL.RESIDENT_GATE_GIT_ENV
+        ))
+
+    def test_toolchain_binding_hashes_exact_paths_and_detects_change(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            paths: dict[str, str] = {}
+            for tool in ("make", "cc", "cxx", "nvcc"):
+                path = root / tool
+                path.write_bytes(tool.encode())
+                path.chmod(0o755)
+                paths[tool] = str(path)
+            with mock.patch.object(TOOL, "RESIDENT_GATE_TOOL_PATHS", paths):
+                bound = TOOL._bind_resident_gate_toolchain()
+                self.assertEqual([item["tool"] for item in bound], list(paths))
+                self.assertTrue(all(
+                    item["path"] == paths[item["tool"]] and
+                    re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                    for item in bound
+                ))
+                Path(paths["nvcc"]).write_bytes(b"changed nvcc")
+                Path(paths["nvcc"]).chmod(0o755)
+                with self.assertRaisesRegex(ValueError, "toolchain.*changed"):
+                    TOOL._verify_resident_gate_toolchain(bound)
+
+    def test_causal_build_removes_stale_output_and_hashes_built_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "reference-source"
+            evidence = root / "evidence"
+            source.mkdir()
+            evidence.mkdir()
+            bench = source / "ds4-bench"
+            bench.write_bytes(b"stale ignored binary")
+            bench.chmod(0o755)
+            source_binding = {
+                "role": "reference",
+                "revision": TOOL.RESIDENT_GATE_REFERENCE_REVISION,
+                "source_root": str(source.resolve()),
+                "source_tree": "2" * 40,
+                "bench_relative_path": "ds4-bench",
+                "path": str(bench.resolve()),
+            }
+            calls: list[tuple[list[str], Path, dict[str, str]]] = []
+
+            def fake_run(argv: list[str], **kwargs: object) -> dict[str, object]:
+                calls.append((list(argv), Path(kwargs["cwd"]), dict(kwargs["env"])))
+                self.assertFalse(bench.exists(), "stale binary reached the build")
+                bench.write_bytes(b"causally built reference")
+                bench.chmod(0o755)
+                Path(kwargs["stdout_path"]).write_bytes(b"build stdout")
+                Path(kwargs["stderr_path"]).write_bytes(b"")
+                return {"returncode": 0, "timed_out": False}
+
+            with mock.patch.object(
+                TOOL, "run_foreground_process", side_effect=fake_run
+            ), mock.patch.object(
+                TOOL, "_bind_resident_gate_source", return_value=source_binding
+            ):
+                before, binding = TOOL._build_resident_gate_subject(
+                    source_binding, evidence, toolchain=self._toolchain(),
+                    timeout_seconds=60,
+                )
+            self.assertTrue(TOOL._same_stat(before, bench.stat()))
+            self.assertEqual(calls, [(
+                list(TOOL.RESIDENT_GATE_BUILD_ARGV["reference"]), source.resolve(),
+                dict(TOOL.RESIDENT_GATE_BUILD_ENV),
+            )])
+            self.assertEqual(
+                binding["binary_sha256"], hashlib.sha256(
+                    b"causally built reference"
+                ).hexdigest(),
+            )
+            self.assertNotEqual(
+                binding["binary_sha256"],
+                hashlib.sha256(b"stale ignored binary").hexdigest(),
+            )
+            self.assertEqual(
+                binding["build"]["argv"],
+                list(TOOL.RESIDENT_GATE_BUILD_ARGV["reference"]),
+            )
+            self.assertEqual(binding["build"]["cwd"], str(source.resolve()))
+            self.assertEqual(
+                binding["build"]["environment"], dict(TOOL.RESIDENT_GATE_BUILD_ENV)
+            )
+            self.assertEqual(
+                set(binding["build"]["evidence"]), {"stdout", "stderr"}
+            )
+            self.assertEqual(binding["build"]["toolchain"], self._toolchain())
+
+    def test_runner_is_serial_no_clobber_and_strips_ds4_environment(self) -> None:
+        manifest = build_fixture()
+        reference_rows = self._rows()
+        candidate_rows = self._rows(factor=0.95)
+        calls: list[tuple[list[str], dict[str, str], str]] = []
+        build_calls: list[tuple[list[str], Path, dict[str, str]]] = []
+
+        def fake_run(argv: list[str], **kwargs: object) -> dict[str, object]:
+            env = dict(kwargs["env"])
+            Path(kwargs["stdout_path"]).write_bytes(b"")
+            Path(kwargs["stderr_path"]).write_bytes(b"")
+            if tuple(argv) in set(TOOL.RESIDENT_GATE_BUILD_ARGV.values()):
+                source = Path(kwargs["cwd"])
+                bench = source / "ds4-bench"
+                self.assertFalse(bench.exists(), "stale build output was trusted")
+                bench.write_bytes(f"built-{source.name}".encode())
+                bench.chmod(0o755)
+                build_calls.append((list(argv), source, env))
+                return {"returncode": 0, "timed_out": False}
+            csv_path = Path(argv[argv.index("--csv") + 1])
+            is_reference = Path(argv[0]).parent.name == "reference-source"
+            calls.append((list(argv), env, csv_path.name))
+            self._write_csv(
+                csv_path,
+                reference_rows if is_reference else candidate_rows,
+                legacy=is_reference,
+            )
+            return {"returncode": 0, "timed_out": False}
+
+        empty_nvml = {
+            "library_version": "580.65.06",
+            "inventory": {
+                "api": TOOL.NVML_COMPUTE_API,
+                "gpu_uuid": HOST_IDENTITY["gpu_uuid"],
+                "processes": [],
+            },
+        }
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            model = root / "laguna-s-2.1-Q4_K_M.gguf"
+            model.write_bytes(b"model")
+            reference_source = root / "reference-source"
+            candidate_source = root / "candidate-source"
+            reference_source.mkdir()
+            candidate_source.mkdir()
+            for source in (reference_source, candidate_source):
+                stale = source / "ds4-bench"
+                stale.write_bytes(b"stale ignored binary")
+                stale.chmod(0o755)
+            evidence = root / "evidence"
+
+            def fake_source(
+                source_dir: Path, *, role: str, revision: str
+            ) -> dict[str, object]:
+                source = source_dir.resolve()
+                return {
+                    "role": role,
+                    "revision": revision,
+                    "source_root": str(source_dir.resolve()),
+                    "source_tree": "2" * 40,
+                    "bench_relative_path": "ds4-bench",
+                    "path": str(source / "ds4-bench"),
+                }
+
+            hostile = {
+                "CUDA_VISIBLE_DEVICES": "7",
+                "CUDA_FORCE_PTX_JIT": "1",
+                "CUDA_CACHE_DISABLE": "1",
+                "CUDA_CACHE_PATH": "/hostile-cache",
+                "LD_PRELOAD": "/hostile/preload.so",
+                "DS4_CUDA_LAGUNA_NO_SPLIT_DECODE": "1",
+                "DS4_BENCH_DISABLE_SNAPSHOT": "0",
+            }
+            with mock.patch.dict(os.environ, hostile, clear=False), \
+                 mock.patch.object(TOOL, "load_manifest", return_value=manifest), \
+                     mock.patch.object(
+                         TOOL, "bind_model_identity", return_value=copy.deepcopy(MODEL_IDENTITY)
+                     ), mock.patch.object(TOOL, "verify_manifest_bindings"), \
+                     mock.patch.object(
+                         TOOL, "collect_host_identity", return_value=copy.deepcopy(HOST_IDENTITY)
+                     ), mock.patch.object(
+                         TOOL, "collect_nvml_pre_child", return_value=empty_nvml
+                     ), mock.patch.object(
+                         TOOL, "run_foreground_process", side_effect=fake_run
+                     ), mock.patch.object(
+                         TOOL, "_bind_resident_gate_source", side_effect=fake_source
+                     ), mock.patch.object(
+                         TOOL, "_bind_resident_gate_toolchain",
+                         return_value=self._toolchain(),
+                     ):
+                result = TOOL.run_resident_gate(
+                    manifest_path=root / "manifest.json",
+                    model=model,
+                    reference_source_dir=reference_source,
+                    reference_revision=TOOL.RESIDENT_GATE_REFERENCE_REVISION,
+                    candidate_source_dir=candidate_source,
+                    candidate_revision="1" * 40,
+                    evidence_dir=evidence,
+                )
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(
+                TOOL.RESIDENT_GATE_BUILD_ARGV["reference"],
+                TOOL.RESIDENT_GATE_BUILD_ARGV["candidate"],
+            )
+            self.assertEqual([Path(call[0][0]).parent.name for call in calls], [
+                "reference-source", "candidate-source", "candidate-source",
+                "reference-source",
+            ])
+            self.assertEqual(build_calls, [
+                (list(TOOL.RESIDENT_GATE_BUILD_ARGV["reference"]),
+                 reference_source.resolve(),
+                 dict(TOOL.RESIDENT_GATE_BUILD_ENV)),
+                (list(TOOL.RESIDENT_GATE_BUILD_ARGV["candidate"]),
+                 candidate_source.resolve(),
+                 dict(TOOL.RESIDENT_GATE_BUILD_ENV)),
+            ])
+            self.assertEqual([call[2] for call in calls], [
+                "pair-a-reference.csv", "pair-a-candidate.csv",
+                "pair-b-candidate.csv", "pair-b-reference.csv",
+            ])
+            self.assertTrue(all(
+                env == dict(TOOL.RESIDENT_GATE_BENCH_ENV)
+                for _, env, _ in calls
+            ))
+            self.assertTrue(all(
+                env.get("DS4_BENCH_DISABLE_SNAPSHOT") == "1" and
+                not any(
+                    key in env for key in hostile
+                    if key != "DS4_BENCH_DISABLE_SNAPSHOT"
+                )
+                for _, env, _ in calls
+            ))
+            self.assertEqual(
+                result["protocol"]["benchmark_environment"],
+                dict(TOOL.RESIDENT_GATE_BENCH_ENV),
+            )
+            self.assertEqual(result["protocol"]["toolchain"], self._toolchain())
+            self.assertEqual(result["protocol"]["execution_order"], [
+                "pair-a:reference", "pair-a:candidate",
+                "pair-b:candidate", "pair-b:reference",
+            ])
+            self.assertEqual(
+                [(run["pair_id"], run["role"]) for run in result["runs"]],
+                [("pair-a", "reference"), ("pair-a", "candidate"),
+                 ("pair-b", "candidate"), ("pair-b", "reference")],
+            )
+            self.assertEqual(
+                result["subjects"][0]["binary_sha256"],
+                hashlib.sha256(b"built-reference-source").hexdigest(),
+            )
+            self.assertEqual(
+                result["subjects"][1]["binary_sha256"],
+                hashlib.sha256(b"built-candidate-source").hexdigest(),
+            )
+            self.assertTrue(all(
+                subject["build"]["toolchain"] == self._toolchain()
+                for subject in result["subjects"]
+            ))
+            self.assertTrue((evidence / "result.json").is_file())
+            with self.assertRaisesRegex(ValueError, "exists|evidence"):
+                TOOL.run_resident_gate(
+                    manifest_path=root / "manifest.json", model=model,
+                    reference_source_dir=reference_source,
+                    reference_revision=TOOL.RESIDENT_GATE_REFERENCE_REVISION,
+                    candidate_source_dir=candidate_source,
+                    candidate_revision="1" * 40,
+                    evidence_dir=evidence,
+                )
+
+    def test_failed_child_writes_terminal_invalid_evidence_then_reraises(self) -> None:
+        manifest = build_fixture()
+        empty_nvml = {
+            "library_version": "580.65.06",
+            "inventory": {
+                "api": TOOL.NVML_COMPUTE_API,
+                "gpu_uuid": HOST_IDENTITY["gpu_uuid"],
+                "processes": [],
+            },
+        }
+        benchmark_invocations = 0
+
+        def fake_run(argv: list[str], **kwargs: object) -> dict[str, object]:
+            nonlocal benchmark_invocations
+            if tuple(argv) in set(TOOL.RESIDENT_GATE_BUILD_ARGV.values()):
+                bench = Path(kwargs["cwd"]) / "ds4-bench"
+                self.assertFalse(bench.exists())
+                bench.write_bytes(f"built-{Path(kwargs['cwd']).name}".encode())
+                bench.chmod(0o755)
+                Path(kwargs["stdout_path"]).write_bytes(b"build stdout")
+                Path(kwargs["stderr_path"]).write_bytes(b"")
+                return {"returncode": 0, "timed_out": False}
+            benchmark_invocations += 1
+            csv_path = Path(argv[argv.index("--csv") + 1])
+            Path(kwargs["stdout_path"]).write_bytes(
+                f"stdout-{benchmark_invocations}".encode()
+            )
+            Path(kwargs["stderr_path"]).write_bytes(
+                f"stderr-{benchmark_invocations}".encode()
+            )
+            if benchmark_invocations == 1:
+                self._write_csv(csv_path, self._rows(), legacy=True)
+                return {"returncode": 0, "timed_out": False}
+            csv_path.write_bytes(b"partial\n")
+            return {"returncode": 9, "timed_out": False}
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            model = root / "laguna-s-2.1-Q4_K_M.gguf"
+            model.write_bytes(b"model")
+            sources: dict[str, Path] = {}
+            binaries: dict[str, Path] = {}
+            for role in ("reference", "candidate"):
+                sources[role] = root / f"{role}-source"
+                sources[role].mkdir()
+                binaries[role] = sources[role] / "ds4-bench"
+                binaries[role].write_bytes(b"stale ignored binary")
+                binaries[role].chmod(0o755)
+
+            def fake_source(
+                source_dir: Path, *, role: str, revision: str
+            ) -> dict[str, object]:
+                source = source_dir.resolve()
+                return {
+                    "role": role,
+                    "revision": revision,
+                    "source_root": str(source_dir.resolve()),
+                    "source_tree": "2" * 40,
+                    "bench_relative_path": "ds4-bench",
+                    "path": str(source / "ds4-bench"),
+                }
+
+            evidence = root / "invalid-evidence"
+            with mock.patch.object(TOOL, "load_manifest", return_value=manifest), \
+                 mock.patch.object(
+                     TOOL, "bind_model_identity", return_value=copy.deepcopy(MODEL_IDENTITY)
+                 ), mock.patch.object(TOOL, "verify_manifest_bindings"), \
+                 mock.patch.object(
+                     TOOL, "collect_host_identity", return_value=copy.deepcopy(HOST_IDENTITY)
+                 ), mock.patch.object(
+                     TOOL, "collect_nvml_pre_child", return_value=empty_nvml
+                 ), mock.patch.object(
+                     TOOL, "run_foreground_process", side_effect=fake_run
+                 ), mock.patch.object(
+                     TOOL, "_bind_resident_gate_source", side_effect=fake_source
+                 ), mock.patch.object(
+                     TOOL, "_bind_resident_gate_toolchain",
+                     return_value=self._toolchain(),
+                 ), self.assertRaisesRegex(ValueError, "pair-a candidate.*failed"):
+                TOOL.run_resident_gate(
+                    manifest_path=root / "manifest.json", model=model,
+                    reference_source_dir=sources["reference"],
+                    reference_revision=TOOL.RESIDENT_GATE_REFERENCE_REVISION,
+                    candidate_source_dir=sources["candidate"],
+                    candidate_revision="1" * 40,
+                    evidence_dir=evidence,
+                )
+            terminal = TOOL.loads_strict(
+                (evidence / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(terminal["status"], "invalid")
+            self.assertIn("pair-a candidate", terminal["reason"])
+            self.assertEqual(
+                set(terminal),
+                {
+                    "schema", "status", "reason", "created_at", "manifest_sha256",
+                    "model", "host", "protocol", "subjects", "runs", "gates",
+                    "evidence",
+                },
+            )
+            self.assertEqual(
+                [(run["pair_id"], run["role"]) for run in terminal["runs"]],
+                [("pair-a", "reference")],
+            )
+            paths = [item["path"] for item in terminal["evidence"]]
+            self.assertIn("pair-a-reference.csv", paths)
+            self.assertIn("pair-a-candidate.csv", paths)
+            self.assertIn("pair-a-candidate.stderr.log", paths)
+            self.assertTrue(all(
+                re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                for item in terminal["evidence"]
+            ))
+
+    def test_failed_causal_build_writes_terminal_invalid_evidence(self) -> None:
+        manifest = build_fixture()
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            model = root / "laguna-s-2.1-Q4_K_M.gguf"
+            model.write_bytes(b"model")
+            sources = {
+                role: root / f"{role}-source"
+                for role in ("reference", "candidate")
+            }
+            for source in sources.values():
+                source.mkdir()
+                stale = source / "ds4-bench"
+                stale.write_bytes(b"stale ignored binary")
+                stale.chmod(0o755)
+
+            def fake_source(
+                source_dir: Path, *, role: str, revision: str
+            ) -> dict[str, object]:
+                source = source_dir.resolve()
+                return {
+                    "role": role,
+                    "revision": revision,
+                    "source_root": str(source),
+                    "source_tree": "2" * 40,
+                    "bench_relative_path": "ds4-bench",
+                    "path": str(source / "ds4-bench"),
+                }
+
+            def fail_build(argv: list[str], **kwargs: object) -> dict[str, object]:
+                self.assertEqual(
+                    tuple(argv), TOOL.RESIDENT_GATE_BUILD_ARGV["reference"]
+                )
+                self.assertFalse((Path(kwargs["cwd"]) / "ds4-bench").exists())
+                Path(kwargs["stdout_path"]).write_bytes(b"failed build stdout")
+                Path(kwargs["stderr_path"]).write_bytes(b"failed build stderr")
+                return {"returncode": 2, "timed_out": False}
+
+            evidence = root / "invalid-build-evidence"
+            with mock.patch.object(TOOL, "load_manifest", return_value=manifest), \
+                 mock.patch.object(
+                     TOOL, "bind_model_identity", return_value=copy.deepcopy(MODEL_IDENTITY)
+                 ), mock.patch.object(TOOL, "verify_manifest_bindings"), \
+                 mock.patch.object(
+                     TOOL, "collect_host_identity", return_value=copy.deepcopy(HOST_IDENTITY)
+                 ), mock.patch.object(
+                     TOOL, "_bind_resident_gate_source", side_effect=fake_source
+                 ), mock.patch.object(
+                     TOOL, "run_foreground_process", side_effect=fail_build
+                 ), mock.patch.object(
+                     TOOL, "_bind_resident_gate_toolchain",
+                     return_value=self._toolchain(),
+                 ), self.assertRaisesRegex(ValueError, "reference build failed"):
+                TOOL.run_resident_gate(
+                    manifest_path=root / "manifest.json", model=model,
+                    reference_source_dir=sources["reference"],
+                    reference_revision=TOOL.RESIDENT_GATE_REFERENCE_REVISION,
+                    candidate_source_dir=sources["candidate"],
+                    candidate_revision="1" * 40,
+                    evidence_dir=evidence,
+                )
+            terminal = TOOL.loads_strict(
+                (evidence / "result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(terminal["status"], "invalid")
+            self.assertIn("reference build failed", terminal["reason"])
+            self.assertEqual(terminal["runs"], [])
+            paths = [item["path"] for item in terminal["evidence"]]
+            self.assertEqual(paths, [
+                "reference-build.stderr.log", "reference-build.stdout.log",
+            ])
+
+    def test_cli_wires_pass_fail_and_invalid_exit_statuses(self) -> None:
+        argv = [
+            "resident-gate", "--manifest", "/manifest.json", "--model", "/model",
+            "--reference-source-dir", "/reference-source",
+            "--reference-revision", TOOL.RESIDENT_GATE_REFERENCE_REVISION,
+            "--candidate-source-dir", "/candidate-source",
+            "--candidate-revision", "1" * 40, "--evidence-dir", "/evidence",
+        ]
+        parsed = TOOL.parse_args(argv)
+        self.assertEqual(parsed.command, "resident-gate")
+        self.assertEqual(parsed.timeout_seconds, 2 * 60 * 60)
+        self.assertFalse(hasattr(parsed, "reference_bench_bin"))
+        self.assertFalse(hasattr(parsed, "candidate_bench_bin"))
+        with mock.patch.object(
+            TOOL, "run_resident_gate", return_value={"status": "failed"}
+        ), mock.patch.object(
+            TOOL, "canonical_bundle_json_bytes", return_value=b'{"status":"failed"}'
+        ), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(TOOL.main(argv), 1)
+        with mock.patch.object(
+            TOOL, "run_resident_gate", side_effect=ValueError("invalid fixture")
+        ), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(TOOL.main(argv), 2)
+        with mock.patch.object(
+            TOOL, "run_resident_gate", side_effect=OSError("child spawn failed")
+        ), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(TOOL.main(argv), 2)
+
+
 class WarmStabilityContractTest(unittest.TestCase):
     def test_freezes_warm_stability_constants_and_accepts_boundary_evidence(self) -> None:
         self.assertEqual(TOOL.WARM_STABILITY_REPETITIONS, 3)

@@ -1185,7 +1185,7 @@ print("[" + ",".join(["0"] * count) + "]")
         with self.assertRaisesRegex(ValueError, "exactly 513 native-template tokens"):
             TOOL.select_rendered_prompt(SEED[:1024], 513, impossible)
 
-    def test_parser_exposes_only_the_two_manifest_commands(self) -> None:
+    def test_parser_exposes_manifest_and_smoke_eval_commands(self) -> None:
         build = TOOL.parse_args([
             "manifest", "build", "--model", "/m", "--output", "/o",
             "--qualification-plan", "/p",
@@ -1196,6 +1196,12 @@ print("[" + ",".join(["0"] * count) + "]")
         self.assertEqual(build.qualification_plan, Path("/p"))
         self.assertEqual(build.trusted_qualification_plan_sha256, "c" * 64)
         self.assertEqual((verify.command, verify.action), ("manifest", "verify"))
+        smoke = TOOL.parse_args([
+            "smoke-eval", "--model", "/m", "--eval-bin", "/e",
+            *sum((["--case-id", case_id] for case_id in TOOL.EVAL_CASE_IDS), []),
+        ])
+        self.assertEqual(smoke.command, "smoke-eval")
+        self.assertEqual(tuple(smoke.case_id), TOOL.EVAL_CASE_IDS)
         for missing in (
             "--qualification-plan",
             "--trusted-qualification-plan-sha256",
@@ -1227,6 +1233,76 @@ print("[" + ",".join(["0"] * count) + "]")
             ])
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
+
+
+class SmokeEvalContractTest(unittest.TestCase):
+    @staticmethod
+    def _record(case_id: str, answer: str = "B") -> dict[str, object]:
+        instance_id = "11111111-1111-1111-1111-111111111111"
+        return {
+            "schema": "ds4.eval.qualification-result/v1",
+            "case_id": case_id,
+            "answer": answer,
+            "grade": "passed",
+            "terminal_status": "completed",
+            "request_metrics": {
+                "schema": "ds4.runtime.request/v1",
+                "instance_id": instance_id,
+            },
+            "runtime_snapshot": {
+                "schema": "ds4.runtime/v1",
+                "instance_id": instance_id,
+            },
+            "evidence_sha256": "a" * 64,
+        }
+
+    def test_runs_resident_then_streamed_and_compares_exact_vectors(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_: object) -> object:
+            calls.append(argv)
+            result = Path(argv[argv.index("--result-jsonl") + 1])
+            result.write_text(
+                "".join(
+                    json.dumps(self._record(case_id), separators=(",", ":")) + "\n"
+                    for case_id in TOOL.EVAL_CASE_IDS
+                ),
+                encoding="utf-8",
+            )
+            return TOOL.subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(TOOL.subprocess, "run", side_effect=fake_run):
+            result = TOOL.run_smoke_eval("/model", "/eval", TOOL.EVAL_CASE_IDS)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("--ssd-streaming", calls[0])
+        self.assertIn("--ssd-streaming", calls[1])
+        for argv in calls:
+            selected = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--case-id"]
+            self.assertEqual(tuple(selected), TOOL.EVAL_CASE_IDS)
+
+    def test_rejects_streamed_result_drift_and_bad_case_order(self) -> None:
+        invocation = 0
+
+        def fake_run(argv: list[str], **_: object) -> object:
+            nonlocal invocation
+            invocation += 1
+            result = Path(argv[argv.index("--result-jsonl") + 1])
+            records = [self._record(case_id) for case_id in TOOL.EVAL_CASE_IDS]
+            if invocation == 2:
+                records[0]["answer"] = "C"
+            result.write_text(
+                "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return TOOL.subprocess.CompletedProcess(argv, 1, "", "")
+
+        with mock.patch.object(TOOL.subprocess, "run", side_effect=fake_run), \
+             self.assertRaisesRegex(ValueError, "vectors differ"):
+            TOOL.run_smoke_eval("/model", "/eval", TOOL.EVAL_CASE_IDS)
+        with self.assertRaisesRegex(ValueError, "manifest order"):
+            TOOL.run_smoke_eval("/model", "/eval", reversed(TOOL.EVAL_CASE_IDS))
 
 
 class WarmStabilityContractTest(unittest.TestCase):

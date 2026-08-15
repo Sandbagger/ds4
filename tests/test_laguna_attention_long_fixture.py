@@ -151,7 +151,7 @@ class LagunaAttentionLongFixtureTest(unittest.TestCase):
                 "value": {
                     "file": "layer-00-v-t0-t511-kv6-kv7.f32",
                     "bytes": 524288,
-                    "sha256": "1b4d52270e650a9c48b4e4a19a400248d69e2e9a882919d22a3bb488bcd5ef7d",
+                    "sha256": "1b4d52270e650a9c48b4e4a19a400248d69d2e9a882919d22a3bb488bcd5ef7d",
                 },
             },
         )

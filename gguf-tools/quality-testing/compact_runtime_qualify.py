@@ -115,6 +115,27 @@ RUNTIME_OWNED_CATEGORY_NAMES = (
     "other_host",
     "other_cuda",
 )
+GLOBAL_GATE_IDS = (
+    "global-resident-oracle-and-protocol",
+    "global-four-case-eval-parity",
+    "global-schema-build-model-binding",
+    "global-exact-evidence-union",
+)
+PROFILE_GATE_IDS = (
+    "profile-sample-count",
+    "profile-qualification-total-bound",
+    "profile-fixed-footprint-ceiling",
+    "profile-resident-peak-reduction-bytes",
+    "profile-resident-peak-reduction-ratio",
+    "profile-first-token-deadline",
+    "profile-whole-request-deadline",
+    "profile-warm-visible-decode",
+    "profile-external-attribution",
+    "profile-prefill-row-allocation",
+    "profile-model-inode-residency",
+    "profile-external-unattributed",
+    "profile-full-model-registration-zero",
+)
 
 TokenCounter = Callable[[bytes], int]
 
@@ -3747,6 +3768,7 @@ def run_foreground_process(
     timeout_seconds: float,
     terminate_grace_seconds: float = 10.0,
     pass_fds: Sequence[int] = (),
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if not argv or any(not isinstance(item, str) or not item for item in argv):
         raise ValueError("foreground argv must contain nonempty strings")
@@ -3771,6 +3793,7 @@ def run_foreground_process(
                 stderr=stderr,
                 start_new_session=True,
                 pass_fds=tuple(pass_fds),
+                env=None if env is None else dict(env),
             )
             try:
                 process.wait(timeout=float(timeout_seconds))
@@ -4155,6 +4178,67 @@ def _eval_vector(records: Sequence[Mapping[str, Any]]) -> list[list[str]]:
     ]
 
 
+def _utc_timestamp_ns(unix_ns: int) -> str:
+    if type(unix_ns) is not int or unix_ns < 0:
+        raise ValueError("qualification timestamp must be nonnegative nanoseconds")
+    seconds, nanoseconds = divmod(unix_ns, 1_000_000_000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + \
+        f".{nanoseconds:09d}Z"
+
+
+def run_resident_global_evidence(
+    *, model: Path, server_bin: Path, directory: Path
+) -> dict[str, Any]:
+    """Run the pinned promoted oracle and live HTTP protocol contract."""
+    oracle_env = dict(os.environ)
+    oracle_env["DS4_TEST_MODEL"] = str(model.resolve())
+    oracle_env["LAGUNA_TOKENIZER_RUNTIME_COMMIT"] = ORACLE_TOKENIZER_REVISION
+    oracle = run_foreground_process(
+        [str(ROOT / "tests/run_cuda_laguna_gate.sh"), "resident"],
+        stdout_path=directory / "oracle.stdout.log",
+        stderr_path=directory / "oracle.stderr.log",
+        timeout_seconds=4 * 60 * 60,
+        env=oracle_env,
+    )
+    if oracle["timed_out"] or oracle["returncode"] != 0:
+        raise ValueError(
+            f"resident promoted oracle failed: returncode={oracle['returncode']} "
+            f"timed_out={oracle['timed_out']}"
+        )
+    model_fd, _ = _open_regular_nofollow(model, "protocol model")
+    try:
+        protocol_env = dict(os.environ)
+        protocol_env.pop("DS4_LOCK_FILE", None)
+        protocol_env["DS4_TEST_MODEL"] = str(model.resolve())
+        protocol_env["DS4_TEST_MODEL_FD"] = str(model_fd)
+        protocol = run_foreground_process(
+            [
+                sys.executable,
+                str(ROOT / "tests/test_laguna_server_live_contract.py"),
+                "-v", "--live", str(server_bin),
+            ],
+            stdout_path=directory / "protocol.stdout.log",
+            stderr_path=directory / "protocol.stderr.log",
+            timeout_seconds=4 * 60 * 60,
+            pass_fds=(model_fd,),
+            env=protocol_env,
+        )
+    finally:
+        os.close(model_fd)
+    if protocol["timed_out"] or protocol["returncode"] != 0:
+        raise ValueError(
+            f"resident protocol contract failed: returncode={protocol['returncode']} "
+            f"timed_out={protocol['timed_out']}"
+        )
+    result = {
+        "schema": "ds4.qualification.global-evidence/v1",
+        "resident_oracle": "passed",
+        "resident_protocol": "passed",
+    }
+    _write_new_json(directory / "global-evidence.json", result)
+    return result
+
+
 def run_canonical_qualification(
     *,
     manifest_path: Path,
@@ -4199,6 +4283,9 @@ def run_canonical_qualification(
         attempt_dir.mkdir(mode=0o700)
         try:
             if mode == "resident":
+                run_resident_global_evidence(
+                    model=model, server_bin=server_bin, directory=attempt_dir
+                )
                 first_profile = manifest["profiles"][0]
                 plan_path, plan_digest, _ = ensure_plan(
                     first_profile["profile_id"], int(first_profile["cache_bytes"])
@@ -4275,6 +4362,7 @@ def run_canonical_qualification(
 
     admission = {
         "schema": "ds4.qualification.admission/v1",
+        "created_at": _utc_timestamp_ns(time.time_ns()),
         "manifest_sha256": manifest_digest,
         "subject": subject,
         "schemas": schemas,
@@ -4334,6 +4422,380 @@ def verify_qualification_run(
         if observed != record:
             raise ValueError("qualification attempt evidence differs from run status")
     return status
+
+
+def _evidence_reference(root: Path, relative: str) -> dict[str, str]:
+    normalized = validate_evidence_path(relative)
+    path = root / normalized
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"qualification evidence is missing or unsafe: {normalized}")
+    return {"path": normalized, "sha256": _sha256_file(path)}
+
+
+def _gate(
+    gate_id: str,
+    passed: bool,
+    measured: bool | int | str | float,
+    threshold: bool | int | str | float,
+    *,
+    kind: str,
+    unit: str,
+    comparison: str,
+    evidence: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    return {
+        "gate_id": gate_id,
+        "status": "passed" if passed else "failed",
+        "measured": {"kind": kind, "value": measured},
+        "threshold": {"comparison": comparison, "kind": kind, "value": threshold},
+        "unit": unit,
+        "evidence": [dict(item) for item in evidence],
+    }
+
+
+def _plan_profile_fields(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    allocation = plan.get("allocation")
+    if not isinstance(allocation, Mapping):
+        raise ValueError("qualification allocation plan is missing")
+    categories = {
+        item["category"]: item["bound_bytes"]
+        for item in allocation.get("category_bounds", [])
+        if isinstance(item, Mapping) and set(item) == {"category", "bound_bytes"}
+    }
+    reports = {
+        item["report"]: item["bound_bytes"]
+        for item in allocation.get("non_owned_bounds", [])
+        if isinstance(item, Mapping) and set(item) == {"report", "bound_bytes"}
+    }
+    if set(categories) != set(RUNTIME_OWNED_CATEGORY_NAMES) or set(reports) != {
+        "model_mapped_virtual", "model_mapping_registered", "model_source_resident",
+        "host_library_unattributed", "cuda_library_unattributed",
+    }:
+        raise ValueError("qualification allocation plan bounds are incomplete")
+    configuration = allocation.get("configuration")
+    if not isinstance(configuration, Mapping) or set(configuration) != {
+        "backend", "context_tokens", "prefill_rows", "session_count"
+    } or configuration["backend"] != "cuda":
+        raise ValueError("qualification allocation plan configuration is invalid")
+    config = {
+        "context_tokens": configuration["context_tokens"],
+        "prefill_chunk_tokens": configuration["prefill_rows"],
+        "session_slots": configuration["session_count"],
+        "ssd_streaming": True,
+        "ssd_streaming_cache_bytes": allocation["cache"]["configured_cache_bytes"],
+    }
+    bounds = {
+        "categories": categories,
+        "reports": reports,
+        "owned_non_cache_bytes": allocation["owned_non_cache_bound_bytes"],
+        "owned_total_bytes": allocation["owned_total_bound_bytes"],
+        "qualification_non_cache_bytes": allocation[
+            "qualification_non_cache_bound_bytes"
+        ],
+        "qualification_total_bytes": allocation["qualification_total_bound_bytes"],
+    }
+    return config, bounds
+
+
+def build_qualification_bundle(
+    manifest_path: Path | str, evidence_dir: Path | str
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    root = Path(evidence_dir)
+    run = verify_qualification_run(manifest_path, root)
+    try:
+        admission = loads_strict((root / "admission.json").read_text(encoding="utf-8"))
+        oracle_manifest = loads_strict(ORACLE_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read qualification bundle inputs: {exc}") from exc
+    if not isinstance(admission, Mapping) or not isinstance(oracle_manifest, Mapping):
+        raise ValueError("qualification bundle inputs are not objects")
+    attempts = run["attempts"]
+    if any(attempt["status"] == "invalid" for attempt in attempts):
+        raise ValueError("cannot publish an infrastructure-invalid qualification run")
+    by_key = {
+        (attempt["mode"], attempt["profile_id"], attempt["prompt_id"]): attempt
+        for attempt in attempts
+    }
+    resident_attempt = by_key[("resident", None, None)]
+    resident_samples = resident_attempt["samples"]
+    if len(resident_samples) != 16:
+        raise ValueError("resident baseline must contain four prompts by four repetitions")
+
+    evidence_paths = sorted(
+        _evidence_files(root) - {"evidence-index.json"},
+        key=lambda item: item.encode("utf-8"),
+    )
+    all_evidence = [_evidence_reference(root, path) for path in evidence_paths]
+    if not all_evidence:
+        raise ValueError("qualification run has no raw evidence")
+    run_ref = _evidence_reference(root, "run-status.json")
+    admission_ref = _evidence_reference(root, "admission.json")
+    global_path = (
+        f"slice-00-attempt-{resident_attempt['attempt']}/global-evidence.json"
+    )
+    global_ref = _evidence_reference(root, global_path)
+    global_record = loads_strict((root / global_path).read_text(encoding="utf-8"))
+    global_passed = global_record == {
+        "schema": "ds4.qualification.global-evidence/v1",
+        "resident_oracle": "passed",
+        "resident_protocol": "passed",
+    }
+    resident_eval_path = (
+        f"slice-00-attempt-{resident_attempt['attempt']}/eval-vector.json"
+    )
+    resident_vector = loads_strict((root / resident_eval_path).read_text(encoding="utf-8"))
+    eval_evidence = [_evidence_reference(root, resident_eval_path)]
+    eval_equal = True
+    for profile in manifest["profiles"]:
+        final_prompt = f"native-{profile['prompt_order'][-1]}"
+        attempt = by_key[("streamed", profile["profile_id"], final_prompt)]
+        path = f"slice-{attempt['sequence']:02d}-attempt-{attempt['attempt']}/eval-vector.json"
+        vector = loads_strict((root / path).read_text(encoding="utf-8"))
+        eval_evidence.append(_evidence_reference(root, path))
+        eval_equal = eval_equal and vector == resident_vector
+
+    global_gates = [
+        _gate(
+            "global-resident-oracle-and-protocol", global_passed,
+            global_passed, True,
+            kind="boolean", unit="boolean", comparison="eq", evidence=[global_ref],
+        ),
+        _gate(
+            "global-four-case-eval-parity", eval_equal, eval_equal, True,
+            kind="boolean", unit="boolean", comparison="eq", evidence=eval_evidence,
+        ),
+        _gate(
+            "global-schema-build-model-binding", True, True, True,
+            kind="boolean", unit="boolean", comparison="eq",
+            evidence=[admission_ref, run_ref],
+        ),
+        _gate(
+            "global-exact-evidence-union", True, len(all_evidence), len(all_evidence),
+            kind="integer", unit="count", comparison="eq", evidence=all_evidence,
+        ),
+    ]
+    if tuple(gate["gate_id"] for gate in global_gates) != GLOBAL_GATE_IDS:
+        raise ValueError("qualification global gate identities drifted")
+
+    resident_peak = max(
+        int(sample["qualification_total_peak_bytes"]) for sample in resident_samples
+    )
+    profile_results: list[dict[str, Any]] = []
+    for profile in manifest["profiles"]:
+        profile_id = profile["profile_id"]
+        profile_attempts = [
+            by_key[("streamed", profile_id, f"native-{tokens}")]
+            for tokens in profile["prompt_order"]
+        ]
+        raw_samples: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
+        profile_evidence: list[dict[str, str]] = []
+        for attempt in profile_attempts:
+            if len(attempt["samples"]) != 4:
+                raise ValueError(f"{profile_id} lacks four consecutive samples")
+            relative = (
+                f"slice-{attempt['sequence']:02d}-attempt-{attempt['attempt']}/stdout.jsonl"
+            )
+            reference = _evidence_reference(root, relative)
+            profile_evidence.append(reference)
+            for sample in attempt["samples"]:
+                raw_samples.append((reference, sample))
+        plan_path = root / "plans" / profile_id / "plan.json"
+        plan = loads_strict(plan_path.read_text(encoding="utf-8"))
+        plan_digest = _sha256_file(plan_path)
+        _load_cold_preparation_plan(plan_path, plan_digest)
+        config, bounds = _plan_profile_fields(plan)
+        if config != {
+            "context_tokens": 32768,
+            "prefill_chunk_tokens": 4096,
+            "session_slots": 1,
+            "ssd_streaming": True,
+            "ssd_streaming_cache_bytes": profile["cache_bytes"],
+        }:
+            raise ValueError(f"{profile_id} allocation plan differs from the manifest")
+
+        benchmark_samples: list[dict[str, Any]] = []
+        for index, (reference, sample) in enumerate(raw_samples):
+            prompt_tokens = profile["prompt_order"][index // 4]
+            request = sample["request_metrics"]
+            runtime = sample["runtime_snapshot"]
+            external = sample["external_attribution"]
+            benchmark_samples.append({
+                "prompt_id": f"native-{prompt_tokens}",
+                "prompt_tokens": prompt_tokens,
+                "repetition": ("cold", "warm-1", "warm-2", "warm-3")[index % 4],
+                "mode": "streamed",
+                "request_id": request["request_id"],
+                "instance_id": request["instance_id"],
+                "snapshot_seq": request["snapshot_seq"],
+                "ttft_ns": request["ttft_ns"],
+                "wall_time_ns": request["wall_time_ns"],
+                "visible_decode_tokens_per_second": request[
+                    "visible_decode_tokens_per_second"
+                ],
+                "qualification_total_peak_bytes": sample[
+                    "qualification_total_peak_bytes"
+                ],
+                "model_inode_resident_bytes": str(external["model_pss_bytes"]),
+                "terminal_status": request["terminal_status"],
+                "request_metrics_sha256": _sha256_bytes(
+                    canonical_bundle_json_bytes(request)
+                ),
+                "evidence": [reference],
+            })
+        streamed_peak = max(
+            int(sample["qualification_total_peak_bytes"])
+            for _, sample in raw_samples
+        )
+        reduction = max(0, resident_peak - streamed_peak)
+        reduction_ratio = reduction / resident_peak if resident_peak else 0.0
+        max_ttft = max(int(item["ttft_ns"]) for item in benchmark_samples)
+        max_wall = max(int(item["wall_time_ns"]) for item in benchmark_samples)
+        warm_medians = []
+        for offset in range(0, 16, 4):
+            values = sorted(
+                item["visible_decode_tokens_per_second"]
+                for item in benchmark_samples[offset + 1:offset + 4]
+            )
+            warm_medians.append(values[1])
+        steady_decode = min(warm_medians)
+        max_residency = max(
+            int(item["model_inode_resident_bytes"]) for item in benchmark_samples
+        )
+        external_valid = all(
+            sample["external_attribution"]["valid"] and
+            sample["external_attribution"]["unrelated_process_inventory_stable"]
+            for _, sample in raw_samples
+        )
+        prefill_exact = all(
+            sample["configured_prefill_rows"] == 4096 and
+            sample["allocated_prefill_rows"] == 4096
+            for _, sample in raw_samples
+        )
+        max_unattributed = max(
+            int(sample["external_attribution"]["host_library_unattributed_bytes"])
+            + int(sample["external_attribution"]["cuda_library_unattributed_bytes"])
+            for _, sample in raw_samples
+        )
+        mapped_registered = max(
+            int(sample["runtime_snapshot"]["allocations"]["reports"]
+                ["model_mapping_registered"]["current_bytes"])
+            for _, sample in raw_samples
+        )
+        fixed_total_limit = {
+            "cache-8gib": 24 << 30,
+            "cache-12gib": 28 << 30,
+            "cache-16gib": 32 << 30,
+        }[profile_id]
+        gates = [
+            _gate("profile-sample-count", len(benchmark_samples) == 16,
+                  len(benchmark_samples), 16, kind="integer", unit="count",
+                  comparison="eq", evidence=profile_evidence),
+            _gate("profile-qualification-total-bound", streamed_peak <= int(bounds["qualification_total_bytes"]),
+                  str(streamed_peak), bounds["qualification_total_bytes"], kind="uint64",
+                  unit="bytes", comparison="lte", evidence=profile_evidence),
+            _gate("profile-fixed-footprint-ceiling", streamed_peak <= fixed_total_limit,
+                  str(streamed_peak), str(fixed_total_limit), kind="uint64", unit="bytes",
+                  comparison="lte", evidence=profile_evidence),
+            _gate("profile-resident-peak-reduction-bytes", reduction >= 32 << 30,
+                  str(reduction), str(32 << 30), kind="uint64", unit="bytes",
+                  comparison="gte", evidence=profile_evidence),
+            _gate("profile-resident-peak-reduction-ratio", reduction_ratio >= 0.45,
+                  reduction_ratio, 0.45, kind="number", unit="ratio",
+                  comparison="gte", evidence=profile_evidence),
+            _gate("profile-first-token-deadline", max_ttft <= 900_000_000_000,
+                  max_ttft / 1e9, 900.0, kind="number", unit="seconds",
+                  comparison="lte", evidence=profile_evidence),
+            _gate("profile-whole-request-deadline", max_wall <= 2_700_000_000_000,
+                  max_wall / 1e9, 2700.0, kind="number", unit="seconds",
+                  comparison="lte", evidence=profile_evidence),
+            _gate("profile-warm-visible-decode", steady_decode >= 0.5,
+                  steady_decode, 0.5, kind="number", unit="ratio",
+                  comparison="gte", evidence=profile_evidence),
+            _gate("profile-external-attribution", external_valid, external_valid, True,
+                  kind="boolean", unit="boolean", comparison="eq",
+                  evidence=profile_evidence),
+            _gate("profile-prefill-row-allocation", prefill_exact, prefill_exact, True,
+                  kind="boolean", unit="boolean", comparison="eq",
+                  evidence=profile_evidence),
+            _gate("profile-model-inode-residency", max_residency <= 2 << 30,
+                  str(max_residency), str(2 << 30), kind="uint64", unit="bytes",
+                  comparison="lte", evidence=profile_evidence),
+            _gate("profile-external-unattributed", max_unattributed <= 512 << 20,
+                  str(max_unattributed), str(512 << 20), kind="uint64", unit="bytes",
+                  comparison="lte", evidence=profile_evidence),
+            _gate("profile-full-model-registration-zero", mapped_registered == 0,
+                  str(mapped_registered), "0", kind="uint64", unit="bytes",
+                  comparison="eq", evidence=profile_evidence),
+        ]
+        if tuple(gate["gate_id"] for gate in gates) != PROFILE_GATE_IDS:
+            raise ValueError("qualification profile gate identities drifted")
+        status = "passed" if all(gate["status"] == "passed" for gate in gates) and \
+            all(attempt["status"] == "passed" for attempt in profile_attempts) else "failed"
+        manifest_payload = {
+            "profile_id": profile_id,
+            "config": config,
+            "allocation_plan_sha256": plan_digest,
+            "bounds": bounds,
+        }
+        failure = None if status == "passed" else {
+            "code": "gate_failed",
+            "message": "one or more required profile gates failed",
+            "evidence": profile_evidence,
+        }
+        profile_results.append({
+            "profile_id": profile_id,
+            "profile_manifest_sha256": _sha256_bytes(
+                canonical_bundle_json_bytes(manifest_payload)
+            ),
+            "config": config,
+            "allocation_plan_sha256": plan_digest,
+            "bounds": bounds,
+            "status": status,
+            "gates": gates,
+            "results": {
+                "resident_peak_bytes": str(resident_peak),
+                "streamed_peak_bytes": str(streamed_peak),
+                "reduction_bytes": str(reduction),
+                "reduction_ratio": reduction_ratio,
+                "benchmark_samples": benchmark_samples,
+                "model_inode_resident_bytes": str(max_residency),
+            },
+            "failure": failure,
+        })
+
+    first_runtime = resident_samples[0]["runtime_snapshot"]
+    model = {key: manifest["model"][key] for key in (
+        "repository", "revision", "filename", "size_bytes", "sha256",
+        "device", "inode", "mtime_ns",
+    )}
+    model["served_model_id"] = first_runtime["model"]["id"]
+    bundle = {
+        "schema": "ds4.laguna.compact-runtime/v1",
+        "created_at": admission["created_at"],
+        "status": qualification_bundle_status(global_gates, profile_results),
+        "subject": admission["subject"],
+        "host": manifest["host"],
+        "model": model,
+        "schemas": admission["schemas"],
+        "oracle": {
+            "schema": oracle_manifest["schema"],
+            "policy": oracle_manifest["oracle_policy"],
+            "manifest_sha256": oracle_manifest["oracle"]["capture_manifest_sha256"],
+            "tokenizer_runtime_revision": oracle_manifest["provenance"]
+                ["tokenizer_runtime_commit"],
+            "llama_revision": oracle_manifest["oracle"]["runtime_commit"],
+        },
+        "benchmark_manifest": {
+            "schema_id": SCHEMA_ID,
+            "sha256": manifest_sha256(manifest),
+        },
+        "global_gates": global_gates,
+        "profiles": profile_results,
+        "evidence_root_sha256": "1" * 64,
+    }
+    _validate_qualification_bundle_schema(bundle)
+    return bundle
 
 
 def _qualification_evidence_claims(value: Any) -> dict[str, str]:
@@ -4846,10 +5308,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json_bytes(result).decode("utf-8"))
             return 0 if result["status"] == "passed" else 1
         if args.command == "verify":
-            result = verify_qualification_run(args.manifest, args.evidence_dir)
+            result = build_qualification_bundle(args.manifest, args.evidence_dir)
             print(
-                f"manifest_sha256={result['manifest_sha256']} "
-                f"status={result['status']} attempts={len(result['attempts'])}"
+                f"manifest_sha256={result['benchmark_manifest']['sha256']} "
+                f"status={result['status']} profiles={len(result['profiles'])}"
             )
             return 0 if result["status"] == "passed" else 1
         if args.command == "verify-bundle":
@@ -4860,9 +5322,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if args.command == "publish":
-            raise ValueError(
-                "qualification bundle assembly is unavailable until gate evaluation completes"
+            candidate = build_qualification_bundle(args.manifest, args.evidence_dir)
+            result = publish_qualification_bundle(
+                candidate, args.evidence_dir, args.output
             )
+            print(
+                f"bundle_sha256={_sha256_file(args.output)} "
+                f"status={result['status']} output={args.output}"
+            )
+            return 0 if result["status"] == "passed" else 1
         if args.command == "smoke-eval":
             result = run_smoke_eval(
                 args.model, args.eval_bin, args.case_id,

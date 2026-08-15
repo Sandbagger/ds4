@@ -1430,6 +1430,49 @@ class QualificationRunnerContractTest(unittest.TestCase):
             "invalid",
         )
 
+    def test_gate_identity_sets_are_closed_stable_and_unique(self) -> None:
+        self.assertEqual(TOOL.GLOBAL_GATE_IDS, (
+            "global-resident-oracle-and-protocol",
+            "global-four-case-eval-parity",
+            "global-schema-build-model-binding",
+            "global-exact-evidence-union",
+        ))
+        self.assertEqual(len(TOOL.PROFILE_GATE_IDS), 13)
+        self.assertEqual(len(set(TOOL.PROFILE_GATE_IDS)), 13)
+        self.assertTrue(all(gate_id.startswith("profile-") for gate_id in TOOL.PROFILE_GATE_IDS))
+
+    def test_allocation_plan_projects_exact_bundle_config_and_bounds(self) -> None:
+        categories = [
+            {"category": name, "bound_bytes": str(index + 1)}
+            for index, name in enumerate(TOOL.RUNTIME_OWNED_CATEGORY_NAMES)
+        ]
+        report_names = (
+            "model_mapped_virtual", "model_mapping_registered", "model_source_resident",
+            "host_library_unattributed", "cuda_library_unattributed",
+        )
+        reports = [
+            {"report": name, "bound_bytes": str(index + 20)}
+            for index, name in enumerate(report_names)
+        ]
+        plan = {"allocation": {
+            "cache": {"configured_cache_bytes": str(8 << 30)},
+            "category_bounds": categories,
+            "non_owned_bounds": reports,
+            "configuration": {
+                "backend": "cuda", "context_tokens": 32768,
+                "prefill_rows": 4096, "session_count": 1,
+            },
+            "owned_non_cache_bound_bytes": "10",
+            "owned_total_bound_bytes": "11",
+            "qualification_non_cache_bound_bytes": "12",
+            "qualification_total_bound_bytes": "13",
+        }}
+        config, bounds = TOOL._plan_profile_fields(plan)
+        self.assertEqual(config["ssd_streaming_cache_bytes"], str(8 << 30))
+        self.assertEqual(config["prefill_chunk_tokens"], 4096)
+        self.assertEqual(bounds["qualification_total_bytes"], "13")
+        self.assertEqual(set(bounds["categories"]), set(TOOL.RUNTIME_OWNED_CATEGORY_NAMES))
+
     def test_binary_admission_hashes_three_clean_matching_cuda_builds(self) -> None:
         version = {
             "schema": "ds4.version/v1",

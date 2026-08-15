@@ -1684,6 +1684,25 @@ class QualificationRunnerContractTest(unittest.TestCase):
             index = TOOL.loads_strict((evidence / "evidence-index.json").read_text(encoding="utf-8"))
             self.assertEqual([entry["path"] for entry in index], ["raw/gate.json"])
 
+    def test_evidence_hashing_ignores_read_induced_atime_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            evidence = Path(name)
+            raw = evidence / "gate.json"
+            raw.write_bytes(b"gate evidence\n")
+            original_hash = TOOL._sha256_file
+
+            def hash_after_atime_change(path: Path) -> str:
+                before = path.stat()
+                os.utime(
+                    path,
+                    ns=(before.st_atime_ns + 1_000_000_000, before.st_mtime_ns),
+                )
+                return original_hash(path)
+
+            with mock.patch.object(TOOL, "_sha256_file", side_effect=hash_after_atime_change):
+                index, _ = TOOL.build_evidence_index(evidence, ("gate.json",))
+            self.assertEqual(index[0]["size_bytes"], str(len(b"gate evidence\n")))
+
     def test_publish_rejects_claim_mismatch_and_verify_rejects_tamper(self) -> None:
         value = self._bundle_fixture()
         with tempfile.TemporaryDirectory() as name:

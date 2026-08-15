@@ -2451,6 +2451,47 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertLess(long_condition_end, streamk_launch)
         self.assertLess(streamk_launch, generic_fallback)
 
+    def test_poolside_q8_streamk_selector_matches_poolside_ties(self) -> None:
+        selector = function_body(
+            "static uint32_t poolside_q8_mmq_tokens_per_tile("
+        )
+        self.assertIn("uint64_t best_tiles = UINT64_MAX;", selector)
+        self.assertIn(
+            "const uint64_t tiles = (n_tokens + choice - 1u) / choice;",
+            selector,
+        )
+        self.assertIn("if (tiles < best_tiles)", selector)
+        self.assertNotIn("if (tiles <= best_tiles)", selector)
+        self.assertIn("best = choice;", selector)
+        self.assertIn("best_tiles = tiles;", selector)
+        self.assertIn("return best;", selector)
+
+        hook = function_body(
+            'extern "C" uint32_t '
+            "ds4_gpu_test_poolside_q8_mmq_tokens_per_tile("
+        )
+        self.assertIn(
+            "return poolside_q8_mmq_tokens_per_tile(n_tokens, fallback);",
+            hook,
+        )
+        self.assertIn(
+            "uint32_t ds4_gpu_test_poolside_q8_mmq_tokens_per_tile(",
+            GPU_HEADER,
+        )
+
+        cases = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_poolside_q8_selector_cases(void)",
+            "Laguna kernel test",
+        )
+        for n_tokens, expected in ((128, 128), (129, 80),
+                                   (512, 128), (513, 112)):
+            self.assertIn(f"{{ {n_tokens}u, {expected}u }}", cases)
+        self.assertIn(
+            "ds4_gpu_test_poolside_q8_mmq_tokens_per_tile(", cases
+        )
+        self.assertIn("cases[i].n_tokens, false", cases)
+
     def test_external_nvml_identity_is_bounded_before_comparison(self) -> None:
         body = function_body(
             "static int cuda_laguna_nvml_snapshot_valid("

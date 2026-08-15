@@ -561,6 +561,9 @@ int ds4_gpu_test_f32_mmvf_microscope_tensor(
         const ds4_gpu_tensor *weight_row,
         const ds4_gpu_tensor *activation,
         uint32_t input_elements);
+uint32_t ds4_gpu_test_poolside_q8_mmq_tokens_per_tile(
+        uint64_t n_tokens,
+        bool fallback);
 int ds4_gpu_test_q4_k_mmvq_microscope_tensor(
         ds4_gpu_tensor *values,
         ds4_gpu_tensor *quantized_input,

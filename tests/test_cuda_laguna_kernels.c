@@ -71,6 +71,31 @@ static int run_f32_to_f16_reference_cases(void) {
     return 0;
 }
 
+static int run_poolside_q8_selector_cases(void) {
+    static const struct {
+        uint64_t n_tokens;
+        uint32_t expected;
+    } cases[] = {
+        { 128u, 128u },
+        { 129u, 80u },
+        { 512u, 128u },
+        { 513u, 112u },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint32_t actual =
+            ds4_gpu_test_poolside_q8_mmq_tokens_per_tile(
+                cases[i].n_tokens, false);
+        if (actual != cases[i].expected) {
+            fprintf(stderr,
+                    "poolside-q8-selector/%llu: got %u expected %u\n",
+                    (unsigned long long)cases[i].n_tokens,
+                    actual, cases[i].expected);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static float reference_f16_to_f32(uint16_t value) {
     const uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
     uint32_t exponent = (value >> 10) & 0x1fu;
@@ -3702,7 +3727,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8-selector|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3717,6 +3742,7 @@ int main(int argc, char **argv) {
          strcmp(argv[2], "q4-l2-frozen") != 0 &&
          strcmp(argv[2], "moe-residual-frozen") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
+         strcmp(argv[2], "poolside-q8-selector") != 0 &&
          strcmp(argv[2], "poolside-q8") != 0 &&
          strcmp(argv[2], "all") != 0)) {
         usage(argv[0]);
@@ -3749,6 +3775,12 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_poolside_q8 = strcmp(argv[2], "poolside-q8") == 0 ||
         strcmp(argv[2], "all") == 0;
+    const bool run_poolside_q8_selector =
+        strcmp(argv[2], "poolside-q8-selector") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    if (run_poolside_q8_selector &&
+        run_poolside_q8_selector_cases() != 0) return 1;
+    if (strcmp(argv[2], "poolside-q8-selector") == 0) return 0;
     if ((run_decode || run_prefill || run_prefill_frozen ||
          run_prefill_long_frozen || run_routed_moe || run_poolside_q8) &&
         run_f32_to_f16_reference_cases() != 0) return 1;

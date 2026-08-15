@@ -10608,11 +10608,31 @@ static uint32_t poolside_q8_mmq_tokens_per_tile(
     const size_t count = fallback ?
         sizeof(ragged) / sizeof(ragged[0]) :
         sizeof(regular) / sizeof(regular[0]);
-    for (size_t i = 0; i < count; i++) {
-        if (n_tokens <= choices[i]) return choices[i];
+
+    /* Poolside 04b2b72 ggml/src/ggml-cuda/mmq.cuh
+     * mul_mat_q_switch_J scans supported J values in ascending order and
+     * replaces J_best only when ceil(n_tokens / J) strictly decreases.
+     * Keeping the first J on a tie is observable at 129 (80, not 128) and
+     * 513 tokens (112, not 128), because Stream-K tile identity uses J. */
+    uint32_t best = choices[0];
+    uint64_t best_tiles = UINT64_MAX;
+    for (size_t i = 0; i < count && best_tiles > 1u; i++) {
+        const uint64_t choice = choices[i];
+        const uint64_t tiles = (n_tokens + choice - 1u) / choice;
+        if (tiles < best_tiles) {
+            best = choice;
+            best_tiles = tiles;
+        }
     }
-    return 128u;
+    return best;
 }
+
+#ifdef DS4_TEST_HOOKS
+extern "C" uint32_t ds4_gpu_test_poolside_q8_mmq_tokens_per_tile(
+        uint64_t n_tokens, bool fallback) {
+    return poolside_q8_mmq_tokens_per_tile(n_tokens, fallback);
+}
+#endif
 
 
 /* ---- INT8 tensor-core exact Q8_0 batch matmul --------------------------

@@ -53,6 +53,9 @@ CORRECTED_MODEL_SIZE = "68248760064"
 CORRECTED_MODEL_SHA256 = (
     "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff"
 )
+CORRECTED_ORACLE_TOKENIZER_REVISION = (
+    "c204ee02e9a68b69f80a7a830bdb05d0be8ab519"
+)
 OLD_MODEL_IDENTITY = {
     "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
     "size_bytes": "68248759648",
@@ -73,7 +76,7 @@ MODEL_IDENTITY = {
 
 RUNTIME_IDENTITY = {
     "source_revision": "a" * 40,
-    "oracle_tokenizer_revision": "15c9b92502fed6bc26842e98d11a6347caadb08e",
+    "oracle_tokenizer_revision": CORRECTED_ORACLE_TOKENIZER_REVISION,
     "executable_path": "/src/ds4/ds4",
     "executable_sha256": "b" * 64,
     "device": "16777234",
@@ -762,6 +765,10 @@ class CompactRuntimeManifestContractTest(unittest.TestCase):
         self.assertEqual(TOOL.MODEL_REVISION, CORRECTED_MODEL_REVISION)
         self.assertEqual(str(TOOL.MODEL_SIZE), CORRECTED_MODEL_SIZE)
         self.assertEqual(TOOL.MODEL_SHA256, CORRECTED_MODEL_SHA256)
+        self.assertEqual(
+            TOOL.ORACLE_TOKENIZER_REVISION,
+            CORRECTED_ORACLE_TOKENIZER_REVISION,
+        )
         self.assertEqual(self.manifest["host"], HOST_IDENTITY)
         TOOL.validate_manifest(self.manifest)
 

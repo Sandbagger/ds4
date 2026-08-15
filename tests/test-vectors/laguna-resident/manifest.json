@@ -83081,23 +83081,23 @@
   "model": {
     "filename": "laguna-s-2.1-Q4_K_M.gguf",
     "repository": "poolside/Laguna-S-2.1-GGUF",
-    "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
-    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
-    "size": 68248759648
+    "revision": "e2ccc0579fc18e6ea2362fa25fccbcd470f0e332",
+    "sha256": "a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff",
+    "size": 68248760064
   },
   "oracle": {
-    "capture_manifest_sha256": "cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e",
+    "capture_manifest_sha256": "94c1cb43859c25e63799005a25d47a12cb414517d48268fd2938efe5472dd499",
     "name": "poolside-llama",
     "runtime_commit": "04b2b72cb54048ead292884adbe11f284e3ec950"
   },
   "oracle_policy": "single-poolside-v1",
   "provenance": {
     "benchmark_sha256": "aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206",
-    "contract_commit": "a250e43722945e293f6044bc7254c4806d5a7912",
+    "contract_commit": "c51af8bbf177e2448d6c4fa2c4396e5be038349e",
     "ds4_seed_token_count": 61440,
     "generator_sha256": "118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d",
     "poolside_seed_token_count": 61440,
-    "tokenizer_runtime_commit": "15c9b92502fed6bc26842e98d11a6347caadb08e"
+    "tokenizer_runtime_commit": "c204ee02e9a68b69f80a7a830bdb05d0be8ab519"
   },
   "schema": "laguna-resident-promoted-v2",
   "thresholds": {

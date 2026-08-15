@@ -7,11 +7,11 @@ verifier="$repo_root/gguf-tools/quality-testing/compare_laguna_logits.py"
 verifier_module_dir="$repo_root/gguf-tools/quality-testing"
 fixture="$repo_root/tests/test-vectors/laguna-resident"
 
-pinned_size=68248759648
-pinned_sha256=e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
-pinned_contract=a250e43722945e293f6044bc7254c4806d5a7912
+pinned_size=68248760064
+pinned_sha256=a34c74e46688122bef83122f4133031bababbefcf57436dde97048c91e2cc6ff
+pinned_contract=c51af8bbf177e2448d6c4fa2c4396e5be038349e
 pinned_llama=04b2b72cb54048ead292884adbe11f284e3ec950
-pinned_capture=cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e
+pinned_capture=94c1cb43859c25e63799005a25d47a12cb414517d48268fd2938efe5472dd499
 production_lock_path=/tmp/ds4.lock
 
 die() {

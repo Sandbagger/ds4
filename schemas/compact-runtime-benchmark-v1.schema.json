@@ -397,7 +397,7 @@
       "required": ["source_revision", "oracle_tokenizer_revision", "executable_path", "executable_sha256", "device", "inode", "size_bytes", "mtime_ns", "token_dump_argv"],
       "properties": {
         "source_revision": { "$ref": "#/$defs/revision" },
-        "oracle_tokenizer_revision": { "const": "15c9b92502fed6bc26842e98d11a6347caadb08e" },
+        "oracle_tokenizer_revision": { "const": "c204ee02e9a68b69f80a7a830bdb05d0be8ab519" },
         "executable_path": { "$ref": "#/$defs/identity" },
         "executable_sha256": { "$ref": "#/$defs/sha256" },
         "device": { "$ref": "#/$defs/positive_uint64" },

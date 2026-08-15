@@ -19,7 +19,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tests/run_cuda_laguna_gate.sh"
+ACTIVE_FIXTURE = ROOT / "tests/test-vectors/laguna-resident/manifest.json"
 PINNED_TOKENIZER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+ACTIVE_TOKENIZER_COMMIT = "c204ee02e9a68b69f80a7a830bdb05d0be8ab519"
 ISOLATED_FIXTURE_VARIABLES = (
     "DS4_LAGUNA_GATE_TEST_CHILD_DIR",
     "DS4_LAGUNA_GATE_TEST_EXPECTED_SIZE",
@@ -315,6 +317,28 @@ def cold_prepare_descriptor_from_plan(descriptor, plan_path, expected_sha256):
 
 
 class LagunaGateRunnerTest(unittest.TestCase):
+    def test_production_pins_match_active_oracle_manifest(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        manifest = json.loads(ACTIVE_FIXTURE.read_text(encoding="utf-8"))
+        expected = {
+            "pinned_size": str(manifest["model"]["size"]),
+            "pinned_sha256": manifest["model"]["sha256"],
+            "pinned_contract": manifest["provenance"]["contract_commit"],
+            "pinned_llama": manifest["oracle"]["runtime_commit"],
+            "pinned_capture": manifest["oracle"]["capture_manifest_sha256"],
+        }
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    source.count(f"{name}={value}\n"),
+                    1,
+                    f"{name} must match the active oracle manifest exactly once",
+                )
+        self.assertEqual(
+            manifest["provenance"]["tokenizer_runtime_commit"],
+            ACTIVE_TOKENIZER_COMMIT,
+        )
+
     def test_c7_cold_prepares_exact_fd_before_compact_model_children(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("cold_prepare_retained_fd()", source)

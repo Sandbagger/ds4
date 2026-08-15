@@ -3527,7 +3527,7 @@ def build_evidence_index(
         before = path.stat(follow_symlinks=False)
         digest = _sha256_file(path)
         after = path.stat(follow_symlinks=False)
-        if before != after:
+        if not _same_stat(before, after):
             raise ValueError(f"evidence changed while hashing: {relative}")
         index.append({
             "path": relative,

@@ -19,6 +19,7 @@ import platform
 import posixpath
 import re
 import select
+import signal
 import socket
 import stat
 import struct
@@ -3728,6 +3729,74 @@ def bind_qualification_binaries(
         "dirty": False,
         "version_sha256": _sha256_bytes(canonical_json_bytes(version)),
         "binaries": binaries,
+    }
+
+
+def run_foreground_process(
+    argv: Sequence[str],
+    *,
+    stdout_path: Path | str,
+    stderr_path: Path | str,
+    timeout_seconds: float,
+    terminate_grace_seconds: float = 10.0,
+    pass_fds: Sequence[int] = (),
+) -> dict[str, Any]:
+    if not argv or any(not isinstance(item, str) or not item for item in argv):
+        raise ValueError("foreground argv must contain nonempty strings")
+    for label, duration in (
+        ("timeout", timeout_seconds), ("terminate grace", terminate_grace_seconds)
+    ):
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or \
+           not math.isfinite(float(duration)) or duration <= 0:
+            raise ValueError(f"foreground {label} must be finite and positive")
+    out_path = Path(stdout_path)
+    err_path = Path(stderr_path)
+    if out_path == err_path:
+        raise ValueError("foreground stdout and stderr evidence paths must differ")
+    process: subprocess.Popen[bytes] | None = None
+    timed_out = False
+    with out_path.open("xb") as stdout, err_path.open("xb") as stderr:
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+                pass_fds=tuple(pass_fds),
+            )
+            try:
+                process.wait(timeout=float(timeout_seconds))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=float(terminate_grace_seconds))
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+        finally:
+            stdout.flush()
+            stderr.flush()
+            os.fsync(stdout.fileno())
+            os.fsync(stderr.fileno())
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+    return {
+        "returncode": process.returncode if process is not None else None,
+        "timed_out": timed_out,
+        "stdout_path": out_path.as_posix(),
+        "stderr_path": err_path.as_posix(),
     }
 
 

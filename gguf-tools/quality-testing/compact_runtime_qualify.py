@@ -4077,6 +4077,117 @@ def run_smoke_eval(
     }
 
 
+def validate_benchmark_transcript(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    manifest_sha256_value: str,
+    resident_mode: bool,
+    ttft_timeout_seconds: float,
+    request_timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    """Validate the flushed four-repetition qualification transcript."""
+    manifest_digest = _sha256(
+        manifest_sha256_value, "qualification transcript manifest SHA-256"
+    )
+    if type(resident_mode) is not bool:
+        raise ValueError("qualification transcript resident mode must be boolean")
+    for label, value in (
+        ("TTFT", ttft_timeout_seconds), ("request", request_timeout_seconds)
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+           not math.isfinite(float(value)) or value <= 0:
+            raise ValueError(f"qualification {label} timeout must be finite and positive")
+    ttft_limit_ns = int(float(ttft_timeout_seconds) * 1_000_000_000)
+    request_limit_ns = int(float(request_timeout_seconds) * 1_000_000_000)
+    position = 0
+    samples: list[dict[str, Any]] = []
+    child_instance: str | None = None
+    milestone_keys = {
+        "schema", "milestone", "repetition_index", "request_id",
+        "accepted_monotonic_ns", "monotonic_ns",
+    }
+    for repetition in range(4):
+        milestones: dict[str, Mapping[str, Any]] = {}
+        request_id: str | None = None
+        accepted: int | None = None
+        for expected in ("request_accepted", "first_token", "request_complete"):
+            if position >= len(records):
+                raise ValueError("qualification transcript is missing ordered milestones")
+            record = records[position]
+            position += 1
+            if not isinstance(record, Mapping) or set(record) != milestone_keys or \
+               record.get("schema") != "ds4.bench.qualification-milestone/v1" or \
+               record.get("milestone") != expected or \
+               record.get("repetition_index") != repetition:
+                raise ValueError("qualification transcript milestone order is invalid")
+            for key in ("accepted_monotonic_ns", "monotonic_ns"):
+                if type(record[key]) is not int or record[key] < 0 or record[key] > UINT64_MAX:
+                    raise ValueError(f"qualification transcript {key} is invalid")
+            if request_id is None:
+                request_id = record["request_id"]
+                accepted = record["accepted_monotonic_ns"]
+            if not isinstance(record["request_id"], str) or not record["request_id"] or \
+               record["request_id"] != request_id or \
+               record["accepted_monotonic_ns"] != accepted or \
+               record["monotonic_ns"] < accepted:
+                raise ValueError("qualification transcript request identity or clock regressed")
+            milestones[expected] = record
+            if expected == "first_token" and record["monotonic_ns"] - accepted > ttft_limit_ns:
+                raise ValueError("qualification TTFT deadline exceeded")
+            if expected == "request_complete" and \
+               record["monotonic_ns"] - accepted > request_limit_ns:
+                raise ValueError("qualification whole-request deadline exceeded")
+        if position >= len(records):
+            raise ValueError("qualification transcript is missing a sample")
+        raw_sample = records[position]
+        position += 1
+        if not isinstance(raw_sample, Mapping):
+            raise ValueError("qualification transcript sample is not an object")
+        sample = dict(raw_sample)
+        required = {
+            "schema", "milestone", "repetition_index", "request_id",
+            "accepted_monotonic_ns", "monotonic_ns", "manifest_sha256",
+            "resident_mode", "request_metrics", "runtime_snapshot",
+        }
+        if not required.issubset(sample) or \
+           sample.get("schema") != "ds4.bench.qualification-sample/v1" or \
+           sample.get("milestone") != "request_complete" or \
+           sample.get("repetition_index") != repetition or \
+           sample.get("request_id") != request_id or \
+           sample.get("accepted_monotonic_ns") != accepted or \
+           sample.get("manifest_sha256") != manifest_digest or \
+           sample.get("resident_mode") is not resident_mode:
+            raise ValueError("qualification transcript sample identity is invalid")
+        request = sample["request_metrics"]
+        runtime = sample["runtime_snapshot"]
+        if not isinstance(request, Mapping) or not isinstance(runtime, Mapping) or \
+           request.get("schema") != "ds4.runtime.request/v1" or \
+           runtime.get("schema") != "ds4.runtime/v1" or \
+           request.get("request_id") != request_id or \
+           request.get("instance_id") != runtime.get("instance_id") or \
+           request.get("terminal_status") != "completed":
+            raise ValueError("qualification transcript runtime/request evidence is invalid")
+        instance = request.get("instance_id")
+        if not isinstance(instance, str) or not instance:
+            raise ValueError("qualification transcript instance identity is invalid")
+        if child_instance is None:
+            child_instance = instance
+        elif instance != child_instance:
+            raise ValueError("qualification samples are not from the same child instance")
+        for key, limit, label in (
+            ("ttft_ns", ttft_limit_ns, "TTFT"),
+            ("wall_time_ns", request_limit_ns, "whole-request"),
+        ):
+            value = request.get(key)
+            if not isinstance(value, str) or not DECIMAL_RE.fullmatch(value) or \
+               int(value) > limit:
+                raise ValueError(f"qualification {label} deadline exceeded")
+        samples.append(sample)
+    if position != len(records):
+        raise ValueError("qualification transcript has trailing or duplicate records")
+    return samples
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -4103,6 +4214,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     smoke_eval.add_argument("--eval-bin", required=True, type=Path)
     smoke_eval.add_argument("--case-id", action="append", required=True)
     smoke_eval.add_argument("--timeout-seconds", type=float, default=4 * 60 * 60)
+    run = commands.add_parser("run", help="run the immutable Laguna qualification")
+    run.add_argument("--manifest", required=True, type=Path)
+    run.add_argument("--model", required=True, type=Path)
+    run.add_argument("--server-bin", required=True, type=Path)
+    run.add_argument("--bench-bin", required=True, type=Path)
+    run.add_argument("--eval-bin", required=True, type=Path)
+    run.add_argument("--evidence-dir", required=True, type=Path)
+    verify_run = commands.add_parser("verify", help="verify qualification evidence")
+    verify_run.add_argument("--manifest", required=True, type=Path)
+    verify_run.add_argument("--evidence-dir", required=True, type=Path)
+    publish = commands.add_parser("publish", help="publish a verified qualification bundle")
+    publish.add_argument("--manifest", required=True, type=Path)
+    publish.add_argument("--evidence-dir", required=True, type=Path)
+    publish.add_argument("--output", required=True, type=Path)
+    verify_bundle = commands.add_parser(
+        "verify-bundle", help="independently verify a published qualification bundle"
+    )
+    verify_bundle.add_argument("bundle", type=Path)
     return parser.parse_args(argv)
 
 

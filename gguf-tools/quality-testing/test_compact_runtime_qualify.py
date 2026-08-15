@@ -1550,6 +1550,7 @@ class QualificationRunnerContractTest(unittest.TestCase):
 
         changed = copy.deepcopy(records)
         changed[-1]["request_metrics"]["instance_id"] = "33333333-3333-3333-3333-333333333333"
+        changed[-1]["runtime_snapshot"]["instance_id"] = "33333333-3333-3333-3333-333333333333"
         with self.assertRaisesRegex(ValueError, "same child instance"):
             TOOL.validate_benchmark_transcript(
                 changed,

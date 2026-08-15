@@ -3067,12 +3067,90 @@ class CudaBuildContractTest(unittest.TestCase):
         ):
             with self.subTest(callback=callback):
                 self.assertIn(f'{{"{callback}", "{stage}"', poolside_probe)
-        self.assertIn("detail_checkpoints=24", poolside_probe)
+        self.assertIn("options.detail_layer == 0 ? 12 : 24", poolside_probe)
+        self.assertIn("detail_checkpoints=%d", poolside_probe)
 
         self.assertIn("static uint32_t detail_head_count(", ds4_probe)
         self.assertIn("detail_layer % 4 == 0 ? 48u : 72u", ds4_probe)
         self.assertIn('"layer-%02d-attn-gated.f32"', ds4_probe)
         self.assertIn("artifact_bytes(artifact, detail_layer)", ds4_probe)
+        self.assertIn(
+            "if (detail_layer == 0 && artifact->routed_only) continue;",
+            ds4_probe,
+        )
+        self.assertIn(
+            "if (state.detail_layer == 0 && checkpoint.routed_only) continue;",
+            poolside_probe,
+        )
+        for callback in (
+            "ffn_moe_logits",
+            "ffn_moe_topk",
+            "ffn_moe_weights_scaled",
+            "ffn_moe_gate",
+            "ffn_moe_up",
+            "ffn_moe_swiglu",
+            "ffn_moe_col_l2",
+            "ffn_moe_down_input",
+            "ffn_moe_down",
+            "ffn_moe_weighted",
+            "ffn_moe_out",
+            "ffn_shexp",
+        ):
+            with self.subTest(routed_callback=callback):
+                self.assertRegex(
+                    poolside_probe,
+                    rf'\{{"{callback}",[^\n]+,\s*(?:false|true),\s*true\}},',
+                )
+        for callback in ("attn_norm", "ffn_inp", "ffn_norm", "ffn_out"):
+            with self.subTest(dense_callback=callback):
+                line = next(
+                    line
+                    for line in poolside_probe.splitlines()
+                    if line.lstrip().startswith(f'{{"{callback}"')
+                )
+                self.assertFalse(line.rstrip().endswith("true},"), line)
+
+        for stage in (
+            "router-logits.f32",
+            "router-selected.i32",
+            "router-weights.f32",
+            "ffn-moe-input.q8_1",
+            "ffn-moe-gate.f32",
+            "ffn-moe-up.f32",
+            "ffn-moe-swiglu.f32",
+            "ffn-moe-col-l2.f32",
+            "ffn-moe-down-input.f32",
+            "ffn-moe-down-input.q8_1",
+            "ffn-moe-down.f32",
+            "ffn-moe-weighted.f32",
+            "ffn-moe-out.f32",
+            "ffn-shared-out.f32",
+        ):
+            with self.subTest(routed_artifact=stage):
+                self.assertRegex(
+                    ds4_probe,
+                    rf'\{{"layer-%02d-{re.escape(stage)}",[^\n]+,\s*1\}},',
+                )
+        for stage in ("attn-norm.f32", "ffn-inp.f32", "ffn-norm.f32", "ffn-out.f32"):
+            with self.subTest(dense_artifact=stage):
+                self.assertRegex(
+                    ds4_probe,
+                    rf'\{{"layer-%02d-{re.escape(stage)}",[^\n]+,\s*0\}},',
+                )
+        self.assertIn("int token_count = 1;", poolside_probe)
+        self.assertIn('if (value == "1") return 1;', poolside_probe)
+        self.assertNotIn('if (value == "22")', poolside_probe)
+
+        diag_parser = source_function_body(
+            DS4_SOURCE,
+            "int ds4_test_laguna_graph_diag_detail_layer(void)",
+            "ds4.c",
+        )
+        self.assertIn(
+            "parsed >= (long)DS4_SHAPE_LAGUNA_S21.n_layer",
+            diag_parser,
+        )
+        self.assertIn("must be in the range 0..47", diag_parser)
 
         gate_up = function_body(
             "__global__ static void glm_poolside_q4_gate_up_kernel("

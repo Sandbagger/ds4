@@ -76,6 +76,7 @@ uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
+int ds4_test_laguna_graph_diag_detail_layer(void);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -518,6 +519,42 @@ static void restore_env_value(const char *name, char *saved) {
     }
 }
 
+static void test_laguna_graph_diag_detail_layer_parser(void) {
+    fprintf(stderr, "RUN: test_laguna_graph_diag_detail_layer_parser\n");
+    char *old_dir = save_env_value("DS4_LAGUNA_DIAG_DIR");
+    char *old_layer = save_env_value("DS4_LAGUNA_DIAG_LAYER");
+
+    CHECK(setenv("DS4_LAGUNA_DIAG_DIR", "/tmp/ds4-diag-parser-test", 1) == 0,
+          "diagnostic parser test sets directory");
+    const struct {
+        const char *value;
+        int expected;
+    } cases[] = {
+        {"0", 0}, {"1", 1}, {"4", 4}, {"47", 47},
+        {"-1", -1}, {"48", -1}, {"4x", -1}, {"", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CHECK(setenv("DS4_LAGUNA_DIAG_LAYER", cases[i].value, 1) == 0,
+              "diagnostic parser test sets layer");
+        CHECK(ds4_test_laguna_graph_diag_detail_layer() == cases[i].expected,
+              "diagnostic parser accepts only layers 0..47");
+    }
+
+    CHECK(unsetenv("DS4_LAGUNA_DIAG_LAYER") == 0,
+          "diagnostic parser test clears layer");
+    CHECK(ds4_test_laguna_graph_diag_detail_layer() == 0,
+          "missing diagnostic layer retains layer-zero default");
+    CHECK(unsetenv("DS4_LAGUNA_DIAG_DIR") == 0,
+          "diagnostic parser test clears directory");
+    CHECK(setenv("DS4_LAGUNA_DIAG_LAYER", "4", 1) == 0,
+          "diagnostic parser test restores a layer without a directory");
+    CHECK(ds4_test_laguna_graph_diag_detail_layer() == 0,
+          "disabled diagnostics ignore the layer selector");
+
+    restore_env_value("DS4_LAGUNA_DIAG_LAYER", old_layer);
+    restore_env_value("DS4_LAGUNA_DIAG_DIR", old_dir);
+}
+
 static void test_cuda_tp_prefill_default_accounting(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_default_accounting\n");
 
@@ -649,6 +686,7 @@ int main(void) {
     test_pertier_overhead_pushes_to_spill();
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
+    test_laguna_graph_diag_detail_layer_parser();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
 

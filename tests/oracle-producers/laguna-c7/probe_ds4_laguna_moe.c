@@ -38,36 +38,37 @@ typedef struct {
     const char *name;
     uint64_t bytes;
     uint64_t bytes_per_head;
+    int routed_only;
 } expected_artifact;
 
 static const expected_artifact EXPECTED_ARTIFACTS[] = {
-    {"layer-%02d-attn-norm.f32", 3072u * 4u, 0},
-    {"layer-%02d-q-proj.f32", 0, 128u * 4u},
-    {"layer-%02d-k-proj.f32", 1024u * 4u, 0},
-    {"layer-%02d-v-proj.f32", 1024u * 4u, 0},
-    {"layer-%02d-gate-proj.f32", 0, 4u},
-    {"layer-%02d-q-rope.f32", 0, 128u * 4u},
-    {"layer-%02d-k-rope.f32", 1024u * 4u, 0},
-    {"layer-%02d-attn-gated.f32", 0, 128u * 4u},
-    {"layer-%02d-attn-o-proj.f32", 3072u * 4u, 0},
-    {"layer-%02d-ffn-inp.f32", 3072u * 4u, 0},
-    {"layer-%02d-ffn-norm.f32", 3072u * 4u, 0},
-    {"layer-%02d-router-logits.f32", 256u * 4u, 0},
-    {"layer-%02d-router-selected.i32", 10u * 4u, 0},
-    {"layer-%02d-router-weights.f32", 10u * 4u, 0},
-    {"layer-%02d-ffn-moe-input.q8_1", 3456u, 0},
-    {"layer-%02d-ffn-moe-gate.f32", 10u * 1024u * 4u, 0},
-    {"layer-%02d-ffn-moe-up.f32", 10u * 1024u * 4u, 0},
-    {"layer-%02d-ffn-moe-swiglu.f32", 10u * 1024u * 4u, 0},
-    {"layer-%02d-ffn-moe-col-l2.f32", 10u * 4u, 0},
-    {"layer-%02d-ffn-moe-down-input.f32", 10u * 1024u * 4u, 0},
-    {"layer-%02d-ffn-moe-down-input.q8_1", 10u * 1024u / 32u * 36u, 0},
-    {"layer-%02d-ffn-moe-down.f32", 10u * 3072u * 4u, 0},
-    {"layer-%02d-ffn-moe-weighted.f32", 10u * 3072u * 4u, 0},
-    {"layer-%02d-ffn-moe-out.f32", 3072u * 4u, 0},
-    {"layer-%02d-ffn-shared-out.f32", 3072u * 4u, 0},
-    {"layer-%02d-ffn-out.f32", 3072u * 4u, 0},
-    {"layer-%02d.f32", 3072u * 4u, 0},
+    {"layer-%02d-attn-norm.f32", 3072u * 4u, 0, 0},
+    {"layer-%02d-q-proj.f32", 0, 128u * 4u, 0},
+    {"layer-%02d-k-proj.f32", 1024u * 4u, 0, 0},
+    {"layer-%02d-v-proj.f32", 1024u * 4u, 0, 0},
+    {"layer-%02d-gate-proj.f32", 0, 4u, 0},
+    {"layer-%02d-q-rope.f32", 0, 128u * 4u, 0},
+    {"layer-%02d-k-rope.f32", 1024u * 4u, 0, 0},
+    {"layer-%02d-attn-gated.f32", 0, 128u * 4u, 0},
+    {"layer-%02d-attn-o-proj.f32", 3072u * 4u, 0, 0},
+    {"layer-%02d-ffn-inp.f32", 3072u * 4u, 0, 0},
+    {"layer-%02d-ffn-norm.f32", 3072u * 4u, 0, 0},
+    {"layer-%02d-router-logits.f32", 256u * 4u, 0, 1},
+    {"layer-%02d-router-selected.i32", 10u * 4u, 0, 1},
+    {"layer-%02d-router-weights.f32", 10u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-input.q8_1", 3456u, 0, 1},
+    {"layer-%02d-ffn-moe-gate.f32", 10u * 1024u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-up.f32", 10u * 1024u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-swiglu.f32", 10u * 1024u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-col-l2.f32", 10u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-down-input.f32", 10u * 1024u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-down-input.q8_1", 10u * 1024u / 32u * 36u, 0, 1},
+    {"layer-%02d-ffn-moe-down.f32", 10u * 3072u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-weighted.f32", 10u * 3072u * 4u, 0, 1},
+    {"layer-%02d-ffn-moe-out.f32", 3072u * 4u, 0, 1},
+    {"layer-%02d-ffn-shared-out.f32", 3072u * 4u, 0, 1},
+    {"layer-%02d-ffn-out.f32", 3072u * 4u, 0, 0},
+    {"layer-%02d.f32", 3072u * 4u, 0, 0},
 };
 
 static uint32_t detail_head_count(int detail_layer) {
@@ -271,6 +272,7 @@ static int verify_artifacts(const char *directory, int detail_layer) {
          i < sizeof(EXPECTED_ARTIFACTS) / sizeof(EXPECTED_ARTIFACTS[0]);
          i++) {
         const expected_artifact *artifact = &EXPECTED_ARTIFACTS[i];
+        if (detail_layer == 0 && artifact->routed_only) continue;
         if (!format_artifact_name(
                 name, sizeof(name), artifact, detail_layer)) return 0;
         const uint64_t expected_bytes = artifact_bytes(artifact, detail_layer);

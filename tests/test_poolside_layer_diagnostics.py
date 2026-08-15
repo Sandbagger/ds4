@@ -85,8 +85,10 @@ class PoolsideLayerDiagnosticsTest(unittest.TestCase):
         self.assertIn("state.detail_layer", probe_source)
 
         self.assertIn('getenv("DS4_LAGUNA_DIAG_LAYER")', ds4_source)
+        self.assertIn("DS4_LAGUNA_DIAG_LAYER", ds4_source)
+        self.assertIn("must be in the range 0..47", ds4_source)
         self.assertIn(
-            "DS4_LAGUNA_DIAG_LAYER must be 0 or 1",
+            "parsed >= (long)DS4_SHAPE_LAGUNA_S21.n_layer",
             ds4_source,
         )
         self.assertIn("laguna_graph_diag_detail_layer", ds4_source)

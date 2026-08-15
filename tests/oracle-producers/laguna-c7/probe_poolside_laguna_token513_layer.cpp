@@ -36,7 +36,7 @@ struct Options {
     fs::path out;
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     int detail_layer = 1;
-    int token_count = kMaxTokens;
+    int token_count = 1;
 };
 
 static void usage(FILE *stream, const char *program) {
@@ -44,7 +44,7 @@ static void usage(FILE *stream, const char *program) {
         stream,
         "Usage: %s --model MODEL --tokens TOKENS.i32 --out DIR "
         "[--flash-attn auto|disabled] [--detail-layer 0..47] "
-        "[--token-count 1|22]\n",
+        "[--token-count 1]\n",
         program);
 }
 
@@ -61,8 +61,7 @@ static int parse_detail_layer(const std::string &value) {
 
 static int parse_token_count(const std::string &value) {
     if (value == "1") return 1;
-    if (value == "22") return kMaxTokens;
-    fail("--token-count must be 1 or 22");
+    fail("--token-count must be 1 for the token-513 resume capture");
 }
 
 static Options parse_options(int argc, char **argv) {
@@ -226,6 +225,7 @@ struct DetailTarget {
     int64_t ne1;
     int64_t ne2;
     bool i32 = false;
+    bool routed_only = false;
 };
 
 static constexpr std::array<DetailTarget, 24> kDetailTargets = {{
@@ -240,18 +240,18 @@ static constexpr std::array<DetailTarget, 24> kDetailTargets = {{
     {"attn_o_proj", "attn-o-proj", DetailLayout::fixed, 3072, -1, 1},
     {"ffn_inp", "ffn-inp", DetailLayout::fixed, 3072, -1, 1},
     {"ffn_norm", "ffn-norm", DetailLayout::fixed, 3072, -1, 1},
-    {"ffn_moe_logits", "router-logits", DetailLayout::fixed, 256, -1, 1},
-    {"ffn_moe_topk", "router-selected", DetailLayout::fixed, 10, -1, 1, true},
-    {"ffn_moe_weights_scaled", "router-weights", DetailLayout::fixed, 1, 10, -1},
-    {"ffn_moe_gate", "ffn-moe-gate", DetailLayout::fixed, 1024, 10, -1},
-    {"ffn_moe_up", "ffn-moe-up", DetailLayout::fixed, 1024, 10, -1},
-    {"ffn_moe_swiglu", "ffn-moe-swiglu", DetailLayout::fixed, 1024, 10, -1},
-    {"ffn_moe_col_l2", "ffn-moe-col-l2", DetailLayout::fixed, 1, 10, -1},
-    {"ffn_moe_down_input", "ffn-moe-down-input", DetailLayout::fixed, 1024, 10, -1},
-    {"ffn_moe_down", "ffn-moe-down", DetailLayout::fixed, 3072, 10, -1},
-    {"ffn_moe_weighted", "ffn-moe-weighted", DetailLayout::fixed, 3072, 10, -1},
-    {"ffn_moe_out", "ffn-moe-out", DetailLayout::fixed, 3072, -1, 1},
-    {"ffn_shexp", "ffn-shared-out", DetailLayout::fixed, 3072, -1, 1},
+    {"ffn_moe_logits", "router-logits", DetailLayout::fixed, 256, -1, 1, false, true},
+    {"ffn_moe_topk", "router-selected", DetailLayout::fixed, 10, -1, 1, true, true},
+    {"ffn_moe_weights_scaled", "router-weights", DetailLayout::fixed, 1, 10, -1, false, true},
+    {"ffn_moe_gate", "ffn-moe-gate", DetailLayout::fixed, 1024, 10, -1, false, true},
+    {"ffn_moe_up", "ffn-moe-up", DetailLayout::fixed, 1024, 10, -1, false, true},
+    {"ffn_moe_swiglu", "ffn-moe-swiglu", DetailLayout::fixed, 1024, 10, -1, false, true},
+    {"ffn_moe_col_l2", "ffn-moe-col-l2", DetailLayout::fixed, 1, 10, -1, false, true},
+    {"ffn_moe_down_input", "ffn-moe-down-input", DetailLayout::fixed, 1024, 10, -1, false, true},
+    {"ffn_moe_down", "ffn-moe-down", DetailLayout::fixed, 3072, 10, -1, false, true},
+    {"ffn_moe_weighted", "ffn-moe-weighted", DetailLayout::fixed, 3072, 10, -1, false, true},
+    {"ffn_moe_out", "ffn-moe-out", DetailLayout::fixed, 3072, -1, 1, false, true},
+    {"ffn_shexp", "ffn-shared-out", DetailLayout::fixed, 3072, -1, 1, false, true},
     {"ffn_out", "ffn-out", DetailLayout::fixed, 3072, -1, 1},
 }};
 
@@ -579,8 +579,10 @@ static void require_complete_capture(const ProbeState &state) {
         }
     }
     for (size_t index = 0; index < kDetailTargets.size(); index++) {
+        const DetailTarget &checkpoint = kDetailTargets[index];
+        if (state.detail_layer == 0 && checkpoint.routed_only) continue;
         if (!state.detail_seen[index]) {
-            fail(detail_callback(kDetailTargets[index], state.detail_layer) +
+            fail(detail_callback(checkpoint, state.detail_layer) +
                  " callback was not observed");
         }
     }
@@ -725,10 +727,12 @@ int main(int argc, char **argv) {
 
         llama_backend_free();
         backend_initialized = false;
+        const int detail_checkpoints = options.detail_layer == 0 ? 12 : 24;
         std::printf("embedding=embd.f32\ndetail_layer=%d\n"
-                    "detail_checkpoints=24\nlayers=48\ntokens=%d\n"
+                    "detail_checkpoints=%d\nlayers=48\ntokens=%d\n"
                     "logits=logits.f32\nout=%s\n",
-                    options.detail_layer, options.token_count,
+                    options.detail_layer, detail_checkpoints,
+                    options.token_count,
                     options.out.c_str());
         return 0;
     } catch (const std::exception &error) {

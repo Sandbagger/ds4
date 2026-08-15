@@ -38608,6 +38608,28 @@ static int generate_raw_swa_cpu(
     return 0;
 }
 
+#ifdef DS4_TEST_HOOKS
+int ds4_test_laguna_graph_diag_detail_layer(void) {
+    const char *dir = getenv("DS4_LAGUNA_DIAG_DIR");
+    if (!dir || !dir[0]) return 0;
+
+    const char *value = getenv("DS4_LAGUNA_DIAG_LAYER");
+    if (!value || !value[0]) return 0;
+
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < 0 ||
+        parsed >= (long)DS4_SHAPE_LAGUNA_S21.n_layer) {
+        fprintf(stderr,
+                "ds4: DS4_LAGUNA_DIAG_LAYER must be in the range 0..47\n");
+        return -1;
+    }
+    return (int)parsed;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 typedef struct {
     uint32_t ctx_size;
@@ -48434,22 +48456,7 @@ static bool laguna_graph_matmul(
 
 #ifdef DS4_TEST_HOOKS
 static int laguna_graph_diag_detail_layer(void) {
-    const char *dir = getenv("DS4_LAGUNA_DIAG_DIR");
-    if (!dir || !dir[0]) return 0;
-
-    const char *value = getenv("DS4_LAGUNA_DIAG_LAYER");
-    if (!value || !value[0]) return 0;
-
-    errno = 0;
-    char *end = NULL;
-    const long parsed = strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' ||
-        parsed < 0 || parsed > 1) {
-        fprintf(stderr,
-                "ds4: DS4_LAGUNA_DIAG_LAYER must be 0 or 1\n");
-        return -1;
-    }
-    return (int)parsed;
+    return ds4_test_laguna_graph_diag_detail_layer();
 }
 
 static bool laguna_graph_diag_dump_tensor(

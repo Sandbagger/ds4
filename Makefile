@@ -715,6 +715,8 @@ endif
 test-cuda-build-contract:
 	python3 tests/test_cuda_build_contract.py -v
 	python3 tests/test_download_model_laguna.py -v
+	python3 gguf-tools/quality-testing/test_compare_gguf_artifacts.py -v
+	python3 gguf-tools/quality-testing/test_reconstruct_gguf_from_prefix.py -v
 	python3 tests/test_main_session_recovery_hardening_contract.py -v
 	python3 tests/test_task18_cuda_failure_source_contract.py -v
 

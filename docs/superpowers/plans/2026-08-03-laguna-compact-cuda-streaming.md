@@ -1,5 +1,12 @@
 # Laguna Compact CUDA SSD-Streaming Implementation Plan
 
+> **Qualification stop — 2026-08-15:** The pinned Poolside revision in this
+> plan (`706fa697…`) is superseded and must not be used for Task 20/21 evidence
+> or publication. Continue only through the corrected-artifact and upstream
+> convergence amendment in
+> [2026-08-15-laguna-upstream-convergence.md](2026-08-15-laguna-upstream-convergence.md).
+> No canonical bundle exists for the current branch.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the pinned Poolside Laguna S 2.1 Q4_K_M artifact numerically correct on one DGX Spark CUDA device, then replace whole-model registration/residency with a genuinely bounded SSD-streaming path that publishes a machine-verifiable compact-runtime qualification bundle.

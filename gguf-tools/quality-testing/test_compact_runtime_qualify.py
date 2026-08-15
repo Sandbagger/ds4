@@ -1458,6 +1458,27 @@ class QualificationRunnerContractTest(unittest.TestCase):
         )
         self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) for record in records))
 
+    def test_foreground_timeout_preserves_output_and_reaps_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            stdout = root / "stdout.log"
+            stderr = root / "stderr.log"
+            result = TOOL.run_foreground_process(
+                [
+                    os.environ.get("PYTHON", "python3"), "-c",
+                    "import sys,time; print('started', flush=True); "
+                    "print('diagnostic', file=sys.stderr, flush=True); time.sleep(60)",
+                ],
+                stdout_path=stdout,
+                stderr_path=stderr,
+                timeout_seconds=0.1,
+                terminate_grace_seconds=0.2,
+            )
+            self.assertTrue(result["timed_out"])
+            self.assertIsNotNone(result["returncode"])
+            self.assertEqual(stdout.read_text(encoding="utf-8"), "started\n")
+            self.assertEqual(stderr.read_text(encoding="utf-8"), "diagnostic\n")
+
     @staticmethod
     def _bundle_fixture() -> dict[str, object]:
         path = ROOT / "tests/test_runtime_contract.py"

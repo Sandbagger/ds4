@@ -371,6 +371,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
+    opt(fp, c, "--qualification-sequence FILE", "Run one manifest-bound cold-plus-three-warm JSONL sequence.");
     fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
@@ -389,6 +390,8 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-n, --tokens N", "Max generated tokens per question. Default: 16000");
     opt(fp, c, "--questions N", "Run only the first N embedded questions.");
     opt(fp, c, "--case-sequence LIST", "Run 1-based case numbers in this comma-separated order.");
+    opt(fp, c, "--case-id ID", "Repeat exactly four pinned qualification IDs in manifest order.");
+    opt(fp, c, "--result-jsonl FILE", "Create closed request/runtime qualification evidence.");
     opt(fp, c, "--trace FILE", "Write questions, outputs, and grading decisions.");
     opt(fp, c, "--regrade-trace FILE", "Regrade a prior trace without loading the model.");
     opt(fp, c, "--soft-limit-reply-budget N", "Soft close thinking near the end of reply budget. Default: 1024");

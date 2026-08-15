@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-bench-eval-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -742,6 +742,9 @@ test-laguna-compact-contract:
 	}
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python tests/test_runtime_contract.py -v
+
+test-laguna-bench-eval-contract:
+	python3 tests/test_bench_eval_contract.py -v
 
 test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_control ds4 ds4-server ds4-agent ds4-bench ds4-eval
 	@command -v uv >/dev/null 2>&1 || { \

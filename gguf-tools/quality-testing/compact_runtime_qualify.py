@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the immutable Laguna compact-runtime benchmark manifest.
-
-This task intentionally stops at manifest construction.  It neither launches a
-qualification server nor publishes a result bundle.
-"""
+"""Build manifests and compare Laguna resident/streamed qualification evidence."""
 
 from __future__ import annotations
 
@@ -3433,6 +3429,121 @@ def write_manifest_atomic(path: Path | str, value: Mapping[str, Any]) -> None:
                 pass
 
 
+def _load_smoke_eval_records(path: Path, expected_ids: Sequence[str]) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read eval evidence {path}: {exc}") from exc
+    if len(lines) != len(expected_ids):
+        raise ValueError(
+            f"eval evidence must contain exactly {len(expected_ids)} records, got {len(lines)}"
+        )
+    required = {
+        "schema", "case_id", "answer", "grade", "terminal_status",
+        "request_metrics", "runtime_snapshot", "evidence_sha256",
+    }
+    records: list[dict[str, Any]] = []
+    for index, (line, expected_id) in enumerate(zip(lines, expected_ids, strict=True)):
+        value = loads_strict(line)
+        if not isinstance(value, dict) or set(value) != required:
+            raise ValueError(f"eval record {index} is not a closed qualification result")
+        if value["schema"] != "ds4.eval.qualification-result/v1":
+            raise ValueError(f"eval record {index} has an unknown schema")
+        if value["case_id"] != expected_id:
+            raise ValueError(f"eval record {index} is duplicated, missing, or out of order")
+        if not isinstance(value["answer"], str) or not value["answer"]:
+            raise ValueError(f"eval record {index} has no answer")
+        if value["grade"] not in {"passed", "failed"}:
+            raise ValueError(f"eval record {index} has an invalid grade")
+        if value["terminal_status"] != "completed":
+            raise ValueError(f"eval record {index} did not complete")
+        request = value["request_metrics"]
+        runtime = value["runtime_snapshot"]
+        if not isinstance(request, dict) or not isinstance(runtime, dict):
+            raise ValueError(f"eval record {index} lacks request/runtime evidence")
+        if request.get("schema") != "ds4.runtime.request/v1" or runtime.get("schema") != "ds4.runtime/v1":
+            raise ValueError(f"eval record {index} has invalid runtime schemas")
+        if request.get("instance_id") != runtime.get("instance_id"):
+            raise ValueError(f"eval record {index} mixes runtime identities")
+        digest = value["evidence_sha256"]
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ValueError(f"eval record {index} has an invalid evidence digest")
+        records.append(value)
+    return records
+
+
+def _run_smoke_eval_mode(
+    *,
+    mode: str,
+    model: Path,
+    eval_bin: Path,
+    case_ids: Sequence[str],
+    directory: Path,
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    result_path = directory / f"{mode}.jsonl"
+    argv = [
+        str(eval_bin), "--model", str(model), "--plain", "--seed", "1",
+        "--result-jsonl", str(result_path),
+    ]
+    if mode == "streamed":
+        argv.append("--ssd-streaming")
+    for case_id in case_ids:
+        argv.extend(("--case-id", case_id))
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"{mode} eval process failed: {exc}") from exc
+    # Exit 1 is a valid run containing at least one wrong answer.
+    if completed.returncode not in (0, 1):
+        raise ValueError(
+            f"{mode} eval exited {completed.returncode}: {completed.stderr.strip()}"
+        )
+    return _load_smoke_eval_records(result_path, case_ids)
+
+
+def run_smoke_eval(
+    model: Path | str,
+    eval_bin: Path | str,
+    case_ids: Sequence[str],
+    *,
+    timeout_seconds: float = 4 * 60 * 60,
+) -> dict[str, Any]:
+    if tuple(case_ids) != EVAL_CASE_IDS:
+        raise ValueError("smoke-eval requires the four pinned case IDs in manifest order")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("smoke-eval timeout must be finite and positive")
+    with tempfile.TemporaryDirectory(prefix="ds4-laguna-smoke-eval-") as name:
+        directory = Path(name)
+        resident = _run_smoke_eval_mode(
+            mode="resident", model=Path(model), eval_bin=Path(eval_bin),
+            case_ids=case_ids, directory=directory, timeout_seconds=timeout_seconds,
+        )
+        streamed = _run_smoke_eval_mode(
+            mode="streamed", model=Path(model), eval_bin=Path(eval_bin),
+            case_ids=case_ids, directory=directory, timeout_seconds=timeout_seconds,
+        )
+    fields = ("answer", "grade", "terminal_status")
+    resident_vector = [tuple(record[field] for field in fields) for record in resident]
+    streamed_vector = [tuple(record[field] for field in fields) for record in streamed]
+    if resident_vector != streamed_vector:
+        raise ValueError("resident and streamed eval vectors differ")
+    return {
+        "schema": "ds4.qualification.smoke-eval/v1",
+        "case_ids": list(case_ids),
+        "result_vector": [list(item) for item in resident_vector],
+        "status": "passed",
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3452,12 +3563,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     verify = actions.add_parser("verify", help="verify an immutable reference manifest")
     verify.add_argument("--manifest", required=True, type=Path)
+    smoke_eval = commands.add_parser(
+        "smoke-eval", help="compare the four pinned eval cases in resident and streamed modes"
+    )
+    smoke_eval.add_argument("--model", required=True, type=Path)
+    smoke_eval.add_argument("--eval-bin", required=True, type=Path)
+    smoke_eval.add_argument("--case-id", action="append", required=True)
+    smoke_eval.add_argument("--timeout-seconds", type=float, default=4 * 60 * 60)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if args.command == "smoke-eval":
+            result = run_smoke_eval(
+                args.model, args.eval_bin, args.case_id,
+                timeout_seconds=args.timeout_seconds,
+            )
+            print(canonical_json_bytes(result).decode("utf-8"))
+            return 0
         if args.action == "build":
             prepared = prepare_manifest(args.model)
             cold_preparation = cold_prepare_from_plan(

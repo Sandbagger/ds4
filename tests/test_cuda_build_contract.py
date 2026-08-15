@@ -2336,6 +2336,28 @@ class CudaBuildContractTest(unittest.TestCase):
             "direct ds4_cuda links need the Laguna cache-policy implementation",
         )
 
+    def test_every_cuda_engine_test_link_includes_qualification_control(self) -> None:
+        engine_test_links: dict[str, list[str]] = {}
+        for rule in re.finditer(
+            r"(?m)^(?P<target>tests/[^:\n]+):\s*(?P<prerequisites>[^\n]*)$",
+            MAKEFILE,
+        ):
+            prerequisites = rule.group("prerequisites").split()
+            if "ds4_cuda_test_hooks.o" in prerequisites:
+                engine_test_links[rule.group("target")] = prerequisites
+
+        self.assertTrue(engine_test_links, "no CUDA engine test links found")
+        missing = sorted(
+            target
+            for target, prerequisites in engine_test_links.items()
+            if "ds4_qualification_control.o" not in prerequisites
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "CUDA engine test links need the qualification-control runtime",
+        )
+
     def test_poolside_mmvq_uses_the_active_configured_physical_device(
         self,
     ) -> None:

@@ -1580,6 +1580,26 @@ class QualificationRunnerContractTest(unittest.TestCase):
                 request_timeout_seconds=2,
             )
 
+    def test_slice_files_and_argv_are_closed_manifest_bound_and_canonical(self) -> None:
+        prompt = next(item for item in self.manifest["prompts"] if item["id"] == "native-512")
+        sequence = TOOL.qualification_sequence_document(
+            self.manifest, prompt, Path("/evidence/prompt.bin"), resident_mode=False
+        )
+        self.assertEqual(set(sequence), {
+            "schema", "prompt_path", "prompt_sha256", "manifest_sha256", "mode",
+            "prompt_tokens", "requested_output_tokens", "repetitions",
+        })
+        self.assertEqual(sequence["repetitions"], 4)
+        argv = TOOL.qualification_bench_argv(
+            Path("/bench"), Path("/model"), Path("/sequence.json"), 17,
+            resident_mode=False, cache_bytes=8 << 30,
+        )
+        self.assertIn("--qualification-control-fd", argv)
+        self.assertIn("--qualification-sequence", argv)
+        self.assertIn("--ssd-streaming-cache-bytes", argv)
+        self.assertNotIn("--ssd-streaming-cache-experts", argv)
+        self.assertEqual(argv[argv.index("--prefill-chunk") + 1], "4096")
+
     @staticmethod
     def _bundle_fixture() -> dict[str, object]:
         path = ROOT / "tests/test_runtime_contract.py"

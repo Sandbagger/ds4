@@ -1185,7 +1185,7 @@ print("[" + ",".join(["0"] * count) + "]")
         with self.assertRaisesRegex(ValueError, "exactly 513 native-template tokens"):
             TOOL.select_rendered_prompt(SEED[:1024], 513, impossible)
 
-    def test_parser_exposes_manifest_and_smoke_eval_commands(self) -> None:
+    def test_parser_exposes_manifest_smoke_and_qualification_commands(self) -> None:
         build = TOOL.parse_args([
             "manifest", "build", "--model", "/m", "--output", "/o",
             "--qualification-plan", "/p",
@@ -1231,6 +1231,23 @@ print("[" + ",".join(["0"] * count) + "]")
                 "--qualification-plan", "/p",
                 "--qualification-plan-sha256", "c" * 64,
             ])
+        run = TOOL.parse_args([
+            "run", "--manifest", "/manifest", "--model", "/model",
+            "--server-bin", "/server", "--bench-bin", "/bench",
+            "--eval-bin", "/eval", "--evidence-dir", "/evidence",
+        ])
+        self.assertEqual(run.command, "run")
+        verify_run = TOOL.parse_args([
+            "verify", "--manifest", "/manifest", "--evidence-dir", "/evidence",
+        ])
+        self.assertEqual(verify_run.command, "verify")
+        publish = TOOL.parse_args([
+            "publish", "--manifest", "/manifest", "--evidence-dir", "/evidence",
+            "--output", "/bundle",
+        ])
+        self.assertEqual(publish.command, "publish")
+        verify_bundle = TOOL.parse_args(["verify-bundle", "/bundle"])
+        self.assertEqual(verify_bundle.bundle, Path("/bundle"))
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
 
@@ -1478,6 +1495,89 @@ class QualificationRunnerContractTest(unittest.TestCase):
             self.assertIsNotNone(result["returncode"])
             self.assertEqual(stdout.read_text(encoding="utf-8"), "started\n")
             self.assertEqual(stderr.read_text(encoding="utf-8"), "diagnostic\n")
+
+    def test_benchmark_transcript_requires_four_ordered_same_instance_samples(self) -> None:
+        manifest_digest = "a" * 64
+        instance_id = "11111111-1111-1111-1111-111111111111"
+        records: list[dict[str, object]] = []
+        for repetition in range(4):
+            request_id = f"22222222-2222-2222-2222-{repetition:012d}"
+            accepted = 1_000_000_000 + repetition * 10_000_000
+            for milestone, stamp in (
+                ("request_accepted", accepted),
+                ("first_token", accepted + 2_000_000),
+                ("request_complete", accepted + 4_000_000),
+            ):
+                records.append({
+                    "schema": "ds4.bench.qualification-milestone/v1",
+                    "milestone": milestone,
+                    "repetition_index": repetition,
+                    "request_id": request_id,
+                    "accepted_monotonic_ns": accepted,
+                    "monotonic_ns": stamp,
+                })
+            records.append({
+                "schema": "ds4.bench.qualification-sample/v1",
+                "milestone": "request_complete",
+                "repetition_index": repetition,
+                "request_id": request_id,
+                "accepted_monotonic_ns": accepted,
+                "monotonic_ns": accepted + 5_000_000,
+                "manifest_sha256": manifest_digest,
+                "resident_mode": False,
+                "request_metrics": {
+                    "schema": "ds4.runtime.request/v1",
+                    "request_id": request_id,
+                    "instance_id": instance_id,
+                    "ttft_ns": "2000000",
+                    "wall_time_ns": "4000000",
+                    "terminal_status": "completed",
+                },
+                "runtime_snapshot": {
+                    "schema": "ds4.runtime/v1",
+                    "instance_id": instance_id,
+                },
+            })
+        samples = TOOL.validate_benchmark_transcript(
+            records,
+            manifest_sha256_value=manifest_digest,
+            resident_mode=False,
+            ttft_timeout_seconds=900,
+            request_timeout_seconds=2700,
+        )
+        self.assertEqual(len(samples), 4)
+        self.assertEqual({sample["request_metrics"]["instance_id"] for sample in samples}, {instance_id})
+
+        changed = copy.deepcopy(records)
+        changed[-1]["request_metrics"]["instance_id"] = "33333333-3333-3333-3333-333333333333"
+        with self.assertRaisesRegex(ValueError, "same child instance"):
+            TOOL.validate_benchmark_transcript(
+                changed,
+                manifest_sha256_value=manifest_digest,
+                resident_mode=False,
+                ttft_timeout_seconds=900,
+                request_timeout_seconds=2700,
+            )
+
+    def test_benchmark_transcript_rejects_deadline_and_order_drift(self) -> None:
+        base = {
+            "schema": "ds4.bench.qualification-milestone/v1",
+            "repetition_index": 0,
+            "request_id": "22222222-2222-2222-2222-222222222222",
+            "accepted_monotonic_ns": 1,
+        }
+        records = [
+            {**base, "milestone": "request_accepted", "monotonic_ns": 1},
+            {**base, "milestone": "first_token", "monotonic_ns": 1_000_000_002},
+        ]
+        with self.assertRaisesRegex(ValueError, "TTFT deadline"):
+            TOOL.validate_benchmark_transcript(
+                records,
+                manifest_sha256_value="a" * 64,
+                resident_mode=False,
+                ttft_timeout_seconds=1,
+                request_timeout_seconds=2,
+            )
 
     @staticmethod
     def _bundle_fixture() -> dict[str, object]:

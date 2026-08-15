@@ -142,6 +142,54 @@ static int g_cuda_poolside_f32_mmvf;
 static int g_cuda_no_laguna_fattn_vec_decode;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    uint64_t optimized_launches;
+    uint64_t combine_launches;
+    uint64_t softplus_launches;
+    uint64_t mul_launches;
+    uint64_t scalar_launches;
+    uint32_t partitions;
+} ds4_gpu_laguna_fattn_vec_test_snapshot;
+
+static std::atomic<uint64_t> g_laguna_fattn_vec_optimized_launches;
+static std::atomic<uint64_t> g_laguna_fattn_vec_combine_launches;
+static std::atomic<uint64_t> g_laguna_fattn_vec_softplus_launches;
+static std::atomic<uint64_t> g_laguna_fattn_vec_mul_launches;
+static std::atomic<uint64_t> g_laguna_fattn_vec_scalar_launches;
+static std::atomic<uint32_t> g_laguna_fattn_vec_partitions;
+
+extern "C" void ds4_gpu_test_laguna_fattn_vec_reset(void) {
+    g_laguna_fattn_vec_optimized_launches.store(
+        0u, std::memory_order_relaxed);
+    g_laguna_fattn_vec_combine_launches.store(
+        0u, std::memory_order_relaxed);
+    g_laguna_fattn_vec_softplus_launches.store(
+        0u, std::memory_order_relaxed);
+    g_laguna_fattn_vec_mul_launches.store(0u, std::memory_order_relaxed);
+    g_laguna_fattn_vec_scalar_launches.store(
+        0u, std::memory_order_relaxed);
+    g_laguna_fattn_vec_partitions.store(0u, std::memory_order_relaxed);
+}
+
+extern "C" int ds4_gpu_test_laguna_fattn_vec_snapshot(
+        ds4_gpu_laguna_fattn_vec_test_snapshot *out) {
+    if (!out) return 0;
+    out->optimized_launches = g_laguna_fattn_vec_optimized_launches.load(
+        std::memory_order_relaxed);
+    out->combine_launches = g_laguna_fattn_vec_combine_launches.load(
+        std::memory_order_relaxed);
+    out->softplus_launches = g_laguna_fattn_vec_softplus_launches.load(
+        std::memory_order_relaxed);
+    out->mul_launches = g_laguna_fattn_vec_mul_launches.load(
+        std::memory_order_relaxed);
+    out->scalar_launches = g_laguna_fattn_vec_scalar_launches.load(
+        std::memory_order_relaxed);
+    out->partitions = g_laguna_fattn_vec_partitions.load(
+        std::memory_order_relaxed);
+    return 1;
+}
+#endif
 
 typedef struct {
     int valid;
@@ -36706,6 +36754,12 @@ static int laguna_attention_decode_fattn_vec_launch(
 
     const dim3 block(32u, 4u, 1u);
     const dim3 grid(1u, partitions, n_head);
+#ifdef DS4_TEST_HOOKS
+    g_laguna_fattn_vec_partitions.store(
+        partitions, std::memory_order_relaxed);
+    g_laguna_fattn_vec_optimized_launches.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
     laguna_attention_decode_fattn_vec_kernel<<<grid, block>>>(
         partial_heads, partial_meta, q, key_cache, value_cache,
         key_count, padded_key_count, n_head, n_head_kv, scale,
@@ -36715,6 +36769,10 @@ static int laguna_attention_decode_fattn_vec_launch(
     }
 
     const dim3 combine_grid(1u, n_head, 1u);
+#ifdef DS4_TEST_HOOKS
+    g_laguna_fattn_vec_combine_launches.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
     laguna_attention_decode_fattn_vec_combine_kernel<<<
         combine_grid, head_dim, partitions * sizeof(float2)>>>(
         heads, partial_heads, partial_meta, partitions);
@@ -36722,12 +36780,20 @@ static int laguna_attention_decode_fattn_vec_launch(
         return -1;
     }
     float *gate_softplus = (float *)partial_meta;
+#ifdef DS4_TEST_HOOKS
+    g_laguna_fattn_vec_softplus_launches.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
     laguna_attention_gate_softplus_kernel<<<1u, n_head>>>(
         gate_softplus, gate, n_head);
     if (!cuda_ok(cudaGetLastError(),
                  "laguna FATTN_VEC softplus launch")) {
         return -1;
     }
+#ifdef DS4_TEST_HOOKS
+    g_laguna_fattn_vec_mul_launches.fetch_add(
+        1u, std::memory_order_relaxed);
+#endif
     laguna_attention_gate_mul_kernel<<<n_head, head_dim>>>(
         heads, gate_softplus, n_head);
     if (!cuda_ok(cudaGetLastError(), "laguna FATTN_VEC gate mul launch")) {
@@ -36844,6 +36910,10 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
             if (fattn_vec < 0) {
                 ok = 0;
             } else if (fattn_vec == 0) {
+#ifdef DS4_TEST_HOOKS
+                g_laguna_fattn_vec_scalar_launches.fetch_add(
+                    1u, std::memory_order_relaxed);
+#endif
                 laguna_attention_decode_gqa_f16_kernel<<<n_head, 1>>>(
                         (float *)heads->ptr, (const float *)q->ptr,
                         (const __half *)key_cache->ptr,

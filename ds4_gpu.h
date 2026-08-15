@@ -345,6 +345,19 @@ ds4_gpu_laguna_compact_request_barrier(
         ds4_runtime_request_context *request);
 
 #ifdef DS4_TEST_HOOKS
+typedef struct {
+    uint64_t optimized_launches;
+    uint64_t combine_launches;
+    uint64_t softplus_launches;
+    uint64_t mul_launches;
+    uint64_t scalar_launches;
+    uint32_t partitions;
+} ds4_gpu_laguna_fattn_vec_test_snapshot;
+
+void ds4_gpu_test_laguna_fattn_vec_reset(void);
+int ds4_gpu_test_laguna_fattn_vec_snapshot(
+        ds4_gpu_laguna_fattn_vec_test_snapshot *out);
+
 typedef enum {
     DS4_GPU_LAGUNA_LIFECYCLE_IDLE = 0,
     DS4_GPU_LAGUNA_LIFECYCLE_CREATING = 1,

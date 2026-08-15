@@ -3801,6 +3801,280 @@ def run_foreground_process(
     }
 
 
+def _terminate_process_group(
+    process: subprocess.Popen[Any], *, grace_seconds: float = 10.0
+) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def _verify_running_executable(
+    process: subprocess.Popen[Any], expected_path: Path, expected_sha256: str
+) -> dict[str, str]:
+    proc_path = Path(f"/proc/{process.pid}/exe")
+    try:
+        target = Path(os.readlink(proc_path))
+    except OSError as exc:
+        raise ValueError(f"cannot resolve running qualification executable: {exc}") from exc
+    expected_stat, expected_identity = _stat_identity(expected_path)
+    observed_stat = proc_path.stat()
+    if not _same_stat(expected_stat, observed_stat) or target != expected_path.resolve():
+        raise ValueError("running qualification executable identity does not match admission")
+    if _sha256_file(proc_path) != expected_sha256:
+        raise ValueError("running qualification executable digest does not match admission")
+    return expected_identity
+
+
+def _write_new_bytes(path: Path, payload: bytes) -> None:
+    with path.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _load_jsonl_bytes(payload: bytes, label: str) -> list[dict[str, Any]]:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} is not UTF-8") from exc
+    lines = text.splitlines()
+    records: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        value = loads_strict(line)
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} record {index} is not an object")
+        records.append(value)
+    return records
+
+
+def run_qualification_benchmark_slice(
+    manifest: Mapping[str, Any],
+    *,
+    model: Path,
+    bench_bin: Path,
+    prompt: Mapping[str, Any],
+    directory: Path,
+    plan_path: Path,
+    plan_sha256: str,
+    resident_mode: bool,
+    cache_bytes: int | None,
+    admitted_binary_sha256: str,
+    frozen_nvml_inventory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run one fresh four-repetition bench child with synchronized evidence."""
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("qualification slice evidence directory must be real")
+    rendered = base64.b64decode(prompt["rendered_base64"], validate=True)
+    prompt_path = (directory / "prompt.bin").resolve()
+    sequence_path = (directory / "sequence.json").resolve()
+    stdout_path = directory / "stdout.jsonl"
+    stderr_path = directory / "stderr.log"
+    control_path = directory / "control.json"
+    _write_new_bytes(prompt_path, rendered)
+    sequence = qualification_sequence_document(
+        manifest, prompt, prompt_path, resident_mode=resident_mode
+    )
+    _write_new_json(sequence_path, sequence)
+    execution = manifest["execution"]
+    ttft_seconds = execution["first_token_timeout_seconds"]
+    request_seconds = execution["whole_request_timeout_seconds"]
+    gpu_uuid = manifest["host"]["gpu_uuid"]
+    control = QualificationControl.create(timeout_seconds=30.0)
+    argv = qualification_bench_argv(
+        bench_bin, model, sequence_path, control.child_fd,
+        resident_mode=resident_mode, cache_bytes=cache_bytes,
+    )
+    process: subprocess.Popen[bytes] | None = None
+    transcript = bytearray()
+    partial = bytearray()
+    control_result: dict[str, Any] = {"checkpoints": []}
+    worker_errors: list[BaseException] = []
+    timed_out_reason: str | None = None
+
+    def capture_inventory() -> Mapping[str, Any]:
+        return collect_nvml_pre_child(gpu_uuid)["inventory"]
+
+    def control_worker() -> None:
+        try:
+            def prepare(
+                descriptor: int, evidence: QualificationModelEvidence
+            ) -> None:
+                control_result["model"] = {
+                    **evidence.identity.as_decimal_mapping(),
+                    "sha256": evidence.sha256,
+                }
+                control_result["cold_preparation"] = cold_prepare_descriptor_from_plan(
+                    descriptor, plan_path, plan_sha256
+                )
+
+            control.receive_model(prepare_descriptor=prepare)
+            if not resident_mode:
+                for checkpoint in range(1, 5):
+                    before, after = control.bracket_sample(
+                        checkpoint,
+                        capture_before=capture_inventory,
+                        capture_after=capture_inventory,
+                        sample_timeout_seconds=float(request_seconds),
+                    )
+                    if process is None:
+                        raise ValueError("qualification process is unavailable")
+                    control_result["checkpoints"].append({
+                        "sequence": checkpoint,
+                        "before": before,
+                        "after": after,
+                        "validated": validate_nvml_checkpoint(
+                            frozen_nvml_inventory,
+                            before,
+                            after,
+                            ds4_pid=process.pid,
+                            gpu_uuid=gpu_uuid,
+                        ),
+                    })
+            control.verify_model_unchanged()
+            if process is None:
+                raise ValueError("qualification process is unavailable")
+            _verify_running_executable(process, bench_bin, admitted_binary_sha256)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    try:
+        with stderr_path.open("xb") as stderr:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                start_new_session=True,
+                pass_fds=(control.child_fd,),
+            )
+            control.close_child_endpoint()
+            _verify_running_executable(process, bench_bin, admitted_binary_sha256)
+            worker = threading.Thread(target=control_worker, daemon=True)
+            worker.start()
+            if process.stdout is None:
+                raise ValueError("qualification child stdout pipe is unavailable")
+            descriptor = process.stdout.fileno()
+            active_ttft_deadline: int | None = None
+            active_request_deadline: int | None = None
+            overall_deadline = time.monotonic() + 60.0 + 4.0 * float(request_seconds)
+            eof = False
+            while not eof:
+                if worker_errors:
+                    raise ValueError(f"qualification control failed: {worker_errors[0]}")
+                now_ns = time.monotonic_ns()
+                if active_ttft_deadline is not None and now_ns >= active_ttft_deadline:
+                    timed_out_reason = "first_token"
+                    break
+                if active_request_deadline is not None and now_ns >= active_request_deadline:
+                    timed_out_reason = "whole_request"
+                    break
+                if time.monotonic() >= overall_deadline:
+                    timed_out_reason = "process"
+                    break
+                ready, _, _ = select.select([descriptor], [], [], 0.25)
+                if ready:
+                    chunk = os.read(descriptor, 65536)
+                    if not chunk:
+                        eof = True
+                    else:
+                        transcript.extend(chunk)
+                        partial.extend(chunk)
+                        while b"\n" in partial:
+                            raw_line, _, remainder = partial.partition(b"\n")
+                            partial[:] = remainder
+                            if not raw_line:
+                                raise ValueError("qualification transcript contains an empty line")
+                            record = loads_strict(raw_line.decode("utf-8"))
+                            if not isinstance(record, dict):
+                                raise ValueError("qualification transcript line is not an object")
+                            if record.get("schema") == "ds4.bench.qualification-milestone/v1":
+                                milestone = record.get("milestone")
+                                accepted = record.get("accepted_monotonic_ns")
+                                if type(accepted) is not int:
+                                    raise ValueError("qualification acceptance clock is invalid")
+                                if milestone == "request_accepted":
+                                    active_ttft_deadline = accepted + int(ttft_seconds * 1e9)
+                                    active_request_deadline = accepted + int(request_seconds * 1e9)
+                                elif milestone == "first_token":
+                                    active_ttft_deadline = None
+                                elif milestone == "request_complete":
+                                    active_request_deadline = None
+                elif process.poll() is not None:
+                    chunk = os.read(descriptor, 65536)
+                    if chunk:
+                        transcript.extend(chunk)
+                        partial.extend(chunk)
+                    else:
+                        eof = True
+            if timed_out_reason is not None:
+                _terminate_process_group(process)
+            else:
+                process.wait()
+            control.close()
+            worker.join(timeout=15.0)
+            if worker.is_alive():
+                raise ValueError("qualification control worker did not terminate")
+            if worker_errors:
+                raise ValueError(f"qualification control failed: {worker_errors[0]}")
+            if timed_out_reason is not None:
+                raise TimeoutError(f"qualification {timed_out_reason} deadline exceeded")
+            if process.returncode != 0:
+                raise ValueError(f"qualification bench exited {process.returncode}")
+            stderr.flush()
+            os.fsync(stderr.fileno())
+    finally:
+        if process is not None and process.poll() is None:
+            _terminate_process_group(process)
+        control.close()
+        if not stdout_path.exists():
+            _write_new_bytes(stdout_path, bytes(transcript))
+        if not control_path.exists():
+            _write_new_json(control_path, {
+                **control_result,
+                "timed_out_reason": timed_out_reason,
+                "returncode": process.returncode if process is not None else None,
+                "error": str(worker_errors[0]) if worker_errors else None,
+            })
+    if partial:
+        raise ValueError("qualification transcript ended with a partial JSONL record")
+    records = _load_jsonl_bytes(bytes(transcript), "qualification bench stdout")
+    samples = validate_benchmark_transcript(
+        records,
+        manifest_sha256_value=manifest_sha256(manifest),
+        resident_mode=resident_mode,
+        ttft_timeout_seconds=float(ttft_seconds),
+        request_timeout_seconds=float(request_seconds),
+    )
+    if not resident_mode:
+        if len(control_result["checkpoints"]) != 4 or process is None:
+            raise ValueError("qualification did not capture exactly four checkpoints")
+    return {
+        "status": "passed",
+        "samples": samples,
+        "reason": None,
+        "evidence": {
+            "stdout": stdout_path.name,
+            "stderr": stderr_path.name,
+            "control": control_path.name,
+            "sequence": sequence_path.name,
+            "prompt": prompt_path.name,
+        },
+    }
+
+
 def _qualification_evidence_claims(value: Any) -> dict[str, str]:
     claims: dict[str, str] = {}
 

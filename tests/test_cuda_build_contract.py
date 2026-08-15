@@ -3686,6 +3686,12 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn(release_binary, clean_recipe)
         self.assertIn(release_object, clean_recipe)
 
+    def test_laguna_release_probe_links_qualification_control(self) -> None:
+        self.assertIn(
+            "ds4_qualification_control.o",
+            rule_prerequisites("tests/probe_ds4_laguna_moe_release").split(),
+        )
+
     def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
         body = function_body('extern "C" void ds4_gpu_cleanup(void)')
         preamble, separator, _ = body.partition("g_current_logical_tier = -1;")

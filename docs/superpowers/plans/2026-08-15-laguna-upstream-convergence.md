@@ -1,7 +1,8 @@
 # Laguna upstream convergence amendment
 
-**Status:** approved implementation amendment; canonical qualification is
-blocked until the corrected artifact is promoted.
+**Status:** approved GB10/CUDA-only implementation amendment; canonical
+qualification is blocked until the corrected artifact is promoted. Metal and
+cross-backend checkpoint compatibility are outside this milestone.
 
 **Date:** 2026-08-15
 
@@ -21,8 +22,8 @@ that PR #594 deliberately does not implement.
 Stop the current Task 21 run. Its Poolside artifact revision is superseded.
 No result produced from revision `706fa69799926b6afde1af9e24ca2a4923f110a1`
 may be called canonical or published. First promote the corrected artifact,
-rebuild every model-bound oracle and manifest, close the KV-ring/checkpoint
-compatibility gap, and rerun the existing qualification stack.
+rebuild every model-bound oracle and manifest, reconfirm the already-correct
+CUDA KV-ring invariant, and rerun the existing qualification stack.
 
 After that truthful compact-runtime bundle exists, converge performance and
 upstreamability in a separate worktree. Prefer PR #594's eventual upstream-main
@@ -44,7 +45,7 @@ pull requests is merged:
 | `laguna-s2.1` (`448d569`) | branch | Antirez's native model, Metal graph, protocol/template support, revised Q4 layout, and later Q2/Q3 work | Already the ancestry of the local resident work through `7e3dbef`; do not reimplement |
 | [PR #594](https://github.com/antirez/ds4/pull/594), head `7005761` | open draft | Full-resident, one-GPU CUDA; mature Q4/Q2/Q3 kernels, Blackwell paths, DFlash, and GB10 measurements; explicitly no SSD streaming | Performance/upstream convergence source after corrected Q4 qualification |
 | [PR #613](https://github.com/antirez/ds4/pull/613), head `ceb4685` | open | Corrected official Poolside GGUF revision | Immediate blocking input |
-| [PR #614](https://github.com/antirez/ds4/pull/614), head `b388b8c` | open | Race-free oversized-prefill KV-ring commit, exact 1024/512 regression, checkpoint payload ABI v3 | Port the shared safety consequence; CUDA algorithm is already equivalent locally |
+| [PR #614](https://github.com/antirez/ds4/pull/614), head `b388b8c` | open | Metal oversized-prefill KV-ring correction, exact 1024/512 regression, checkpoint payload ABI v3 | No GB10 implementation work; local CUDA was race-free from its first commit |
 | [PR #633](https://github.com/antirez/ds4/pull/633), head `4f4c724` | open | APEX IQ4_XS/Q6_K and official BF16 mixed-precision targets plus metadata-driven RoPE | Defer until corrected Q4 compact qualification passes |
 | [PR #634](https://github.com/antirez/ds4/pull/634), head `fefbcb7` | closed, unmerged draft | Metal/MLXFast and DFlash experiments | No action |
 
@@ -112,12 +113,14 @@ repairs. The first credible isolated donor is its split-history decode
 attention, and even that changes reduction order and must pass the promoted
 Poolside oracle.
 
-PR #614's CUDA-relevant invariant is already present locally:
+PR #614 adds no GB10-critical implementation work. Its CUDA-relevant invariant
+is already present locally:
 `laguna_commit_kv_f16_kernel()` skips staged rows older than the newest
 `cache_cap`, and `tests/test_cuda_laguna_kernels.c` constructs the same expected
-newest-row ring. The local shared checkpoint payload ABI is nevertheless still
-v2, and its Metal kernel has not incorporated PR #614. A shared v3 cache format
-must not be emitted until both backends have the race-free behavior.
+newest-row ring. That behavior existed from the local CUDA implementation's
+first commit, so checkpoints created by this GB10 path do not carry the Metal
+race that motivated ABI v3. Keep ABI v2 for this milestone; Metal repair,
+cross-backend checkpoint import, and a shared ABI bump are explicitly deferred.
 
 ## Amended implementation order
 
@@ -172,15 +175,13 @@ keep the current qualified candidate recoverable throughout.
   proves its complete source range identical and its provenance records both
   artifacts. Regenerate behavior/eval fixtures unconditionally.
 
-### Phase 3 — close the PR #614 cache-safety gap
+### Phase 3 — reconfirm the GB10 CUDA-ring invariant
 
-- [ ] Keep the existing CUDA newest-`cache_cap` implementation and strengthen
-  its source/numeric contract only if the upstream case exposes a missing edge.
-- [ ] Port the equivalent oversized-prefill fix and exact 1024-token/512-row
-  regression to Metal.
-- [ ] Bump the shared checkpoint graph-payload ABI from v2 to v3 only in the
-  same change that makes every Laguna-writing backend safe; test rejection of
-  v2 checkpoints and update the documented header.
+- [ ] Run the existing CUDA oversized/multi-wrap prefill contract against the
+  corrected artifact. Strengthen it only if the upstream 1024-token/512-row
+  case exposes an untested edge.
+- [ ] Keep checkpoint payload ABI v2. Do not port Metal code or invalidate
+  checkpoints produced by the already-correct GB10 path.
 
 ### Phase 4 — rerun Tasks 19 and 20 on corrected provenance
 
@@ -224,10 +225,6 @@ keep the current qualified candidate recoverable throughout.
   local work in logical stacks: corrected oracle/admission; compact
   ledger/runtime; compact attachment/cache/I/O; streamed graph;
   evidence/protocol/lifecycle; qualification tooling.
-- [ ] Port the independent `ac1a187` capability hardening so tile16 MMA
-  requires both CUDA binary and PTX versions at least 8.0; this prevents a
-  low-virtual-architecture JIT from selecting a compiled no-op and does not
-  couple the compact path to PR #594's model arithmetic.
 - [ ] Start with independently useful primitives such as split-history decode
   attention. Do not import PR #594's routed-MoE implementation: rework any
   later MoE optimization around the local Poolside-exact Q8_1, column-L2
@@ -245,6 +242,9 @@ keep the current qualified candidate recoverable throughout.
 
 ### Deferred expansion
 
+- [ ] All Metal Laguna changes, cross-backend checkpoint import, and ABI v3.
+- [ ] Non-GB10 CUDA portability hardening, including `ac1a187`'s PTX-version
+  guard for lower-virtual-architecture builds.
 - [ ] PR #594/#633 Q2/Q3, IQ4_XS/Q6_K, BF16, and DFlash support.
 - [ ] Multi-GPU, tensor parallel, ROCm, and distributed Laguna execution.
 - [ ] Deployment, port assignment, peer eviction, or co-residency claims.

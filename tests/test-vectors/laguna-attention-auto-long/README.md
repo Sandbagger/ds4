@@ -6,6 +6,27 @@ the 22-token fixture cannot reach:
 - layer 0 uses 512 tokens, GQA6, and eight 64-key FATTN iterations;
 - layer 1 uses 64 tokens and the GQA9 `ncols=64`, `np=1` topology.
 
+The v2 extension also freezes the corrected-model layer-0 decode row at
+position 512.  Its five compact suffix files retain Q heads 41/42, K/V heads
+6/7, gate heads 41/42, and the corresponding gated-attention output.  Together
+with the existing 512-row K/V files, they form the exact `key_count=513`,
+`padded_key_count=768`, `P=3` FATTN_VEC input/output seam.
+
+The prefix K/V files remain historical `706fa697…` callback captures.  They are
+reused, not relabelled as a corrected-model recapture: the fixed 512 token bytes
+are identical, and the independent bounded GGUF comparator found all 814 tensor
+layouts and payloads identical between `706fa697…` and corrected `e2ccc057…`.
+Only `tokenizer.chat_template` metadata differs.  The external comparison
+report identity and the explicit absence of a corrected 512-row callback
+recapture are pinned in the manifest.
+
+The corrected suffix came from the trusted Poolside `04b2b72…` DGX capture.
+The manifest pins its raw callback hashes, byte extraction offsets, probe and
+CUDA-library identities, and the three FATTN source files that define dispatch
+and arithmetic.  It also records the observed GB10 resource contract: 162
+registers/thread, 8448 bytes static shared/block, 128 threads/block, three
+resident blocks/SM, 48 SMs, and launch grid `1x3x48`.
+
 Each fixture retains two adjacent query heads for every query position.  The
 heads straddle a GQA-to-KV-head boundary and retain the corresponding two KV
 heads for every key position.  Unrelated heads are zero-filled by

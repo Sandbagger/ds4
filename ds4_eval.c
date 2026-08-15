@@ -2,6 +2,7 @@
 #include "ds4_build_info.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_plan_io.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -30,6 +31,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -58,6 +61,7 @@
 #define EVAL_MAX_CHOICES 10
 #define EVAL_ANSWER_MAX 32
 #define EVAL_MAX_CONTEXT 1000000
+#define EVAL_QUALIFICATION_CASE_COUNT 4
 
 typedef enum {
     EVAL_PENDING,
@@ -1198,6 +1202,8 @@ typedef struct {
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
+    const char *result_jsonl_path;
+    const char *case_ids[EVAL_QUALIFICATION_CASE_COUNT];
     ds4_backend backend;
     int qualification_control_fd;
     int threads;
@@ -1219,6 +1225,7 @@ typedef struct {
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
+    int case_id_count;
     ds4_think_mode think_mode;
     ds4_dist_options dist;
     bool plain;
@@ -1427,6 +1434,12 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
 static double run_clock_sec(void) {
     struct timespec ts;
 #ifdef CLOCK_UPTIME_RAW
@@ -1593,6 +1606,18 @@ static eval_config parse_options(int argc, char **argv) {
             c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--case-sequence")) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--case-id")) {
+            if (c.case_id_count >= EVAL_QUALIFICATION_CASE_COUNT) {
+                fprintf(stderr, "ds4-eval: --case-id requires exactly four stable IDs\n");
+                exit(2);
+            }
+            c.case_ids[c.case_id_count++] = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--result-jsonl")) {
+            if (c.result_jsonl_path) {
+                fprintf(stderr, "ds4-eval: --result-jsonl may only be specified once\n");
+                exit(2);
+            }
+            c.result_jsonl_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
@@ -1722,6 +1747,57 @@ static eval_config parse_options(int argc, char **argv) {
         }
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
+
+    static const char *const qualification_case_ids[
+        EVAL_QUALIFICATION_CASE_COUNT] = {
+        "recNu3MXkvWUzHZr9",
+        "001b51d76b4d422988f2c11f104a2c6c",
+        "aime2025-01",
+        "compsec-076",
+    };
+    if ((c.case_id_count > 0) != (c.result_jsonl_path != NULL)) {
+        fprintf(stderr,
+                "ds4-eval: --case-id and --result-jsonl are required together\n");
+        exit(2);
+    }
+    if (c.case_id_count > 0) {
+        if (c.case_id_count != EVAL_QUALIFICATION_CASE_COUNT) {
+            fprintf(stderr, "ds4-eval: qualification requires exactly four --case-id values\n");
+            exit(2);
+        }
+        if (c.case_sequence || c.question_limit > 0) {
+            fprintf(stderr,
+                    "ds4-eval: stable --case-id selection cannot be mixed with index selection\n");
+            exit(2);
+        }
+        for (int i = 0; i < EVAL_QUALIFICATION_CASE_COUNT; i++) {
+            for (int previous = 0; previous < i; previous++) {
+                if (!strcmp(c.case_ids[i], c.case_ids[previous])) {
+                    fprintf(stderr, "ds4-eval: duplicate --case-id: %s\n",
+                            c.case_ids[i]);
+                    exit(2);
+                }
+            }
+            bool known = false;
+            for (int expected = 0; expected < EVAL_QUALIFICATION_CASE_COUNT; expected++) {
+                if (!strcmp(c.case_ids[i], qualification_case_ids[expected])) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                fprintf(stderr, "ds4-eval: unknown --case-id: %s\n", c.case_ids[i]);
+                exit(2);
+            }
+            if (strcmp(c.case_ids[i], qualification_case_ids[i]) != 0) {
+                fprintf(stderr,
+                        "ds4-eval: out-of-order --case-id: %s\n",
+                        c.case_ids[i]);
+                exit(2);
+            }
+        }
+        c.plain = true;
+    }
 
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
@@ -3692,9 +3768,54 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
 }
 
+static bool write_qualification_result(FILE *result_jsonl,
+                                       ds4_engine *engine,
+                                       const eval_case *tc,
+                                       const char *answer,
+                                       bool pass,
+                                       const ds4_runtime_request_metrics *metrics) {
+    char request_json[8192];
+    char runtime_json[32768];
+    char digest_input[49152];
+    char evidence_digest[DS4_PLAN_IO_SHA256_HEX_SIZE];
+    char err[256];
+    size_t request_length = 0;
+    size_t runtime_length = 0;
+    ds4_runtime_wire_snapshot runtime;
+    if (!ds4_runtime_request_metrics_json(metrics, request_json,
+                                          sizeof(request_json),
+                                          &request_length) ||
+        !ds4_engine_runtime_snapshot(engine, &runtime) ||
+        !ds4_runtime_wire_snapshot_json(&runtime, runtime_json,
+                                        sizeof(runtime_json),
+                                        &runtime_length)) {
+        return false;
+    }
+    const int digest_length = snprintf(
+        digest_input, sizeof(digest_input),
+        "case_id=%s\nanswer=%s\ngrade=%s\nterminal_status=completed\n"
+        "request=%s\nruntime=%s\n",
+        tc->id, answer, pass ? "passed" : "failed", request_json, runtime_json);
+    if (digest_length < 0 || (size_t)digest_length >= sizeof(digest_input) ||
+        !ds4_plan_io_sha256(digest_input, (size_t)digest_length,
+                            evidence_digest, err, sizeof(err))) {
+        return false;
+    }
+    fprintf(result_jsonl,
+            "{\"schema\":\"ds4.eval.qualification-result/v1\","
+            "\"case_id\":\"%s\",\"answer\":\"%s\","
+            "\"grade\":\"%s\",\"terminal_status\":\"completed\","
+            "\"request_metrics\":%s,\"runtime_snapshot\":%s,"
+            "\"evidence_sha256\":\"%s\"}\n",
+            tc->id, answer, pass ? "passed" : "failed",
+            request_json, runtime_json, evidence_digest);
+    return fflush(result_jsonl) == 0;
+}
+
 static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                     const eval_config *cfg, eval_ui *ui,
-                                    FILE *trace, int idx, uint64_t *rng) {
+                                    FILE *trace, FILE *result_jsonl,
+                                    int idx, uint64_t *rng) {
     const eval_case *tc = &eval_cases[idx];
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
@@ -3759,6 +3880,17 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->max_tokens = generation_limit;
     ui->think_max_tokens = generation_limit - cfg->hard_limit_reply_budget;
     if (ui->think_max_tokens < 0) ui->think_max_tokens = 0;
+    ds4_runtime_request_context request = {0};
+    const bool qualification_result = result_jsonl != NULL;
+    if (qualification_result &&
+        (!ds4_runtime_request_begin(&request, now_ns()) ||
+         !ds4_runtime_request_set_prompt_tokens(&request, (uint64_t)prompt.len) ||
+         !ds4_runtime_request_mark_prefill_started(&request, now_ns()))) {
+        fprintf(stderr, "ds4-eval: failed to initialize qualification request\n");
+        free(question);
+        ds4_tokens_free(&prompt);
+        return EVAL_RUN_ERROR;
+    }
     tui_run_clock_start(ui);
     if (tty) {
         tui_reset_stream(ui, tc, ds4_think_mode_enabled(think_mode));
@@ -3778,7 +3910,12 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     char err[256];
     ds4_session_set_progress(session, eval_prefill_progress, ui);
     ds4_session_set_display_progress(session, eval_prefill_progress, ui);
-    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+    const int sync_rc = qualification_result
+        ? ds4_session_sync_attributed(session, &prompt, &request, err, sizeof(err))
+        : ds4_session_sync(session, &prompt, err, sizeof(err));
+    if (sync_rc != 0 ||
+        (qualification_result &&
+         !ds4_runtime_request_mark_prefill_complete(&request, now_ns()))) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         tui_run_clock_stop(ui);
@@ -3939,7 +4076,10 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             think_close.remaining_budget = remaining_budget;
             think_close.rank = close_rank;
         }
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        const int eval_rc = qualification_result
+            ? ds4_session_eval_attributed(session, token, &request, err, sizeof(err))
+            : ds4_session_eval(session, token, err, sizeof(err));
+        if (eval_rc != 0) {
             plain_reset_color(use_plain_color);
             ui->generated_tokens[idx] = ui->generated;
             tui_run_clock_stop(ui);
@@ -3958,6 +4098,18 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         char *text = ds4_token_text(engine, token, &len);
         buf_append(&raw, text, len);
         ui->generated++;
+        if (qualification_result &&
+            (!ds4_runtime_request_add_generated_tokens(&request, 1) ||
+             !ds4_runtime_request_record_visible_decoded(&request, 1, now_ns()) ||
+             (ui->generated == 1 &&
+              !ds4_runtime_request_mark_first_visible_emitted(&request, now_ns())))) {
+            fprintf(stderr, "ds4-eval: failed to attribute qualification decode\n");
+            free(text);
+            free(question);
+            ds4_tokens_free(&think_close_tokens);
+            buf_free(&raw);
+            return EVAL_RUN_ERROR;
+        }
         ui->generated_tokens[idx] = ui->generated;
         tui_run_clock_tick(ui);
         if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
@@ -3997,6 +4149,21 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     find_case_answer(tc, raw.v ? raw.v : "", got, sizeof(got));
     snprintf(ui->guess[idx], EVAL_ANSWER_MAX, "%s", got);
     bool pass = answer_matches(tc, got);
+    if (qualification_result) {
+        ds4_runtime_request_metrics metrics;
+        if (ds4_session_request_barrier(session, &request, err, sizeof(err)) != 0 ||
+            !ds4_runtime_request_finish(&request, DS4_RUNTIME_REQUEST_COMPLETED,
+                                        now_ns(), &metrics) ||
+            !write_qualification_result(result_jsonl, engine, tc, got, pass,
+                                        &metrics)) {
+            fprintf(stderr, "ds4-eval: failed to finalize qualification evidence: %s\n",
+                    err[0] ? err : "serialization failure");
+            free(question);
+            ds4_tokens_free(&think_close_tokens);
+            buf_free(&raw);
+            return EVAL_RUN_ERROR;
+        }
+    }
     ui->status[idx] = pass ? EVAL_PASSED : EVAL_FAILED;
     ui->generated_tokens[idx] = ui->generated;
     tui_run_clock_stop(ui);
@@ -4239,7 +4406,29 @@ int main(int argc, char **argv) {
     }
     int *case_sequence = NULL;
     int case_sequence_len = 0;
-    if (cfg.case_sequence &&
+    if (cfg.case_id_count > 0) {
+        case_sequence = malloc(EVAL_QUALIFICATION_CASE_COUNT * sizeof(*case_sequence));
+        if (!case_sequence) {
+            fprintf(stderr, "ds4-eval: out of memory while selecting stable cases\n");
+            return 1;
+        }
+        for (int selected = 0; selected < EVAL_QUALIFICATION_CASE_COUNT; selected++) {
+            case_sequence[selected] = -1;
+            for (int candidate = 0; candidate < ncases; candidate++) {
+                if (!strcmp(eval_cases[candidate].id, cfg.case_ids[selected])) {
+                    case_sequence[selected] = candidate;
+                    break;
+                }
+            }
+            if (case_sequence[selected] < 0) {
+                fprintf(stderr, "ds4-eval: embedded qualification case missing: %s\n",
+                        cfg.case_ids[selected]);
+                free(case_sequence);
+                return 2;
+            }
+        }
+        case_sequence_len = EVAL_QUALIFICATION_CASE_COUNT;
+    } else if (cfg.case_sequence &&
         parse_case_sequence(cfg.case_sequence, ncases, &case_sequence, &case_sequence_len) != 0) {
         return 2;
     }
@@ -4260,10 +4449,25 @@ int main(int argc, char **argv) {
         }
     }
 
+    FILE *result_jsonl = NULL;
+    if (cfg.result_jsonl_path) {
+        const int result_fd = open(cfg.result_jsonl_path,
+                                   O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (result_fd < 0 || !(result_jsonl = fdopen(result_fd, "w"))) {
+            fprintf(stderr, "ds4-eval: cannot create result JSONL '%s': %s\n",
+                    cfg.result_jsonl_path, strerror(errno));
+            if (result_fd >= 0) close(result_fd);
+            if (trace) fclose(trace);
+            free(case_sequence);
+            return 2;
+        }
+    }
+
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
         if (trace) fclose(trace);
+        if (result_jsonl) fclose(result_jsonl);
         free(case_sequence);
         return 2;
     }
@@ -4272,6 +4476,7 @@ int main(int argc, char **argv) {
     const int open_rc = ds4_engine_open(&engine, &opt);
     if (open_rc != 0) {
         if (trace) fclose(trace);
+        if (result_jsonl) fclose(result_jsonl);
         free(case_sequence);
         return open_rc;
     }
@@ -4307,6 +4512,7 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
         if (trace) fclose(trace);
+        if (result_jsonl) fclose(result_jsonl);
         ds4_engine_close(engine);
         free(case_sequence);
         return 1;
@@ -4346,7 +4552,8 @@ int main(int argc, char **argv) {
             ui.selected_case = next;
         }
 
-        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next, &rng);
+        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace,
+                                              result_jsonl, next, &rng);
         if (result == EVAL_RUN_ERROR) {
             rc = 1;
             break;
@@ -4395,6 +4602,7 @@ int main(int argc, char **argv) {
     ds4_session_free(session);
     ds4_engine_close(engine);
     if (trace) fclose(trace);
+    if (result_jsonl) fclose(result_jsonl);
     free(case_sequence);
     return rc || failed ? 1 : 0;
 }

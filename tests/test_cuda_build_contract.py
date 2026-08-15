@@ -215,6 +215,7 @@ LAGUNA_C7_ORACLE_PRODUCER_FILES = {
     "probe_ds4_laguna_behavior.c",
     "probe_ds4_laguna_moe.c",
     "probe_poolside_laguna_behavior.cpp",
+    "probe_poolside_laguna_token513_layer.cpp",
     "probe_poolside_laguna_token513_moe.cpp",
     "probe_poolside_laguna_moe.cpp",
     "short.tokens.i32",
@@ -3023,6 +3024,55 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn('"%s/layer-%02d-%s.%s"', DS4_SOURCE)
         self.assertIn('"ffn-moe-input"', decode)
         self.assertIn('"q8_1"', decode)
+
+    def test_laguna_token513_probes_select_any_detail_layer(self) -> None:
+        ds4_probe = (
+            ROOT / "tests/oracle-producers/laguna-c7/probe_ds4_laguna_moe.c"
+        ).read_text(encoding="utf-8")
+        poolside_probe_path = (
+            ROOT
+            / "tests/oracle-producers/laguna-c7/"
+            "probe_poolside_laguna_token513_layer.cpp"
+        )
+        self.assertTrue(
+            poolside_probe_path.is_file(),
+            "missing derivative arbitrary-layer Poolside token-513 probe",
+        )
+        poolside_probe = poolside_probe_path.read_text(encoding="utf-8")
+
+        self.assertIn("out->detail_layer = 1;", ds4_probe)
+        self.assertIn('strcmp(flag, "--detail-layer")', ds4_probe)
+        self.assertIn("parsed >= LAGUNA_LAYERS", ds4_probe)
+        self.assertIn("format_artifact_name(", ds4_probe)
+        self.assertIn(
+            'setenv("DS4_LAGUNA_DIAG_LAYER", detail_layer, 1)',
+            ds4_probe,
+        )
+
+        self.assertIn("int detail_layer = 1;", poolside_probe)
+        self.assertIn("parsed >= kLayers", poolside_probe)
+        self.assertIn("detail_layer % 4 == 0 ? 48 : 72", poolside_probe)
+        self.assertIn('"layer-%02d-%s.f32"', poolside_probe)
+        self.assertIn("std::array<DetailTarget, 24>", poolside_probe)
+        for callback, stage in (
+            ("attn_norm", "attn-norm"),
+            ("Qcur", "q-proj"),
+            ("Kcur", "k-proj"),
+            ("Vcur", "v-proj"),
+            ("attn_gate_proj", "gate-proj"),
+            ("Qcur_rope", "q-rope"),
+            ("Kcur_rope", "k-rope"),
+            ("attn_gated", "attn-gated"),
+            ("attn_o_proj", "attn-o-proj"),
+        ):
+            with self.subTest(callback=callback):
+                self.assertIn(f'{{"{callback}", "{stage}"', poolside_probe)
+        self.assertIn("detail_checkpoints=24", poolside_probe)
+
+        self.assertIn("static uint32_t detail_head_count(", ds4_probe)
+        self.assertIn("detail_layer % 4 == 0 ? 48u : 72u", ds4_probe)
+        self.assertIn('"layer-%02d-attn-gated.f32"', ds4_probe)
+        self.assertIn("artifact_bytes(artifact, detail_layer)", ds4_probe)
 
         gate_up = function_body(
             "__global__ static void glm_poolside_q4_gate_up_kernel("

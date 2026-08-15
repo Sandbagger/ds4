@@ -1,4 +1,4 @@
-/* Direct DS4 512+1 decode capture for the Laguna layer-1 routed MoE.
+/* Direct DS4 512+1 decode capture for a selected Laguna routed-MoE layer.
  *
  * The release-control build emits token-513 logits using only release DS4 and
  * CUDA objects.  The hook build runs the same decode twice from the same
@@ -20,6 +20,7 @@ enum {
     RESUME_TOKEN = 3612,
     CONTEXT_TOKENS = 1024,
     VOCAB_SIZE = 100352,
+    LAGUNA_LAYERS = 48,
 };
 
 typedef struct {
@@ -27,6 +28,7 @@ typedef struct {
     const char *tokens;
     const char *out;
     const char *release_logits;
+    int detail_layer;
 } options;
 
 #define LOGITS_BYTES ((size_t)VOCAB_SIZE * sizeof(float))
@@ -35,45 +37,81 @@ typedef struct {
 typedef struct {
     const char *name;
     uint64_t bytes;
+    uint64_t bytes_per_head;
 } expected_artifact;
 
 static const expected_artifact EXPECTED_ARTIFACTS[] = {
-    {"layer-01-ffn-norm.f32", 3072u * 4u},
-    {"layer-01-router-logits.f32", 256u * 4u},
-    {"layer-01-router-selected.i32", 10u * 4u},
-    {"layer-01-router-weights.f32", 10u * 4u},
-    {"layer-01-ffn-moe-input.q8_1", 3456u},
-    {"layer-01-ffn-moe-gate.f32", 10u * 1024u * 4u},
-    {"layer-01-ffn-moe-up.f32", 10u * 1024u * 4u},
-    {"layer-01-ffn-moe-swiglu.f32", 10u * 1024u * 4u},
-    {"layer-01-ffn-moe-col-l2.f32", 10u * 4u},
-    {"layer-01-ffn-moe-down-input.f32", 10u * 1024u * 4u},
-    {"layer-01-ffn-moe-down-input.q8_1", 10u * 1024u / 32u * 36u},
-    {"layer-01-ffn-moe-down.f32", 10u * 3072u * 4u},
-    {"layer-01-ffn-moe-weighted.f32", 10u * 3072u * 4u},
-    {"layer-01-ffn-moe-out.f32", 3072u * 4u},
-    {"layer-01-ffn-shared-out.f32", 3072u * 4u},
-    {"layer-01-ffn-out.f32", 3072u * 4u},
-    {"layer-01.f32", 3072u * 4u},
+    {"layer-%02d-attn-norm.f32", 3072u * 4u, 0},
+    {"layer-%02d-q-proj.f32", 0, 128u * 4u},
+    {"layer-%02d-k-proj.f32", 1024u * 4u, 0},
+    {"layer-%02d-v-proj.f32", 1024u * 4u, 0},
+    {"layer-%02d-gate-proj.f32", 0, 4u},
+    {"layer-%02d-q-rope.f32", 0, 128u * 4u},
+    {"layer-%02d-k-rope.f32", 1024u * 4u, 0},
+    {"layer-%02d-attn-gated.f32", 0, 128u * 4u},
+    {"layer-%02d-attn-o-proj.f32", 3072u * 4u, 0},
+    {"layer-%02d-ffn-inp.f32", 3072u * 4u, 0},
+    {"layer-%02d-ffn-norm.f32", 3072u * 4u, 0},
+    {"layer-%02d-router-logits.f32", 256u * 4u, 0},
+    {"layer-%02d-router-selected.i32", 10u * 4u, 0},
+    {"layer-%02d-router-weights.f32", 10u * 4u, 0},
+    {"layer-%02d-ffn-moe-input.q8_1", 3456u, 0},
+    {"layer-%02d-ffn-moe-gate.f32", 10u * 1024u * 4u, 0},
+    {"layer-%02d-ffn-moe-up.f32", 10u * 1024u * 4u, 0},
+    {"layer-%02d-ffn-moe-swiglu.f32", 10u * 1024u * 4u, 0},
+    {"layer-%02d-ffn-moe-col-l2.f32", 10u * 4u, 0},
+    {"layer-%02d-ffn-moe-down-input.f32", 10u * 1024u * 4u, 0},
+    {"layer-%02d-ffn-moe-down-input.q8_1", 10u * 1024u / 32u * 36u, 0},
+    {"layer-%02d-ffn-moe-down.f32", 10u * 3072u * 4u, 0},
+    {"layer-%02d-ffn-moe-weighted.f32", 10u * 3072u * 4u, 0},
+    {"layer-%02d-ffn-moe-out.f32", 3072u * 4u, 0},
+    {"layer-%02d-ffn-shared-out.f32", 3072u * 4u, 0},
+    {"layer-%02d-ffn-out.f32", 3072u * 4u, 0},
+    {"layer-%02d.f32", 3072u * 4u, 0},
 };
+
+static uint32_t detail_head_count(int detail_layer) {
+    return detail_layer % 4 == 0 ? 48u : 72u;
+}
+
+static uint64_t artifact_bytes(
+        const expected_artifact *artifact,
+        int detail_layer) {
+    return artifact->bytes +
+           artifact->bytes_per_head * detail_head_count(detail_layer);
+}
 #endif
 
 static void usage(FILE *stream, const char *program) {
 #ifdef DS4_LAGUNA_RELEASE_CONTROL
     fprintf(stream,
             "usage: %s --model MODEL --tokens PREFIX-512.i32 "
-            "--release-logits FILE\n",
+            "--release-logits FILE [--detail-layer 0..47]\n",
             program);
 #else
     fprintf(stream,
             "usage: %s --model MODEL --tokens PREFIX-512.i32 --out DIR "
-            "--release-logits FILE\n",
+            "--release-logits FILE [--detail-layer 0..47]\n",
             program);
 #endif
 }
 
+static int parse_detail_layer(const char *value, int *out) {
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < 0 || parsed >= LAGUNA_LAYERS) {
+        return 0;
+    }
+    *out = (int)parsed;
+    return 1;
+}
+
 static int parse_options(int argc, char **argv, options *out) {
     memset(out, 0, sizeof(*out));
+    out->detail_layer = 1;
+    int have_detail_layer = 0;
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc) return 0;
         const char *flag = argv[i++];
@@ -87,6 +125,10 @@ static int parse_options(int argc, char **argv, options *out) {
         } else if (strcmp(flag, "--release-logits") == 0 &&
                    !out->release_logits) {
             out->release_logits = value;
+        } else if (strcmp(flag, "--detail-layer") == 0 &&
+                   !have_detail_layer &&
+                   parse_detail_layer(value, &out->detail_layer)) {
+            have_detail_layer = 1;
         } else {
             return 0;
         }
@@ -212,21 +254,35 @@ static int read_release_logits(const char *path, float *logits) {
 #endif
 
 #ifndef DS4_LAGUNA_RELEASE_CONTROL
-static int verify_artifacts(const char *directory) {
+static int format_artifact_name(
+        char *out,
+        size_t out_size,
+        const expected_artifact *artifact,
+        int detail_layer) {
+    const int length = snprintf(
+            out, out_size, artifact->name, detail_layer);
+    return length >= 0 && (size_t)length < out_size;
+}
+
+static int verify_artifacts(const char *directory, int detail_layer) {
     char path[4096];
+    char name[128];
     for (size_t i = 0;
          i < sizeof(EXPECTED_ARTIFACTS) / sizeof(EXPECTED_ARTIFACTS[0]);
          i++) {
         const expected_artifact *artifact = &EXPECTED_ARTIFACTS[i];
+        if (!format_artifact_name(
+                name, sizeof(name), artifact, detail_layer)) return 0;
+        const uint64_t expected_bytes = artifact_bytes(artifact, detail_layer);
         const int length = snprintf(
-                path, sizeof(path), "%s/%s", directory, artifact->name);
+                path, sizeof(path), "%s/%s", directory, name);
         if (length < 0 || (size_t)length >= sizeof(path)) return 0;
         struct stat status;
         if (stat(path, &status) != 0 || !S_ISREG(status.st_mode) ||
-            status.st_size < 0 || (uint64_t)status.st_size != artifact->bytes) {
+            status.st_size < 0 || (uint64_t)status.st_size != expected_bytes) {
             fprintf(stderr,
                     "capture: artifact %s missing or wrong size (expected %llu)\n",
-                    path, (unsigned long long)artifact->bytes);
+                    path, (unsigned long long)expected_bytes);
             return 0;
         }
     }
@@ -319,8 +375,13 @@ int main(int argc, char **argv) {
                 "capture: release and hook-null token-513 logits differ\n");
         goto cleanup;
     }
-    if (setenv("DS4_LAGUNA_DIAG_DIR", opt.out, 1) != 0 ||
-        setenv("DS4_LAGUNA_DIAG_LAYER", "1", 1) != 0) {
+    char detail_layer[16];
+    const int detail_layer_length = snprintf(
+            detail_layer, sizeof(detail_layer), "%d", opt.detail_layer);
+    if (detail_layer_length < 0 ||
+        (size_t)detail_layer_length >= sizeof(detail_layer) ||
+        setenv("DS4_LAGUNA_DIAG_DIR", opt.out, 1) != 0 ||
+        setenv("DS4_LAGUNA_DIAG_LAYER", detail_layer, 1) != 0) {
         fprintf(stderr, "capture: enable diagnostics failed\n");
         goto cleanup;
     }
@@ -335,13 +396,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "capture: diagnostics perturbed token-513 logits\n");
         goto cleanup;
     }
-    if (!verify_artifacts(opt.out)) goto cleanup;
+    if (!verify_artifacts(opt.out, opt.detail_layer)) goto cleanup;
 
     fprintf(stderr,
-            "probe_ds4_laguna_moe PASS token=513 layer=1 "
+            "probe_ds4_laguna_moe PASS token=513 layer=%d "
             "resume_token=%d release_vs_hook_null=bit-exact "
             "hook_null_vs_hook_active=bit-exact\n",
-            RESUME_TOKEN);
+            opt.detail_layer, RESUME_TOKEN);
     rc = 0;
 #endif
 

@@ -3632,8 +3632,16 @@ class CudaBuildContractTest(unittest.TestCase):
             rule_prerequisites("tests/test_cuda_laguna_model"),
         )
 
-    def test_cuda_laguna_stream_build_artifact_is_ignored(self) -> None:
-        self.assertIn("/tests/test_cuda_laguna_stream", GITIGNORE)
+    def test_cuda_laguna_generated_artifacts_are_ignored(self) -> None:
+        for path in (
+            "/tests/test_cuda_laguna_stream",
+            "/tests/cuda_long_context_smoke",
+            "/tests/test-vectors/laguna-resident/swa-513.prompt",
+            "/tests/test-vectors/laguna-resident/yarn-8193.prompt",
+            "/tests/test-vectors/laguna-resident/deep-32768.prompt",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, GITIGNORE)
 
     def test_resident_gate_has_one_runner_recipe_and_build_only_prerequisites(
         self,

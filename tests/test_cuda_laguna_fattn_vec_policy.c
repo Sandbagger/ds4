@@ -9,7 +9,7 @@ static ds4_cuda_laguna_fattn_vec_decode_shape canonical_shape(void) {
         .compute_major = 12,
         .compute_minor = 1,
         .sm_count = 48,
-        .max_blocks_per_sm = 6,
+        .poolside_partitions = 3u,
         .query_tokens = 1u,
         .pos = 512u,
         .cache_cap = 4096u,
@@ -38,16 +38,7 @@ static int expect_partitions(
 
 int main(void) {
     ds4_cuda_laguna_fattn_vec_decode_shape shape = canonical_shape();
-    if (expect_partitions("canonical", shape, 6u)) return 1;
-
-    shape.max_blocks_per_sm = 1;
-    if (expect_partitions("occupancy-one", shape, 1u)) return 1;
-    shape.max_blocks_per_sm = 2;
-    if (expect_partitions("occupancy-two", shape, 2u)) return 1;
-    shape.max_blocks_per_sm = 12;
-    if (expect_partitions("occupancy-capped-by-six-tiles", shape, 6u)) {
-        return 1;
-    }
+    if (expect_partitions("canonical", shape, 3u)) return 1;
 
 #define EXPECT_REJECTED(field, value) do { \
         shape = canonical_shape(); \
@@ -58,7 +49,9 @@ int main(void) {
     EXPECT_REJECTED(compute_major, 11);
     EXPECT_REJECTED(compute_minor, 0);
     EXPECT_REJECTED(sm_count, 47);
-    EXPECT_REJECTED(max_blocks_per_sm, 0);
+    EXPECT_REJECTED(poolside_partitions, 1u);
+    EXPECT_REJECTED(poolside_partitions, 2u);
+    EXPECT_REJECTED(poolside_partitions, 4u);
     EXPECT_REJECTED(query_tokens, 2u);
     EXPECT_REJECTED(pos, 511u);
     EXPECT_REJECTED(cache_cap, 767u);

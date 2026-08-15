@@ -83,6 +83,7 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+#include "ds4_cuda_laguna_fattn_vec_policy.h"
 #include "ds4_laguna_plan.h"
 #include "ds4_laguna_stream.h"
 #include "ds4_iq2_tables_cuda.inc"
@@ -138,6 +139,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_cuda_poolside_mmvq;
 static int g_cuda_poolside_f32_mmvf;
+static int g_cuda_no_laguna_fattn_vec_decode;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
@@ -293,6 +295,8 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_decode_score4 = getenv("DS4_CUDA_DECODE_SCORE4") != NULL;
     g_cuda_decode_score8 = getenv("DS4_CUDA_DECODE_SCORE8") != NULL;
     g_cuda_no_decode_value512 = getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL;
+    g_cuda_no_laguna_fattn_vec_decode =
+        getenv("DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE") != NULL;
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
     g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
     g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
@@ -36392,6 +36396,346 @@ __global__ static void laguna_store_kv_f16_kernel(
     value_cache[dst] = __float2half_rn(v[i]);
 }
 
+/* Poolside llama.cpp 04b2b72 FATTN_VEC, narrowed to Laguna q=1/D=128/F16.
+ * The pinned sm_121a binary uses 162 registers/thread and 8448 bytes of
+ * static shared memory, hence three resident blocks on the 48-SM GB10.  Its
+ * launcher keeps that P=3 topology for K=768, so block y visits tiles y and
+ * y+3.  Poolside's K permutation preserves physical [key][KV head][D]
+ * strides, exactly matching DS4's non-wrapped token-513 cache.  Do not
+ * substitute PR594's scaled-dot or strided-key reduction. */
+__launch_bounds__(128, 1)
+__global__ static void laguna_attention_decode_fattn_vec_kernel(
+        float *partial_heads, float2 *partial_meta, const float *q,
+        const __half *key_cache, const __half *value_cache,
+        uint32_t key_count, uint32_t padded_key_count,
+        uint32_t n_head, uint32_t n_head_kv, float scale,
+        uint32_t partitions) {
+    constexpr uint32_t threads = 128u;
+    constexpr uint32_t keys_per_partition = 128u;
+    constexpr uint32_t head_dim = 128u;
+    constexpr float max_offset = 3.0f * 0.6931f;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = threadIdx.y;
+    const uint32_t tid = warp * 32u + lane;
+    const uint32_t head = blockIdx.z;
+    const uint32_t partition = blockIdx.y;
+    if (tid >= threads || head >= n_head || partition >= partitions) return;
+
+    const uint32_t lane_kq = lane & 7u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t kv_head = head / (n_head / n_head_kv);
+    const float2 *query =
+        (const float2 *)(q + (uint64_t)head * head_dim);
+    const __half2 *key_base = (const __half2 *)(
+        key_cache + (uint64_t)kv_head * head_dim);
+    const __half2 *value_base = (const __half2 *)(
+        value_cache + (uint64_t)kv_head * head_dim);
+    const uint64_t cache_row_pairs =
+        (uint64_t)n_head_kv * (head_dim / 2u);
+
+    float2 Q_reg[8];
+#pragma unroll
+    for (uint32_t slot = 0u; slot < 8u; slot++) {
+        const uint32_t pair = (slot >> 2u) * 32u +
+            lane_kq * 4u + (slot & 3u);
+        Q_reg[slot] = query[pair];
+        Q_reg[slot].x *= scale;
+        Q_reg[slot].y *= scale;
+    }
+
+    float2 VKQ[8] = {};
+    float max_score = -FLT_MAX / 2.0f;
+    float row_sum = 0.0f;
+    __shared__ float KQ[4u * 4u * head_dim];
+    __shared__ float max_shared[32];
+    __shared__ float sum_shared[32];
+
+    for (uint32_t tile = partition * keys_per_partition;
+         tile < padded_key_count;
+         tile += partitions * keys_per_partition) {
+        float score_reg = -INFINITY;
+        float max_score_new = max_score;
+#pragma unroll
+        for (uint32_t key_slot = 0u; key_slot < 8u; key_slot++) {
+            const uint32_t key = tile + warp * 32u +
+                (lane & ~7u) + key_slot;
+            float score = 0.0f;
+#pragma unroll
+            for (uint32_t slot = 0u; slot < 8u; slot++) {
+                const uint32_t pair = (slot >> 2u) * 32u +
+                    lane_kq * 4u + (slot & 3u);
+                const float2 key_value = key < key_count ?
+                    __half22float2(key_base[
+                        (uint64_t)key * cache_row_pairs + pair]) :
+                    make_float2(0.0f, 0.0f);
+                score += key_value.x * Q_reg[slot].x;
+                score += key_value.y * Q_reg[slot].y;
+            }
+#pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1) {
+                score += __shfl_xor_sync(
+                    0xffffffffu, score, offset, 8);
+            }
+            const float mask_value = key < key_count ? 0.0f : -INFINITY;
+            score += mask_value;
+            max_score_new = fmaxf(max_score_new, score + max_offset);
+            if (lane_kq == key_slot) score_reg = score;
+        }
+#pragma unroll
+        for (int offset = 8; offset < 32; offset <<= 1) {
+            max_score_new = fmaxf(
+                max_score_new,
+                __shfl_xor_sync(
+                    0xffffffffu, max_score_new, offset, 32));
+        }
+        const float old_scale = expf(max_score - max_score_new);
+        max_score = max_score_new;
+        const float weight = expf(score_reg - max_score);
+        row_sum = row_sum * old_scale + weight;
+        KQ[tid] = weight;
+#pragma unroll
+        for (uint32_t slot = 0u; slot < 8u; slot++) {
+            VKQ[slot].x *= old_scale;
+            VKQ[slot].y *= old_scale;
+        }
+        __syncwarp(0xffffffffu);
+
+#pragma unroll
+        for (uint32_t key0 = 0u; key0 < 32u; key0 += 4u) {
+            const uint32_t key = tile + warp * 32u + key0 + subgroup;
+            const float key_weight = KQ[warp * 32u + key0 + subgroup];
+#pragma unroll
+            for (uint32_t slot = 0u; slot < 8u; slot++) {
+                const uint32_t pair = (slot >> 2u) * 32u +
+                    lane_kq * 4u + (slot & 3u);
+                const float2 value = key < key_count ?
+                    __half22float2(value_base[
+                        (uint64_t)key * cache_row_pairs + pair]) :
+                    make_float2(0.0f, 0.0f);
+                VKQ[slot].x += value.x * key_weight;
+                VKQ[slot].y += value.y * key_weight;
+            }
+        }
+    }
+
+    if (warp == 0u) {
+        max_shared[lane] = -FLT_MAX / 2.0f;
+        sum_shared[lane] = 0.0f;
+    }
+    __syncthreads();
+    if (lane == 0u) max_shared[warp] = max_score;
+    __syncthreads();
+
+    float combined_max = max_shared[lane];
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        combined_max = fmaxf(
+            combined_max,
+            __shfl_xor_sync(
+                0xffffffffu, combined_max, offset, 32));
+    }
+    const float block_scale = expf(max_score - combined_max);
+    max_score = combined_max;
+#pragma unroll
+    for (uint32_t slot = 0u; slot < 8u; slot++) {
+        VKQ[slot].x *= block_scale;
+        VKQ[slot].y *= block_scale;
+    }
+
+    float *VKQ_shared = KQ +
+        ((uint64_t)warp * 4u + subgroup) * head_dim;
+#pragma unroll
+    for (uint32_t slot = 0u; slot < 8u; slot++) {
+        const uint32_t pair = (slot >> 2u) * 32u +
+            lane_kq * 4u + (slot & 3u);
+        VKQ_shared[2u * pair] = VKQ[slot].x;
+        VKQ_shared[2u * pair + 1u] = VKQ[slot].y;
+    }
+
+    row_sum *= block_scale;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        row_sum += __shfl_xor_sync(
+            0xffffffffu, row_sum, offset, 32);
+    }
+    if (lane == 0u) sum_shared[warp] = row_sum;
+    __syncthreads();
+
+    float combined_sum = sum_shared[lane];
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        combined_sum += __shfl_xor_sync(
+            0xffffffffu, combined_sum, offset, 32);
+    }
+
+    float raw_value = 0.0f;
+#pragma unroll
+    for (uint32_t source_warp = 0u; source_warp < 4u; source_warp++) {
+#pragma unroll
+        for (uint32_t source_group = 0u; source_group < 4u;
+             source_group++) {
+            raw_value += KQ[
+                ((uint64_t)source_warp * 4u + source_group) * head_dim + tid];
+        }
+    }
+    if (partitions == 1u) raw_value /= combined_sum;
+    partial_heads[
+        ((uint64_t)head * partitions + partition) * head_dim + tid] =
+        raw_value;
+    if (tid == 0u && partitions != 1u) {
+        partial_meta[(uint64_t)head * partitions + partition] =
+            make_float2(max_score, combined_sum);
+    }
+}
+
+__global__ static void laguna_attention_decode_fattn_vec_combine_kernel(
+        float *raw_heads, const float *partial_heads,
+        const float2 *partial_meta, uint32_t partitions) {
+    constexpr uint32_t head_dim = 128u;
+    const uint32_t head = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    const float *parts = partial_heads +
+        (uint64_t)head * partitions * head_dim;
+    const float2 *source_meta = partial_meta +
+        (uint64_t)head * partitions;
+    extern __shared__ float2 meta[];
+    for (uint32_t index = dim; index < 2u * partitions;
+         index += head_dim) {
+        ((float *)meta)[index] = ((const float *)source_meta)[index];
+    }
+    __syncthreads();
+
+    float max_score = meta[0].x;
+    for (uint32_t part = 1u; part < partitions; part++) {
+        max_score = fmaxf(max_score, meta[part].x);
+    }
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (uint32_t part = 0u; part < partitions; part++) {
+        const float part_scale = expf(meta[part].x - max_score);
+        numerator += part_scale * parts[(uint64_t)part * head_dim + dim];
+        denominator += part_scale * meta[part].y;
+    }
+    raw_heads[(uint64_t)head * head_dim + dim] = numerator / denominator;
+}
+
+__global__ static void laguna_attention_gate_softplus_kernel(
+        float *gate_softplus, const float *gate, uint32_t n_head) {
+    const uint32_t head = blockIdx.x * blockDim.x + threadIdx.x;
+    if (head >= n_head) return;
+    const float gate_value = gate[head];
+    gate_softplus[head] = gate_value > 20.0f ? gate_value :
+        logf(1.0f + expf(gate_value));
+}
+
+__global__ static void laguna_attention_gate_mul_kernel(
+        float *raw_heads, const float *gate_softplus, uint32_t n_head) {
+    constexpr uint32_t head_dim = 128u;
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    if (head >= n_head || dim >= head_dim) return;
+    const uint64_t index = (uint64_t)head * head_dim + dim;
+    raw_heads[index] = raw_heads[index] * gate_softplus[head];
+}
+
+/* Returns 0 when the exact slice is ineligible, 1 after a successful launch,
+ * and -1 if an eligible launch failed. */
+static int laguna_attention_decode_fattn_vec_launch(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const float *gate,
+        uint32_t pos, uint32_t cache_cap, uint32_t key_start,
+        uint32_t key_count, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t head_dim, float scale, int logical_tier) {
+    const int physical_device = g_gpu[logical_tier].device_id;
+    int compute_major = 0;
+    int compute_minor = 0;
+    int sm_count = 0;
+    if (cudaDeviceGetAttribute(
+            &compute_major, cudaDevAttrComputeCapabilityMajor,
+            physical_device) != cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &compute_minor, cudaDevAttrComputeCapabilityMinor,
+            physical_device) != cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &sm_count, cudaDevAttrMultiProcessorCount,
+            physical_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint32_t poolside_partitions = 3u;
+    const uint32_t padded_key_count = 768u;
+    ds4_cuda_laguna_fattn_vec_decode_shape shape = {};
+    shape.rollback = g_cuda_no_laguna_fattn_vec_decode;
+    shape.compute_major = compute_major;
+    shape.compute_minor = compute_minor;
+    shape.sm_count = sm_count;
+    shape.poolside_partitions = poolside_partitions;
+    shape.query_tokens = 1u;
+    shape.pos = pos;
+    shape.cache_cap = cache_cap;
+    shape.key_start = key_start;
+    shape.key_count = key_count;
+    shape.padded_key_count = padded_key_count;
+    shape.n_head = n_head;
+    shape.n_head_kv = n_head_kv;
+    shape.head_dim = head_dim;
+    const uint32_t partitions =
+        ds4_cuda_laguna_fattn_vec_decode_partitions(&shape);
+    if (partitions == 0u) return 0;
+
+    const uint64_t partial_values =
+        (uint64_t)n_head * partitions * head_dim;
+    const uint64_t partial_bytes = partial_values * sizeof(float);
+    const uint64_t meta_values = (uint64_t)n_head * partitions;
+    const uint64_t meta_bytes = meta_values * sizeof(float2);
+    if (partial_bytes > UINT64_MAX - meta_bytes) {
+        return -1;
+    }
+    const uint64_t scratch_bytes = partial_bytes + meta_bytes;
+    /* Correctness-first resident slice: Poolside's three partials/meta use
+     * exactly 74,880 bytes.  The meta region is reused for 48 F32 softplus
+     * values after combine.  This legacy temporary slab is deliberately not
+     * a bounded-memory/compact-admission claim. */
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
+        logical_tier, scratch_bytes, "laguna FATTN_VEC decode");
+    if (!scratch) return -1;
+    float *partial_heads = (float *)scratch;
+    float2 *partial_meta =
+        (float2 *)((unsigned char *)partial_heads + partial_bytes);
+
+    const dim3 block(32u, 4u, 1u);
+    const dim3 grid(1u, partitions, n_head);
+    laguna_attention_decode_fattn_vec_kernel<<<grid, block>>>(
+        partial_heads, partial_meta, q, key_cache, value_cache,
+        key_count, padded_key_count, n_head, n_head_kv, scale,
+        partitions);
+    if (!cuda_ok(cudaGetLastError(), "laguna FATTN_VEC decode launch")) {
+        return -1;
+    }
+
+    const dim3 combine_grid(1u, n_head, 1u);
+    laguna_attention_decode_fattn_vec_combine_kernel<<<
+        combine_grid, head_dim, partitions * sizeof(float2)>>>(
+        heads, partial_heads, partial_meta, partitions);
+    if (!cuda_ok(cudaGetLastError(), "laguna FATTN_VEC combine launch")) {
+        return -1;
+    }
+    float *gate_softplus = (float *)partial_meta;
+    laguna_attention_gate_softplus_kernel<<<1u, n_head>>>(
+        gate_softplus, gate, n_head);
+    if (!cuda_ok(cudaGetLastError(),
+                 "laguna FATTN_VEC softplus launch")) {
+        return -1;
+    }
+    laguna_attention_gate_mul_kernel<<<n_head, head_dim>>>(
+        heads, gate_softplus, n_head);
+    if (!cuda_ok(cudaGetLastError(), "laguna FATTN_VEC gate mul launch")) {
+        return -1;
+    }
+    return 1;
+}
+
 /* Correctness-first decode path: one block owns one query head and thread zero
  * performs a stable online reduction over the caller's causal logical rows.
  * This is intentionally not grouped, flash, or fused; later work can replace
@@ -36491,13 +36835,24 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
                 (uint64_t)(pos % cache_cap), kv_values);
         ok = cuda_ok(cudaGetLastError(), "laguna KV store launch");
         if (ok) {
-            laguna_attention_decode_gqa_f16_kernel<<<n_head, 1>>>(
-                    (float *)heads->ptr, (const float *)q->ptr,
-                    (const __half *)key_cache->ptr,
-                    (const __half *)value_cache->ptr, (const float *)gate->ptr,
-                    key_start, key_count, cache_cap, n_head, n_head_kv,
-                    head_dim, scale);
-            ok = cuda_ok(cudaGetLastError(), "laguna decode attention launch");
+            const int fattn_vec = laguna_attention_decode_fattn_vec_launch(
+                (float *)heads->ptr, (const float *)q->ptr,
+                (const __half *)key_cache->ptr,
+                (const __half *)value_cache->ptr, (const float *)gate->ptr,
+                pos, cache_cap, key_start, key_count, n_head, n_head_kv,
+                head_dim, scale, logical_tier);
+            if (fattn_vec < 0) {
+                ok = 0;
+            } else if (fattn_vec == 0) {
+                laguna_attention_decode_gqa_f16_kernel<<<n_head, 1>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)key_cache->ptr,
+                        (const __half *)value_cache->ptr,
+                        (const float *)gate->ptr, key_start, key_count,
+                        cache_cap, n_head, n_head_kv, head_dim, scale);
+                ok = cuda_ok(cudaGetLastError(),
+                             "laguna decode attention launch");
+            }
         }
     }
     return ok;

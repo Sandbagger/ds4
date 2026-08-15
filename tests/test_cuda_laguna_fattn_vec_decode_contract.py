@@ -13,14 +13,14 @@ MAKEFILE = (ROOT / "Makefile").read_text()
 
 def function_body(name: str) -> str:
     match = re.search(
-        rf"(?:__global__\s+static\s+void|static\s+int|static\s+uint32_t|"
+        rf"(?:__global__\s+static\s+void|static\s+void|static\s+int|static\s+uint32_t|"
         rf"extern\s+\"C\"\s+int)\s+{name}\s*\(",
         CUDA,
     )
     if match is None:
         return ""
     next_function = re.search(
-        r"\n(?:__global__\s+static\s+void|static\s+int|static\s+uint32_t|"
+        r"\n(?:__global__\s+static\s+void|static\s+void|static\s+int|static\s+uint32_t|"
         r"extern\s+\"C\"\s+int)\s+",
         CUDA[match.end() :],
     )
@@ -53,27 +53,32 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
         body = function_body("laguna_attention_decode_fattn_vec_kernel")
         self.assertTrue(body, "missing targeted FATTN_VEC kernel")
         for pinned in (
-            "Poolside llama.cpp 04b2b72",
             "constexpr uint32_t threads = 128u",
             "constexpr uint32_t keys_per_partition = 128u",
+            "tile += partitions * keys_per_partition",
             "3.0f * 0.6931f",
-            "__hmul2",
+            "Q_reg[slot].x *= scale",
             "__shfl_xor_sync",
+            "cache_row_pairs",
             "padded_key_count",
             "key < key_count ? 0.0f : -INFINITY",
         ):
             self.assertIn(pinned, body)
+        self.assertIn("Poolside llama.cpp 04b2b72", CUDA)
 
     def test_partition_combine_precedes_separate_gate_boundary(self) -> None:
         combine = function_body("laguna_attention_decode_fattn_vec_combine_kernel")
-        gate = function_body("laguna_attention_gate_softplus_kernel")
+        softplus = function_body("laguna_attention_gate_softplus_kernel")
+        gate_mul = function_body("laguna_attention_gate_mul_kernel")
         self.assertIn("for (uint32_t part = 0u; part < partitions; part++)", combine)
         self.assertIn("expf(meta[part].x - max_score)", combine)
-        self.assertIn("raw_heads[", gate)
+        self.assertIn("gate_softplus[head] =", softplus)
         self.assertRegex(
-            gate,
+            softplus,
             r"logf\(1\.0f \+ expf\(gate_value\)\)",
         )
+        self.assertIn("raw_heads[index] =", gate_mul)
+        self.assertIn("gate_softplus[head]", gate_mul)
 
     def test_decode_dispatch_is_narrow_and_rollback_is_init_latched(self) -> None:
         refresh = function_body("cuda_decode_dispatch_env_refresh")
@@ -88,14 +93,19 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
 
         launch = function_body("laguna_attention_decode_fattn_vec_launch")
         for required in (
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor",
+            "poolside_partitions = 3u",
             "padded_key_count = 768u",
-            "laguna_stage_fattn_vec_kv_f16_kernel<<<",
+            "const dim3 grid(1u, partitions, n_head)",
+            "const dim3 combine_grid(1u, n_head, 1u)",
             "laguna_attention_decode_fattn_vec_kernel<<<",
             "laguna_attention_decode_fattn_vec_combine_kernel<<<",
             "laguna_attention_gate_softplus_kernel<<<",
+            "laguna_attention_gate_mul_kernel<<<",
         ):
             self.assertIn(required, launch)
+        self.assertNotIn("cudaOccupancy", launch)
+        self.assertNotIn("laguna_stage_fattn_vec_kv_f16_kernel", CUDA)
+        self.assertIn("scratch_bytes = partial_bytes + meta_bytes", launch)
 
 
 if __name__ == "__main__":

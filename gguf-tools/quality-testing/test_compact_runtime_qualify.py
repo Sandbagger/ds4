@@ -1443,7 +1443,7 @@ class QualificationRunnerContractTest(unittest.TestCase):
         value = self._bundle_fixture()
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
-            evidence = root / "evidence"
+            evidence = root / "compact-runtime-evidence"
             (evidence / "raw").mkdir(parents=True)
             (evidence / "raw" / "gate.json").write_bytes(b"gate evidence\n")
             output = root / "bundle.json"
@@ -1458,7 +1458,7 @@ class QualificationRunnerContractTest(unittest.TestCase):
         value = self._bundle_fixture()
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
-            evidence = root / "evidence"
+            evidence = root / "compact-runtime-evidence"
             (evidence / "raw").mkdir(parents=True)
             raw = evidence / "raw" / "gate.json"
             raw.write_bytes(b"gate evidence\n")

@@ -10,6 +10,7 @@ import base64
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import math
 import mmap
@@ -811,6 +812,18 @@ def _canonical_text(value: Any) -> str:
 def canonical_json_bytes(value: Any) -> bytes:
     """Canonicalize the manifest's explicitly supported RFC 8785 domain."""
     return _canonical_text(value).encode("utf-8")
+
+
+def canonical_bundle_json_bytes(value: Any) -> bytes:
+    """Canonicalize the full qualification-result I-JSON domain with RFC 8785."""
+    try:
+        import rfc8785
+    except ImportError as exc:
+        raise ValueError("qualification publication requires pinned rfc8785") from exc
+    try:
+        return rfc8785.dumps(value)
+    except (rfc8785.CanonicalizationError, UnicodeError) as exc:
+        raise ValueError(f"cannot RFC 8785-canonicalize qualification result: {exc}") from exc
 
 
 def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
@@ -3469,13 +3482,16 @@ def _evidence_files(root: Path) -> set[str]:
 def build_evidence_index(
     root: Path | str,
     references: Sequence[str],
+    *,
+    excluded_paths: Sequence[str] = (),
 ) -> tuple[list[dict[str, str]], str]:
     directory = Path(root)
     normalized = [validate_evidence_path(path) for path in references]
     if len(set(normalized)) != len(normalized):
         raise ValueError("evidence references contain a duplicate path")
     referenced = set(normalized)
-    observed = _evidence_files(directory)
+    excluded = {validate_evidence_path(path) for path in excluded_paths}
+    observed = _evidence_files(directory) - excluded
     if observed != referenced:
         missing = sorted(referenced - observed)
         extra = sorted(observed - referenced)
@@ -3521,7 +3537,9 @@ def verify_evidence_index(
         normalized_index.append({"path": path, "size_bytes": size, "sha256": digest})
     if paths != sorted(set(paths), key=lambda item: item.encode("utf-8")):
         raise ValueError("evidence index paths are duplicated or not byte-sorted")
-    observed_index, observed_digest = build_evidence_index(Path(root), paths)
+    observed_index, observed_digest = build_evidence_index(
+        Path(root), paths, excluded_paths=("evidence-index.json",)
+    )
     if observed_index != normalized_index or observed_digest != expected_digest:
         raise ValueError("evidence digest or size changed")
 
@@ -3628,7 +3646,171 @@ def qualification_bundle_status(
         return "invalid"
     if any(status != "passed" for status in global_statuses):
         return "failed"
-    return "passed" if "passed" in profile_statuses else "failed"
+    if "passed" in profile_statuses:
+        return "passed"
+    return "invalid" if all(status == "invalid" for status in profile_statuses) else "failed"
+
+
+def _qualification_evidence_claims(value: Any) -> dict[str, str]:
+    claims: dict[str, str] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, Mapping):
+            if set(node) == {"path", "sha256"}:
+                path = validate_evidence_path(node["path"])
+                digest = node["sha256"]
+                if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+                    raise ValueError(f"evidence claimed an invalid digest: {path}")
+                previous = claims.get(path)
+                if previous is not None and previous != digest:
+                    raise ValueError(f"evidence path has conflicting claimed digests: {path}")
+                claims[path] = digest
+                return
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    if not claims:
+        raise ValueError("qualification bundle has no referenced evidence")
+    return claims
+
+
+def _validate_qualification_bundle_schema(value: Mapping[str, Any]) -> None:
+    schema_module_path = ROOT / "gguf-tools/quality-testing/compact_runtime_schema.py"
+    spec = importlib.util.spec_from_file_location(
+        "ds4_compact_runtime_schema_for_publication", schema_module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load the qualification schema profile")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    schema = module.loads_strict(
+        (ROOT / "schemas/ds4-laguna-compact-runtime-v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = module.validator_for(schema)
+    errors = sorted(validator.iter_errors(value), key=lambda error: list(error.absolute_path))
+    if errors:
+        first = errors[0]
+        location = ".".join(map(str, first.absolute_path)) or "bundle"
+        raise ValueError(f"qualification bundle schema failure at {location}: {first.message}")
+
+
+def _publish_new_bytes(path: Path, payload: bytes) -> None:
+    if not path.parent.is_dir() or path.exists() or path.is_symlink():
+        raise ValueError(f"immutable publication target is unavailable: {path}")
+    descriptor = -1
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ValueError(f"immutable publication target already exists: {path}") from exc
+        temporary.unlink()
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def publish_qualification_bundle(
+    value: Mapping[str, Any],
+    evidence_dir: Path | str,
+    output: Path | str,
+) -> dict[str, Any]:
+    bundle = loads_strict(canonical_bundle_json_bytes(value).decode("utf-8"))
+    expected_status = qualification_bundle_status(
+        bundle.get("global_gates", ()), bundle.get("profiles", ())
+    )
+    if bundle.get("status") != expected_status:
+        raise ValueError("qualification bundle status does not match required gate propagation")
+    claims = _qualification_evidence_claims(bundle)
+    directory = Path(evidence_dir)
+    index_path = directory / "evidence-index.json"
+    if index_path.exists() or index_path.is_symlink():
+        raise ValueError("immutable evidence index already exists")
+    index, root_digest = build_evidence_index(directory, tuple(claims))
+    for entry in index:
+        if claims[entry["path"]] != entry["sha256"]:
+            raise ValueError(f"evidence claimed digest does not match file: {entry['path']}")
+    bundle["evidence_root_sha256"] = root_digest
+    _validate_qualification_bundle_schema(bundle)
+    _write_new_json(index_path, index)
+    verify_evidence_index(directory, index, root_digest)
+    target = Path(output)
+    payload = canonical_bundle_json_bytes(bundle)
+    _publish_new_bytes(target, payload)
+    digest = _sha256_bytes(payload)
+    sidecar = Path(str(target) + ".sha256")
+    _publish_new_bytes(sidecar, f"{digest}  {target.name}\n".encode("ascii"))
+    return bundle
+
+
+def verify_qualification_bundle(
+    bundle_path: Path | str,
+    evidence_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    path = Path(bundle_path)
+    try:
+        payload = path.read_bytes()
+        bundle = loads_strict(payload.decode("utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read qualification bundle: {exc}") from exc
+    if not isinstance(bundle, dict) or canonical_bundle_json_bytes(bundle) != payload:
+        raise ValueError("qualification bundle is not exact canonical JSON")
+    _validate_qualification_bundle_schema(bundle)
+    expected_status = qualification_bundle_status(
+        bundle["global_gates"], bundle["profiles"]
+    )
+    if bundle["status"] != expected_status:
+        raise ValueError("qualification bundle status propagation is invalid")
+    sidecar = Path(str(path) + ".sha256")
+    try:
+        sidecar_text = sidecar.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read qualification bundle sidecar: {exc}") from exc
+    expected_sidecar = f"{_sha256_bytes(payload)}  {path.name}\n"
+    if sidecar_text != expected_sidecar:
+        raise ValueError("qualification bundle sidecar digest changed")
+    directory = Path(evidence_dir) if evidence_dir is not None else (
+        path.parent / "compact-runtime-evidence"
+    )
+    index_path = directory / "evidence-index.json"
+    try:
+        index = loads_strict(index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read qualification evidence index: {exc}") from exc
+    if not isinstance(index, list):
+        raise ValueError("qualification evidence index is not an array")
+    verify_evidence_index(directory, index, bundle["evidence_root_sha256"])
+    claims = _qualification_evidence_claims(bundle)
+    indexed = {entry["path"]: entry["sha256"] for entry in index}
+    if claims != indexed:
+        raise ValueError("qualification evidence index is not the exact claimed union")
+    return bundle
 
 
 def _load_smoke_eval_records(path: Path, expected_ids: Sequence[str]) -> list[dict[str, Any]]:

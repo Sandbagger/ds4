@@ -17899,7 +17899,8 @@ extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor(
     }
     if (out && x && model_map && in_dim != 0u && out_dim != 0u &&
         (in_dim & 31u) == 0u && in_dim <= UINT32_MAX &&
-        out_dim <= UINT32_MAX && n_tok > 1u && n_tok <= UINT32_MAX) {
+        out_dim <= UINT32_MAX && n_tok > 1u && n_tok <= UINT32_MAX &&
+        getenv("DS4_CUDA_NO_POOLSIDE_Q8_STREAMK") == NULL) {
         const uint64_t blocks = in_dim / 32u;
         if (out_dim > UINT64_MAX / (blocks * 34u)) {
             return cuda_matmul_q8_0_tensor_labeled(
@@ -37149,7 +37150,8 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                         (const __half *)staged_value->ptr,
                         (const float *)gate->ptr, n_tokens, n_head,
                         n_head_kv, scale);
-            } else if (auto_mma64_eligible && n_tokens > 22u &&
+            } else if (getenv("DS4_CUDA_NO_LAGUNA_AUTO_MMA64") == NULL &&
+                       auto_mma64_eligible && n_tokens > 22u &&
                        (n_head == 48u || n_head == 72u) &&
                        n_head_kv == 8u) {
                 const dim3 grid((n_tokens + 15u) / 16u, n_head, 1u);

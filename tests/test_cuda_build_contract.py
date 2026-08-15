@@ -2029,6 +2029,33 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertRegex(body, r"\bcompute_minor\s*==\s*1\b")
         self.assertNotRegex(body, r"\bcompute_major\s*>=\s*8\b")
 
+    def test_laguna_auto_mma64_has_narrow_diagnostic_rollback(self) -> None:
+        body = function_body(
+            'extern "C" int ds4_gpu_laguna_attention_prefill_tensor('
+        )
+        env_name = "DS4_CUDA_NO_LAGUNA_AUTO_MMA64"
+        guard = f'getenv("{env_name}") == NULL'
+        self.assertEqual(body.count(env_name), 1)
+
+        short_dispatch = body.index("if (auto_mma_eligible")
+        short_launch = body.index(
+            "laguna_attention_prefill_auto_mma32_kernel<<<", short_dispatch
+        )
+        long_dispatch = body.index("} else if (", short_launch)
+        long_condition_end = body.index(") {", long_dispatch)
+        long_launch = body.index(
+            "laguna_attention_prefill_auto_mma64_kernel<<<", long_dispatch
+        )
+        scalar_launch = body.index(
+            "laguna_attention_prefill_gqa_f16_kernel<<<", long_launch
+        )
+
+        self.assertNotIn(env_name, body[short_dispatch:long_dispatch])
+        self.assertIn(guard, body[long_dispatch:long_condition_end])
+        self.assertIn("auto_mma64_eligible", body[long_dispatch:long_condition_end])
+        self.assertLess(long_condition_end, long_launch)
+        self.assertLess(long_launch, scalar_launch)
+
     def test_laguna_page_disposal_establishes_read_ptes_before_advice(
         self,
     ) -> None:
@@ -2395,6 +2422,34 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cudaGetDevice(&current_device)", guarded)
         self.assertIn("current_device == physical_device", guarded)
         self.assertNotIn("cudaSetDevice", n1_prefix)
+
+    def test_poolside_q8_streamk_has_narrow_diagnostic_rollback(self) -> None:
+        body = function_body(
+            'extern "C" int ds4_gpu_matmul_q8_0_poolside_tensor('
+        )
+        env_name = "DS4_CUDA_NO_POOLSIDE_Q8_STREAMK"
+        guard = f'getenv("{env_name}") == NULL'
+        self.assertEqual(body.count(env_name), 1)
+
+        one_token_launch = body.index(
+            "matmul_q8_0_preq_poolside_mmvq1_kernel"
+        )
+        long_dispatch = body.index(
+            "if (out && x && model_map && in_dim != 0u", one_token_launch
+        )
+        long_condition_end = body.index(") {", long_dispatch)
+        streamk_launch = body.index(
+            "matmul_q8_0_preq_poolside_streamk_kernel", long_dispatch
+        )
+        generic_fallback = body.rindex(
+            "return cuda_matmul_q8_0_tensor_labeled("
+        )
+
+        self.assertNotIn(env_name, body[:long_dispatch])
+        self.assertIn("n_tok > 1u", body[long_dispatch:long_condition_end])
+        self.assertIn(guard, body[long_dispatch:long_condition_end])
+        self.assertLess(long_condition_end, streamk_launch)
+        self.assertLess(streamk_launch, generic_fallback)
 
     def test_external_nvml_identity_is_bounded_before_comparison(self) -> None:
         body = function_body(

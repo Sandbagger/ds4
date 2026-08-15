@@ -27,9 +27,15 @@
 /tests/cuda_long_context_smoke
 /tests/test_cuda_session_batch
 /tests/test_layer_pack
+/tests/test_laguna_plan
+/tests/test_laguna_stream
 /tests/test_metal_session_batch
+/tests/test_plan_io
 /tests/test_q4k_dot
+/tests/test_runtime
+/tests/test_runtime_cpp_link
 /tests/test_sampling
+/tests/test_session_logits_only
 /tests/test-vectors/laguna-resident/swa-513.prompt
 /tests/test-vectors/laguna-resident/yarn-8193.prompt
 /tests/test-vectors/laguna-resident/deep-32768.prompt

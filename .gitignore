@@ -23,6 +23,7 @@
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_laguna_kernels
 /tests/test_cuda_laguna_model
+/tests/test_cuda_laguna_stream
 /tests/test_cuda_session_batch
 /tests/test_layer_pack
 /tests/test_metal_session_batch

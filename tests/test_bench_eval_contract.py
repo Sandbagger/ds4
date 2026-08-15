@@ -15,6 +15,9 @@ QUALIFIER = (
     ROOT / "gguf-tools/quality-testing/compact_runtime_qualify.py"
 ).read_text(encoding="utf-8")
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
+README = (ROOT / "README.md").read_text(encoding="utf-8")
+CONTRIBUTING = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+VECTOR_README = (ROOT / "tests/test-vectors/README.md").read_text(encoding="utf-8")
 
 CASE_IDS = (
     "recNu3MXkvWUzHZr9",
@@ -109,6 +112,23 @@ class QualificationHarnessContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(target)
         self.assertIn("tests/test_bench_eval_contract.py", target.group("body"))
+
+    def test_reference_runbook_pins_curve_and_excludes_service_policy(self) -> None:
+        combined = "\n".join((README, CONTRIBUTING, VECTOR_README))
+        for value in (
+            "32,768", "4,096", "one session slot", "8/12/16-GiB",
+            "one cold plus exactly three", "45-minute", "15-minute",
+            "recNu3MXkvWUzHZr9", "001b51d76b4d422988f2c11f104a2c6c",
+            "aime2025-01", "compsec-076",
+        ):
+            self.assertIn(value, combined, value)
+        for command in ("run", "verify", "publish", "verify-bundle"):
+            self.assertIn(f"compact_runtime_qualify.py \\\n+  {command}", README)
+        for excluded in (
+            "drop_caches", "legacy whole-map", "deprecated expert-count",
+            "daemonization", "port selection", "peer eviction", "co-residency",
+        ):
+            self.assertIn(excluded, combined, excluded)
 
 
 if __name__ == "__main__":

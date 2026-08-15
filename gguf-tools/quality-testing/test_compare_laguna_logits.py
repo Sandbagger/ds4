@@ -46,8 +46,11 @@ LEGACY_CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
 CONTRACT_COMMIT = "c51af8bbf177e2448d6c4fa2c4396e5be038349e"
 TOKENIZER_RUNTIME_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 LLAMA_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
-CAPTURE_MANIFEST_SHA256 = (
+LEGACY_CAPTURE_MANIFEST_SHA256 = (
     "cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e"
+)
+CAPTURE_MANIFEST_SHA256 = (
+    "94c1cb43859c25e63799005a25d47a12cb414517d48268fd2938efe5472dd499"
 )
 ORACLE_POLICY = "single-poolside-v1"
 PROMOTED_SCHEMA = "laguna-resident-promoted-v2"
@@ -340,7 +343,7 @@ def write_promoted_fixture(root: Path) -> None:
         "oracle": {
             "name": "poolside-llama",
             "runtime_commit": LLAMA_COMMIT,
-            "capture_manifest_sha256": CAPTURE_MANIFEST_SHA256,
+            "capture_manifest_sha256": LEGACY_CAPTURE_MANIFEST_SHA256,
         },
         "provenance": {
             "contract_commit": LEGACY_CONTRACT_COMMIT,
@@ -738,7 +741,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         self,
         fixture: Path,
         tokenizer_commit: str = TOKENIZER_RUNTIME_COMMIT,
-        capture_digest: str = CAPTURE_MANIFEST_SHA256,
+        capture_digest: str = LEGACY_CAPTURE_MANIFEST_SHA256,
         gguf_size: int = GGUF_SIZE,
         gguf_sha256: str = GGUF_SHA256,
         contract_commit: str = LEGACY_CONTRACT_COMMIT,
@@ -766,7 +769,7 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         self,
         fixture: Path,
         tokenizer_commit: str = TOKENIZER_RUNTIME_COMMIT,
-        capture_digest: str = CAPTURE_MANIFEST_SHA256,
+        capture_digest: str = LEGACY_CAPTURE_MANIFEST_SHA256,
         gguf_size: int = GGUF_SIZE,
         gguf_sha256: str = GGUF_SHA256,
         contract_commit: str = LEGACY_CONTRACT_COMMIT,
@@ -806,6 +809,10 @@ class CompareLagunaLogitsTest(unittest.TestCase):
         )
 
     def test_capture_v2_binds_corrected_model_template_and_explicit_modes(self) -> None:
+        self.assertEqual(
+            self.tool_module.CAPTURE_MANIFEST_SHA256,
+            CAPTURE_MANIFEST_SHA256,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             capture = root / "capture"

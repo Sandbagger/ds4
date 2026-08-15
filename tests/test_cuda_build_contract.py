@@ -437,6 +437,16 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_cuda_spark_builds_the_native_gb10_architecture(self) -> None:
+        self.assertEqual(
+            rule_recipe_lines("cuda-spark"),
+            [
+                "\t$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent "
+                "CUDA_ARCH=native",
+            ],
+            "the production GB10 target must match the resident performance gate",
+        )
+
     def test_compact_runtime_contract_has_pinned_standalone_target(self) -> None:
         requirements = [
             line

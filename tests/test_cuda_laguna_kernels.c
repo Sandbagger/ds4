@@ -1248,6 +1248,58 @@ cleanup:
     return rc;
 }
 
+static int run_decode_attention_fattn_vec_swa_ring_case(void) {
+    const int rollback =
+        getenv("DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE") != NULL;
+    const laguna_decode_attention_case c = {
+        "gqa9-swa-fattn-vec-ring", 72u, 8u, 512u, 512u, 1u,
+        512u, 0.0f, true,
+    };
+
+    ds4_gpu_test_laguna_fattn_vec_reset();
+    if (run_decode_attention_case(&c) != 0) return 1;
+
+    ds4_gpu_laguna_fattn_vec_test_snapshot launches = {0};
+    if (!ds4_gpu_test_laguna_fattn_vec_snapshot(&launches)) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-swa-ring: counter snapshot "
+                "failed\n");
+        return 1;
+    }
+    const ds4_gpu_laguna_fattn_vec_test_snapshot expected_launches = rollback
+        ? (ds4_gpu_laguna_fattn_vec_test_snapshot) {
+              0u, 0u, 0u, 0u, 1u, 0u,
+          }
+        : (ds4_gpu_laguna_fattn_vec_test_snapshot) {
+              1u, 1u, 1u, 1u, 0u, 4u,
+          };
+    if (launches.optimized_launches != expected_launches.optimized_launches ||
+        launches.combine_launches != expected_launches.combine_launches ||
+        launches.softplus_launches != expected_launches.softplus_launches ||
+        launches.mul_launches != expected_launches.mul_launches ||
+        launches.scalar_launches != expected_launches.scalar_launches ||
+        launches.partitions != expected_launches.partitions) {
+        fprintf(stderr,
+                "decode-attention-fattn-vec-swa-ring: launches="
+                "%llu/%llu/%llu/%llu scalar=%llu p=%u expected="
+                "%llu/%llu/%llu/%llu scalar=%llu p=%u\n",
+                (unsigned long long)launches.optimized_launches,
+                (unsigned long long)launches.combine_launches,
+                (unsigned long long)launches.softplus_launches,
+                (unsigned long long)launches.mul_launches,
+                (unsigned long long)launches.scalar_launches,
+                launches.partitions,
+                (unsigned long long)expected_launches.optimized_launches,
+                (unsigned long long)expected_launches.combine_launches,
+                (unsigned long long)expected_launches.softplus_launches,
+                (unsigned long long)expected_launches.mul_launches,
+                (unsigned long long)expected_launches.scalar_launches,
+                expected_launches.partitions);
+        return 1;
+    }
+    return 0;
+}
+
 static int run_decode_attention_cases(void) {
     static const float gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
     const uint32_t global_counts[] = { 1u, 1023u, 1024u, 1025u };
@@ -4060,7 +4112,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|decode-attention-fattn-vec-frozen|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8-selector|poolside-q8|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|decode-attention-fattn-vec-frozen|decode-attention-fattn-vec-swa-ring|prefill-attention|prefill-attention-frozen|prefill-attention-long-frozen|router-frozen|q4-mmq-frozen|q4-l2-frozen|moe-residual-frozen|routed-moe|poolside-q8-selector|poolside-q8|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -4068,6 +4120,7 @@ int main(int argc, char **argv) {
         (strcmp(argv[2], "norm-rope") != 0 &&
          strcmp(argv[2], "decode-attention") != 0 &&
          strcmp(argv[2], "decode-attention-fattn-vec-frozen") != 0 &&
+         strcmp(argv[2], "decode-attention-fattn-vec-swa-ring") != 0 &&
          strcmp(argv[2], "prefill-attention") != 0 &&
          strcmp(argv[2], "prefill-attention-frozen") != 0 &&
          strcmp(argv[2], "prefill-attention-long-frozen") != 0 &&
@@ -4088,6 +4141,9 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_decode_fattn_vec_frozen =
         strcmp(argv[2], "decode-attention-fattn-vec-frozen") == 0 ||
+        strcmp(argv[2], "all") == 0;
+    const bool run_decode_fattn_vec_swa_ring =
+        strcmp(argv[2], "decode-attention-fattn-vec-swa-ring") == 0 ||
         strcmp(argv[2], "all") == 0;
     const bool run_prefill = strcmp(argv[2], "prefill-attention") == 0 ||
         strcmp(argv[2], "all") == 0;
@@ -4194,6 +4250,10 @@ int main(int argc, char **argv) {
     }
     if (run_decode_fattn_vec_frozen &&
         run_decode_attention_fattn_vec_frozen_case() != 0) {
+        rc = 1;
+    }
+    if (run_decode_fattn_vec_swa_ring &&
+        run_decode_attention_fattn_vec_swa_ring_case() != 0) {
         rc = 1;
     }
     if (run_prefill && run_prefill_attention_cases() != 0) {

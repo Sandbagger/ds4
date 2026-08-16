@@ -68,6 +68,36 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
             self.assertIn(pinned, body)
         self.assertIn("Poolside llama.cpp 04b2b72", CUDA)
 
+    def test_swa_ring_specialization_preserves_absolute_key_order(self) -> None:
+        body = function_body("laguna_attention_decode_fattn_vec_kernel")
+        self.assertTrue(body, "missing targeted FATTN_VEC kernel")
+        self.assertIsNotNone(
+            re.search(r"template\s*<\s*bool\s+swa_ring\s*>", CUDA),
+            "missing compile-time SWA ring specialization",
+        )
+        for pinned in (
+            "key >= key_start",
+            "key - key_start < key_count",
+            "key < cache_cap ? key : key - cache_cap",
+        ):
+            self.assertTrue(
+                pinned in body,
+                f"missing SWA ring source contract: {pinned}",
+            )
+        self.assertNotIn("key % cache_cap", body)
+
+        launch = function_body("laguna_attention_decode_fattn_vec_launch")
+        for specialization in ("true", "false"):
+            self.assertRegex(
+                launch,
+                rf"laguna_attention_decode_fattn_vec_kernel\s*<\s*{specialization}\s*>\s*<<<",
+            )
+        self.assertRegex(
+            launch,
+            r"key_start\s*,\s*key_count\s*,\s*cache_cap\s*,\s*"
+            r"padded_key_count",
+        )
+
     def test_partition_combine_precedes_separate_gate_boundary(self) -> None:
         combine = function_body("laguna_attention_decode_fattn_vec_combine_kernel")
         softplus = function_body("laguna_attention_gate_softplus_kernel")
@@ -95,7 +125,7 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
 
         launch = function_body("laguna_attention_decode_fattn_vec_launch")
         for required in (
-            "poolside_partitions = 3u",
+            "poolside_partitions = n_head == 72u ? 4u : 3u",
             "padded_key_count = 768u",
             "const dim3 grid(1u, partitions, n_head)",
             "const dim3 combine_grid(1u, n_head, 1u)",
@@ -104,10 +134,22 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
             "laguna_attention_gate_softplus_kernel<<<",
             "laguna_attention_gate_mul_kernel<<<",
         ):
-            self.assertIn(required, launch)
+            self.assertTrue(
+                required in launch,
+                f"missing FATTN_VEC launch contract: {required}",
+            )
         self.assertNotIn("cudaOccupancy", launch)
         self.assertNotIn("laguna_stage_fattn_vec_kv_f16_kernel", CUDA)
+        self.assertIn(
+            "partial_values =\n        (uint64_t)n_head * partitions * head_dim",
+            launch,
+        )
+        self.assertIn(
+            "meta_values = (uint64_t)n_head * partitions",
+            launch,
+        )
         self.assertIn("scratch_bytes = partial_bytes + meta_bytes", launch)
+        self.assertIn("149,760 bytes", launch)
 
     def test_frozen_cuda_case_owns_exact_oracle_poison_and_fresh_rollback(self) -> None:
         for required in (
@@ -135,6 +177,31 @@ class LagunaFattnVecDecodeContractTest(unittest.TestCase):
         ):
             self.assertIn(required, HEADER)
             self.assertIn(required, CUDA)
+
+    def test_swa_ring_cuda_case_owns_launch_proof_and_fresh_rollback(self) -> None:
+        for required in (
+            "decode-attention-fattn-vec-swa-ring",
+            '"gqa9-swa-fattn-vec-ring", 72u, 8u, 512u, 512u, 1u,',
+            "ds4_gpu_test_laguna_fattn_vec_reset",
+            "ds4_gpu_test_laguna_fattn_vec_snapshot",
+            "expected_launches",
+            "0u, 0u, 0u, 0u, 1u, 0u",
+            "1u, 1u, 1u, 1u, 0u, 4u",
+        ):
+            self.assertIn(required, KERNEL_TEST)
+        normal = (
+            "env -u DS4_CUDA_MOE_DECODE_GRAPH "
+            "-u DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE "
+            "./tests/test_cuda_laguna_kernels --case "
+            "decode-attention-fattn-vec-swa-ring"
+        )
+        rollback = (
+            "DS4_CUDA_NO_LAGUNA_FATTN_VEC_DECODE=1 "
+            "./tests/test_cuda_laguna_kernels --case "
+            "decode-attention-fattn-vec-swa-ring"
+        )
+        self.assertIn(normal, MAKEFILE)
+        self.assertIn(rollback, MAKEFILE)
 
     def test_frozen_cuda_exact_failure_reports_bits_and_passed_scale(self) -> None:
         for required in (

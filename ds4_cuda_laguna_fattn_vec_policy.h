@@ -27,15 +27,22 @@ static inline uint32_t ds4_cuda_laguna_fattn_vec_decode_partitions(
         const ds4_cuda_laguna_fattn_vec_decode_shape *shape) {
     if (!shape || shape->rollback ||
         shape->compute_major != 12 || shape->compute_minor != 1 ||
-        shape->sm_count != 48 || shape->poolside_partitions != 3u ||
-        shape->query_tokens != 1u || shape->pos != 512u ||
-        shape->cache_cap < 768u || shape->key_start != 0u ||
-        shape->key_count != 513u || shape->padded_key_count != 768u ||
-        shape->n_head != 48u || shape->n_head_kv != 8u ||
-        shape->head_dim != 128u) {
+        shape->sm_count != 48 || shape->query_tokens != 1u ||
+        shape->pos != 512u || shape->padded_key_count != 768u ||
+        shape->n_head_kv != 8u || shape->head_dim != 128u) {
         return 0u;
     }
-    return 3u;
+    if (shape->poolside_partitions == 3u &&
+        shape->cache_cap >= 768u && shape->key_start == 0u &&
+        shape->key_count == 513u && shape->n_head == 48u) {
+        return 3u;
+    }
+    if (shape->poolside_partitions == 4u &&
+        shape->cache_cap == 512u && shape->key_start == 1u &&
+        shape->key_count == 512u && shape->n_head == 72u) {
+        return 4u;
+    }
+    return 0u;
 }
 
 #endif

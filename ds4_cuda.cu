@@ -36447,15 +36447,17 @@ __global__ static void laguna_store_kv_f16_kernel(
 /* Poolside llama.cpp 04b2b72 FATTN_VEC, narrowed to Laguna q=1/D=128/F16.
  * The pinned sm_121a binary uses 162 registers/thread and 8448 bytes of
  * static shared memory, hence three resident blocks on the 48-SM GB10.  Its
- * launcher keeps that P=3 topology for K=768, so block y visits tiles y and
- * y+3.  Poolside's K permutation preserves physical [key][KV head][D]
- * strides, exactly matching DS4's non-wrapped token-513 cache.  Do not
- * substitute PR594's scaled-dot or strided-key reduction. */
+ * launcher uses P=3 for the 48-head full layer and P=4 for the 72-head SWA
+ * layer at K=768.  Poolside partitions absolute keys before applying the SWA
+ * mask, so key 0 stays masked while key 512 maps to row 0 of DS4's 512-row
+ * ring.  Do not substitute PR594's scaled-dot or strided-key reduction. */
+template <bool swa_ring>
 __launch_bounds__(128, 1)
 __global__ static void laguna_attention_decode_fattn_vec_kernel(
         float *partial_heads, float2 *partial_meta, const float *q,
         const __half *key_cache, const __half *value_cache,
-        uint32_t key_count, uint32_t padded_key_count,
+        uint32_t key_start, uint32_t key_count, uint32_t cache_cap,
+        uint32_t padded_key_count,
         uint32_t n_head, uint32_t n_head_kv, float scale,
         uint32_t partitions) {
     constexpr uint32_t threads = 128u;
@@ -36507,15 +36509,27 @@ __global__ static void laguna_attention_decode_fattn_vec_kernel(
         for (uint32_t key_slot = 0u; key_slot < 8u; key_slot++) {
             const uint32_t key = tile + warp * 32u +
                 (lane & ~7u) + key_slot;
+            const bool key_active = key >= key_start &&
+                key - key_start < key_count;
+            const uint32_t cache_row =
+                key < cache_cap ? key : key - cache_cap;
             float score = 0.0f;
 #pragma unroll
             for (uint32_t slot = 0u; slot < 8u; slot++) {
                 const uint32_t pair = (slot >> 2u) * 32u +
                     lane_kq * 4u + (slot & 3u);
-                const float2 key_value = key < key_count ?
-                    __half22float2(key_base[
-                        (uint64_t)key * cache_row_pairs + pair]) :
-                    make_float2(0.0f, 0.0f);
+                float2 key_value;
+                if (swa_ring) {
+                    key_value = key_active ?
+                        __half22float2(key_base[
+                            (uint64_t)cache_row * cache_row_pairs + pair]) :
+                        make_float2(0.0f, 0.0f);
+                } else {
+                    key_value = key < key_count ?
+                        __half22float2(key_base[
+                            (uint64_t)key * cache_row_pairs + pair]) :
+                        make_float2(0.0f, 0.0f);
+                }
                 score += key_value.x * Q_reg[slot].x;
                 score += key_value.y * Q_reg[slot].y;
             }
@@ -36524,7 +36538,9 @@ __global__ static void laguna_attention_decode_fattn_vec_kernel(
                 score += __shfl_xor_sync(
                     0xffffffffu, score, offset, 8);
             }
-            const float mask_value = key < key_count ? 0.0f : -INFINITY;
+            const float mask_value = swa_ring ?
+                (key_active ? 0.0f : -INFINITY) :
+                (key < key_count ? 0.0f : -INFINITY);
             score += mask_value;
             max_score_new = fmaxf(max_score_new, score + max_offset);
             if (lane_kq == key_slot) score_reg = score;
@@ -36551,15 +36567,27 @@ __global__ static void laguna_attention_decode_fattn_vec_kernel(
 #pragma unroll
         for (uint32_t key0 = 0u; key0 < 32u; key0 += 4u) {
             const uint32_t key = tile + warp * 32u + key0 + subgroup;
+            const bool key_active = key >= key_start &&
+                key - key_start < key_count;
+            const uint32_t cache_row =
+                key < cache_cap ? key : key - cache_cap;
             const float key_weight = KQ[warp * 32u + key0 + subgroup];
 #pragma unroll
             for (uint32_t slot = 0u; slot < 8u; slot++) {
                 const uint32_t pair = (slot >> 2u) * 32u +
                     lane_kq * 4u + (slot & 3u);
-                const float2 value = key < key_count ?
-                    __half22float2(value_base[
-                        (uint64_t)key * cache_row_pairs + pair]) :
-                    make_float2(0.0f, 0.0f);
+                float2 value;
+                if (swa_ring) {
+                    value = key_active ?
+                        __half22float2(value_base[
+                            (uint64_t)cache_row * cache_row_pairs + pair]) :
+                        make_float2(0.0f, 0.0f);
+                } else {
+                    value = key < key_count ?
+                        __half22float2(value_base[
+                            (uint64_t)key * cache_row_pairs + pair]) :
+                        make_float2(0.0f, 0.0f);
+                }
                 VKQ[slot].x += value.x * key_weight;
                 VKQ[slot].y += value.y * key_weight;
             }
@@ -36711,7 +36739,7 @@ static int laguna_attention_decode_fattn_vec_launch(
         return 0;
     }
 
-    const uint32_t poolside_partitions = 3u;
+    const uint32_t poolside_partitions = n_head == 72u ? 4u : 3u;
     const uint32_t padded_key_count = 768u;
     ds4_cuda_laguna_fattn_vec_decode_shape shape = {};
     shape.rollback = g_cuda_no_laguna_fattn_vec_decode;
@@ -36741,10 +36769,11 @@ static int laguna_attention_decode_fattn_vec_launch(
         return -1;
     }
     const uint64_t scratch_bytes = partial_bytes + meta_bytes;
-    /* Correctness-first resident slice: Poolside's three partials/meta use
-     * exactly 74,880 bytes.  The meta region is reused for 48 F32 softplus
-     * values after combine.  This legacy temporary slab is deliberately not
-     * a bounded-memory/compact-admission claim. */
+    /* Correctness-first resident slices: the 48-head P=3 full layer uses
+     * exactly 74,880 bytes; the 72-head P=4 SWA layer uses 149,760 bytes.
+     * The meta region is reused for F32 softplus values after
+     * combine.  This legacy temporary slab is deliberately not a
+     * bounded-memory/compact-admission claim. */
     unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
         logical_tier, scratch_bytes, "laguna FATTN_VEC decode");
     if (!scratch) return -1;
@@ -36760,10 +36789,19 @@ static int laguna_attention_decode_fattn_vec_launch(
     g_laguna_fattn_vec_optimized_launches.fetch_add(
         1u, std::memory_order_relaxed);
 #endif
-    laguna_attention_decode_fattn_vec_kernel<<<grid, block>>>(
-        partial_heads, partial_meta, q, key_cache, value_cache,
-        key_count, padded_key_count, n_head, n_head_kv, scale,
-        partitions);
+    /* Split the laguna_attention_decode_fattn_vec_kernel<<< launch so the
+     * non-ring binary retains its original address and mask arithmetic. */
+    if (partitions == 4u) {
+        laguna_attention_decode_fattn_vec_kernel<true><<<grid, block>>>(
+            partial_heads, partial_meta, q, key_cache, value_cache,
+            key_start, key_count, cache_cap, padded_key_count,
+            n_head, n_head_kv, scale, partitions);
+    } else {
+        laguna_attention_decode_fattn_vec_kernel<false><<<grid, block>>>(
+            partial_heads, partial_meta, q, key_cache, value_cache,
+            key_start, key_count, cache_cap, padded_key_count,
+            n_head, n_head_kv, scale, partitions);
+    }
     if (!cuda_ok(cudaGetLastError(), "laguna FATTN_VEC decode launch")) {
         return -1;
     }

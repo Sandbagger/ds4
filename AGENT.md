@@ -54,3 +54,12 @@ At every major change where one of the following could be affected, make sure to
 2. Test the SSD streaming path.
 3. Test the distributed inference if it could be affected, but ask the user before doing so.
 4. Check if CUDA could be broken after the change, and ask the user to give you access to the CUDA machine to actually test if everything is still fine.
+
+## Model onboarding
+
+Onboarding a new model? Start at `docs/PORTING.md`: pre-flight GGUFs with
+`gguf-tools/model_check.py` against a `gguf-tools/models/*.desc` descriptor,
+capture and compare staged activations with
+`tests/oracle-producers/portcheck.py`, pin goldens once green, and log model
+quirks in `docs/models/<model>.md`. Do not rediscover capture env vars by
+grepping ds4.c; the runbook and ledgers exist so you read ~200 lines instead.

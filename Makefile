@@ -787,7 +787,13 @@ test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_contro
 	DS4_RUNTIME_SERVER_URL= uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python tests/test_runtime_endpoint_contract.py -v
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-server-contract \
+test-portcheck:
+	python3 tests/test_portcheck.py
+
+test-model-check:
+	python3 tests/test_model_check.py
+
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-server-contract test-portcheck test-model-check \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_session_logits_only tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link \
 	tests/test_plan_io tests/test_laguna_plan $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent

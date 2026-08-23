@@ -585,5 +585,248 @@ class CompareLagunaLogitsTest(unittest.TestCase):
             self.assertEqual(verified.returncode, 0, verified.stderr)
 
 
+CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
+CAPTURE_MANIFEST_SHA256 = (
+    "cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e"
+)
+
+
+def fixed_model_v2() -> dict[str, object]:
+    model = fixed_model()
+    return {
+        "repository": model["repository"],
+        "revision": model["revision"],
+        "filename": model["file"],
+        "size": model["size"],
+        "sha256": model["sha256"],
+    }
+
+
+def write_promoted_fixture_v2(root: Path) -> None:
+    """Normative laguna-resident-promoted-v2 fixture (single Poolside oracle).
+
+    Mirrors docs/superpowers/specs/2026-08-01-laguna-single-poolside-oracle-
+    design.md § Fixture schema: exactly four vectors, no Metal artifacts,
+    provenance block, cuda_admission-only thresholds.
+    """
+    populate_fixture_inputs(root)
+    cases = []
+    for case_index, (case_id, render, frontier, context) in enumerate(CASES):
+        prompt = (
+            b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
+            + (root / "short.txt").read_bytes()
+            + b"</user>\n<assistant></think>"
+            if case_id == "short"
+            else (root / f"{case_id}.prompt").read_bytes()
+        )
+        tokens = case_tokens(case_id, frontier)
+        name = f"{case_id}.llama.f32"
+        payload = f32_bytes(case_index + 3)
+        (root / name).write_bytes(payload)
+        cases.append(
+            {
+                "id": case_id,
+                "render": render,
+                "prompt_hex": prompt.hex(),
+                "prompt_sha256": sha256(prompt),
+                "poolside_tokens": tokens,
+                "ds4_tokens": tokens,
+                "frontier": frontier,
+                "context": context,
+                "vector": {
+                    "file": name,
+                    "sha256": sha256(payload),
+                    "argmax": case_index + 3,
+                },
+            }
+        )
+
+    continuation_name = "yarn-8193.continuation.i32"
+    continuation_payload = i32_bytes(CONTINUATION)
+    (root / continuation_name).write_bytes(continuation_payload)
+
+    manifest = {
+        "schema": "laguna-resident-promoted-v2",
+        "oracle_policy": "single-poolside-v1",
+        "vocab_size": VOCAB_SIZE,
+        "continuation_case": "yarn-8193",
+        "continuation_tokens": 8,
+        "model": fixed_model_v2(),
+        "oracle": {
+            "name": "poolside-llama",
+            "runtime_commit": LLAMA_COMMIT,
+            "capture_manifest_sha256": CAPTURE_MANIFEST_SHA256,
+        },
+        "provenance": {
+            "contract_commit": CONTRACT_COMMIT,
+            "tokenizer_runtime_commit": "0123456789abcdef0123456789abcdef01234567",
+            "generator_sha256": "118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d",
+            "benchmark_sha256": "aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206",
+            "poolside_seed_token_count": 61440,
+            "ds4_seed_token_count": 32768,
+        },
+        "thresholds": {
+            "cuda_admission": {
+                "centered_rms": 0.04,
+                "centered_max_abs": 0.20,
+                "top20_overlap": 18,
+                "argmax_equal": True,
+                "continuation_equal": True,
+            }
+        },
+        "cases": cases,
+        "continuation": {
+            "case": "yarn-8193",
+            "file": continuation_name,
+            "sha256": sha256(continuation_payload),
+            "argmax": CONTINUATION,
+        },
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+class SinglePoolsideV2ContractTests(unittest.TestCase):
+    """RED SPEC for the single-Poolside oracle migration (2026-08-01 design).
+
+    Step 1 of the migration sequencing: these tests define the v2 promoted
+    contract and fail against the current v1 dual-oracle tool. The comparator
+    migration (step 2) turns them green without editing them.
+    """
+
+    def run_verify_v2(self, fixture: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(TOOL),
+                "--verify-promoted",
+                str(fixture),
+                "--contract-commit",
+                CONTRACT_COMMIT,
+                "--tokenizer-runtime-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--llama-commit",
+                LLAMA_COMMIT,
+                "--capture-manifest-sha256",
+                CAPTURE_MANIFEST_SHA256,
+                "--gguf-size",
+                str(GGUF_SIZE),
+                "--gguf-sha256",
+                GGUF_SHA256,
+                *extra,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_v2_fixture_verifies_with_single_oracle_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "promoted-v2"
+            fixture.mkdir()
+            write_promoted_fixture_v2(fixture)
+            before = tree_digest(fixture)
+
+            completed = self.run_verify_v2(fixture)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                f"verified={fixture} cases=4 vectors=4 oracle=poolside\n",
+            )
+            self.assertEqual(tree_digest(fixture), before)
+
+    def test_v2_verifier_rejects_v1_dual_oracle_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / "legacy"
+            legacy.mkdir()
+            write_promoted_fixture(legacy)
+
+            completed = self.run_verify_v2(legacy)
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("verification failed:", completed.stderr)
+
+    def test_v2_verifier_rejects_legacy_metal_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "promoted-v2"
+            fixture.mkdir()
+            write_promoted_fixture_v2(fixture)
+
+            completed = self.run_verify_v2(
+                fixture,
+                "--dwarfstar-commit",
+                DWARFSTAR_COMMIT,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+
+    def test_v2_manifest_extra_key_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "extra-key"
+            fixture.mkdir()
+            write_promoted_fixture_v2(fixture)
+            path = fixture / "manifest.json"
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            manifest["metal_metrics"] = {}
+            path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            completed = self.run_verify_v2(fixture)
+
+            self.assertNotEqual(completed.returncode, 0)
+
+    def test_v2_tampered_vector_fails_closed_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            base.mkdir()
+            write_promoted_fixture_v2(base)
+            fixture = Path(tmp) / "tampered"
+            shutil.copytree(base, fixture)
+            victim = fixture / "swa-513.llama.f32"
+            victim.write_bytes(b"X" + victim.read_bytes()[1:])
+            before = tree_digest(fixture)
+
+            completed = self.run_verify_v2(fixture)
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("verification failed:", completed.stderr)
+            self.assertEqual(tree_digest(fixture), before)
+
+    def test_v2_promote_requires_pinned_capture_trust_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "capture"
+            capture.mkdir()
+            write_capture(capture, "llama")
+            ds4 = root / "fake-ds4"
+            ds4.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+            ds4.chmod(0o755)
+            promoted = root / "promoted"
+            promoted.mkdir()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(TOOL),
+                    "--ds4",
+                    str(ds4),
+                    "--llama",
+                    str(capture),
+                    "--promote",
+                    str(promoted),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("trust anchor", completed.stderr.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

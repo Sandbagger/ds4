@@ -48,35 +48,44 @@ class LifecycleChild:
             raise AssertionError(f"invalid lifecycle ready record: {self.ready!r}")
         self.port = int(self.ready["port"])
 
-    def connections_accepted(self, timeout: float = 2.0) -> int | None:
+    def connections_accepted(self, timeout: float = 30.0) -> int | None:
         """Ask the child how many connections the accept loop has registered.
 
         Deterministic replacement for fixed sleeps before signalling: a
         connection that is still in the listen backlog is NOT preaccepted,
-        so tests must wait until the child reports >= 1.
+        so tests must wait until the child reports >= 1. Polls until the
+        deadline, returning only once the accept loop has registered the
+        connection (or None if it never did). The deadline must tolerate
+        real machine churn — qualification windows run this right after
+        nvcc links and vLLM stop/start cycles, which starve the accept
+        thread for seconds at a time (windows 5/6, 2026-08-24).
         """
         import select
 
         assert self.proc.stdin is not None
         assert self.proc.stdout is not None
         deadline = time.monotonic() + timeout
+        last = None
         while time.monotonic() < deadline:
             try:
                 self.proc.stdin.write("connections\n")
                 self.proc.stdin.flush()
             except BrokenPipeError:
-                return None
+                return last
             if select.select([self.proc.stdout], [], [], 0.5)[0]:
                 line = self.proc.stdout.readline()
                 if not line:
-                    return None
+                    return last
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if "connections" in record:
-                    return int(record["connections"])
-        return None
+                    count = int(record["connections"])
+                    if count >= 1:
+                        return count
+                    last = count
+        return last
 
     def connect(self) -> socket.socket:
         conn = socket.create_connection(("127.0.0.1", self.port), timeout=2)

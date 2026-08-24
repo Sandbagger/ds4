@@ -17274,14 +17274,40 @@ typedef struct {
     server *srv;
 } test_lifecycle_command_arg;
 
-static void *test_lifecycle_unsafe_command(void *opaque) {
+/* Stdin control plane for the lifecycle seam.  Tests must be able to
+ * observe accept-loop progress deterministically before signalling: a
+ * connection still in the listen backlog is not preaccepted, so a fixed
+ * sleep races scheduler jitter under load (seen 2026-08-23).
+ * Deliberately raw read(2), not stdio: fgets holds the stdin FILE lock
+ * while blocked, and exit()'s stdio cleanup then deadlocks behind it.
+ * Commands are single newline-terminated writes; a trailing partial
+ * line without a newline is dropped. */
+static void *test_lifecycle_command_thread(void *opaque) {
     test_lifecycle_command_arg *arg = opaque;
-    char command[32] = {0};
-    if (fgets(command, sizeof(command), stdin) &&
-        !strcmp(command, "unsafe\n")) {
-        server_lifecycle_release_preparing(arg->srv, false, true);
+    char buf[64];
+    for (;;) {
+        const ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        if (n <= 0) return NULL;
+        size_t start = 0;
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] != '\n') continue;
+            const size_t len = (size_t)i - start;
+            if (len == 6 && !strncmp(buf + start, "unsafe", 6)) {
+                server_lifecycle_release_preparing(arg->srv, false, true);
+            } else if (len == 11 &&
+                       !strncmp(buf + start, "connections", 11)) {
+                pthread_mutex_lock(&arg->srv->mu);
+                const size_t count = arg->srv->client_connection_count;
+                pthread_mutex_unlock(&arg->srv->mu);
+                printf("{\"connections\":%zu}\n", count);
+                fflush(stdout);
+            }
+            /* One shot, like the original single-fgets reader: the unsafe
+             * scenario joins this thread, so it must terminate after the
+             * first command instead of blocking on further input. */
+            return NULL;
+        }
     }
-    return NULL;
 }
 
 /* Model-free real-process seam for Task 18.  It deliberately reuses the
@@ -17357,9 +17383,9 @@ static int test_server_lifecycle_stdio_on_port(const char *scenario,
 
     pthread_t unsafe_thread = (pthread_t){0};
     test_lifecycle_command_arg command_arg = {.srv = &s};
-    if (unsafe && pthread_create(&unsafe_thread, NULL,
-                                 test_lifecycle_unsafe_command,
-                                 &command_arg) != 0) {
+    if (pthread_create(&unsafe_thread, NULL,
+                       test_lifecycle_command_thread,
+                       &command_arg) != 0) {
         close(wake_fds[0]);
         close(wake_fds[1]);
         close(listen_fd);
@@ -17368,6 +17394,10 @@ static int test_server_lifecycle_stdio_on_port(const char *scenario,
         pthread_mutex_destroy(&s.mu);
         return 1;
     }
+    /* Only the unsafe scenario has command-before-exit ordering semantics;
+     * every other scenario detaches so a still-open stdin pipe can never
+     * block the exit path. */
+    if (!unsafe) pthread_detach(unsafe_thread);
 
     g_listen_fd = listen_fd;
     g_accept_wake_fd = wake_fds[1];

@@ -48,6 +48,36 @@ class LifecycleChild:
             raise AssertionError(f"invalid lifecycle ready record: {self.ready!r}")
         self.port = int(self.ready["port"])
 
+    def connections_accepted(self, timeout: float = 2.0) -> int | None:
+        """Ask the child how many connections the accept loop has registered.
+
+        Deterministic replacement for fixed sleeps before signalling: a
+        connection that is still in the listen backlog is NOT preaccepted,
+        so tests must wait until the child reports >= 1.
+        """
+        import select
+
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self.proc.stdin.write("connections\n")
+                self.proc.stdin.flush()
+            except BrokenPipeError:
+                return None
+            if select.select([self.proc.stdout], [], [], 0.5)[0]:
+                line = self.proc.stdout.readline()
+                if not line:
+                    return None
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "connections" in record:
+                    return int(record["connections"])
+        return None
+
     def connect(self) -> socket.socket:
         conn = socket.create_connection(("127.0.0.1", self.port), timeout=2)
         conn.settimeout(3)
@@ -111,7 +141,12 @@ class Task18LifecycleContract(unittest.TestCase):
         child = self.child("active-safe")
         conn = child.connect()
         self.addCleanup(conn.close)
-        time.sleep(0.05)  # let the production accept loop own this connection
+        accepted = child.connections_accepted()
+        if not accepted or accepted < 1:
+            self.fail(
+                f"accept loop never registered the preaccepted connection "
+                f"(connections={accepted}); refusing to race the signal"
+            )
         child.signal(signal.SIGTERM)
         conn.sendall(
             b"POST /v1/chat/completions HTTP/1.1\r\n"

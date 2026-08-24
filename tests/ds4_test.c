@@ -5411,45 +5411,72 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
  * (121 GiB GB10 unified pool): loading Laguna-S-2.1 Q4_K_M covers ~63.6 GiB
  * of tensor spans, reclaims every page-cache byte, and creating the
  * 100k-token session then drives the pool into swap-death
- * (docs/models/laguna-s21.md). The gate refuses the case unless measured
- * MemAvailable can hold model bytes + KV reserve + fixed overhead, with
- * headroom. DS4_TEST_ALLOW_LONG_CONTEXT=1 forces the attempt. */
+ * (docs/models/laguna-s21.md). Calibration is deliberately conservative:
+ * the thrash reproduced on an IDLE pool (~119 GiB MemAvailable, coding
+ * stack stopped), i.e. the true footprint is ~1.9x the model file. Headroom
+ * is sized so the real-file case computes a threshold (~127 GiB) above the
+ * whole physical pool of a 128G-class host -- refusing it by construction --
+ * while a 160G+-class host still runs the case. DS4_TEST_ALLOW_LONG_CONTEXT=1
+ * forces the attempt. */
 #define TEST_LONG_KV_BYTES_PER_TOKEN (192ull * 1024ull)
-#define TEST_LONG_FIXED_RESERVE_BYTES (8ull << 30)
-#define TEST_LONG_HEADROOM_NUM 21
+#define TEST_LONG_FIXED_RESERVE_BYTES (16ull << 30)
+#define TEST_LONG_HEADROOM_NUM 26
 #define TEST_LONG_HEADROOM_DEN 20
 
 static uint64_t test_long_context_budget_required_bytes(size_t model_bytes,
                                                         long ctx_tokens) {
-    (void)model_bytes;
-    (void)ctx_tokens;
-    return 0; /* red spec: replaced by real budget math */
+    uint64_t required = (uint64_t)model_bytes + TEST_LONG_FIXED_RESERVE_BYTES;
+    if (ctx_tokens > 0) {
+        required += (uint64_t)ctx_tokens * TEST_LONG_KV_BYTES_PER_TOKEN;
+    }
+    return required;
 }
 
+/* Fail-safe: unmeasurable model size or MemAvailable means "skip", never
+ * "gamble the pool". */
 static bool test_long_context_budget_allows(size_t model_bytes, long ctx_tokens,
                                             size_t memavail_bytes, bool force) {
-    (void)model_bytes;
-    (void)ctx_tokens;
-    (void)memavail_bytes;
-    (void)force;
-    return true; /* red spec: replaced by real budget decision */
+    if (force) return true;
+    if (model_bytes == 0 || memavail_bytes == 0) return false;
+    const uint64_t required =
+        test_long_context_budget_required_bytes(model_bytes, ctx_tokens);
+    const uint64_t headroom_needed = required * TEST_LONG_HEADROOM_NUM;
+    const uint64_t need =
+        (headroom_needed + TEST_LONG_HEADROOM_DEN - 1) / TEST_LONG_HEADROOM_DEN;
+    return (uint64_t)memavail_bytes >= need;
+}
+
+static size_t test_long_context_memavailable_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t avail_bytes = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            avail_bytes = (size_t)kb * 1024ull;
+            break;
+        }
+    }
+    fclose(f);
+    return avail_bytes;
 }
 
 static void test_long_context_budget_gate(void) {
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     const uint64_t model = 64 * gib;
 
-    /* required = 64 GiB model + 100k x 192 KiB KV + 8 GiB reserve */
+    /* required = 64 GiB model + 100k x 192 KiB KV + 16 GiB reserve */
     TEST_ASSERT(test_long_context_budget_required_bytes(model, 100000) ==
-                96970211328ull);
-    /* headroom-adjusted floor: ceil(required x 21/20) = 101818721894 */
-    TEST_ASSERT(!test_long_context_budget_allows(model, 100000, 90 * gib, false));
-    TEST_ASSERT(test_long_context_budget_allows(model, 100000, 96 * gib, false));
-    TEST_ASSERT(!test_long_context_budget_allows(model, 1000000, 96 * gib, false));
+                105560145920ull);
+    /* headroom-adjusted floor: ceil(required x 26/20) = 137228189696 */
+    TEST_ASSERT(!test_long_context_budget_allows(model, 100000, 125 * gib, false));
+    TEST_ASSERT(test_long_context_budget_allows(model, 100000, 140 * gib, false));
+    TEST_ASSERT(!test_long_context_budget_allows(model, 1000000, 140 * gib, false));
 
     /* unmeasurable inputs never gamble the pool */
     TEST_ASSERT(!test_long_context_budget_allows(model, 100000, 0, false));
-    TEST_ASSERT(!test_long_context_budget_allows(0, 100000, 96 * gib, false));
+    TEST_ASSERT(!test_long_context_budget_allows(0, 100000, 140 * gib, false));
 
     /* explicit override runs even when the budget says no */
     TEST_ASSERT(test_long_context_budget_allows(model, 100000, 1 * gib, true));
@@ -5463,6 +5490,30 @@ static void test_long_story_fact_recall(void) {
     char *prompt_text = test_read_file(prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
+
+    /* Memory-budget gate: the model spans + 100k-token KV + reserve must fit
+     * in measured MemAvailable with headroom before we touch the engine.
+     * Without this, loading on a fully-shared unified pool thrashes it into
+     * swap-death (docs/models/laguna-s21.md 2026-08-24). */
+    struct stat model_st;
+    const size_t avail_bytes = test_long_context_memavailable_bytes();
+    const bool have_model =
+        stat(test_model_path(), &model_st) == 0 && model_st.st_size > 0;
+    if (!test_env_bool("DS4_TEST_ALLOW_LONG_CONTEXT") &&
+        !test_long_context_budget_allows(
+            have_model ? (size_t)model_st.st_size : 0, 100000, avail_bytes,
+            false)) {
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        const uint64_t required = test_long_context_budget_required_bytes(
+            have_model ? (size_t)model_st.st_size : 0, 100000);
+        fprintf(stderr,
+                "ds4-test: skipping long-context: need >= %.1f GiB free "
+                "(model + 100k-token KV + reserve), MemAvailable %.1f GiB; "
+                "set DS4_TEST_ALLOW_LONG_CONTEXT=1 to force\n",
+                (double)required / gib, (double)avail_bytes / gib);
+        free(prompt_text);
+        return;
+    }
 
     ds4_engine *engine = test_get_engine(false);
     if (!engine) {
@@ -10575,6 +10626,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
     puts("  DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
+    puts("  DS4_TEST_ALLOW_LONG_CONTEXT=1  Run the long-context case even when the memory-budget gate would skip it.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");

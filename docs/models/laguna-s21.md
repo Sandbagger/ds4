@@ -59,3 +59,37 @@ something new about this model.
 - Capture dirs abort on stale files (`O_EXCL`) — fresh dir every run.
 - Dumping syncs + restarts the CUDA command batch; probes assert logits stay
   bitwise identical with observer on/off before trusting any capture.
+
+## 2026-08-24 — long-context memory-budget gate in the qualification harness
+
+Three qualification windows on spark-09fa (121 GiB GB10 unified pool) died in
+hard swap-death during `DS4_TEST_MODEL=<laguna Q4_K_M> ./ds4_test`, all in the
+model-backed phase, with coder+ds4-server stopped — not residency competition.
+`~/window.log` 60 s ticks pin the curve: mid-load (~48 GiB spans covered) the
+pool still showed ~20 GiB available; right after "startup model preparation
+covered 63.56 GiB of tensor spans" it read 121/121 used, 0 free, 0 buff/cache,
+0 available — every large process OOM-dumped, ssh banner-exchange dead. The
+box stayed unresponsive ~2 h until the window script's own `timeout` TERM
+landed and the restore trap freed it.
+
+Reading: on GB10 the device spans are unified-pool allocations, so model load
+(63.56 GiB) + CUDA context + `ds4_session_create(..., 100000)` KV + MoE
+staging cannot co-exist with anything else; kswapd reclaims all page cache and
+the pool tips over during load itself. The thrash reproduced on an IDLE pool
+(~119 GiB available), i.e. true footprint ≈ 1.9× the model file.
+
+Fix: memory-budget gate in `tests/ds4_test.c`, decisions pinned offline by
+`--long-context-budget`. Before engine load, `test_long_story_fact_recall`
+stats the model and reads `/proc/meminfo:MemAvailable`, skipping with a marker
+line unless
+
+    model_bytes + ctx_tokens x 192 KiB (KV reserve) + 16 GiB fixed reserve,
+    with 26/20 headroom,
+
+fits into MemAvailable. Headroom is calibrated so the real-file case computes
+a ~127 GiB floor — above the whole physical pool of a 128G-class host, which
+therefore refuses by construction — while a 160G+-class host runs the case.
+Unmeasurable inputs skip (fail-safe). `DS4_TEST_ALLOW_LONG_CONTEXT=1` forces
+the attempt. A bounded variant (SSD-streaming profile or explicit small-KV
+mode) remains open; this gate only makes the default run honest about not
+fitting.

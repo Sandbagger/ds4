@@ -5407,6 +5407,54 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
     }
 }
 
+/* Long-context memory-budget gate. Observed 2026-08-24 on spark-09fa
+ * (121 GiB GB10 unified pool): loading Laguna-S-2.1 Q4_K_M covers ~63.6 GiB
+ * of tensor spans, reclaims every page-cache byte, and creating the
+ * 100k-token session then drives the pool into swap-death
+ * (docs/models/laguna-s21.md). The gate refuses the case unless measured
+ * MemAvailable can hold model bytes + KV reserve + fixed overhead, with
+ * headroom. DS4_TEST_ALLOW_LONG_CONTEXT=1 forces the attempt. */
+#define TEST_LONG_KV_BYTES_PER_TOKEN (192ull * 1024ull)
+#define TEST_LONG_FIXED_RESERVE_BYTES (8ull << 30)
+#define TEST_LONG_HEADROOM_NUM 21
+#define TEST_LONG_HEADROOM_DEN 20
+
+static uint64_t test_long_context_budget_required_bytes(size_t model_bytes,
+                                                        long ctx_tokens) {
+    (void)model_bytes;
+    (void)ctx_tokens;
+    return 0; /* red spec: replaced by real budget math */
+}
+
+static bool test_long_context_budget_allows(size_t model_bytes, long ctx_tokens,
+                                            size_t memavail_bytes, bool force) {
+    (void)model_bytes;
+    (void)ctx_tokens;
+    (void)memavail_bytes;
+    (void)force;
+    return true; /* red spec: replaced by real budget decision */
+}
+
+static void test_long_context_budget_gate(void) {
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t model = 64 * gib;
+
+    /* required = 64 GiB model + 100k x 192 KiB KV + 8 GiB reserve */
+    TEST_ASSERT(test_long_context_budget_required_bytes(model, 100000) ==
+                96970211328ull);
+    /* headroom-adjusted floor: ceil(required x 21/20) = 101818721894 */
+    TEST_ASSERT(!test_long_context_budget_allows(model, 100000, 90 * gib, false));
+    TEST_ASSERT(test_long_context_budget_allows(model, 100000, 96 * gib, false));
+    TEST_ASSERT(!test_long_context_budget_allows(model, 1000000, 96 * gib, false));
+
+    /* unmeasurable inputs never gamble the pool */
+    TEST_ASSERT(!test_long_context_budget_allows(model, 100000, 0, false));
+    TEST_ASSERT(!test_long_context_budget_allows(0, 100000, 96 * gib, false));
+
+    /* explicit override runs even when the budget says no */
+    TEST_ASSERT(test_long_context_budget_allows(model, 100000, 1 * gib, true));
+}
+
 static void test_long_story_fact_recall(void) {
     const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
     if (!prompt_path || !prompt_path[0]) {
@@ -10499,6 +10547,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--long-context-budget", "long-context-budget", "offline memory-budget gate decisions for the long-context case", test_long_context_budget_gate},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

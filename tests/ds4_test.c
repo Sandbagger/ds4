@@ -41,6 +41,34 @@ static uint64_t test_env_gib(const char *name) {
     return (uint64_t)n * one_gib;
 }
 
+/* Unified-memory budget gate for model-backed tests. Observed 2026-08-24 on
+ * spark-09fa (121 GiB GB10 unified pool): loading Laguna-S-2.1 Q4_K_M covers
+ * ~63.56 GiB of tensor spans, reclaims every page-cache byte, and creating
+ * the 100k-token session then drives the pool into swap-death
+ * (docs/models/laguna-s21.md). Two calibration points: the long-context
+ * thrash reproduced on an IDLE pool (~119 GiB available), i.e. true
+ * footprint ≈ 1.9x the model file; and TWO cached engines (fast + quality,
+ * 2x63.56 GiB spans) thrashed the idle pool again in qualification window #7.
+ * The gate therefore (a) refuses any engine open whose footprint does not
+ * fit MemAvailable with headroom — sized so one Laguna engine clears a
+ * 128G-class host by construction while smaller models still run — and
+ * (b) evicts the opposite cached class before opening (LRU-of-1).
+ * DS4_TEST_ALLOW_LONG_CONTEXT=1 forces the attempt. */
+#define TEST_LONG_KV_BYTES_PER_TOKEN (192ull * 1024ull)
+#define TEST_LONG_FIXED_RESERVE_BYTES (16ull << 30)
+#define TEST_LONG_HEADROOM_NUM 26
+#define TEST_LONG_HEADROOM_DEN 20
+
+static uint64_t test_long_context_budget_required_bytes(size_t model_bytes,
+                                                        long ctx_tokens);
+
+static bool test_long_context_budget_allows(size_t model_bytes, long ctx_tokens,
+                                            size_t memavail_bytes, bool force);
+
+static size_t test_long_context_memavailable_bytes(void);
+
+static void test_long_context_budget_gate(void);
+
 static char *test_save_env(const char *name) {
     const char *value = getenv(name);
     if (!value) return NULL;
@@ -116,9 +144,41 @@ static ds4_engine *test_open_engine(bool quality) {
     return engine;
 }
 
+static ds4_engine *test_get_engine(bool quality);
+static void test_close_engine(bool quality);
+
 static ds4_engine *test_get_engine(bool quality) {
     ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
+    ds4_engine **other = quality ? &test_engine_fast : &test_engine_quality;
     if (*slot) return *slot;
+
+    /* LRU-of-1: two Laguna-scale engines cannot co-reside in a unified
+     * pool (window #7, 2026-08-24). Alternating entries pay a reload. */
+    if (*other) {
+        fprintf(stderr, "ds4-test: evicting cached %s engine before %s open\n",
+                quality ? "fast" : "quality", quality ? "quality" : "fast");
+        test_close_engine(!quality);
+    }
+
+    /* Budget preflight: refuse to materialize spans the pool cannot hold. */
+    const size_t avail_bytes = test_long_context_memavailable_bytes();
+    struct stat model_st;
+    const bool have_model =
+        stat(test_model_path(), &model_st) == 0 && model_st.st_size > 0;
+    if (!test_env_bool("DS4_TEST_ALLOW_LONG_CONTEXT") &&
+        !test_long_context_budget_allows(
+            have_model ? (size_t)model_st.st_size : 0, 0, avail_bytes,
+            false)) {
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        const uint64_t required = test_long_context_budget_required_bytes(
+            have_model ? (size_t)model_st.st_size : 0, 0);
+        fprintf(stderr,
+                "ds4-test: skipping model-backed case: need >= %.1f GiB free "
+                "for single-engine residency, MemAvailable %.1f GiB; set "
+                "DS4_TEST_ALLOW_LONG_CONTEXT=1 to force\n",
+                (double)required / gib, (double)avail_bytes / gib);
+        return NULL;
+    }
 
     *slot = test_open_engine(quality);
     return *slot;
@@ -5480,6 +5540,13 @@ static void test_long_context_budget_gate(void) {
 
     /* explicit override runs even when the budget says no */
     TEST_ASSERT(test_long_context_budget_allows(model, 100000, 1 * gib, true));
+
+    /* single-engine residency (no session KV): model + fixed reserve */
+    TEST_ASSERT(test_long_context_budget_required_bytes(model, 0) ==
+                85899345920ull);
+    /* headroom floor ceil(required x 26/20) = 111169149696 */
+    TEST_ASSERT(!test_long_context_budget_allows(model, 0, 100 * gib, false));
+    TEST_ASSERT(test_long_context_budget_allows(model, 0, 110 * gib, false));
 }
 
 static void test_long_story_fact_recall(void) {
@@ -10598,7 +10665,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
-    {"--long-context-budget", "long-context-budget", "offline memory-budget gate decisions for the long-context case", test_long_context_budget_gate},
+    {"--long-context-budget", "long-context-budget", "offline memory-budget decisions for model-backed cases", test_long_context_budget_gate},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
@@ -10626,7 +10693,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
     puts("  DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
-    puts("  DS4_TEST_ALLOW_LONG_CONTEXT=1  Run the long-context case even when the memory-budget gate would skip it.");
+    puts("  DS4_TEST_ALLOW_LONG_CONTEXT=1  Run model-backed cases even when the memory-budget gate would skip them.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");

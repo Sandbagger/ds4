@@ -93,3 +93,27 @@ Unmeasurable inputs skip (fail-safe). `DS4_TEST_ALLOW_LONG_CONTEXT=1` forces
 the attempt. A bounded variant (SSD-streaming profile or explicit small-KV
 mode) remains open; this gate only makes the default run honest about not
 fitting.
+
+## 2026-08-24 (later) — engine residency: LRU-of-1 cache + preflight
+
+Window #7 thrashed the idle pool even after the long-context gate landed:
+`test_get_engine` caches TWO engines (fast + quality). After long-context
+skipped correctly, later GPU entries opened the second class —
+2 × 63.56 GiB device spans ≈ 127 GiB anon on a ~119 GiB-available pool.
+This is also why full `./ds4_test --all` never survived a window on a
+121G host before today.
+
+Fix: `test_get_engine` now evicts the opposite cached class before opening
+(LRU-of-1, marker line on eviction), and every open passes a budget
+preflight (model bytes + 16 GiB fixed reserve, ×26/20 headroom against
+MemAvailable; NULL return = graceful per-entry skip, matching existing
+caller contracts). Alternating fast/quality entries pay a reload (~24 s)
+instead of a thrash. Pins added to `--long-context-budget`
+(single-engine required-bytes + boundary decisions).
+
+Separately: `tests/test_task18_lifecycle_contract.py`
+`connections_accepted()` now actually polls until the accept loop reports
+>=1 (its docstring always claimed this; the code returned the first reply,
+even 0). Deadline raised 2 s → 30 s: qualification windows run the suite
+right after nvcc links and vLLM stop/start cycles, which starve the child's
+accept thread for seconds at a time (windows 5/6 failures).

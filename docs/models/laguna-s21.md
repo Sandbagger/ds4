@@ -180,3 +180,29 @@ raw log in `~` so crashes preserve it.
 
 Open item: hammer validation on a clean pool (needs reboot to clear NVRM
 residue from today's kill storm; SIGKILL paths skip teardown entirely).
+
+## 2026-08-25 (III) — window #12: first full `make test` completion on GB10
+
+Window #12 (commit 8521247f, v4 script, 2h budget) completed end-to-end —
+the first full qualification run ever on this box. No thrash, no guard
+trips, host memory flat at 108/121 throughout, and **`think-tool-recovery:
+OK`** — the LRU engine-class transition that killed windows #7-#9 passes
+under the teardown-ordering fix (309a8613).
+
+Remaining reds are one class: `--logprob-vectors`,
+`--local-golden-vectors`, `--metal-kernels` (3 entries, 39 assertions).
+These compare local top-logprobs against external API captures
+(official.vec / local-golden.vec) and assert kernel-fixture setups; they
+are not numerics regressions — the same run's `metal-tensor-equivalence`
+passed bitwise-exact (max_abs=0 on every case), so inference itself is
+sound. Closing them requires the Poolside capture pipeline to emit Laguna
+official vectors (planned comparator-v2 / capture work), or explicit
+fixture wiring in the harness env. Until then they are expected-red on
+Laguna+GB10 and should be read as such; do not burn windows re-litigating
+them.
+
+Also observed: device-free fluctuated around the single-engine floor
+(~103.4 GiB) during the run, so entries straddled skip/run boundaries by
+scheduler luck. Harmless under the gates but worth remembering when
+comparing runs: which model cases execute can vary with residual NVRM
+state from before the window.

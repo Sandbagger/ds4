@@ -5563,8 +5563,7 @@ static size_t test_budget_effective_avail_bytes(void) {
         test_long_context_memavailable_bytes(), test_cuda_free_bytes());
 }
 
-static void test_long_context_budget_gate(void) {
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+static void test_long_context_budget_gate(void) {    const uint64_t gib = 1024ull * 1024ull * 1024ull;
     const uint64_t model = 64 * gib;
 
     /* required = 64 GiB model + 100k x 192 KiB KV + 16 GiB reserve */
@@ -5597,6 +5596,47 @@ static void test_long_context_budget_gate(void) {
     TEST_ASSERT(test_budget_effective_avail_pick(77 * gib, (size_t)-1) ==
                 77 * gib); /* no CUDA build: host view is all we have */
     TEST_ASSERT(test_budget_effective_avail_pick(77 * gib, 0) == 0);
+}
+
+/* Zero-delay open/close alternation across engine classes. Self-limiting:
+ * aborts (red) the moment device-free ratchets below baseline - 8 GiB,
+ * well before a second overlapping residency could threaten the pool.
+ * Requires >= 106 GiB effective free so the first open passes the budget
+ * gate; soft-skips otherwise (run on an idle box). */
+static void test_engine_transition_hammer(void) {
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    const double baseline = (double)test_budget_effective_avail_bytes() / gib;
+    if (baseline < 106.0) {
+        fprintf(stderr,
+                "hammer: soft-skip, need >= 106 GiB effective free for "
+                "safe open/close cycles (have %.1f)\n",
+                baseline);
+        return;
+    }
+    for (int cycle = 0; cycle < 6; cycle++) {
+        const bool q = (cycle & 1) != 0;
+        fprintf(stderr, "hammer: cycle %d opening %s engine\n", cycle,
+                q ? "quality" : "fast");
+        ds4_engine *eng = test_get_engine(q);
+        if (!eng) {
+            fprintf(stderr, "hammer: engine unavailable; stopping\n");
+            return;
+        }
+        test_close_engine(q);
+        const double after =
+            (double)test_budget_effective_avail_bytes() / gib;
+        fprintf(stderr, "hammer: post-close effective free %.2f GiB\n",
+                after);
+        if (after < baseline - 8.0) {
+            fprintf(stderr,
+                    "TEARDOWN RATCHET: effective free dropped %.2f -> %.2f "
+                    "GiB across transitions\n",
+                    baseline, after);
+            TEST_ASSERT(!"device memory ratcheted down across engine "
+                         "transitions");
+            return;
+        }
+    }
 }
 
 static void test_long_story_fact_recall(void) {
@@ -10719,6 +10759,7 @@ static const ds4_test_entry test_entries[] = {
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--long-context-budget", "long-context-budget", "offline memory-budget decisions for model-backed cases", test_long_context_budget_gate},
+    {"--engine-transition-hammer", "engine-transition-hammer", "zero-delay open/close alternation with ratchet detection (needs idle pool)", test_engine_transition_hammer},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

@@ -143,3 +143,40 @@ query is the only programmatic device-side truth available here.
 Operational rule reinforced: never trust a single memory view on unified-
 memory GPUs; any budget decision must consult the allocator's own accounting
 before materializing spans.
+
+## 2026-08-25 (II) — close-path teardown ordering; the full window-death chain
+
+Windows #7-#9 shared one death class: NVRM kernel OOM storms
+(`NV_ERR_NO_MEMORY (0x00000051)` from `_memdescAllocInternal`) at engine
+transitions, followed by total box loss. Three independent mechanisms
+stacked:
+
+1. **Teardown ordering** (primary, fixed 309a8613): `ds4_engine_close`
+   munmapped the model and closed its fd *before* `ds4_gpu_cleanup`, so
+   every `cudaHostUnregister` against those mappings failed silently
+   (return codes discarded, bookkeeping cleared regardless). NVRM kept
+   pinning state behind pages Linux considered free. Fix: cleanup runs
+   while mappings are alive; all teardown CUDA calls checked and loud
+   under `DS4_TEARDOWN_DEBUG=1` with device-free marks M0-M5.
+2. **Unit auto-restart resurrection**: coder is `Restart=always`, ds4-server
+   `Restart=on-failure`. Any abnormal exit during a window's stop phase
+   made systemd silently reload ~57 GiB stacks mid-run — window #8's
+   +74 GiB-in-one-minute tick. Fix: window scripts runtime-MASK both units
+   around the run.
+3. **Escaped EngineCore orphans**: unit stop does not reap vLLM EngineCore
+   children; they hold device spans indefinitely. Fix: pkill sweep after
+   stop, before drain-wait.
+
+Compounding measurement hazard: on GB10 unified memory, host MemAvailable
+can report ~99 GiB free while NVRM holds 98.5/121 (gpu-sample timer caught
+it). All budget decisions now take min(host, cudaMemGetInfo) — see
+b2ee4eff — and `--budget-report` exposes both views for scripts.
+
+Diagnostics added: `--engine-transition-hammer` (a5107026) hammers
+zero-delay open/close alternation across engine classes and aborts red on
+an 8 GiB ratchet — safe by construction. Window script v4 masks units,
+sweeps orphans, drains on device truth, guards both views, and keeps the
+raw log in `~` so crashes preserve it.
+
+Open item: hammer validation on a clean pool (needs reboot to clear NVRM
+residue from today's kill storm; SIGKILL paths skip teardown entirely).

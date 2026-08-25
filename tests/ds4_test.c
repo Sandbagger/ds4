@@ -67,6 +67,8 @@ static bool test_long_context_budget_allows(size_t model_bytes, long ctx_tokens,
 
 static size_t test_long_context_memavailable_bytes(void);
 
+static size_t test_budget_effective_avail_bytes(void);
+
 static void test_long_context_budget_gate(void);
 
 static char *test_save_env(const char *name) {
@@ -160,8 +162,10 @@ static ds4_engine *test_get_engine(bool quality) {
         test_close_engine(!quality);
     }
 
-    /* Budget preflight: refuse to materialize spans the pool cannot hold. */
-    const size_t avail_bytes = test_long_context_memavailable_bytes();
+    /* Budget preflight: refuse to materialize spans the unified pool cannot
+     * hold (device view included — NVRM can hold spans the host does not
+     * see). */
+    const size_t avail_bytes = test_budget_effective_avail_bytes();
     struct stat model_st;
     const bool have_model =
         stat(test_model_path(), &model_st) == 0 && model_st.st_size > 0;
@@ -174,8 +178,9 @@ static ds4_engine *test_get_engine(bool quality) {
             have_model ? (size_t)model_st.st_size : 0, 0);
         fprintf(stderr,
                 "ds4-test: skipping model-backed case: need >= %.1f GiB free "
-                "for single-engine residency, MemAvailable %.1f GiB; set "
-                "DS4_TEST_ALLOW_LONG_CONTEXT=1 to force\n",
+                "for single-engine residency, effective free %.1f GiB (min "
+                "of host and device); set DS4_TEST_ALLOW_LONG_CONTEXT=1 to "
+                "force\n",
                 (double)required / gib, (double)avail_bytes / gib);
         return NULL;
     }
@@ -5522,6 +5527,42 @@ static size_t test_long_context_memavailable_bytes(void) {
     return avail_bytes;
 }
 
+/* Host MemAvailable lies on GB10 unified memory: after vLLM stop/start
+ * churn Linux frees the pages from process accounting while NVRM still
+ * holds the spans (window #8, 2026-08-25: host reported ~99 GiB free
+ * while nvidia-smi showed 98.5/121 GiB committed; the next CUDA alloc
+ * storm killed the kernel driver). Gate on the minimum of both views.
+ * cuda_free_bytes == SIZE_MAX means "no CUDA here" (host view only);
+ * 0 means "query failed" (fail safe: no budget at all). */
+static size_t test_budget_effective_avail_pick(size_t meminfo_bytes,
+                                               size_t cuda_free_bytes) {
+    if (cuda_free_bytes == (size_t)-1) return meminfo_bytes;
+    if (cuda_free_bytes == 0) return 0;
+    return meminfo_bytes < cuda_free_bytes ? meminfo_bytes : cuda_free_bytes;
+}
+
+#ifndef DS4_NO_GPU
+/* cudaError_t cudaMemGetInfo(size_t*, size_t*) — declared locally because
+ * this TU compiles without CUDA include paths (ds4_gpu.h is header-free by
+ * design); libcudart is linked by every ds4_test link variant. */
+int cudaMemGetInfo(size_t *free_bytes, size_t *total_bytes);
+static size_t test_cuda_free_bytes(void) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != 0 /* cudaSuccess */) {
+        return 0;
+    }
+    return free_bytes;
+}
+#else
+static size_t test_cuda_free_bytes(void) { return (size_t)-1; }
+#endif
+
+static size_t test_budget_effective_avail_bytes(void) {
+    return test_budget_effective_avail_pick(
+        test_long_context_memavailable_bytes(), test_cuda_free_bytes());
+}
+
 static void test_long_context_budget_gate(void) {
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     const uint64_t model = 64 * gib;
@@ -5547,6 +5588,15 @@ static void test_long_context_budget_gate(void) {
     /* headroom floor ceil(required x 26/20) = 111169149696 */
     TEST_ASSERT(!test_long_context_budget_allows(model, 0, 100 * gib, false));
     TEST_ASSERT(test_long_context_budget_allows(model, 0, 110 * gib, false));
+
+    /* unified-pool truth: effective availability = min(host, device) */
+    TEST_ASSERT(test_budget_effective_avail_pick(100 * gib, 20 * gib) ==
+                20 * gib);
+    TEST_ASSERT(test_budget_effective_avail_pick(10 * gib, 50 * gib) ==
+                10 * gib);
+    TEST_ASSERT(test_budget_effective_avail_pick(77 * gib, (size_t)-1) ==
+                77 * gib); /* no CUDA build: host view is all we have */
+    TEST_ASSERT(test_budget_effective_avail_pick(77 * gib, 0) == 0);
 }
 
 static void test_long_story_fact_recall(void) {
@@ -5559,11 +5609,13 @@ static void test_long_story_fact_recall(void) {
     if (!prompt_text) return;
 
     /* Memory-budget gate: the model spans + 100k-token KV + reserve must fit
-     * in measured MemAvailable with headroom before we touch the engine.
-     * Without this, loading on a fully-shared unified pool thrashes it into
-     * swap-death (docs/models/laguna-s21.md 2026-08-24). */
+     * in effective availability (min of host MemAvailable and device-free —
+     * NVRM can hold spans the host view does not see) with headroom before
+     * we touch the engine. Without this, loading on a fully-shared unified
+     * pool thrashes it into swap-death (docs/models/laguna-s21.md
+     * 2026-08-24). */
+    const size_t avail_bytes = test_budget_effective_avail_bytes();
     struct stat model_st;
-    const size_t avail_bytes = test_long_context_memavailable_bytes();
     const bool have_model =
         stat(test_model_path(), &model_st) == 0 && model_st.st_size > 0;
     if (!test_env_bool("DS4_TEST_ALLOW_LONG_CONTEXT") &&
@@ -5575,8 +5627,9 @@ static void test_long_story_fact_recall(void) {
             have_model ? (size_t)model_st.st_size : 0, 100000);
         fprintf(stderr,
                 "ds4-test: skipping long-context: need >= %.1f GiB free "
-                "(model + 100k-token KV + reserve), MemAvailable %.1f GiB; "
-                "set DS4_TEST_ALLOW_LONG_CONTEXT=1 to force\n",
+                "(model + 100k-token KV + reserve), effective free %.1f GiB "
+                "(min of host and device); set DS4_TEST_ALLOW_LONG_CONTEXT=1 "
+                "to force\n",
                 (double)required / gib, (double)avail_bytes / gib);
         free(prompt_text);
         return;

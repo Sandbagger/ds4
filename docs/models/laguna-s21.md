@@ -117,3 +117,29 @@ Separately: `tests/test_task18_lifecycle_contract.py`
 even 0). Deadline raised 2 s → 30 s: qualification windows run the suite
 right after nvcc links and vLLM stop/start cycles, which starve the child's
 accept thread for seconds at a time (windows 5/6 failures).
+
+## 2026-08-25 — gate on device-free memory, not host MemAvailable (window #8 post-mortem)
+
+Window #8 (commit 63687e3d) still died: tick curve showed used 22→96 GiB in
+the first minute and 121/121 by T+4m44s; persistent journal (boot -2) shows
+an NVRM kernel OOM storm — repeated `NV_ERR_NO_MEMORY (0x00000051)` from
+`_memdescAllocInternal` at T+73 s — with the journal ending 2 min later.
+Root cause: **host MemAvailable lies about unified-pool headroom during vLLM
+stop/start churn.** The gpu-sample timer recorded `gpu_mem_used_mib=98564`
+(98.5 of 121 GiB) forty seconds BEFORE the window opened, while the host
+tick showed only 22 GiB used: Linux had freed the stopped coder's pages from
+process accounting, but NVRM still held the spans. The MemAvailable-based
+gate therefore saw ~99 GiB free, passed, and ds4_test allocated into a pool
+that had ~22 GiB truth — the driver died first, then the box.
+
+Fix: preflight availability is now `min(MemAvailable, cudaMemGetInfo().free)`
+(`test_budget_effective_avail_pick`, pinned in `--long-context-budget`;
+SIZE_MAX sentinel = no-CUDA build falls back to host view; failed query = 0
+= fail safe). Live check with the coding stack resident: host 21.4 GiB vs
+device 1.9 GiB → min selected → long-context skips correctly. nvidia-smi
+CSV reports `[N/A]` for memory fields on this GB10/driver combo, so the CUDA
+query is the only programmatic device-side truth available here.
+
+Operational rule reinforced: never trust a single memory view on unified-
+memory GPUs; any budget decision must consult the allocator's own accounting
+before materializing spans.

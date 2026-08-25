@@ -10779,6 +10779,19 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--budget-report")) {
+        /* Zero-allocation unified-pool probe for window scripts: prints all
+         * availability views without touching engines. */
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        const size_t dev = test_cuda_free_bytes();
+        printf("host_free_gib=%.1f\n",
+               (double)test_long_context_memavailable_bytes() / gib);
+        printf("device_free_gib=%.1f\n",
+               dev == (size_t)-1 ? -1.0 : (double)dev / gib);
+        printf("effective_free_gib=%.1f\n",
+               (double)test_budget_effective_avail_bytes() / gib);
+        return 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--server-lifecycle-stdio")) {
         if ((argc != 4 && argc != 6) || strcmp(argv[2], "--scenario") ||
             (argc == 6 && strcmp(argv[4], "--port"))) {

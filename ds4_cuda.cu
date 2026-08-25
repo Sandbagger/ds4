@@ -7212,22 +7212,57 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
+/* Teardown diagnostics (DS4_TEARDOWN_DEBUG=1): loud CUDA errors at every
+ * unregister/free plus cudaMemGetInfo marks around close boundaries.
+ * Motivated by spark-09fa windows #7-#9: unregister-after-munmap ordering
+ * silently failed and left NVRM pinning state behind across LRU engine
+ * transitions, ending in NVRM kernel OOM storms. */
+static int ds4_teardown_debug(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_TEARDOWN_DEBUG");
+        v = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+static void dbg_cuda(cudaError_t err, const char *what) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4-cuda: TEARDOWN %s: %s (%d)\n", what,
+                cudaGetErrorString(err), (int)err);
+    }
+}
+
+static void ds4_mem_mark(const char *tag) {
+    if (!ds4_teardown_debug()) return;
+    size_t fr = 0;
+    size_t to = 0;
+    if (cudaMemGetInfo(&fr, &to) == cudaSuccess) {
+        fprintf(stderr, "ds4-cuda: MARK %s device_free=%.2f GiB\n", tag,
+                (double)fr / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        fprintf(stderr, "ds4-cuda: MARK %s device_free=unknown\n", tag);
+    }
+}
+
 static void cuda_model_range_release_all(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
-            (void)cudaHostUnregister(r.registered_base);
+            dbg_cuda(cudaHostUnregister(r.registered_base),
+                     "cudaHostUnregister(range)");
         } else if (r.device_ptr && !r.arena_allocated) {
-            (void)cudaFree(r.device_ptr);
+            dbg_cuda(cudaFree(r.device_ptr), "cudaFree(range)");
         }
     }
     for (const cuda_model_arena &a : g_model_arenas) {
-        if (a.device_ptr) (void)cudaFree(a.device_ptr);
+        if (a.device_ptr) dbg_cuda(cudaFree(a.device_ptr), "cudaFree(arena)");
     }
     g_model_arenas.clear();
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
     cuda_model_load_progress_reset();
+    ds4_mem_mark("M2-post-range-release-all");
 }
 
 static int cublas_ok(cublasStatus_t st, const char *what) {
@@ -7454,6 +7489,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     } else {
         (void)cudaDeviceSynchronize();
     }
+    ds4_mem_mark("M1-post-sync");
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -7544,11 +7580,13 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_model_upload_stream = NULL;
     }
     if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
+        dbg_cuda(cudaFree((void *)g_model_device_base), "cudaFree(model device)");
     }
     if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
+        dbg_cuda(cudaHostUnregister((void *)g_model_host_base),
+                 "cudaHostUnregister(model main)");
     }
+    ds4_mem_mark("M3-post-main-unregister");
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
@@ -7572,6 +7610,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
     }
+    ds4_mem_mark("M4-post-gpu-cleanup");
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);

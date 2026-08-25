@@ -2636,6 +2636,44 @@ static void model_close(ds4_model *m) {
     m->fd = -1;
 }
 
+/* Teardown memory mark (DS4_TEARDOWN_DEBUG=1): host + device views. The
+ * device view is authoritative on GB10 unified memory — NVRM can hold
+ * spans after Linux releases the pages (spark-09fa windows #7-#9). */
+#ifndef DS4_NO_GPU
+int cudaMemGetInfo(size_t *free_bytes, size_t *total_bytes);
+#endif
+static void ds4_close_mem_mark(const char *tag) {
+    const char *e = getenv("DS4_TEARDOWN_DEBUG");
+    if (!e || !e[0] || strcmp(e, "0") == 0) return;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    char line[512];
+    FILE *mf = fopen("/proc/meminfo", "r");
+    double host = -1.0;
+    if (mf) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), mf)) {
+            unsigned long long kb = 0;
+            if (sscanf(buf, "MemAvailable: %llu kB", &kb) == 1) {
+                host = (double)kb * 1024.0 / gib;
+                break;
+            }
+        }
+        fclose(mf);
+    }
+    double dev = -1.0;
+#ifndef DS4_NO_GPU
+    {
+        size_t fr = 0, to = 0;
+        if (cudaMemGetInfo(&fr, &to) == 0 /* cudaSuccess */) dev = (double)fr / gib;
+    }
+#endif
+    snprintf(line, sizeof(line),
+             "ds4: MARK %s host_free=%.2f GiB device_free=%.2f GiB\n", tag,
+             host, dev);
+    fputs(line, stderr);
+    (void)line;
+}
+
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
     if (!m || !m->map || m->size == 0) return;
 
@@ -63113,6 +63151,19 @@ void ds4_engine_close(ds4_engine *e) {
     }
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+#ifndef DS4_NO_GPU
+    /* CUDA unregisters/frees must run while every host mapping they point
+     * into is still alive. The previous order munmap'd the model first and
+     * unregistered afterwards; the unregister silently failed, NVRM kept
+     * pinning state behind, and LRU engine transitions ratcheted the pool
+     * into NVRM kernel OOM storms (spark-09fa windows #7-#9). */
+    ds4_close_mem_mark("M0-pre-gpu-cleanup");
+    if (e->shared_prefill_workspace_ready) {
+        metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
+        e->shared_prefill_workspace_ready = false;
+    }
+    ds4_gpu_cleanup();
+#endif
     if (e->mtp_model.map) model_close(&e->mtp_model);
     for (size_t i = 1; i < 3; i++) {
         if (!ds4_engine_laguna_release_record(
@@ -63124,13 +63175,7 @@ void ds4_engine_close(ds4_engine *e) {
         }
     }
     model_close(&e->model);
-#ifndef DS4_NO_GPU
-    if (e->shared_prefill_workspace_ready) {
-        metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
-        e->shared_prefill_workspace_ready = false;
-    }
-    ds4_gpu_cleanup();
-#endif
+    ds4_close_mem_mark("M5-post-model-close");
 #ifdef DS4_TEST_HOOKS
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
     !defined(DS4_ROCM_BUILD)

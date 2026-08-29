@@ -155,12 +155,12 @@ static bool create_session(ds4_session **out, bool terminal) {
         return false;
     }
     const int ctx = ds4_session_ctx(*out);
-    const bool valid = state.pos >= 0 && state.pos < ctx &&
+    const bool valid = state.pos > 0 && state.pos < ctx &&
                        state.checkpoint_valid &&
                        state.logits_only_terminal == terminal &&
                        state.token_hash != 0 && state.logit_hash != 0;
-    CHECKF(state.pos >= 0 && state.pos < ctx,
-           "create %s: fixture position %d is not below context %d",
+    CHECKF(state.pos > 0 && state.pos < ctx,
+           "create %s: fixture position %d is not strictly between zero and context %d",
            terminal ? "terminal" : "inert", state.pos, ctx);
     CHECKF(state.checkpoint_valid,
            "create %s: fixture checkpoint is not valid",

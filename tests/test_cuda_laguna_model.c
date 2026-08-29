@@ -539,6 +539,16 @@ static bool run_deep_exact_context(
         fail_message("capture deep-32768 terminal state", NULL);
         goto done;
     }
+#ifdef DS4_TEST_HOOKS
+    ds4_test_session_state terminal_state = {0};
+    if (ds4_test_session_state_read(session, &terminal_state) != 0 ||
+        !terminal_state.logits_only_terminal ||
+        !terminal_state.checkpoint_valid ||
+        terminal_state.pos != 32768) {
+        fail_message("deep-32768 terminal hook state", NULL);
+        goto done;
+    }
+#endif
     if (!compare_session_oracle(session, fixture, "deep-32768")) goto done;
 
     memset(err, 0, sizeof(err));

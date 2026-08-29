@@ -42,7 +42,7 @@ MATERIALIZED_PROMPT_FILES = frozenset(
     {"swa-513.prompt", "yarn-8193.prompt", "deep-32768.prompt"}
 )
 CASES = (
-    ("short", "laguna-ds4", 3, 1024),
+    ("short", "laguna-ds4", 22, 1024),
     ("swa-513", "raw", 513, 1024),
     ("yarn-8193", "raw", 8193, 8202),
     ("deep-32768", "raw", 32768, 32768),
@@ -133,7 +133,7 @@ VOCAB_SIZE = 100352
 # Dispatch is by the exact rendered payload digest.  Basenames are deliberately
 # ignored so promotion cannot accidentally tokenize a different byte payload.
 PROMPT_COUNTS = {
-    "e3dc84f54d1afb86e11f782bb9d19715340855df5ef602cde682768008aef74d": 3,
+    "e3dc84f54d1afb86e11f782bb9d19715340855df5ef602cde682768008aef74d": 22,
     "17fe521315d24902e6b34efb26a04c5dcaa395f56a0572078a4db1f40e84a490": 513,
     "92f6c7f1817119f7a390e55b5ce667db688924aa4d181c14a4921bb166ae28b5": 8193,
     "99fdb470b5b2afe3a23f24e7868383a020b5238da618bf2495dda327d866f568": 32768,
@@ -205,7 +205,7 @@ def main():
             values[0] = 999
     elif prompt_digest in PROMPT_COUNTS:
         count = PROMPT_COUNTS[prompt_digest]
-        values = [100000, 17, 100001] if count == 3 else [index % VOCAB_SIZE for index in range(count)]
+        values = [100000] + list(range(20)) + [100001] if count == 22 else [index % VOCAB_SIZE for index in range(count)]
     else:
         print(f"unexpected prompt content digest: {prompt_digest}", file=sys.stderr)
         return 3
@@ -261,7 +261,7 @@ def promoted_model() -> dict[str, object]:
 
 def case_tokens(case_id: str, frontier: int) -> list[int]:
     if case_id == "short":
-        return [100000, 17, 100001]
+        return [100000] + list(range(20)) + [100001]
     return [index % VOCAB_SIZE for index in range(frontier)]
 
 
@@ -1411,7 +1411,7 @@ class SinglePoolsideV2ContractTests(unittest.TestCase):
             )
 
             expected_payloads = {
-                sha256(source_rendered_prompt("short")): (source_rendered_prompt("short"), 3, 100000, 100001),
+                sha256(source_rendered_prompt("short")): (source_rendered_prompt("short"), 22, 100000, 100001),
                 sha256(source_rendered_prompt("swa-513")): (source_rendered_prompt("swa-513"), 513, 0, 512),
                 sha256(source_rendered_prompt("yarn-8193")): (source_rendered_prompt("yarn-8193"), 8193, 0, 8192),
                 sha256(source_rendered_prompt("deep-32768")): (source_rendered_prompt("deep-32768"), 32768, 0, 32767),

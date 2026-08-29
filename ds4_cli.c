@@ -763,7 +763,7 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     ds4_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
-    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+    if (ds4_session_sync_logits_only(session, prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);

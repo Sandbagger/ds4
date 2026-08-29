@@ -367,6 +367,26 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 int ds4_session_sync_logits_only(
         ds4_session *s, const ds4_tokens *prompt,
         char *err, size_t errlen);
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    int pos;
+    bool checkpoint_valid;
+    bool logits_only_terminal;
+    uint64_t token_hash;
+    uint64_t logit_hash;
+} ds4_test_session_state;
+
+int ds4_test_logits_only_sync_mode(
+        bool native_cuda_build,
+        bool laguna, ds4_backend backend,
+        bool session_distributed, bool engine_distributed,
+        bool transport_tensor_parallel, bool cuda_tensor_parallel,
+        int prompt_len, int ctx_size);
+int ds4_test_session_create_policy(
+        ds4_session **out, int ctx_size, bool terminal);
+int ds4_test_session_state_read(
+        const ds4_session *s, ds4_test_session_state *out);
+#endif
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

@@ -47,7 +47,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-resident dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-resident test-session-logits-only-policy dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -289,6 +289,15 @@ tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4
 tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_session_logits_only.o: tests/test_session_logits_only.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_session_logits_only: tests/test_session_logits_only.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-session-logits-only-policy: tests/test_session_logits_only
+	./tests/test_session_logits_only
+
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
@@ -380,13 +389,15 @@ else
 endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test \
-	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_layer_pack tests/test_engine_mgpu_placement \
+	tests/test_session_logits_only tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
+	./tests/test_session_logits_only
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
@@ -423,4 +434,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_laguna_model tests/test_session_logits_only tests/test_session_logits_only.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

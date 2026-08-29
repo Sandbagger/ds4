@@ -1468,6 +1468,170 @@ static int run_prefill_attention_cases(void) {
     return rc;
 }
 
+/* Model-shaped Q8_0 prefill coverage. Laguna's 22-token short case enters the
+ * tensor-core path that scalar and tiny-batch kernel fixtures do not reach. */
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} laguna_q8_0_block;
+
+_Static_assert(sizeof(laguna_q8_0_block) == 34u, "Q8_0 block layout changed");
+
+static void laguna_fill_q8_0_block(
+        laguna_q8_0_block *block, uint32_t row, uint32_t column_block) {
+    const float scale = 0.0015f + 0.000031f * (float)((row * 7u + column_block * 11u) % 29u);
+    block->d = reference_f32_to_f16(scale);
+    for (uint32_t i = 0; i < 32u; i++) {
+        block->qs[i] = (int8_t)((int32_t)((row * 17u + column_block * 13u + i * 19u) % 255u) - 127);
+    }
+}
+
+static void laguna_quantize_q8_0_reference(
+        int8_t *quantized, float *scales, const float *input,
+        uint32_t n_tokens, uint32_t in_dim) {
+    const uint32_t blocks = in_dim / 32u;
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            const float *src = input + (uint64_t)token * in_dim + block * 32u;
+            float max_abs = 0.0f;
+            for (uint32_t i = 0; i < 32u; i++) {
+                max_abs = fmaxf(max_abs, fabsf(src[i]));
+            }
+            const float scale = max_abs / 127.0f;
+            const float inv_scale = scale != 0.0f ? 1.0f / scale : 0.0f;
+            scales[(uint64_t)token * blocks + block] = scale;
+            for (uint32_t i = 0; i < 32u; i++) {
+                long value = lrintf(src[i] * inv_scale);
+                if (value > 127) value = 127;
+                if (value < -128) value = -128;
+                quantized[((uint64_t)token * blocks + block) * 32u + i] = (int8_t)value;
+            }
+        }
+    }
+}
+
+static void laguna_q8_0_matmul_reference(
+        float *output, const laguna_q8_0_block *weights,
+        const int8_t *quantized, const float *scales,
+        uint32_t n_tokens, uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t blocks = in_dim / 32u;
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t row = 0; row < out_dim; row++) {
+            float sum = 0.0f;
+            for (uint32_t block = 0; block < blocks; block++) {
+                const laguna_q8_0_block *weight = weights + (uint64_t)row * blocks + block;
+                const int8_t *input = quantized + ((uint64_t)token * blocks + block) * 32u;
+                int32_t dot = 0;
+                for (uint32_t i = 0; i < 32u; i++) {
+                    dot += (int32_t)weight->qs[i] * (int32_t)input[i];
+                }
+                sum += reference_f16_to_f32(weight->d) *
+                    scales[(uint64_t)token * blocks + block] * (float)dot;
+            }
+            output[(uint64_t)token * out_dim + row] = sum;
+        }
+    }
+}
+
+static int run_q8_matmul_prefill_case(void) {
+    const uint32_t n_tokens = 22u;
+    const uint32_t in_dim = 3072u;
+    const uint32_t out_dim = 73u;
+    const uint32_t blocks = in_dim / 32u;
+    const uint64_t weight_count = (uint64_t)out_dim * blocks;
+    const uint64_t input_count = (uint64_t)n_tokens * in_dim;
+    const uint64_t output_count = (uint64_t)n_tokens * out_dim;
+    laguna_q8_0_block *weights = calloc((size_t)weight_count, sizeof(*weights));
+    float *input = malloc((size_t)input_count * sizeof(*input));
+    int8_t *quantized = malloc((size_t)input_count * sizeof(*quantized));
+    float *scales = malloc((size_t)n_tokens * blocks * sizeof(*scales));
+    float *reference = malloc((size_t)output_count * sizeof(*reference));
+    float *actual = malloc((size_t)output_count * sizeof(*actual));
+    ds4_gpu_tensor *input_tensor = NULL;
+    ds4_gpu_tensor *output_tensor = NULL;
+    int rc = 1;
+
+    if (!weights || !input || !quantized || !scales || !reference || !actual) {
+        fprintf(stderr, "q8-matmul: fixture allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            laguna_fill_q8_0_block(weights + (uint64_t)row * blocks + block,
+                                   row, block);
+        }
+    }
+    for (uint64_t i = 0; i < input_count; i++) {
+        input[i] = (float)((int32_t)((i * 23u + (i / in_dim) * 41u) % 257u) - 128) /
+            (31.0f + (float)(i % 7u));
+    }
+    laguna_quantize_q8_0_reference(quantized, scales, input, n_tokens, in_dim);
+    laguna_q8_0_matmul_reference(reference, weights, quantized, scales,
+                                 n_tokens, in_dim, out_dim);
+
+    if (!ds4_gpu_set_model_map(weights, weight_count * sizeof(*weights))) {
+        fprintf(stderr, "q8-matmul: model map setup failed\n");
+        goto cleanup;
+    }
+    input_tensor = ds4_gpu_tensor_alloc(input_count * sizeof(*input));
+    output_tensor = ds4_gpu_tensor_alloc(output_count * sizeof(*actual));
+    if (!input_tensor || !output_tensor ||
+        !ds4_gpu_tensor_write(input_tensor, 0, input,
+                              input_count * sizeof(*input)) ||
+        !ds4_gpu_matmul_q8_0_tensor(output_tensor, weights,
+                                    weight_count * sizeof(*weights), 0u,
+                                    in_dim, out_dim, input_tensor, n_tokens)) {
+        fprintf(stderr, "q8-matmul: CUDA setup or wrapper failed\n");
+        goto cleanup;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess ||
+        !ds4_gpu_tensor_read(output_tensor, 0, actual,
+                             output_count * sizeof(*actual))) {
+        fprintf(stderr, "q8-matmul: CUDA completion or read failed\n");
+        goto cleanup;
+    }
+
+    double square_error = 0.0;
+    float max_abs = 0.0f;
+    uint64_t worst = 0u;
+    int finite = 1;
+    for (uint64_t i = 0; i < output_count; i++) {
+        if (!isfinite(actual[i]) || !isfinite(reference[i])) {
+            finite = 0;
+            worst = i;
+            continue;
+        }
+        const float error = fabsf(actual[i] - reference[i]);
+        if (error > max_abs) {
+            max_abs = error;
+            worst = i;
+        }
+        square_error += (double)error * error;
+    }
+    const double rms = finite ? sqrt(square_error / (double)output_count) : INFINITY;
+    if (!finite || max_abs > 2.0e-3f || rms > 5.0e-4) {
+        fprintf(stderr,
+                "q8-matmul/model-prefill: max_abs=%g rms=%g token=%llu row=%llu actual=%g reference=%g\n",
+                (double)max_abs, rms,
+                (unsigned long long)(worst / out_dim),
+                (unsigned long long)(worst % out_dim),
+                (double)actual[worst], (double)reference[worst]);
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(output_tensor);
+    ds4_gpu_tensor_free(input_tensor);
+    free(actual);
+    free(reference);
+    free(scales);
+    free(quantized);
+    free(input);
+    free(weights);
+    return rc;
+}
+
 /* Independent Q4_K/Q8_K routed-MoE oracle.  Both quantization boundaries
  * belong here: a float-only reference would be testing a different kernel. */
 #define LAGUNA_QK_K 256u
@@ -2040,7 +2204,7 @@ cleanup:
 }
 
 static void usage(const char *program) {
-    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|routed-moe|all\n", program);
+    fprintf(stderr, "usage: %s --case norm-rope|decode-attention|prefill-attention|q8-matmul|routed-moe|all\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2048,6 +2212,7 @@ int main(int argc, char **argv) {
         (strcmp(argv[2], "norm-rope") != 0 &&
          strcmp(argv[2], "decode-attention") != 0 &&
          strcmp(argv[2], "prefill-attention") != 0 &&
+         strcmp(argv[2], "q8-matmul") != 0 &&
          strcmp(argv[2], "routed-moe") != 0 &&
          strcmp(argv[2], "all") != 0)) {
         usage(argv[0]);
@@ -2059,9 +2224,11 @@ int main(int argc, char **argv) {
         strcmp(argv[2], "all") == 0;
     const bool run_prefill = strcmp(argv[2], "prefill-attention") == 0 ||
         strcmp(argv[2], "all") == 0;
+    const bool run_q8_matmul = strcmp(argv[2], "q8-matmul") == 0 ||
+        strcmp(argv[2], "all") == 0;
     const bool run_routed_moe = strcmp(argv[2], "routed-moe") == 0 ||
         strcmp(argv[2], "all") == 0;
-    if ((run_decode || run_prefill || run_routed_moe) &&
+    if ((run_decode || run_prefill || run_q8_matmul || run_routed_moe) &&
         run_f32_to_f16_reference_cases() != 0) return 1;
     if (!ds4_gpu_init()) {
         fprintf(stderr, "norm-rope: ds4_gpu_init failed\n");
@@ -2132,6 +2299,9 @@ int main(int argc, char **argv) {
         rc = 1;
     }
     if (run_prefill && run_prefill_attention_cases() != 0) {
+        rc = 1;
+    }
+    if (run_q8_matmul && run_q8_matmul_prefill_case() != 0) {
         rc = 1;
     }
     if (run_routed_moe && run_routed_moe_cases() != 0) {

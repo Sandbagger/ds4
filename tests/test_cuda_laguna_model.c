@@ -52,6 +52,247 @@ static bool fail_message(const char *what, const char *detail) {
     return false;
 }
 
+typedef void (*laguna_policy_change_fn)(ds4_engine_options *options);
+
+typedef struct {
+    const char *name;
+    bool native_cuda_build;
+    ds4_backend backend;
+    bool revised_layout;
+    laguna_policy_change_fn change;
+    bool load_slice;
+    bool gpu_cfg_present;
+    int effective_power_percent;
+    ds4_test_laguna_support_category expected;
+} laguna_policy_row;
+
+static ds4_engine_options laguna_policy_baseline(void) {
+    ds4_engine_options options;
+    memset(&options, 0, sizeof(options));
+    options.model_path = "policy-only-no-model.gguf";
+    options.backend = DS4_BACKEND_CUDA;
+    options.n_threads = 1;
+    options.context_size = 1024;
+    options.placement_ctx_hint = 1024;
+    options.mtp_draft_tokens = 1;
+    options.mtp_margin = 3.0f;
+    /* Raw zero is the CLI-unset sentinel; the explicit effective input is 100. */
+    options.power_percent = 0;
+    options.distributed.role = DS4_DISTRIBUTED_NONE;
+    options.tp.role = DS4_TP_NONE;
+    options.tp.transport = DS4_TP_TRANSPORT_AUTO;
+    return options;
+}
+
+static void laguna_policy_set_ssd_streaming(ds4_engine_options *options) {
+    options->ssd_streaming = true;
+}
+
+static void laguna_policy_set_distributed_coordinator(ds4_engine_options *options) {
+    options->distributed.role = DS4_DISTRIBUTED_COORDINATOR;
+}
+
+static void laguna_policy_set_tp_leader(ds4_engine_options *options) {
+    options->tp.role = DS4_TP_LEADER;
+}
+
+static void laguna_policy_set_cuda_tensor_parallel(ds4_engine_options *options) {
+    options->cuda_tensor_parallel = true;
+}
+
+static void laguna_policy_set_steering_file(ds4_engine_options *options) {
+    options->directional_steering_file = "steering.bin";
+}
+
+static void laguna_policy_set_steering_attn(ds4_engine_options *options) {
+    options->directional_steering_attn = 1.0f;
+}
+
+static void laguna_policy_set_steering_ffn(ds4_engine_options *options) {
+    options->directional_steering_ffn = 1.0f;
+}
+
+static void laguna_policy_set_prefill_chunk(ds4_engine_options *options) {
+    options->prefill_chunk = 128u;
+}
+
+static void laguna_policy_set_mtp_path(ds4_engine_options *options) {
+    options->mtp_path = "support.gguf";
+}
+
+static void laguna_policy_set_dspark(ds4_engine_options *options) {
+    options->dspark = true;
+}
+
+static void laguna_policy_set_glm_mtp(ds4_engine_options *options) {
+    options->glm_mtp = true;
+}
+
+static void laguna_policy_set_first_token_test(ds4_engine_options *options) {
+    options->first_token_test = true;
+}
+
+static void laguna_policy_set_tp_requested(ds4_engine_options *options) {
+    options->tp.requested = true;
+}
+
+static void laguna_policy_set_distributed_layers(ds4_engine_options *options) {
+    options->distributed.layers.set = true;
+}
+
+static void laguna_policy_set_glm_mtp_timing(ds4_engine_options *options) {
+    options->glm_mtp_timing = true;
+}
+
+static bool run_laguna_admission_policy(void) {
+    static const laguna_policy_row rows[] = {
+        {
+            "native revised CUDA", true, DS4_BACKEND_CUDA, true, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ACCEPT,
+        },
+        {
+            "native legacy CUDA", true, DS4_BACKEND_CUDA, false, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_LEGACY_LAYOUT,
+        },
+        {
+            "non-native/ROCm CUDA", false, DS4_BACKEND_CUDA, true, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_BACKEND,
+        },
+        {
+            "Metal revised", false, DS4_BACKEND_METAL, true, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ACCEPT,
+        },
+        {
+            "Metal legacy", false, DS4_BACKEND_METAL, false, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ACCEPT,
+        },
+        {
+            "CPU", true, DS4_BACKEND_CPU, true, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_BACKEND,
+        },
+        {
+            "synthetic unknown backend", true, (ds4_backend)99, true, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_BACKEND,
+        },
+        {
+            "ssd_streaming", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_streaming,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "effective load_slice", true, DS4_BACKEND_CUDA, true, NULL,
+            true, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "distributed coordinator role", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_distributed_coordinator,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "TP leader role", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_tp_leader,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "cuda_tensor_parallel", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_cuda_tensor_parallel,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "gpu_cfg_present", true, DS4_BACKEND_CUDA, true, NULL,
+            false, true, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "steering file", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_steering_file,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "steering attn", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_steering_attn,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "steering ffn", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_steering_ffn,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "effective power 50", true, DS4_BACKEND_CUDA, true, NULL,
+            false, false, 50, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "raw custom prefill chunk", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_prefill_chunk,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "mtp/support path", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_mtp_path,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "dspark", true, DS4_BACKEND_CUDA, true, laguna_policy_set_dspark,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "glm_mtp", true, DS4_BACKEND_CUDA, true, laguna_policy_set_glm_mtp,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "first_token_test", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_first_token_test,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "tp.requested", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_tp_requested,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "distributed.layers.set", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_distributed_layers,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "glm_mtp_timing", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_glm_mtp_timing,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+    };
+    const size_t row_count = sizeof(rows) / sizeof(rows[0]);
+    if (row_count != 25u) {
+        fprintf(stderr,
+                "FAIL: Laguna admission policy row count=%zu expected=25\n",
+                row_count);
+        return false;
+    }
+
+    for (size_t i = 0; i < row_count; i++) {
+        ds4_engine_options options = laguna_policy_baseline();
+        /* Keep the real options backend aligned with the explicit backend input. */
+        options.backend = rows[i].backend;
+        if (rows[i].change) rows[i].change(&options);
+        const ds4_test_laguna_support_category got =
+            ds4_test_laguna_support_reason(
+                rows[i].native_cuda_build,
+                rows[i].backend,
+                rows[i].revised_layout,
+                &options,
+                rows[i].load_slice,
+                rows[i].gpu_cfg_present,
+                rows[i].effective_power_percent);
+        if (got != rows[i].expected) {
+            fprintf(stderr,
+                    "FAIL: Laguna admission policy row=\"%s\" got=%d expected=%d\n",
+                    rows[i].name, (int)got, (int)rows[i].expected);
+            return false;
+        }
+    }
+    fprintf(stderr, "Laguna admission policy PASS rows=%zu\n", row_count);
+    return true;
+}
+
 static uint32_t read_le_u32(const unsigned char *p) {
     return (uint32_t)p[0] |
            ((uint32_t)p[1] << 8) |
@@ -805,7 +1046,19 @@ static bool run_mixed_batch(ds4_engine *engine) {
     return ok;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    bool policy_only = false;
+    if (argc != 1) {
+        if (argc != 2 || strcmp(argv[1], "--policy-only") != 0) {
+            fprintf(stderr, "FAIL: unknown argument (only --policy-only is supported)\n");
+            return 2;
+        }
+        policy_only = true;
+    }
+
+    if (!run_laguna_admission_policy()) return 1;
+    if (policy_only) return 0;
+
     const char *model = getenv("DS4_TEST_MODEL");
     if (!model || !model[0]) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");

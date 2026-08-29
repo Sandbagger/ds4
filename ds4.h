@@ -376,6 +376,24 @@ typedef struct {
     uint64_t logit_hash;
 } ds4_test_session_state;
 
+typedef enum {
+    DS4_TEST_LAGUNA_SUPPORT_ACCEPT = 0,
+    DS4_TEST_LAGUNA_SUPPORT_BACKEND = 1,
+    DS4_TEST_LAGUNA_SUPPORT_LEGACY_LAYOUT = 2,
+    DS4_TEST_LAGUNA_SUPPORT_SSD = 3,
+    DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY = 4,
+    DS4_TEST_LAGUNA_SUPPORT_ADVANCED = 5,
+} ds4_test_laguna_support_category;
+
+ds4_test_laguna_support_category ds4_test_laguna_support_reason(
+        bool native_cuda_build,
+        ds4_backend backend,
+        bool revised_layout,
+        const ds4_engine_options *options,
+        bool load_slice,
+        bool gpu_cfg_present,
+        int effective_power_percent);
+
 int ds4_test_logits_only_sync_mode(
         bool native_cuda_build,
         bool laguna, ds4_backend backend,

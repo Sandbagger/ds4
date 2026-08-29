@@ -1580,6 +1580,62 @@ class SinglePoolsideV2ContractTests(unittest.TestCase):
             )
             self.assertEqual(tree_digest(destination), before)
 
+    def test_cli_promotion_resolves_relative_ds4_executable_from_repository_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "capture"
+            capture_digest = write_capture(capture)
+            capture_before = tree_digest(capture)
+            fake_ds4, _, ds4_repo = build_clean_ds4_repo(root)
+            relative_ds4 = ds4_repo / "ds4"
+            shutil.copy2(fake_ds4, relative_ds4)
+            relative_ds4.chmod(0o755)
+            destination_parent = root / "destination-parent"
+            destination_parent.mkdir()
+            destination = destination_parent / "promoted"
+            populate_destination(destination)
+            destination_before_inputs = {
+                name: (destination / name).read_bytes() for name in FIXED_INPUT_FILES
+            }
+            environment = os.environ.copy()
+            path_parts = [
+                part
+                for part in environment.get("PATH", "").split(os.pathsep)
+                if part not in ("", ".", str(ds4_repo))
+            ]
+            environment["PATH"] = os.pathsep.join(path_parts)
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(ds4_repo)
+                code, stdout, stderr, error = run_main_in_process(
+                    "./ds4",
+                    capture,
+                    destination,
+                    capture_digest,
+                    environment=environment,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertIsNone(error, f"relative --ds4 CLI runner raised {error!r}")
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(
+                stdout,
+                f"promoted={destination} cases=4 vectors=4 oracle=poolside\n",
+            )
+            self.assertEqual(stderr, "")
+            self.assertEqual(fixture_entries(destination), set(PROMOTED_FILES))
+            self.assertEqual(
+                {name: (destination / name).read_bytes() for name in FIXED_INPUT_FILES},
+                destination_before_inputs,
+            )
+            self.assertEqual(tree_digest(capture), capture_before)
+            self.assertEqual({path.name for path in destination_parent.iterdir()}, {"promoted"})
+            self.assertEqual(
+                capture_digest,
+                read_manifest(destination)["oracle"]["capture_manifest_sha256"],
+            )
+
     def test_cli_promotion_output_is_exact_v2_string(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

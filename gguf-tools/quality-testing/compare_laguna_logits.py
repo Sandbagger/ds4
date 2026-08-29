@@ -49,7 +49,7 @@ PROMOTED_MODEL = {
 }
 
 CASE_SPECS = (
-    ("short", "laguna-ds4", 3, 1024),
+    ("short", "laguna-ds4", 22, 1024),
     ("swa-513", "raw", 513, 1024),
     ("yarn-8193", "raw", 8193, 8202),
     ("deep-32768", "raw", 32768, 32768),

@@ -476,14 +476,41 @@ static bool terminal_state_unchanged(
     return unchanged;
 }
 
+static bool expect_rejection_unchanged(
+        ds4_session *session,
+        const float *expected_logits,
+        int expected_pos,
+        int rc,
+        int expected_rc,
+        const char *operation) {
+    if (rc != expected_rc) {
+        fprintf(stderr,
+                "FAIL: %s returned %d instead of %d\n",
+                operation, rc, expected_rc);
+        return false;
+    }
+    return terminal_state_unchanged(
+            session, expected_logits, expected_pos, operation);
+}
+
 static bool expect_terminal_rejection(
         ds4_session *session,
         const float *expected_logits,
         int expected_pos,
         int rc,
+        int expected_rc,
+        const char *err,
         const char *operation) {
-    if (rc == 0) {
-        fprintf(stderr, "FAIL: terminal %s unexpectedly succeeded\n", operation);
+    if (rc != expected_rc) {
+        fprintf(stderr,
+                "FAIL: terminal %s returned %d instead of %d\n",
+                operation, rc, expected_rc);
+        return false;
+    }
+    if (!err || !strstr(err, "session is logits-only terminal")) {
+        fprintf(stderr,
+                "FAIL: terminal %s returned wrong error: %s\n",
+                operation, err ? err : "(null)");
         return false;
     }
     return terminal_state_unchanged(
@@ -522,8 +549,8 @@ static bool run_deep_exact_context(
     memset(err, 0, sizeof(err));
     const int ordinary_rc = ds4_session_sync(
             session, &tokens, err, sizeof(err));
-    if (!expect_terminal_rejection(
-            session, baseline_logits, initial_pos, ordinary_rc,
+    if (!expect_rejection_unchanged(
+            session, baseline_logits, initial_pos, ordinary_rc, 1,
             "deep-32768 ordinary equal-context sync")) goto done;
 
     memset(err, 0, sizeof(err));
@@ -556,7 +583,7 @@ static bool run_deep_exact_context(
     const int direct_rc = ds4_session_eval(
             session, direct_token, err, sizeof(err));
     if (!expect_terminal_rejection(
-            session, baseline_logits, terminal_pos, direct_rc,
+            session, baseline_logits, terminal_pos, direct_rc, 1, err,
             "deep-32768 direct decode")) goto done;
 
     ds4_session_rewind(session, terminal_pos - 1);
@@ -567,7 +594,7 @@ static bool run_deep_exact_context(
     const int rewind_rc = ds4_session_eval(
             session, direct_token, err, sizeof(err));
     if (!expect_terminal_rejection(
-            session, baseline_logits, terminal_pos, rewind_rc,
+            session, baseline_logits, terminal_pos, rewind_rc, 1, err,
             "deep-32768 rewind followed by decode")) goto done;
 
     memset(err, 0, sizeof(err));
@@ -576,13 +603,13 @@ static bool run_deep_exact_context(
             session, &tokens, 0, err, sizeof(err));
     if (!expect_terminal_rejection(
             session, baseline_logits, terminal_pos, rewrite_rc,
-            "deep-32768 rewrite")) goto done;
+            DS4_SESSION_REWRITE_ERROR, err, "deep-32768 rewrite")) goto done;
 
     memset(err, 0, sizeof(err));
     const int repeat_sync_rc = ds4_session_sync(
             session, &tokens, err, sizeof(err));
     if (!expect_terminal_rejection(
-            session, baseline_logits, terminal_pos, repeat_sync_rc,
+            session, baseline_logits, terminal_pos, repeat_sync_rc, 1, err,
             "deep-32768 ordinary repeat sync")) goto done;
 
     memset(err, 0, sizeof(err));
@@ -590,14 +617,14 @@ static bool run_deep_exact_context(
             session, &tokens, err, sizeof(err));
     if (!expect_terminal_rejection(
             session, baseline_logits, terminal_pos, repeat_logits_only_rc,
-            "deep-32768 logits-only repeat sync")) goto done;
+            1, err, "deep-32768 logits-only repeat sync")) goto done;
 
     ds4_session_snapshot snapshot = {0};
     memset(err, 0, sizeof(err));
     const int snapshot_rc = ds4_session_save_snapshot(
             session, &snapshot, err, sizeof(err));
     if (!expect_terminal_rejection(
-            session, baseline_logits, terminal_pos, snapshot_rc,
+            session, baseline_logits, terminal_pos, snapshot_rc, 1, err,
             "deep-32768 snapshot save")) {
         ds4_session_snapshot_free(&snapshot);
         goto done;
@@ -614,7 +641,7 @@ static bool run_deep_exact_context(
     const int payload_rc = ds4_session_stage_payload(
             session, &payload, err, sizeof(err));
     if (!expect_terminal_rejection(
-            session, baseline_logits, terminal_pos, payload_rc,
+            session, baseline_logits, terminal_pos, payload_rc, 1, err,
             "deep-32768 staged payload export")) {
         ds4_session_payload_file_free(&payload);
         goto done;
@@ -651,7 +678,7 @@ static bool run_deep_exact_context(
     const int batch_rc = ds4_sessions_eval_batch(
             items, 2, err, sizeof(err));
     if (!expect_terminal_rejection(
-            session, baseline_logits, terminal_pos, batch_rc,
+            session, baseline_logits, terminal_pos, batch_rc, 1, err,
             "deep-32768 decode batch with terminal session")) goto done;
     if (!terminal_state_unchanged(
             control, control_logits, control_pos,

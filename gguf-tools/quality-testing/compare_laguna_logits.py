@@ -774,6 +774,7 @@ def discover_tokenizer_provenance(ds4: Path) -> dict[str, Any]:
     )
     return {
         "repository": repository,
+        "executable": executable,
         "head": head,
         "contract_commit": contract_commit,
     }
@@ -1494,6 +1495,7 @@ def promote(ds4: Path, llama_root: Path, destination: Path) -> None:
         }
 
         provenance = discover_tokenizer_provenance(ds4)
+        tokenizer_executable = provenance["executable"]
         tokenizer_runtime_commit = provenance["head"]
 
         ds4_tokens: dict[str, list[int]] = {}
@@ -1507,7 +1509,7 @@ def promote(ds4: Path, llama_root: Path, destination: Path) -> None:
             for case in capture["cases"]:
                 case_id = case["id"]
                 actual = dump_ds4_tokens(
-                    ds4,
+                    tokenizer_executable,
                     tokenize_root / case["prompt_name"],
                     case_id,
                 )
@@ -1515,7 +1517,7 @@ def promote(ds4: Path, llama_root: Path, destination: Path) -> None:
                     fail(f"{case_id}: DS4 and Poolside token arrays differ")
                 ds4_tokens[case_id] = actual
             benchmark_tokens = dump_ds4_tokens(
-                ds4,
+                tokenizer_executable,
                 tokenize_root / benchmark_name,
                 benchmark_name,
             )
@@ -1680,7 +1682,7 @@ def promote(ds4: Path, llama_root: Path, destination: Path) -> None:
             stage, stage_fd, stage_identity, "promotion stage directory"
         )
 
-        final_provenance = discover_tokenizer_provenance(ds4)
+        final_provenance = discover_tokenizer_provenance(tokenizer_executable)
         if final_provenance["head"] != tokenizer_runtime_commit:
             fail("tokenizer repository HEAD changed during promotion")
 

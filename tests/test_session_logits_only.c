@@ -26,6 +26,8 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
 #define TEST_LOGIT_SENTINEL 1234567.0f
 #define TEST_CTX 8
 #define TERMINAL_ERROR "session is logits-only terminal"
+#define EXACT_CONTEXT_ERROR \
+    "exact-context logits-only sync requires local Laguna CUDA"
 
 enum {
     TEST_SYNC_INVALID = 0,
@@ -278,6 +280,63 @@ static void test_sync_mode_matrix(void) {
               ctx, ctx) == TEST_SYNC_INVALID,
           "Metal equality must not infer native CUDA");
     CHECK(rows == 576, "eligibility matrix did not cover all 192 combinations");
+}
+
+static void test_public_sync_policy(void) {
+    fprintf(stderr, "RUN: nonterminal public sync policy\n");
+    ds4_session *inert = NULL;
+    if (!create_session(&inert, false)) return;
+
+    ds4_test_session_state before;
+    if (!capture_state("public sync baseline", inert, &before)) {
+        ds4_session_free(inert);
+        return;
+    }
+
+    int equal_storage[TEST_CTX + 1];
+    int over_storage[TEST_CTX + 1];
+    int short_storage[TEST_CTX + 1];
+    ds4_tokens equal_prompt = prompt_for_len(equal_storage, TEST_CTX, 40);
+    ds4_tokens over_prompt = prompt_for_len(over_storage, TEST_CTX + 1, 50);
+    ds4_tokens short_prompt = prompt_for_len(short_storage, TEST_CTX - 1, 60);
+    char err[256];
+
+    memset(err, 0, sizeof(err));
+    const int equal_rc = ds4_session_sync_logits_only(
+        inert, &equal_prompt, err, sizeof(err));
+    CHECKF(equal_rc == 1,
+           "nonterminal exact-context sync returned %d", equal_rc);
+    CHECKF(strstr(err, EXACT_CONTEXT_ERROR) != NULL,
+           "nonterminal exact-context sync got '%s'", err);
+    check_state_unchanged("nonterminal exact-context sync", inert, &before);
+
+    memset(err, 0, sizeof(err));
+    const int over_rc = ds4_session_sync_logits_only(
+        inert, &over_prompt, err, sizeof(err));
+    CHECKF(over_rc == 1,
+           "non-equal over-context sync returned %d", over_rc);
+    CHECKF(strstr(err,
+                   "prompt length 9 exceeds context 8 "
+                   "(one token of generation room is required)") != NULL,
+           "non-equal over-context sync got '%s'", err);
+    CHECKF(strstr(err, EXACT_CONTEXT_ERROR) == NULL,
+           "non-equal over-context sync used exact-context error: '%s'", err);
+    check_state_unchanged("non-equal over-context sync", inert, &before);
+
+    int cancel_calls = 0;
+    ds4_session_set_cancel(inert, count_cancel, &cancel_calls);
+    memset(err, 0, sizeof(err));
+    const int short_rc = ds4_session_sync_logits_only(
+        inert, &short_prompt, err, sizeof(err));
+    CHECKF(short_rc == DS4_SESSION_SYNC_INTERRUPTED,
+           "non-equal short sync returned %d", short_rc);
+    CHECKF(strcmp(err, "interrupted") == 0,
+           "non-equal short sync got '%s'", err);
+    CHECKF(cancel_calls == 1,
+           "non-equal short sync called cancel %d times", cancel_calls);
+    check_state_unchanged("non-equal short sync", inert, &before);
+
+    ds4_session_free(inert);
 }
 
 static void test_allowed_reads(void) {
@@ -753,6 +812,7 @@ static void test_batch_rejections(void) {
 
 int main(void) {
     test_sync_mode_matrix();
+    test_public_sync_policy();
     test_allowed_reads();
     test_scalar_rejections();
     test_layer_rejections();

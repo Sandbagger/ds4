@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Promote and verify the pinned Laguna Metal/Poolside oracle fixtures."""
+"""Promote and verify the pinned Laguna Poolside oracle fixture."""
 
 from __future__ import annotations
 
@@ -7,12 +7,11 @@ import argparse
 import array
 import ast
 import hashlib
-import heapq
 import json
 import math
 import os
 import re
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,52 +23,97 @@ VOCAB_SIZE = 100352
 VECTOR_BYTES = VOCAB_SIZE * 4
 CONTINUATION_TOKENS = 8
 CONTINUATION_BYTES = CONTINUATION_TOKENS * 4
+MAX_CONTRACT_FILE_BYTES = 16 * 1024 * 1024
+
+CONTRACT_COMMIT = "a250e43722945e293f6044bc7254c4806d5a7912"
+LLAMA_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
+CAPTURE_MANIFEST_SHA256 = (
+    "cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e"
+)
 GENERATOR_SHA256 = "118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d"
 BENCHMARK_SHA256 = "aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206"
 
-MODEL = {
+CAPTURE_MODEL = {
     "repository": "poolside/Laguna-S-2.1-GGUF",
     "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
     "file": "laguna-s-2.1-Q4_K_M.gguf",
     "size": 68248759648,
     "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
 }
-LLAMA_COMMIT = "04b2b72cb54048ead292884adbe11f284e3ec950"
+PROMOTED_MODEL = {
+    "repository": "poolside/Laguna-S-2.1-GGUF",
+    "revision": "706fa69799926b6afde1af9e24ca2a4923f110a1",
+    "filename": "laguna-s-2.1-Q4_K_M.gguf",
+    "size": 68248759648,
+    "sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+}
 
 CASE_SPECS = (
-    ("short", "laguna-ds4", None, 1024),
+    ("short", "laguna-ds4", 3, 1024),
     ("swa-513", "raw", 513, 1024),
     ("yarn-8193", "raw", 8193, 8202),
     ("deep-32768", "raw", 32768, 32768),
 )
-ORACLES = ("metal", "llama")
-FIXTURE_INPUT_FILES = {
+
+FIXED_INPUT_FILES = {
     "cases.json",
     "short.txt",
     "generate_benchmark_prompt.py",
     "benchmark-32768.txt",
+}
+MATERIALIZED_PROMPT_FILES = {
     "swa-513.prompt",
     "yarn-8193.prompt",
     "deep-32768.prompt",
 }
-PROMOTION_LIMITS = {
-    "centered_rms": 0.02,
-    "centered_max_abs": 0.10,
-    "top20_overlap": 18,
-    "argmax_equal": True,
-    "continuation_equal": True,
+PROMOTED_VECTOR_FILES = {
+    f"{case_id}.llama.f32" for case_id, _, _, _ in CASE_SPECS
 }
+PROMOTED_OUTPUT_FILES = (
+    MATERIALIZED_PROMPT_FILES
+    | PROMOTED_VECTOR_FILES
+    | {"yarn-8193.continuation.i32", "manifest.json"}
+)
+PROMOTED_FILES = FIXED_INPUT_FILES | PROMOTED_OUTPUT_FILES
+
+CAPTURE_ARTIFACT_FILES = {
+    "short.prompt",
+    "swa-513.prompt",
+    "yarn-8193.prompt",
+    "deep-32768.prompt",
+    "short.tokens.i32",
+    "swa-513.tokens.i32",
+    "yarn-8193.tokens.i32",
+    "deep-32768.tokens.i32",
+    "short.logits.f32",
+    "swa-513.logits.f32",
+    "yarn-8193.logits.f32",
+    "deep-32768.logits.f32",
+    "yarn-8193.continuation.i32",
+    "yarn-8193.step-00.logits.f32",
+    "yarn-8193.step-01.logits.f32",
+    "yarn-8193.step-02.logits.f32",
+    "yarn-8193.step-03.logits.f32",
+    "yarn-8193.step-04.logits.f32",
+    "yarn-8193.step-05.logits.f32",
+    "yarn-8193.step-06.logits.f32",
+    "yarn-8193.step-07.logits.f32",
+}
+
 CUDA_LIMITS = {
     "centered_rms": 0.04,
     "centered_max_abs": 0.20,
     "top20_overlap": 18,
     "argmax_equal": True,
-    "teacher_forced_ids_equal": True,
+    "continuation_equal": True,
 }
+
+SHORT_RENDERED_PREFIX = b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
+SHORT_RENDERED_SUFFIX = b"</user>\n<assistant></think>"
 
 
 class ContractError(RuntimeError):
-    """A fixture or capture violates the pinned contract."""
+    """A fixture, capture, or provenance record violates the contract."""
 
 
 def fail(message: str) -> None:
@@ -85,15 +129,95 @@ def duplicate_rejecting_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json_bytes(payload: bytes, path: Path) -> dict[str, Any]:
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle, object_pairs_hook=duplicate_rejecting_object)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        fail(f"cannot read {path}: {exc}")
+        value = json.loads(payload, object_pairs_hook=duplicate_rejecting_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"cannot parse {path}: {exc}")
     if not isinstance(value, dict):
         fail(f"{path}: top-level JSON value must be an object")
     return value
+
+
+def _read_open_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    # Opening an attacker-swapped FIFO/device must not block before fstat can
+    # reject its non-regular mode.  O_NONBLOCK is harmless for regular files.
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    return flags
+
+
+def _directory_open_flags() -> int:
+    # Keep directory opens portable: O_NONBLOCK is for file reads only and is
+    # not needed (or consistently accepted) with O_DIRECTORY.
+    flags = _read_open_flags() & ~getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    return flags
+
+
+def read_bytes_with_stat(
+    path: Path, dir_fd: int | None = None
+) -> tuple[bytes, os.stat_result]:
+    """Read one regular file through one descriptor and return its inode."""
+    fd: int | None = None
+    target: str | Path = path if dir_fd is None else path.name
+    try:
+        try:
+            if dir_fd is None:
+                fd = os.open(target, _read_open_flags())
+            else:
+                fd = os.open(target, _read_open_flags(), dir_fd=dir_fd)
+        except OSError as exc:
+            fail(f"cannot open regular file {path}: {exc}")
+        try:
+            metadata = os.fstat(fd)
+        except OSError as exc:
+            fail(f"cannot stat regular file {path}: {exc}")
+        if (
+            not isinstance(metadata.st_size, int)
+            or metadata.st_size < 0
+            or metadata.st_size > MAX_CONTRACT_FILE_BYTES
+        ):
+            fail(
+                f"regular file size out of bounds for {path}: "
+                f"{metadata.st_size!r} bytes (limit {MAX_CONTRACT_FILE_BYTES})"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"missing regular file: {path}")
+        try:
+            payload = os.read(fd, metadata.st_size)
+            after = os.fstat(fd)
+        except (OSError, OverflowError) as exc:
+            fail(f"cannot read {path}: {exc}")
+        if len(payload) != metadata.st_size:
+            fail(
+                f"short read for {path}: expected {metadata.st_size} bytes, "
+                f"got {len(payload)}"
+            )
+        if (
+            after.st_dev != metadata.st_dev
+            or after.st_ino != metadata.st_ino
+            or after.st_size != metadata.st_size
+        ):
+            fail(f"regular file changed while reading: {path}")
+        return payload, metadata
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def read_bytes(path: Path) -> bytes:
+    payload, _ = read_bytes_with_stat(path)
+    return payload
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return load_json_bytes(read_bytes(path), path)
 
 
 def require_object(value: Any, label: str) -> dict[str, Any]:
@@ -150,17 +274,19 @@ def require_hex(value: Any, length: int, label: str) -> str:
     return text
 
 
+def require_commit(value: Any, label: str) -> str:
+    return require_hex(value, 40, label)
+
+
 def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def encode_f32(values: list[float]) -> bytes:
-    encoded = array.array("f", values)
-    if encoded.itemsize != 4:
-        fail("runtime float32 representation is not four bytes")
-    if sys.byteorder != "little":
-        encoded.byteswap()
-    return encoded.tobytes()
+def require_safe_name(value: Any, expected: str, label: str) -> str:
+    name = require_string(value, label)
+    if name != expected or Path(name).name != name:
+        fail(f"{label} must be {expected!r}")
+    return name
 
 
 def encode_i32(values: list[int]) -> bytes:
@@ -172,56 +298,44 @@ def encode_i32(values: list[int]) -> bytes:
     return encoded.tobytes()
 
 
-def read_bytes(path: Path) -> bytes:
-    try:
-        if path.is_symlink() or not path.is_file():
-            fail(f"missing regular file: {path}")
-        return path.read_bytes()
-    except OSError as exc:
-        fail(f"cannot read {path}: {exc}")
-
-
-def require_safe_name(value: Any, expected: str, label: str) -> str:
-    name = require_string(value, label)
-    if name != expected or Path(name).name != name:
-        fail(f"{label} must be {expected!r}")
-    return name
-
-
-def decode_f32(path: Path, expected_sha: str | None = None) -> tuple[bytes, list[float]]:
-    payload = read_bytes(path)
-    if len(payload) != VECTOR_BYTES:
-        fail(f"{path.name}: expected {VECTOR_BYTES} bytes, got {len(payload)}")
+def decode_i32_payload(
+    payload: bytes, count: int, label: str, expected_sha: str | None = None
+) -> tuple[bytes, list[int]]:
+    expected_bytes = count * 4
+    if len(payload) != expected_bytes:
+        fail(f"{label}: expected {expected_bytes} bytes, got {len(payload)}")
     if expected_sha is not None and sha256_bytes(payload) != expected_sha:
-        fail(f"{path.name}: SHA-256 mismatch")
+        fail(f"{label}: SHA-256 mismatch")
+    values = array.array("i")
+    if values.itemsize != 4:
+        fail("runtime int32 representation is not four bytes")
+    values.frombytes(payload)
+    if sys.byteorder != "little":
+        values.byteswap()
+    result = list(values)
+    if any(token < 0 or token >= VOCAB_SIZE for token in result):
+        fail(f"{label}: token ID outside vocabulary")
+    return payload, result
+
+
+def decode_f32_payload(
+    payload: bytes, label: str, expected_sha: str | None = None
+) -> tuple[bytes, list[float]]:
+    if len(payload) != VECTOR_BYTES:
+        fail(f"{label}: expected {VECTOR_BYTES} bytes, got {len(payload)}")
+    if expected_sha is not None and sha256_bytes(payload) != expected_sha:
+        fail(f"{label}: SHA-256 mismatch")
     values = array.array("f")
+    if values.itemsize != 4:
+        fail("runtime float32 representation is not four bytes")
     values.frombytes(payload)
     if sys.byteorder != "little":
         values.byteswap()
     result = list(values)
     if len(result) != VOCAB_SIZE:
-        fail(f"{path.name}: expected {VOCAB_SIZE} logits")
+        fail(f"{label}: expected {VOCAB_SIZE} logits")
     if not all(math.isfinite(item) for item in result):
-        fail(f"{path.name}: non-finite logit")
-    return payload, result
-
-
-def decode_i32(path: Path, count: int, expected_sha: str | None = None) -> tuple[bytes, list[int]]:
-    payload = read_bytes(path)
-    expected_bytes = count * 4
-    if len(payload) != expected_bytes:
-        fail(f"{path.name}: expected {expected_bytes} bytes, got {len(payload)}")
-    if expected_sha is not None and sha256_bytes(payload) != expected_sha:
-        fail(f"{path.name}: SHA-256 mismatch")
-    values = array.array("i")
-    values.frombytes(payload)
-    if values.itemsize != 4:
-        fail("runtime int32 representation is not four bytes")
-    if sys.byteorder != "little":
-        values.byteswap()
-    result = list(values)
-    if any(token < 0 or token >= VOCAB_SIZE for token in result):
-        fail(f"{path.name}: token ID outside vocabulary")
+        fail(f"{label}: non-finite logit")
     return payload, result
 
 
@@ -239,101 +353,61 @@ def argmax(values: list[float]) -> int:
     return max(range(len(values)), key=values.__getitem__)
 
 
-def top_indices(values: list[float], count: int) -> set[int]:
-    ranked = heapq.nlargest(count, range(len(values)), key=lambda index: (values[index], -index))
-    return set(ranked)
-
-
-def compare_logits(left: list[float], right: list[float]) -> dict[str, Any]:
-    differences = [a - b for a, b in zip(left, right, strict=True)]
-    mean_difference = math.fsum(differences) / len(differences)
-    centered = [value - mean_difference for value in differences]
-    rms = math.sqrt(math.fsum(value * value for value in centered) / len(centered))
-    maximum = max(abs(value) for value in centered)
-    left_argmax = argmax(left)
-    right_argmax = argmax(right)
-    return {
-        "centered_rms": rms,
-        "centered_max_abs": maximum,
-        "top20_overlap": len(top_indices(left, 20) & top_indices(right, 20)),
-        "argmax_equal": left_argmax == right_argmax,
-    }
-
-
-def check_metric_limits(metrics: dict[str, Any], label: str) -> None:
-    if require_number(metrics.get("centered_rms"), f"{label}.centered_rms") > 0.02:
-        fail(f"{label}: centered RMS exceeds 0.02")
-    if require_number(metrics.get("centered_max_abs"), f"{label}.centered_max_abs") > 0.10:
-        fail(f"{label}: centered max absolute error exceeds 0.10")
-    if require_int(metrics.get("top20_overlap"), f"{label}.top20_overlap") < 18:
-        fail(f"{label}: top-20 overlap is below 18")
-    if not require_bool(metrics.get("argmax_equal"), f"{label}.argmax_equal"):
-        fail(f"{label}: oracle argmax differs")
-
-
-def require_model(value: Any, label: str) -> dict[str, Any]:
-    model = require_object(value, label)
-    require_exact_keys(model, set(MODEL), label)
-    if model != MODEL:
-        fail(f"{label}: pinned model identity mismatch")
-    return model
-
-
-def require_commit(value: Any, label: str) -> str:
-    return require_hex(value, 40, label)
-
-
-def expected_promoted_files() -> set[str]:
-    files = set(FIXTURE_INPUT_FILES) | {"manifest.json", "yarn-8193.continuation.i32"}
-    for case_id, _, _, _ in CASE_SPECS:
-        for oracle in ORACLES:
-            files.add(f"{case_id}.{oracle}.f32")
-    return files
-
-
-def expected_promotion_outputs() -> set[str]:
-    return expected_promoted_files() - FIXTURE_INPUT_FILES
-
-
 def actual_files(root: Path) -> set[str]:
+    if root.is_symlink() or not root.is_dir():
+        fail(f"fixture directory does not exist: {root}")
     try:
         entries = list(root.iterdir())
     except OSError as exc:
         fail(f"cannot list {root}: {exc}")
     files: set[str] = set()
     for entry in entries:
-        if entry.name == "__pycache__" and entry.is_dir() and not entry.is_symlink():
-            continue
         if entry.is_symlink() or not entry.is_file():
-            fail(f"{root}: fixture must contain regular files only")
+            fail(f"{root}: fixture must contain regular files only ({entry.name})")
         files.add(entry.name)
     return files
 
 
-def validate_fixture_inputs(root: Path) -> None:
-    short = read_bytes(root / "short.txt")
-    if short != b"Explain why a ring buffer wraps, in two sentences.\n":
-        fail("short.txt does not match the fixed contract")
-    generator = read_bytes(root / "generate_benchmark_prompt.py")
-    benchmark = read_bytes(root / "benchmark-32768.txt")
-    if sha256_bytes(generator) != GENERATOR_SHA256:
-        fail("prompt generator SHA-256 mismatch")
-    if sha256_bytes(benchmark) != BENCHMARK_SHA256:
-        fail("benchmark seed SHA-256 mismatch")
+def require_model(value: Any, expected: dict[str, Any], label: str) -> dict[str, Any]:
+    model = require_object(value, label)
+    require_exact_keys(model, set(expected), label)
+    if model != expected:
+        fail(f"{label}: pinned model identity mismatch")
+    return model
 
-    cases = load_json(root / "cases.json")
+
+def validate_fixture_inputs(root: Path) -> dict[str, Any]:
+    if root.is_symlink() or not root.is_dir():
+        fail(f"promotion destination must be a populated fixture directory: {root}")
+
+    generator_payload = read_bytes(root / "generate_benchmark_prompt.py")
+    if sha256_bytes(generator_payload) != GENERATOR_SHA256:
+        fail("prompt generator SHA-256 mismatch against fixed input")
+    benchmark_payload = read_bytes(root / "benchmark-32768.txt")
+    if sha256_bytes(benchmark_payload) != BENCHMARK_SHA256:
+        fail("benchmark seed SHA-256 mismatch against fixed input")
+    short_payload = read_bytes(root / "short.txt")
+    if short_payload != b"Explain why a ring buffer wraps, in two sentences.\n":
+        fail("short.txt does not match the fixed contract")
+
+    cases_path = root / "cases.json"
+    cases_payload = read_bytes(cases_path)
+    cases = load_json_bytes(cases_payload, cases_path)
     require_exact_keys(
         cases,
         {"schema", "vocab_size", "continuation_case", "continuation_tokens", "cases"},
         "cases.json",
     )
-    if cases["schema"] != "laguna-resident-oracle-v1":
+    if require_string(cases["schema"], "cases.json.schema") != "laguna-resident-oracle-v1":
         fail("cases.json schema mismatch")
     if require_int(cases["vocab_size"], "cases.json.vocab_size") != VOCAB_SIZE:
         fail("cases.json vocabulary mismatch")
-    if cases["continuation_case"] != "yarn-8193":
+    if require_string(cases["continuation_case"], "cases.json.continuation_case") != "yarn-8193":
         fail("cases.json continuation case mismatch")
-    if require_int(cases["continuation_tokens"], "cases.json.continuation_tokens") != CONTINUATION_TOKENS:
+    if (
+        require_int(cases["continuation_tokens"], "cases.json.continuation_tokens")
+        != CONTINUATION_TOKENS
+    ):
         fail("cases.json continuation length mismatch")
     entries = require_list(cases["cases"], "cases.json.cases")
     if len(entries) != len(CASE_SPECS):
@@ -341,229 +415,71 @@ def validate_fixture_inputs(root: Path) -> None:
     for index, (case_id, render, frontier, context) in enumerate(CASE_SPECS):
         entry = require_object(entries[index], f"cases.json.cases[{index}]")
         expected_keys = {"id", "render", "prompt", "ctx"}
-        if frontier is not None:
+        if case_id != "short":
             expected_keys.add("frontier")
         require_exact_keys(entry, expected_keys, f"cases.json.cases[{index}]")
-        expected_prompt = "short.txt" if case_id == "short" else f"{case_id}.prompt"
-        if entry["id"] != case_id or entry["render"] != render or entry["prompt"] != expected_prompt:
+        if require_string(entry["id"], f"cases.json.cases[{index}].id") != case_id:
             fail(f"cases.json case {index} identity mismatch")
+        if require_string(entry["render"], f"cases.json.cases[{index}].render") != render:
+            fail(f"cases.json case {index} render mismatch")
+        expected_prompt = "short.txt" if case_id == "short" else f"{case_id}.prompt"
+        require_safe_name(entry["prompt"], expected_prompt, f"cases.json.{case_id}.prompt")
         if require_int(entry["ctx"], f"cases.json.{case_id}.ctx") != context:
             fail(f"cases.json {case_id} context mismatch")
-        if frontier is not None and require_int(
+        if case_id != "short" and require_int(
             entry["frontier"], f"cases.json.{case_id}.frontier"
         ) != frontier:
             fail(f"cases.json {case_id} frontier mismatch")
 
-
-def verify_promoted(
-    root: Path,
-    dwarfstar_commit: str,
-    llama_commit: str,
-    gguf_size: int,
-    gguf_sha256: str,
-) -> None:
-    if not root.is_dir():
-        fail(f"promoted fixture directory does not exist: {root}")
-    expected_files = expected_promoted_files()
-    found_files = actual_files(root)
-    if found_files != expected_files:
-        fail(
-            f"promoted file set mismatch: missing={sorted(expected_files - found_files)} "
-            f"extra={sorted(found_files - expected_files)}"
-        )
-    validate_fixture_inputs(root)
-
-    manifest = load_json(root / "manifest.json")
-    require_exact_keys(
-        manifest,
-        {
-            "schema",
-            "vocab_size",
-            "continuation_case",
-            "continuation_tokens",
-            "model",
-            "runtimes",
-            "dwarfstar_commit",
-            "thresholds",
-            "seed",
-            "cases",
-            "continuation",
+    return {
+        "payloads": {
+            "generate_benchmark_prompt.py": generator_payload,
+            "benchmark-32768.txt": benchmark_payload,
+            "short.txt": short_payload,
+            "cases.json": cases_payload,
         },
-        "manifest",
+        "generator": generator_payload,
+        "benchmark": benchmark_payload,
+        "short": short_payload,
+        "cases": cases,
+    }
+
+
+def validate_cuda_thresholds(value: Any, label: str) -> dict[str, Any]:
+    thresholds = require_object(value, label)
+    require_exact_keys(thresholds, set(CUDA_LIMITS), label)
+    rms = require_number(thresholds["centered_rms"], f"{label}.centered_rms")
+    maximum = require_number(thresholds["centered_max_abs"], f"{label}.centered_max_abs")
+    overlap = require_int(thresholds["top20_overlap"], f"{label}.top20_overlap")
+    argmax_equal = require_bool(thresholds["argmax_equal"], f"{label}.argmax_equal")
+    continuation_equal = require_bool(
+        thresholds["continuation_equal"], f"{label}.continuation_equal"
     )
-    if manifest["schema"] != "laguna-resident-promoted-v1":
-        fail("unknown promoted manifest schema")
-    if require_int(manifest["vocab_size"], "manifest.vocab_size") != VOCAB_SIZE:
-        fail("manifest vocabulary size mismatch")
-    if manifest["continuation_case"] != "yarn-8193":
-        fail("manifest continuation case mismatch")
-    if require_int(manifest["continuation_tokens"], "manifest.continuation_tokens") != CONTINUATION_TOKENS:
-        fail("manifest continuation length mismatch")
-    require_model(manifest["model"], "manifest.model")
-    if gguf_size != MODEL["size"] or gguf_sha256 != MODEL["sha256"]:
-        fail("supplied GGUF identity does not match the pinned model")
-
-    dwarfstar_commit = require_commit(dwarfstar_commit, "supplied dwarfstar commit")
-    llama_commit = require_commit(llama_commit, "supplied llama commit")
-    if llama_commit != LLAMA_COMMIT:
-        fail("supplied Poolside llama commit does not match the pinned runtime")
-    runtimes = require_object(manifest["runtimes"], "manifest.runtimes")
-    require_exact_keys(runtimes, {"metal_commit", "llama_commit"}, "manifest.runtimes")
-    if require_commit(runtimes["metal_commit"], "manifest.runtimes.metal_commit") != dwarfstar_commit:
-        fail("DwarfStar/Metal runtime commit mismatch")
-    if require_commit(runtimes["llama_commit"], "manifest.runtimes.llama_commit") != llama_commit:
-        fail("Poolside llama runtime commit mismatch")
-    if require_commit(manifest["dwarfstar_commit"], "manifest.dwarfstar_commit") != dwarfstar_commit:
-        fail("DwarfStar contract commit mismatch")
-
-    thresholds = require_object(manifest["thresholds"], "manifest.thresholds")
-    require_exact_keys(thresholds, {"promotion", "cuda_admission"}, "manifest.thresholds")
-    if require_object(thresholds["promotion"], "manifest.thresholds.promotion") != PROMOTION_LIMITS:
-        fail("promotion thresholds differ from the fixed contract")
-    if require_object(thresholds["cuda_admission"], "manifest.thresholds.cuda_admission") != CUDA_LIMITS:
-        fail("CUDA admission thresholds differ from the fixed contract")
-
-    seed = require_object(manifest["seed"], "manifest.seed")
-    require_exact_keys(
-        seed,
-        {
-            "generator_sha256",
-            "benchmark_sha256",
-            "poolside_token_count",
-            "dwarfstar_token_count",
-        },
-        "manifest.seed",
-    )
-    if require_hex(seed["generator_sha256"], 64, "manifest.seed.generator_sha256") != GENERATOR_SHA256:
-        fail("manifest generator SHA-256 mismatch")
-    if require_hex(seed["benchmark_sha256"], 64, "manifest.seed.benchmark_sha256") != BENCHMARK_SHA256:
-        fail("manifest benchmark SHA-256 mismatch")
-    if require_int(seed["poolside_token_count"], "manifest.seed.poolside_token_count") < 32768:
-        fail("Poolside benchmark seed has fewer than 32768 tokens")
-    if require_int(seed["dwarfstar_token_count"], "manifest.seed.dwarfstar_token_count") < 32768:
-        fail("DwarfStar benchmark seed has fewer than 32768 tokens")
-
-    cases = require_list(manifest["cases"], "manifest.cases")
-    if len(cases) != len(CASE_SPECS):
-        fail("manifest must contain exactly four cases")
-    case_argmaxes: dict[str, dict[str, int]] = {}
-    for index, (case_id, render, fixed_frontier, context) in enumerate(CASE_SPECS):
-        case = require_object(cases[index], f"manifest.cases[{index}]")
-        require_exact_keys(
-            case,
-            {
-                "id",
-                "render",
-                "prompt_hex",
-                "prompt_sha256",
-                "metal_tokens",
-                "llama_tokens",
-                "frontier",
-                "context",
-                "oracles",
-                "metrics",
-            },
-            f"manifest.cases[{index}]",
-        )
-        if case["id"] != case_id or case["render"] != render:
-            fail(f"manifest case {index} identity/render mismatch")
-        frontier = require_int(case["frontier"], f"{case_id}.frontier")
-        if frontier <= 0 or (fixed_frontier is not None and frontier != fixed_frontier):
-            fail(f"{case_id}: invalid frontier")
-        if require_int(case["context"], f"{case_id}.context") != context:
-            fail(f"{case_id}: context mismatch")
-        prompt_hex = require_string(case["prompt_hex"], f"{case_id}.prompt_hex")
-        try:
-            prompt = bytes.fromhex(prompt_hex)
-        except ValueError:
-            fail(f"{case_id}: prompt_hex is invalid")
-        if prompt.hex() != prompt_hex or not prompt:
-            fail(f"{case_id}: prompt_hex is noncanonical or empty")
-        try:
-            prompt.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            fail(f"{case_id}: rendered prompt is not valid UTF-8")
-        if require_hex(case["prompt_sha256"], 64, f"{case_id}.prompt_sha256") != sha256_bytes(prompt):
-            fail(f"{case_id}: prompt SHA-256 mismatch")
-        if case_id == "short":
-            expected_prompt = (
-                b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
-                + read_bytes(root / "short.txt")
-                + b"</user>\n<assistant></think>"
-            )
-        else:
-            expected_prompt = read_bytes(root / f"{case_id}.prompt")
-        if prompt != expected_prompt:
-            fail(f"{case_id}: manifest prompt bytes differ from checked-in input")
-        metal_tokens = validate_token_list(case["metal_tokens"], frontier, f"{case_id}.metal_tokens")
-        llama_tokens = validate_token_list(case["llama_tokens"], frontier, f"{case_id}.llama_tokens")
-        if metal_tokens != llama_tokens:
-            fail(f"{case_id}: Metal and Poolside token arrays differ")
-
-        oracle_entries = require_object(case["oracles"], f"{case_id}.oracles")
-        require_exact_keys(oracle_entries, set(ORACLES), f"{case_id}.oracles")
-        vectors: dict[str, list[float]] = {}
-        case_argmaxes[case_id] = {}
-        for oracle in ORACLES:
-            entry = require_object(oracle_entries[oracle], f"{case_id}.{oracle}")
-            require_exact_keys(entry, {"file", "sha256", "argmax"}, f"{case_id}.{oracle}")
-            name = require_safe_name(entry["file"], f"{case_id}.{oracle}.f32", f"{case_id}.{oracle}.file")
-            expected_sha = require_hex(entry["sha256"], 64, f"{case_id}.{oracle}.sha256")
-            _, vector = decode_f32(root / name, expected_sha)
-            recorded_argmax = require_int(entry["argmax"], f"{case_id}.{oracle}.argmax")
-            if recorded_argmax != argmax(vector):
-                fail(f"{case_id}.{oracle}: recorded argmax mismatch")
-            vectors[oracle] = vector
-            case_argmaxes[case_id][oracle] = recorded_argmax
-
-        recorded_metrics = require_object(case["metrics"], f"{case_id}.metrics")
-        require_exact_keys(
-            recorded_metrics,
-            {"centered_rms", "centered_max_abs", "top20_overlap", "argmax_equal"},
-            f"{case_id}.metrics",
-        )
-        computed_metrics = compare_logits(vectors["metal"], vectors["llama"])
-        for name in ("centered_rms", "centered_max_abs"):
-            recorded = require_number(recorded_metrics[name], f"{case_id}.metrics.{name}")
-            if not math.isclose(recorded, float(computed_metrics[name]), rel_tol=1e-7, abs_tol=1e-9):
-                fail(f"{case_id}: recorded {name} does not match vectors")
-        for name in ("top20_overlap", "argmax_equal"):
-            if recorded_metrics[name] != computed_metrics[name]:
-                fail(f"{case_id}: recorded {name} does not match vectors")
-        check_metric_limits(recorded_metrics, f"{case_id}.metrics")
-
-    continuation = require_object(manifest["continuation"], "manifest.continuation")
-    require_exact_keys(
-        continuation,
-        {"case", "file", "sha256", "metal_argmax", "llama_argmax"},
-        "manifest.continuation",
-    )
-    if continuation["case"] != "yarn-8193":
-        fail("continuation case mismatch")
-    name = require_safe_name(
-        continuation["file"],
-        "yarn-8193.continuation.i32",
-        "manifest.continuation.file",
-    )
-    expected_sha = require_hex(continuation["sha256"], 64, "manifest.continuation.sha256")
-    _, continuation_ids = decode_i32(root / name, CONTINUATION_TOKENS, expected_sha)
-    metal_ids = validate_token_list(
-        continuation["metal_argmax"], CONTINUATION_TOKENS, "manifest.continuation.metal_argmax"
-    )
-    llama_ids = validate_token_list(
-        continuation["llama_argmax"], CONTINUATION_TOKENS, "manifest.continuation.llama_argmax"
-    )
-    if metal_ids != llama_ids or metal_ids != continuation_ids:
-        fail("Metal, Poolside, and promoted continuation IDs differ")
-    for oracle, ids in (("metal", metal_ids), ("llama", llama_ids)):
-        if case_argmaxes["yarn-8193"][oracle] != ids[0]:
-            fail(f"{oracle}: YaRN frontier argmax differs from continuation step zero")
+    actual = {
+        "centered_rms": rms,
+        "centered_max_abs": maximum,
+        "top20_overlap": overlap,
+        "argmax_equal": argmax_equal,
+        "continuation_equal": continuation_equal,
+    }
+    if actual != CUDA_LIMITS:
+        fail(f"{label}: thresholds differ from the fixed CUDA admission contract")
+    return actual
 
 
-def validate_capture(root: Path, expected_oracle: str) -> dict[str, Any]:
-    if not root.is_dir():
+def validate_capture(root: Path, expected_oracle: str = "llama") -> dict[str, Any]:
+    if root.is_symlink() or not root.is_dir():
         fail(f"capture directory does not exist: {root}")
-    capture = load_json(root / "capture.json")
+
+    capture_path = root / "capture.json"
+    capture_payload = read_bytes(capture_path)
+    actual_capture_sha = sha256_bytes(capture_payload)
+    if actual_capture_sha != CAPTURE_MANIFEST_SHA256:
+        fail("Poolside capture.json trust-anchor SHA-256 mismatch")
+    capture = load_json_bytes(capture_payload, capture_path)
+
+    if expected_oracle != "llama":
+        fail(f"unsupported capture oracle: {expected_oracle}")
     require_exact_keys(
         capture,
         {
@@ -576,46 +492,53 @@ def validate_capture(root: Path, expected_oracle: str) -> dict[str, Any]:
             "cases",
             "continuation",
             "files",
-            *( {"dwarfstar_commit"} if expected_oracle == "metal" else set() ),
         },
-        f"{expected_oracle} capture",
+        "Poolside capture",
     )
-    if capture["schema"] != "laguna-resident-capture-v1":
-        fail(f"{expected_oracle}: unknown capture schema")
-    if capture["oracle"] != expected_oracle:
-        fail(f"{expected_oracle}: capture oracle identity mismatch")
-    runtime_commit = require_commit(capture["runtime_commit"], f"{expected_oracle}.runtime_commit")
-    if expected_oracle == "llama" and runtime_commit != LLAMA_COMMIT:
+    if require_string(capture["schema"], "Poolside capture.schema") != "laguna-resident-capture-v1":
+        fail("Poolside capture schema mismatch")
+    if require_string(capture["oracle"], "Poolside capture.oracle") != "llama":
+        fail("Poolside capture oracle identity mismatch")
+    runtime_commit = require_commit(capture["runtime_commit"], "Poolside capture.runtime_commit")
+    if runtime_commit != LLAMA_COMMIT:
         fail("Poolside capture runtime commit does not match the pinned revision")
-    if expected_oracle == "metal":
-        if require_commit(capture["dwarfstar_commit"], "metal.dwarfstar_commit") != runtime_commit:
-            fail("Metal runtime and DwarfStar commits differ")
-    if require_int(capture["vocab_size"], f"{expected_oracle}.vocab_size") != VOCAB_SIZE:
-        fail(f"{expected_oracle}: vocabulary size mismatch")
+    if require_int(capture["vocab_size"], "Poolside capture.vocab_size") != VOCAB_SIZE:
+        fail("Poolside capture vocabulary mismatch")
     seed_token_count = require_int(
-        capture["seed_token_count"], f"{expected_oracle}.seed_token_count"
+        capture["seed_token_count"], "Poolside capture.seed_token_count"
     )
-    if seed_token_count < 32768:
-        fail(f"{expected_oracle}: benchmark seed has fewer than 32768 tokens")
-    require_model(capture["model"], f"{expected_oracle}.model")
+    if seed_token_count != 61440:
+        fail("Poolside capture seed token count must be exactly 61440")
+    require_model(capture["model"], CAPTURE_MODEL, "Poolside capture.model")
 
-    files = require_object(capture["files"], f"{expected_oracle}.files")
-    expected_names = set(files) | {"capture.json"}
-    if actual_files(root) != expected_names:
-        fail(f"{expected_oracle}: capture file set mismatch")
-    for name, recorded_sha in files.items():
-        if not isinstance(name, str) or Path(name).name != name:
-            fail(f"{expected_oracle}: unsafe capture filename")
-        expected_sha = require_hex(recorded_sha, 64, f"{expected_oracle}.files[{name}]")
-        if sha256_bytes(read_bytes(root / name)) != expected_sha:
-            fail(f"{expected_oracle}: SHA-256 mismatch for {name}")
+    files = require_object(capture["files"], "Poolside capture.files")
+    require_exact_keys(files, CAPTURE_ARTIFACT_FILES, "Poolside capture.files")
+    found_files = actual_files(root)
+    expected_files = CAPTURE_ARTIFACT_FILES | {"capture.json"}
+    if found_files != expected_files:
+        fail(
+            "Poolside capture file allowlist mismatch: "
+            f"missing={sorted(expected_files - found_files)} "
+            f"extra={sorted(found_files - expected_files)}"
+        )
 
-    cases = require_list(capture["cases"], f"{expected_oracle}.cases")
-    if len(cases) != len(CASE_SPECS):
-        fail(f"{expected_oracle}: expected four cases")
-    decoded_cases = []
+    # Capture artifact payloads are read exactly once after the trust anchor has
+    # been checked.  All decoding and promotion below uses these byte strings.
+    artifact_payloads: dict[str, bytes] = {}
+    for name in sorted(CAPTURE_ARTIFACT_FILES):
+        require_safe_name(name, name, f"Poolside capture.files[{name}]")
+        expected_sha = require_hex(files[name], 64, f"Poolside capture.files[{name}]")
+        payload = read_bytes(root / name)
+        if sha256_bytes(payload) != expected_sha:
+            fail(f"Poolside capture: SHA-256 mismatch for {name}")
+        artifact_payloads[name] = payload
+
+    entries = require_list(capture["cases"], "Poolside capture.cases")
+    if len(entries) != len(CASE_SPECS):
+        fail("Poolside capture must contain exactly four cases")
+    decoded_cases: list[dict[str, Any]] = []
     for index, (case_id, render, fixed_frontier, context) in enumerate(CASE_SPECS):
-        case = require_object(cases[index], f"{expected_oracle}.cases[{index}]")
+        case = require_object(entries[index], f"Poolside capture.cases[{index}]")
         require_exact_keys(
             case,
             {
@@ -630,41 +553,52 @@ def validate_capture(root: Path, expected_oracle: str) -> dict[str, Any]:
                 "token_count",
                 "argmax",
             },
-            f"{expected_oracle}.cases[{index}]",
+            f"Poolside capture.cases[{index}]",
         )
-        if case["id"] != case_id or case["render"] != render:
-            fail(f"{expected_oracle}: case {index} identity/render mismatch")
+        if require_string(case["id"], f"Poolside capture.{case_id}.id") != case_id:
+            fail(f"Poolside capture case {index} identity mismatch")
+        if require_string(case["render"], f"Poolside capture.{case_id}.render") != render:
+            fail(f"Poolside capture case {index} render mismatch")
         expected_prompt_ref = "short.txt" if case_id == "short" else f"{case_id}.prompt"
-        if case["prompt"] != expected_prompt_ref:
-            fail(f"{expected_oracle}.{case_id}: prompt reference mismatch")
-        frontier = require_int(case["frontier"], f"{expected_oracle}.{case_id}.frontier")
-        if frontier <= 0 or (fixed_frontier is not None and frontier != fixed_frontier):
-            fail(f"{expected_oracle}.{case_id}: invalid frontier")
-        if require_int(case["context"], f"{expected_oracle}.{case_id}.context") != context:
-            fail(f"{expected_oracle}.{case_id}: context mismatch")
-        if require_int(case["token_count"], f"{expected_oracle}.{case_id}.token_count") != frontier:
-            fail(f"{expected_oracle}.{case_id}: token count/frontier mismatch")
+        require_safe_name(case["prompt"], expected_prompt_ref, f"Poolside capture.{case_id}.prompt")
+        frontier = require_int(case["frontier"], f"Poolside capture.{case_id}.frontier")
+        if frontier <= 0 or (fixed_frontier != frontier):
+            fail(f"Poolside capture.{case_id}: invalid frontier")
+        if require_int(case["context"], f"Poolside capture.{case_id}.context") != context:
+            fail(f"Poolside capture.{case_id}: context mismatch")
+        if require_int(case["token_count"], f"Poolside capture.{case_id}.token_count") != frontier:
+            fail(f"Poolside capture.{case_id}: token count/frontier mismatch")
         prompt_name = require_safe_name(
-            case["prompt_file"], f"{case_id}.prompt", f"{expected_oracle}.{case_id}.prompt_file"
+            case["prompt_file"], f"{case_id}.prompt", f"Poolside capture.{case_id}.prompt_file"
         )
         tokens_name = require_safe_name(
             case["tokens_file"],
             f"{case_id}.tokens.i32",
-            f"{expected_oracle}.{case_id}.tokens_file",
+            f"Poolside capture.{case_id}.tokens_file",
         )
         logits_name = require_safe_name(
             case["logits_file"],
             f"{case_id}.logits.f32",
-            f"{expected_oracle}.{case_id}.logits_file",
+            f"Poolside capture.{case_id}.logits_file",
         )
-        prompt = read_bytes(root / prompt_name)
+        prompt = artifact_payloads[prompt_name]
         if not prompt:
-            fail(f"{expected_oracle}.{case_id}: empty prompt")
-        _, tokens = decode_i32(root / tokens_name, frontier)
-        logits_payload, logits = decode_f32(root / logits_name)
-        recorded_argmax = require_int(case["argmax"], f"{expected_oracle}.{case_id}.argmax")
+            fail(f"Poolside capture.{case_id}: empty prompt")
+        try:
+            prompt.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            fail(f"Poolside capture.{case_id}: prompt is not valid UTF-8")
+        _, tokens = decode_i32_payload(
+            artifact_payloads[tokens_name], frontier, f"Poolside capture.{case_id}.tokens"
+        )
+        logits_payload, logits = decode_f32_payload(
+            artifact_payloads[logits_name], f"Poolside capture.{case_id}.logits"
+        )
+        recorded_argmax = require_int(case["argmax"], f"Poolside capture.{case_id}.argmax")
+        if recorded_argmax < 0 or recorded_argmax >= VOCAB_SIZE:
+            fail(f"Poolside capture.{case_id}: argmax outside vocabulary")
         if recorded_argmax != argmax(logits):
-            fail(f"{expected_oracle}.{case_id}: argmax mismatch")
+            fail(f"Poolside capture.{case_id}: recorded argmax mismatch")
         decoded_cases.append(
             {
                 "id": case_id,
@@ -676,56 +610,67 @@ def validate_capture(root: Path, expected_oracle: str) -> dict[str, Any]:
                 "logits": logits,
                 "logits_payload": logits_payload,
                 "argmax": recorded_argmax,
-                "prompt_path": root / prompt_name,
+                "prompt_name": prompt_name,
             }
         )
 
-    continuation = require_object(capture["continuation"], f"{expected_oracle}.continuation")
+    continuation = require_object(capture["continuation"], "Poolside capture.continuation")
     require_exact_keys(
         continuation,
         {"case", "tokens_file", "logits_files", "argmax"},
-        f"{expected_oracle}.continuation",
+        "Poolside capture.continuation",
     )
-    if continuation["case"] != "yarn-8193":
-        fail(f"{expected_oracle}: continuation case mismatch")
-    token_name = require_safe_name(
+    if require_string(continuation["case"], "Poolside capture.continuation.case") != "yarn-8193":
+        fail("Poolside capture continuation case mismatch")
+    continuation_name = require_safe_name(
         continuation["tokens_file"],
         "yarn-8193.continuation.i32",
-        f"{expected_oracle}.continuation.tokens_file",
+        "Poolside capture.continuation.tokens_file",
     )
-    token_payload, token_ids = decode_i32(root / token_name, CONTINUATION_TOKENS)
+    token_payload, continuation_ids = decode_i32_payload(
+        artifact_payloads[continuation_name],
+        CONTINUATION_TOKENS,
+        "Poolside capture.continuation",
+    )
     recorded_ids = validate_token_list(
-        continuation["argmax"], CONTINUATION_TOKENS, f"{expected_oracle}.continuation.argmax"
+        continuation["argmax"], CONTINUATION_TOKENS, "Poolside capture.continuation.argmax"
     )
-    if token_ids != recorded_ids:
-        fail(f"{expected_oracle}: continuation binary/manifest mismatch")
-    logits_names = require_list(continuation["logits_files"], f"{expected_oracle}.continuation.logits_files")
+    if continuation_ids != recorded_ids:
+        fail("Poolside capture continuation binary/manifest mismatch")
+    logits_names = require_list(
+        continuation["logits_files"], "Poolside capture.continuation.logits_files"
+    )
     if len(logits_names) != CONTINUATION_TOKENS:
-        fail(f"{expected_oracle}: continuation must contain eight logit rows")
+        fail("Poolside capture continuation must contain eight logit rows")
     for step, value in enumerate(logits_names):
         name = require_safe_name(
             value,
             f"yarn-8193.step-{step:02d}.logits.f32",
-            f"{expected_oracle}.continuation.logits_files[{step}]",
+            f"Poolside capture.continuation.logits_files[{step}]",
         )
-        _, logits = decode_f32(root / name)
+        _, logits = decode_f32_payload(
+            artifact_payloads[name], f"Poolside capture continuation step {step}"
+        )
         if argmax(logits) != recorded_ids[step]:
-            fail(f"{expected_oracle}: teacher-forced argmax mismatch at step {step}")
+            fail(f"Poolside capture continuation argmax mismatch at step {step}")
     if recorded_ids[0] != decoded_cases[2]["argmax"]:
-        fail(f"{expected_oracle}: YaRN frontier argmax differs from continuation step zero")
+        fail("Poolside capture YaRN frontier argmax differs from continuation step zero")
 
     return {
+        "capture_sha256": actual_capture_sha,
         "runtime_commit": runtime_commit,
-        "model": capture["model"],
+        "model": dict(CAPTURE_MODEL),
         "cases": decoded_cases,
         "continuation_ids": recorded_ids,
         "continuation_payload": token_payload,
         "seed_token_count": seed_token_count,
+        "payloads": artifact_payloads,
     }
 
 
 def parse_dump_tokens(stdout: str, label: str) -> list[int]:
-    first_line = stdout.splitlines()[0].strip() if stdout.splitlines() else ""
+    lines = stdout.splitlines()
+    first_line = lines[0].strip() if lines else ""
     try:
         value = ast.literal_eval(first_line)
     except (SyntaxError, ValueError) as exc:
@@ -739,7 +684,7 @@ def parse_dump_tokens(stdout: str, label: str) -> list[int]:
 
 
 def dump_ds4_tokens(ds4: Path, prompt_path: Path, label: str) -> list[int]:
-    model_path = os.environ.get("LAGUNA_MODEL", str(MODEL["file"]))
+    model_path = os.environ.get("LAGUNA_MODEL", PROMOTED_MODEL["filename"])
     command = [
         str(ds4),
         "--dump-tokens",
@@ -750,351 +695,1145 @@ def dump_ds4_tokens(ds4: Path, prompt_path: Path, label: str) -> list[int]:
         str(prompt_path),
     ]
     try:
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
-    except OSError as exc:
-        fail(f"{label}: cannot execute {ds4}: {exc}")
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        fail(f"{label}: ds4 --dump-tokens timed out: {exc}")
+    except (OSError, UnicodeError) as exc:
+        fail(f"{label}: cannot execute ds4: {exc}")
     if completed.returncode != 0:
         fail(f"{label}: ds4 --dump-tokens failed: {completed.stderr.strip()}")
     return parse_dump_tokens(completed.stdout, label)
 
 
-def verify_ds4_tokens(ds4: Path, prompt_path: Path, expected: list[int], label: str) -> None:
-    actual = dump_ds4_tokens(ds4, prompt_path, label)
-    if actual != expected:
-        fail(f"{label}: DwarfStar and Poolside token arrays differ")
-
-
-def require_ds4_token(value: Any, label: str) -> int:
-    token = require_object(value, label)
-    require_exact_keys(token, {"id", "text", "bytes"}, label)
-    token_id = require_int(token["id"], f"{label}.id")
-    if token_id < 0 or token_id >= VOCAB_SIZE:
-        fail(f"{label}.id outside vocabulary")
-    require_string(token["text"], f"{label}.text")
-    raw_bytes = require_list(token["bytes"], f"{label}.bytes")
-    for index, item in enumerate(raw_bytes):
-        byte = require_int(item, f"{label}.bytes[{index}]")
-        if byte < 0 or byte > 255:
-            fail(f"{label}.bytes[{index}] outside byte range")
-    return token_id
-
-
-def discover_dwarfstar_commit(ds4: Path) -> str:
+def git_output(location: Path, args: list[str], label: str) -> str:
+    command = ["git", "-C", str(location), *args]
     try:
-        executable = ds4.resolve(strict=True)
         completed = subprocess.run(
-            ["git", "-C", str(executable.parent), "rev-parse", "HEAD"],
+            command,
             check=False,
             capture_output=True,
             text=True,
+            timeout=30,
         )
-    except OSError as exc:
-        fail(f"cannot resolve DwarfStar executable: {exc}")
+    except subprocess.TimeoutExpired as exc:
+        fail(f"{label}: git command timed out: {exc}")
+    except (OSError, UnicodeError) as exc:
+        fail(f"{label}: git command failed: {exc}")
     if completed.returncode != 0:
-        fail(f"cannot determine DwarfStar commit: {completed.stderr.strip()}")
-    return require_commit(completed.stdout.strip(), "DwarfStar runtime commit")
+        detail = (completed.stderr or completed.stdout).strip()
+        fail(f"{label}: git command failed: {detail}")
+    return completed.stdout
 
 
-def validate_native_metal_capture(
-    root: Path, ds4: Path, llama: dict[str, Any]
-) -> dict[str, Any]:
-    if not root.is_dir():
-        fail(f"Metal capture directory does not exist: {root}")
-    expected_files = {
-        *(f"{case_id}.logits.json" for case_id, _, _, _ in CASE_SPECS),
-        "yarn-8193.continuation.json",
-    }
-    found_files = actual_files(root)
-    if found_files != expected_files:
-        fail(
-            f"Metal capture file set mismatch: missing={sorted(expected_files - found_files)} "
-            f"extra={sorted(found_files - expected_files)}"
-        )
+def discover_tokenizer_provenance(ds4: Path) -> dict[str, Any]:
+    try:
+        executable = ds4.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        fail(f"cannot resolve tokenizer executable: {exc}")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        fail(f"tokenizer executable is not executable: {ds4}")
 
-    model_env = os.environ.get("LAGUNA_MODEL")
-    if not model_env:
-        fail("native Metal promotion requires LAGUNA_MODEL")
-    expected_model = Path(model_env).resolve()
-    if expected_model.name != MODEL["file"]:
-        fail("LAGUNA_MODEL filename does not match the pinned artifact")
-    runtime_commit = discover_dwarfstar_commit(ds4)
+    top_text = git_output(executable.parent, ["rev-parse", "--show-toplevel"], "tokenizer repository")
+    top_name = top_text.strip()
+    if not top_name:
+        fail("tokenizer repository top-level is empty")
+    try:
+        repository = Path(top_name).resolve(strict=True)
+    except OSError as exc:
+        fail(f"cannot resolve tokenizer repository top-level: {exc}")
+    if not repository.is_dir():
+        fail("tokenizer repository top-level is not a directory")
 
-    decoded_cases = []
-    for (case_id, render, fixed_frontier, context), llama_case in zip(
-        CASE_SPECS, llama["cases"], strict=True
-    ):
-        raw = load_json(root / f"{case_id}.logits.json")
-        require_exact_keys(
-            raw,
-            {
-                "source",
-                "model",
-                "backend",
-                "quant_bits",
-                "prompt_tokens",
-                "ctx",
-                "vocab",
-                "argmax_token",
-                "argmax_logit",
-                "logits",
-            },
-            f"Metal {case_id} logits",
-        )
-        if raw["source"] != "ds4" or raw["backend"] != "metal":
-            fail(f"Metal {case_id}: source/backend mismatch")
-        recorded_model = Path(require_string(raw["model"], f"Metal {case_id}.model")).resolve()
-        if recorded_model != expected_model:
-            fail(f"Metal {case_id}: model path differs from LAGUNA_MODEL")
-        if require_int(raw["quant_bits"], f"Metal {case_id}.quant_bits") <= 0:
-            fail(f"Metal {case_id}: invalid routed quantization")
-        frontier = len(llama_case["tokens"])
-        if fixed_frontier is not None and frontier != fixed_frontier:
-            fail(f"Metal {case_id}: Poolside frontier mismatch")
-        if require_int(raw["prompt_tokens"], f"Metal {case_id}.prompt_tokens") != frontier:
-            fail(f"Metal {case_id}: prompt token count mismatch")
-        if require_int(raw["ctx"], f"Metal {case_id}.ctx") != context:
-            fail(f"Metal {case_id}: context mismatch")
-        if require_int(raw["vocab"], f"Metal {case_id}.vocab") != VOCAB_SIZE:
-            fail(f"Metal {case_id}: vocabulary mismatch")
-        raw_logits = require_list(raw["logits"], f"Metal {case_id}.logits")
-        if len(raw_logits) != VOCAB_SIZE:
-            fail(f"Metal {case_id}: expected {VOCAB_SIZE} logits")
-        logits = [
-            require_number(value, f"Metal {case_id}.logits[{index}]")
-            for index, value in enumerate(raw_logits)
-        ]
-        logits_payload = encode_f32(logits)
-        recorded_argmax = require_ds4_token(raw["argmax_token"], f"Metal {case_id}.argmax_token")
-        if recorded_argmax != argmax(logits):
-            fail(f"Metal {case_id}: recorded argmax mismatch")
-        if not math.isclose(
-            require_number(raw["argmax_logit"], f"Metal {case_id}.argmax_logit"),
-            logits[recorded_argmax],
-            rel_tol=1e-7,
-            abs_tol=1e-9,
-        ):
-            fail(f"Metal {case_id}: argmax logit mismatch")
-        verify_ds4_tokens(ds4, llama_case["prompt_path"], llama_case["tokens"], case_id)
-        decoded_cases.append(
-            {
-                "id": case_id,
-                "render": render,
-                "frontier": frontier,
-                "context": context,
-                "prompt": llama_case["prompt"],
-                "tokens": llama_case["tokens"],
-                "logits": logits,
-                "logits_payload": logits_payload,
-                "argmax": recorded_argmax,
-                "prompt_path": llama_case["prompt_path"],
-            }
-        )
+    head_text = git_output(repository, ["rev-parse", "HEAD"], "tokenizer HEAD")
+    head = require_commit(head_text.strip(), "tokenizer runtime HEAD")
 
-    continuation = load_json(root / "yarn-8193.continuation.json")
-    require_exact_keys(
-        continuation,
-        {"source", "prompt_tokens", "ctx", "top_k", "steps"},
-        "Metal continuation",
+    status_text = git_output(
+        repository,
+        ["status", "--short", "--untracked-files=no"],
+        "tokenizer tracked status",
     )
-    if continuation["source"] != "ds4":
-        fail("Metal continuation source mismatch")
-    if require_int(continuation["prompt_tokens"], "Metal continuation.prompt_tokens") != 8193:
-        fail("Metal continuation prompt-token mismatch")
-    if require_int(continuation["ctx"], "Metal continuation.ctx") != 8202:
-        fail("Metal continuation context mismatch")
-    if require_int(continuation["top_k"], "Metal continuation.top_k") != 20:
-        fail("Metal continuation top-k mismatch")
-    steps = require_list(continuation["steps"], "Metal continuation.steps")
-    if len(steps) != CONTINUATION_TOKENS:
-        fail("Metal continuation must contain eight steps")
-    continuation_ids = []
-    for index, value in enumerate(steps):
-        step = require_object(value, f"Metal continuation.steps[{index}]")
-        require_exact_keys(step, {"step", "selected", "top_logprobs"}, f"Metal continuation.steps[{index}]")
-        if require_int(step["step"], f"Metal continuation.steps[{index}].step") != index:
-            fail("Metal continuation step index mismatch")
-        continuation_ids.append(
-            require_ds4_token(step["selected"], f"Metal continuation.steps[{index}].selected")
-        )
-        require_list(step["top_logprobs"], f"Metal continuation.steps[{index}].top_logprobs")
-    if continuation_ids[0] != decoded_cases[2]["argmax"]:
-        fail("Metal YaRN frontier argmax differs from continuation step zero")
+    if status_text.strip():
+        fail("tokenizer repository has dirty tracked files")
 
+    contract_commit = require_commit(CONTRACT_COMMIT, "fixed contract commit")
+    git_output(
+        repository,
+        ["cat-file", "-e", f"{contract_commit}^{{commit}}"],
+        "fixed contract commit resolution",
+    )
+    git_output(
+        repository,
+        ["merge-base", "--is-ancestor", contract_commit, head],
+        "fixed contract ancestor proof",
+    )
     return {
-        "runtime_commit": runtime_commit,
-        "model": MODEL,
-        "cases": decoded_cases,
-        "continuation_ids": continuation_ids,
-        "continuation_payload": encode_i32(continuation_ids),
+        "repository": repository,
+        "head": head,
+        "contract_commit": contract_commit,
     }
 
 
-def promote(ds4: Path, metal_root: Path, llama_root: Path, destination: Path) -> None:
-    llama = validate_capture(llama_root, "llama")
-    metal = (
-        validate_capture(metal_root, "metal")
-        if (metal_root / "capture.json").is_file()
-        else validate_native_metal_capture(metal_root, ds4, llama)
-    )
-    if metal["model"] != llama["model"]:
-        fail("Metal and Poolside model identities differ")
-    if not destination.is_dir():
-        fail(f"promotion destination must be the populated fixture directory: {destination}")
-    found_inputs = actual_files(destination)
-    if found_inputs != FIXTURE_INPUT_FILES:
+def rendered_short_prompt(short_payload: bytes) -> bytes:
+    return SHORT_RENDERED_PREFIX + short_payload + SHORT_RENDERED_SUFFIX
+
+
+def validate_capture_determinism(capture: dict[str, Any], inputs: dict[str, Any]) -> None:
+    cases = capture["cases"]
+    if cases[0]["prompt"] != rendered_short_prompt(inputs["short"]):
+        fail("short: captured rendered prompt differs from deterministic rendering")
+    benchmark = inputs["benchmark"]
+    deep_tokens = cases[3]["tokens"]
+    for index, (case_id, _, frontier, _) in enumerate(CASE_SPECS[1:], start=1):
+        prompt = cases[index]["prompt"]
+        if len(prompt) > len(benchmark):
+            fail(f"{case_id}: captured prompt is longer than benchmark seed")
+        if prompt != benchmark[: len(prompt)]:
+            fail(f"{case_id}: captured prompt is not an exact benchmark prefix")
+        if cases[index]["tokens"] != deep_tokens[:frontier]:
+            fail(f"{case_id}: captured token IDs are not the benchmark frontier prefix")
+
+
+def validate_destination_for_promotion(
+    destination: Path,
+    expected_prompts: dict[str, bytes],
+) -> tuple[dict[str, Any], dict[str, tuple[int, int]], int, tuple[int, int]]:
+    found = actual_files(destination)
+    partial_outputs = found & (PROMOTED_VECTOR_FILES | {"yarn-8193.continuation.i32"})
+    if "manifest.json" not in found and partial_outputs:
         fail(
-            f"pre-promotion fixture set mismatch: missing={sorted(FIXTURE_INPUT_FILES - found_inputs)} "
-            f"extra={sorted(found_inputs - FIXTURE_INPUT_FILES)}"
+            "stale partial publication; existing output paths require explicit cleanup: "
+            + ", ".join(sorted(partial_outputs))
         )
-    validate_fixture_inputs(destination)
-    for llama_case in llama["cases"]:
-        case_id = llama_case["id"]
-        if case_id != "short" and read_bytes(destination / f"{case_id}.prompt") != llama_case["prompt"]:
-            fail(f"{case_id}: materialized fixture prompt differs from Poolside capture")
+    if "manifest.json" in found:
+        fail("promotion output already exists: manifest.json (no-clobber)")
 
-    dwarfstar_seed = dump_ds4_tokens(
-        ds4, destination / "benchmark-32768.txt", "benchmark-32768"
+    allowed = FIXED_INPUT_FILES | MATERIALIZED_PROMPT_FILES
+    missing = FIXED_INPUT_FILES - found
+    extra = found - allowed
+    if missing or extra:
+        fail(
+            "pre-promotion fixture set mismatch: "
+            f"missing={sorted(missing)} extra={sorted(extra)}"
+        )
+
+    inputs = validate_fixture_inputs(destination)
+    existing_prompts: dict[str, tuple[int, int]] = {}
+    for name, expected in sorted(expected_prompts.items()):
+        if name not in found:
+            continue
+        actual, metadata = read_bytes_with_stat(destination / name)
+        if actual != expected:
+            fail(f"existing prompt bytes mismatch for {name}")
+        existing_prompts[name] = (metadata.st_dev, metadata.st_ino)
+    destination_fd, destination_identity = open_owned_directory(
+        destination, "promotion destination"
     )
-    if len(dwarfstar_seed) < 32768:
-        fail("DwarfStar benchmark seed has fewer than 32768 tokens")
-    if dwarfstar_seed[:32768] != llama["cases"][3]["tokens"]:
-        fail("DwarfStar and Poolside benchmark first 32768 token IDs differ")
+    return inputs, existing_prompts, destination_fd, destination_identity
 
-    manifest_cases = []
+
+def open_owned_directory(path: Path, label: str) -> tuple[int, tuple[int, int]]:
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(path, _directory_open_flags())
+        except OSError as exc:
+            fail(f"{label} cannot be opened as a directory: {exc}")
+        try:
+            metadata = os.fstat(fd)
+        except OSError as exc:
+            fail(f"{label} cannot be stat'ed: {exc}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            fail(f"{label} is not a directory")
+        return fd, (metadata.st_dev, metadata.st_ino)
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+def assert_owned_directory(
+    path: Path,
+    fd: int,
+    identity: tuple[int, int],
+    label: str,
+) -> None:
+    try:
+        descriptor_stat = os.fstat(fd)
+    except OSError as exc:
+        fail(f"{label} ownership was lost: {exc}")
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or descriptor_stat.st_dev != identity[0]
+        or descriptor_stat.st_ino != identity[1]
+    ):
+        fail(f"{label} ownership was lost")
+    try:
+        path_stat = path.lstat()
+    except OSError as exc:
+        fail(f"{label} path was removed or replaced: {exc}")
+    if (
+        not stat.S_ISDIR(path_stat.st_mode)
+        or path_stat.st_dev != identity[0]
+        or path_stat.st_ino != identity[1]
+    ):
+        fail(f"{label} path was removed or replaced")
+
+
+def revalidate_existing_prompts(
+    destination: Path,
+    destination_fd: int,
+    destination_identity: tuple[int, int],
+    expected_prompts: dict[str, bytes],
+    existing_prompts: dict[str, tuple[int, int]],
+) -> None:
+    assert_owned_directory(
+        destination,
+        destination_fd,
+        destination_identity,
+        "promotion destination",
+    )
+    for name, expected in sorted(expected_prompts.items()):
+        if name not in existing_prompts:
+            continue
+        actual, metadata = read_bytes_with_stat(destination / name, destination_fd)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity != existing_prompts[name]:
+            fail(f"existing prompt inode changed for {name}")
+        if actual != expected:
+            fail(f"existing prompt bytes changed for {name}")
+
+
+def revalidate_fixed_inputs(
+    destination: Path,
+    destination_fd: int,
+    destination_identity: tuple[int, int],
+    final_inputs: dict[str, Any],
+) -> None:
+    assert_owned_directory(
+        destination,
+        destination_fd,
+        destination_identity,
+        "promotion destination",
+    )
+    payloads = final_inputs["payloads"]
+    for name in sorted(FIXED_INPUT_FILES):
+        try:
+            actual, _ = read_bytes_with_stat(destination / name, destination_fd)
+        except ContractError:
+            raise
+        if actual != payloads[name]:
+            fail(f"destination fixed input changed before manifest publication: {name}")
+
+
+def stage_entry_identity(stage_fd: int, name: str) -> tuple[int, int]:
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(name, _read_open_flags(), dir_fd=stage_fd)
+        except OSError as exc:
+            fail(f"staged output cannot be opened: {name}: {exc}")
+        try:
+            metadata = os.fstat(fd)
+        except OSError as exc:
+            fail(f"staged output cannot be stat'ed: {name}: {exc}")
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"staged output is not a regular file: {name}")
+        return metadata.st_dev, metadata.st_ino
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _record_stage_entry(
+    stage_fd: int | None,
+    name: str,
+    owned_entries: dict[str, tuple[int, int]] | None,
+) -> None:
+    if stage_fd is None or owned_entries is None:
+        return
+    try:
+        owned_entries[name] = stage_entry_identity(stage_fd, name)
+    except ContractError:
+        # Preserve the original write failure.  Cleanup will leave an entry
+        # whose ownership could not be proved rather than deleting it blindly.
+        pass
+
+
+def write_stage_file(
+    stage: Path,
+    name: str,
+    payload: bytes,
+    stage_fd: int | None = None,
+    owned_entries: dict[str, tuple[int, int]] | None = None,
+) -> None:
+    if stage_fd is None:
+        try:
+            (stage / name).write_bytes(payload)
+        except OSError as exc:
+            fail(f"cannot stage {name}: {exc}")
+        return
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=stage_fd)
+        except OSError as exc:
+            fail(f"cannot stage {name}: {exc}")
+        view = memoryview(payload)
+        offset = 0
+        try:
+            while offset < len(view):
+                written = os.write(fd, view[offset:])
+                if written <= 0:
+                    fail(f"cannot stage {name}: short write")
+                offset += written
+        except OSError as exc:
+            _record_stage_entry(stage_fd, name, owned_entries)
+            fail(f"cannot stage {name}: {exc}")
+        except BaseException:
+            _record_stage_entry(stage_fd, name, owned_entries)
+            raise
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    _record_stage_entry(stage_fd, name, owned_entries)
+
+
+def unlink_owned_links(
+    published: list[tuple[str, int, int]], destination_fd: int | None, destination: Path
+) -> None:
+    for name, device, inode in reversed(published):
+        if destination_fd is not None:
+            try:
+                current = os.stat(name, dir_fd=destination_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != device
+                or current.st_ino != inode
+            ):
+                continue
+            try:
+                os.unlink(name, dir_fd=destination_fd)
+            except OSError:
+                pass
+            continue
+        target = destination / name
+        try:
+            current = target.lstat()
+        except OSError:
+            continue
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != device
+            or current.st_ino != inode
+        ):
+            continue
+        try:
+            target.unlink()
+        except OSError:
+            pass
+
+
+def cleanup_stage(
+    stage: Path | None,
+    stage_fd: int | None,
+    stage_identity: tuple[int, int] | None,
+    owned_entries: dict[str, tuple[int, int]],
+) -> None:
+    if stage is None:
+        return
+    if stage_fd is not None and stage_identity is not None:
+        try:
+            descriptor_stat = os.fstat(stage_fd)
+        except OSError:
+            descriptor_stat = None
+        if descriptor_stat is not None and (
+            stat.S_ISDIR(descriptor_stat.st_mode)
+            and descriptor_stat.st_dev == stage_identity[0]
+            and descriptor_stat.st_ino == stage_identity[1]
+        ):
+            for name, (device, inode) in owned_entries.items():
+                try:
+                    current = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_dev != device
+                    or current.st_ino != inode
+                ):
+                    continue
+                try:
+                    os.unlink(name, dir_fd=stage_fd)
+                except OSError:
+                    pass
+    try:
+        if stage_fd is not None:
+            os.close(stage_fd)
+    except OSError:
+        pass
+
+    try:
+        current = stage.lstat()
+    except OSError:
+        return
+    if (
+        stage_identity is None
+        or not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != stage_identity[0]
+        or current.st_ino != stage_identity[1]
+    ):
+        return
+    try:
+        os.rmdir(stage)
+    except OSError:
+        pass
+
+
+def remove_owned_directory(
+    path: Path, fd: int | None, identity: tuple[int, int] | None
+) -> None:
+    if identity is None:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return
+    owned_descriptor = False
+    if fd is not None:
+        try:
+            descriptor_stat = os.fstat(fd)
+        except OSError:
+            descriptor_stat = None
+        owned_descriptor = descriptor_stat is not None and (
+            stat.S_ISDIR(descriptor_stat.st_mode)
+            and descriptor_stat.st_dev == identity[0]
+            and descriptor_stat.st_ino == identity[1]
+        )
+    try:
+        current = path.lstat()
+    except OSError:
+        current = None
+    if owned_descriptor and current is not None and (
+        stat.S_ISDIR(current.st_mode)
+        and current.st_dev == identity[0]
+        and current.st_ino == identity[1]
+    ):
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def build_promoted_manifest(
+    capture: dict[str, Any],
+    ds4_tokens: dict[str, list[int]],
+    ds4_seed_token_count: int,
+    tokenizer_runtime_commit: str,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    manifest_cases: list[dict[str, Any]] = []
     vector_payloads: dict[str, bytes] = {}
-    for spec, metal_case, llama_case in zip(CASE_SPECS, metal["cases"], llama["cases"], strict=True):
-        case_id, render, _, context = spec
-        if metal_case["id"] != case_id or llama_case["id"] != case_id:
-            fail(f"{case_id}: capture ordering mismatch")
-        if metal_case["render"] != render or llama_case["render"] != render:
-            fail(f"{case_id}: capture render mismatch")
-        if metal_case["context"] != context or llama_case["context"] != context:
-            fail(f"{case_id}: capture context mismatch")
-        if metal_case["frontier"] != llama_case["frontier"]:
-            fail(f"{case_id}: capture frontiers differ")
-        if metal_case["prompt"] != llama_case["prompt"]:
-            fail(f"{case_id}: exact prompt bytes differ")
-        if metal_case["tokens"] != llama_case["tokens"]:
-            fail(f"{case_id}: Metal and Poolside token arrays differ")
-        verify_ds4_tokens(ds4, metal_case["prompt_path"], llama_case["tokens"], case_id)
-
-        metrics = compare_logits(metal_case["logits"], llama_case["logits"])
-        check_metric_limits(metrics, f"{case_id}.metrics")
-        oracles: dict[str, dict[str, Any]] = {}
-        for oracle, case in (("metal", metal_case), ("llama", llama_case)):
-            name = f"{case_id}.{oracle}.f32"
-            payload = case["logits_payload"]
-            vector_payloads[name] = payload
-            oracles[oracle] = {
-                "file": name,
-                "sha256": sha256_bytes(payload),
-                "argmax": case["argmax"],
-            }
-        prompt = metal_case["prompt"]
+    for case_id, render, frontier, context in CASE_SPECS:
+        case = next(item for item in capture["cases"] if item["id"] == case_id)
+        actual_tokens = ds4_tokens[case_id]
+        if len(actual_tokens) != frontier or actual_tokens != case["tokens"]:
+            fail(f"{case_id}: DS4 and Poolside token arrays differ")
+        name = f"{case_id}.llama.f32"
+        payload = case["logits_payload"]
+        vector_payloads[name] = payload
         manifest_cases.append(
             {
                 "id": case_id,
                 "render": render,
-                "prompt_hex": prompt.hex(),
-                "prompt_sha256": sha256_bytes(prompt),
-                "metal_tokens": metal_case["tokens"],
-                "llama_tokens": llama_case["tokens"],
-                "frontier": metal_case["frontier"],
+                "prompt_hex": case["prompt"].hex(),
+                "prompt_sha256": sha256_bytes(case["prompt"]),
+                "poolside_tokens": list(case["tokens"]),
+                "ds4_tokens": list(actual_tokens),
+                "frontier": frontier,
                 "context": context,
-                "oracles": oracles,
-                "metrics": metrics,
+                "vector": {
+                    "file": name,
+                    "sha256": sha256_bytes(payload),
+                    "argmax": case["argmax"],
+                },
             }
         )
 
-    metal_continuation = metal["continuation_ids"]
-    llama_continuation = llama["continuation_ids"]
-    if metal_continuation != llama_continuation:
-        fail("Metal and Poolside teacher-forced continuations differ")
-    continuation_payload = llama["continuation_payload"]
-    if continuation_payload != metal["continuation_payload"]:
-        fail("Metal and Poolside continuation binaries differ")
-    if metal_continuation[0] != metal["cases"][2]["argmax"]:
-        fail("Metal YaRN frontier argmax differs from continuation step zero")
-    if llama_continuation[0] != llama["cases"][2]["argmax"]:
-        fail("Poolside YaRN frontier argmax differs from continuation step zero")
-
+    continuation_ids = capture["continuation_ids"]
+    continuation_payload = capture["continuation_payload"]
+    continuation_name = "yarn-8193.continuation.i32"
+    payloads = dict(vector_payloads)
+    payloads[continuation_name] = continuation_payload
     manifest = {
-        "schema": "laguna-resident-promoted-v1",
+        "schema": "laguna-resident-promoted-v2",
+        "oracle_policy": "single-poolside-v1",
         "vocab_size": VOCAB_SIZE,
         "continuation_case": "yarn-8193",
         "continuation_tokens": CONTINUATION_TOKENS,
-        "model": MODEL,
-        "runtimes": {
-            "metal_commit": metal["runtime_commit"],
-            "llama_commit": llama["runtime_commit"],
+        "model": dict(PROMOTED_MODEL),
+        "oracle": {
+            "name": "poolside-llama",
+            "runtime_commit": LLAMA_COMMIT,
+            "capture_manifest_sha256": capture["capture_sha256"],
         },
-        "dwarfstar_commit": metal["runtime_commit"],
-        "thresholds": {
-            "promotion": PROMOTION_LIMITS,
-            "cuda_admission": CUDA_LIMITS,
-        },
-        "seed": {
+        "provenance": {
+            "contract_commit": CONTRACT_COMMIT,
+            "tokenizer_runtime_commit": tokenizer_runtime_commit,
             "generator_sha256": GENERATOR_SHA256,
             "benchmark_sha256": BENCHMARK_SHA256,
-            "poolside_token_count": llama["seed_token_count"],
-            "dwarfstar_token_count": len(dwarfstar_seed),
+            "poolside_seed_token_count": capture["seed_token_count"],
+            "ds4_seed_token_count": ds4_seed_token_count,
         },
+        "thresholds": {"cuda_admission": dict(CUDA_LIMITS)},
         "cases": manifest_cases,
         "continuation": {
             "case": "yarn-8193",
-            "file": "yarn-8193.continuation.i32",
+            "file": continuation_name,
             "sha256": sha256_bytes(continuation_payload),
-            "metal_argmax": metal_continuation,
-            "llama_argmax": llama_continuation,
+            "argmax": list(continuation_ids),
         },
     }
+    manifest_payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    payloads["manifest.json"] = manifest_payload
+    return manifest, payloads
 
-    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent))
-    published: list[Path] = []
+
+def verify_promoted(
+    root: Path,
+    contract_commit: str,
+    tokenizer_runtime_commit: str,
+    llama_commit: str,
+    capture_manifest_sha256: str,
+    gguf_size: int,
+    gguf_sha256: str,
+) -> None:
+    if root.is_symlink() or not root.is_dir():
+        fail(f"promoted fixture directory does not exist: {root}")
+    found_files = actual_files(root)
+    if found_files != PROMOTED_FILES:
+        fail(
+            f"promoted file set mismatch: missing={sorted(PROMOTED_FILES - found_files)} "
+            f"extra={sorted(found_files - PROMOTED_FILES)}"
+        )
+
+    supplied_contract = require_commit(contract_commit, "supplied contract commit")
+    supplied_tokenizer = require_commit(
+        tokenizer_runtime_commit, "supplied tokenizer runtime commit"
+    )
+    supplied_llama = require_commit(llama_commit, "supplied llama commit")
+    supplied_capture = require_hex(
+        capture_manifest_sha256, 64, "supplied capture manifest SHA-256"
+    )
+    supplied_size = require_int(gguf_size, "supplied GGUF size")
+    supplied_hash = require_hex(gguf_sha256, 64, "supplied GGUF SHA-256")
+    if supplied_contract != CONTRACT_COMMIT:
+        fail("supplied contract commit does not match the fixed contract pin")
+    if supplied_llama != LLAMA_COMMIT:
+        fail("supplied llama commit does not match the pinned runtime")
+    if supplied_size != PROMOTED_MODEL["size"] or supplied_hash != PROMOTED_MODEL["sha256"]:
+        fail("supplied GGUF identity does not match the pinned model")
+
+    inputs = validate_fixture_inputs(root)
+    manifest = load_json(root / "manifest.json")
+    require_exact_keys(
+        manifest,
+        {
+            "schema",
+            "oracle_policy",
+            "vocab_size",
+            "continuation_case",
+            "continuation_tokens",
+            "model",
+            "oracle",
+            "provenance",
+            "thresholds",
+            "cases",
+            "continuation",
+        },
+        "manifest",
+    )
+    if require_string(manifest["schema"], "manifest.schema") != "laguna-resident-promoted-v2":
+        fail("unknown promoted manifest schema")
+    if require_string(manifest["oracle_policy"], "manifest.oracle_policy") != "single-poolside-v1":
+        fail("manifest oracle policy mismatch")
+    if require_int(manifest["vocab_size"], "manifest.vocab_size") != VOCAB_SIZE:
+        fail("manifest vocabulary size mismatch")
+    if (
+        require_string(manifest["continuation_case"], "manifest.continuation_case")
+        != "yarn-8193"
+    ):
+        fail("manifest continuation case mismatch")
+    if (
+        require_int(manifest["continuation_tokens"], "manifest.continuation_tokens")
+        != CONTINUATION_TOKENS
+    ):
+        fail("manifest continuation length mismatch")
+    require_model(manifest["model"], PROMOTED_MODEL, "manifest.model")
+
+    oracle = require_object(manifest["oracle"], "manifest.oracle")
+    require_exact_keys(oracle, {"name", "runtime_commit", "capture_manifest_sha256"}, "manifest.oracle")
+    if require_string(oracle["name"], "manifest.oracle.name") != "poolside-llama":
+        fail("manifest oracle name mismatch")
+    if require_commit(oracle["runtime_commit"], "manifest.oracle.runtime_commit") != supplied_llama:
+        fail("manifest oracle runtime commit mismatch")
+    if require_hex(oracle["capture_manifest_sha256"], 64, "manifest.oracle.capture_manifest_sha256") != supplied_capture:
+        fail("manifest oracle capture digest mismatch")
+
+    provenance = require_object(manifest["provenance"], "manifest.provenance")
+    require_exact_keys(
+        provenance,
+        {
+            "contract_commit",
+            "tokenizer_runtime_commit",
+            "generator_sha256",
+            "benchmark_sha256",
+            "poolside_seed_token_count",
+            "ds4_seed_token_count",
+        },
+        "manifest.provenance",
+    )
+    if require_commit(provenance["contract_commit"], "manifest.provenance.contract_commit") != supplied_contract:
+        fail("manifest contract provenance mismatch")
+    if require_commit(
+        provenance["tokenizer_runtime_commit"], "manifest.provenance.tokenizer_runtime_commit"
+    ) != supplied_tokenizer:
+        fail("manifest tokenizer runtime provenance mismatch")
+    if require_hex(provenance["generator_sha256"], 64, "manifest.provenance.generator_sha256") != GENERATOR_SHA256:
+        fail("manifest generator SHA-256 mismatch")
+    if require_hex(provenance["benchmark_sha256"], 64, "manifest.provenance.benchmark_sha256") != BENCHMARK_SHA256:
+        fail("manifest benchmark SHA-256 mismatch")
+    if require_int(
+        provenance["poolside_seed_token_count"], "manifest.provenance.poolside_seed_token_count"
+    ) != 61440:
+        fail("manifest Poolside seed token count mismatch")
+    ds4_seed_count = require_int(
+        provenance["ds4_seed_token_count"], "manifest.provenance.ds4_seed_token_count"
+    )
+    if ds4_seed_count < 32768:
+        fail("manifest DS4 seed token count is below 32768")
+
+    thresholds = require_object(manifest["thresholds"], "manifest.thresholds")
+    require_exact_keys(thresholds, {"cuda_admission"}, "manifest.thresholds")
+    validate_cuda_thresholds(thresholds["cuda_admission"], "manifest.thresholds.cuda_admission")
+
+    entries = require_list(manifest["cases"], "manifest.cases")
+    if len(entries) != len(CASE_SPECS):
+        fail("manifest must contain exactly four cases")
+    case_argmaxes: dict[str, int] = {}
+    deep_tokens: list[int] | None = None
+    for index, (case_id, render, frontier, context) in enumerate(CASE_SPECS):
+        case = require_object(entries[index], f"manifest.cases[{index}]")
+        require_exact_keys(
+            case,
+            {
+                "id",
+                "render",
+                "prompt_hex",
+                "prompt_sha256",
+                "poolside_tokens",
+                "ds4_tokens",
+                "frontier",
+                "context",
+                "vector",
+            },
+            f"manifest.cases[{index}]",
+        )
+        if require_string(case["id"], f"manifest.cases[{index}].id") != case_id:
+            fail(f"manifest case {index} identity mismatch")
+        if require_string(case["render"], f"manifest.{case_id}.render") != render:
+            fail(f"manifest {case_id} render mismatch")
+        if require_int(case["frontier"], f"manifest.{case_id}.frontier") != frontier:
+            fail(f"{case_id}: frontier mismatch")
+        if require_int(case["context"], f"manifest.{case_id}.context") != context:
+            fail(f"{case_id}: context mismatch")
+
+        prompt_hex = require_string(case["prompt_hex"], f"manifest.{case_id}.prompt_hex")
+        try:
+            prompt = bytes.fromhex(prompt_hex)
+        except ValueError:
+            fail(f"{case_id}: prompt_hex is invalid")
+        if prompt.hex() != prompt_hex or not prompt:
+            fail(f"{case_id}: prompt_hex is noncanonical or empty")
+        try:
+            prompt.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            fail(f"{case_id}: rendered prompt is not valid UTF-8")
+        if require_hex(case["prompt_sha256"], 64, f"manifest.{case_id}.prompt_sha256") != sha256_bytes(prompt):
+            fail(f"{case_id}: prompt SHA-256 mismatch")
+        if case_id == "short":
+            expected_prompt = rendered_short_prompt(inputs["short"])
+        else:
+            prompt_name = require_safe_name(
+                f"{case_id}.prompt", f"{case_id}.prompt", f"manifest.{case_id}.prompt_file"
+            )
+            expected_prompt = read_bytes(root / prompt_name)
+            if len(expected_prompt) > len(inputs["benchmark"]):
+                fail(f"{case_id}: prompt is longer than benchmark seed")
+            if expected_prompt != inputs["benchmark"][: len(expected_prompt)]:
+                fail(f"{case_id}: prompt is not an exact benchmark prefix")
+        if prompt != expected_prompt:
+            fail(f"{case_id}: manifest prompt bytes differ from deterministic input")
+
+        poolside_tokens = validate_token_list(
+            case["poolside_tokens"], frontier, f"manifest.{case_id}.poolside_tokens"
+        )
+        ds4_tokens = validate_token_list(
+            case["ds4_tokens"], frontier, f"manifest.{case_id}.ds4_tokens"
+        )
+        if poolside_tokens != ds4_tokens:
+            fail(f"{case_id}: Poolside and DS4 token arrays differ")
+        if case_id != "short":
+            if deep_tokens is None:
+                deep_tokens = poolside_tokens if case_id == "deep-32768" else None
+        if case_id == "deep-32768":
+            deep_tokens = poolside_tokens
+        elif case_id != "short" and deep_tokens is not None:
+            if poolside_tokens != deep_tokens[:frontier]:
+                fail(f"{case_id}: token IDs are not the benchmark frontier prefix")
+
+        vector = require_object(case["vector"], f"manifest.{case_id}.vector")
+        require_exact_keys(vector, {"file", "sha256", "argmax"}, f"manifest.{case_id}.vector")
+        vector_name = require_safe_name(
+            vector["file"], f"{case_id}.llama.f32", f"manifest.{case_id}.vector.file"
+        )
+        vector_sha = require_hex(vector["sha256"], 64, f"manifest.{case_id}.vector.sha256")
+        vector_payload, vector_values = decode_f32_payload(
+            read_bytes(root / vector_name), f"manifest.{case_id}.vector", vector_sha
+        )
+        del vector_payload
+        recorded_argmax = require_int(vector["argmax"], f"manifest.{case_id}.vector.argmax")
+        if recorded_argmax < 0 or recorded_argmax >= VOCAB_SIZE:
+            fail(f"{case_id}: vector argmax outside vocabulary")
+        if recorded_argmax != argmax(vector_values):
+            fail(f"{case_id}: recorded vector argmax mismatch")
+        case_argmaxes[case_id] = recorded_argmax
+
+    # The fixed case order places the deep row last.  Check all shorter rows
+    # against it after decoding so the comparison is independent of list order.
+    if deep_tokens is None:
+        fail("manifest deep benchmark case is missing")
+    for index, (case_id, _, frontier, _) in enumerate(CASE_SPECS[1:], start=1):
+        row = validate_token_list(
+            entries[index]["poolside_tokens"], frontier, f"manifest.{case_id}.poolside_tokens"
+        )
+        if row != deep_tokens[:frontier]:
+            fail(f"{case_id}: token IDs are not the benchmark frontier prefix")
+
+    continuation = require_object(manifest["continuation"], "manifest.continuation")
+    require_exact_keys(
+        continuation,
+        {"case", "file", "sha256", "argmax"},
+        "manifest.continuation",
+    )
+    if require_string(continuation["case"], "manifest.continuation.case") != "yarn-8193":
+        fail("manifest continuation case mismatch")
+    continuation_name = require_safe_name(
+        continuation["file"],
+        "yarn-8193.continuation.i32",
+        "manifest.continuation.file",
+    )
+    continuation_sha = require_hex(continuation["sha256"], 64, "manifest.continuation.sha256")
+    _, continuation_ids = decode_i32_payload(
+        read_bytes(root / continuation_name),
+        CONTINUATION_TOKENS,
+        "manifest.continuation",
+        continuation_sha,
+    )
+    recorded_ids = validate_token_list(
+        continuation["argmax"], CONTINUATION_TOKENS, "manifest.continuation.argmax"
+    )
+    if continuation_ids != recorded_ids:
+        fail("manifest continuation binary and argmax IDs differ")
+    if recorded_ids[0] != case_argmaxes["yarn-8193"]:
+        fail("manifest YaRN frontier argmax differs from continuation step zero")
+
+
+def promote(ds4: Path, llama_root: Path, destination: Path) -> None:
+    lock_path = destination.with_name(f".{destination.name}.lock")
+    # Pin the caller-requested destination before any path-based preflight.  The
+    # held descriptor lets the later under-lock validation reject a retargeted
+    # path even when the replacement contains an otherwise valid fixture.
+    requested_destination_fd, requested_destination_identity = open_owned_directory(
+        destination, "requested destination"
+    )
     try:
-        for name in FIXTURE_INPUT_FILES:
-            shutil.copy2(destination / name, temporary / name)
-        for name, payload in vector_payloads.items():
-            (temporary / name).write_bytes(payload)
-        (temporary / "yarn-8193.continuation.i32").write_bytes(continuation_payload)
-        (temporary / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        capture = validate_capture(llama_root, "llama")
+        inputs = validate_fixture_inputs(destination)
+        validate_capture_determinism(capture, inputs)
+
+        expected_prompts = {
+            case["prompt_name"]: case["prompt"]
+            for case in capture["cases"]
+            if case["id"] != "short"
+        }
+
+        provenance = discover_tokenizer_provenance(ds4)
+        tokenizer_runtime_commit = provenance["head"]
+
+        ds4_tokens: dict[str, list[int]] = {}
+        with tempfile.TemporaryDirectory(prefix="laguna-tokenize-") as tokenize_name:
+            tokenize_root = Path(tokenize_name)
+            for case in capture["cases"]:
+                write_stage_file(tokenize_root, case["prompt_name"], case["prompt"])
+            benchmark_name = "benchmark-32768.txt"
+            write_stage_file(tokenize_root, benchmark_name, inputs["benchmark"])
+
+            for case in capture["cases"]:
+                case_id = case["id"]
+                actual = dump_ds4_tokens(
+                    ds4,
+                    tokenize_root / case["prompt_name"],
+                    case_id,
+                )
+                if actual != case["tokens"]:
+                    fail(f"{case_id}: DS4 and Poolside token arrays differ")
+                ds4_tokens[case_id] = actual
+            benchmark_tokens = dump_ds4_tokens(
+                ds4,
+                tokenize_root / benchmark_name,
+                benchmark_name,
+            )
+            if len(benchmark_tokens) < 32768:
+                fail("DS4 benchmark seed has fewer than 32768 tokens")
+            if benchmark_tokens[:32768] != capture["cases"][3]["tokens"]:
+                fail("DS4 and Poolside benchmark first 32768 token IDs differ")
+
+        _, payloads = build_promoted_manifest(
+            capture,
+            ds4_tokens,
+            len(benchmark_tokens),
+            tokenizer_runtime_commit,
+        )
+        manifest_payload = payloads["manifest.json"]
+    except BaseException:
+        try:
+            os.close(requested_destination_fd)
+        except OSError:
+            pass
+        raise
+
+    lock_fd: int | None = None
+    lock_identity: tuple[int, int] | None = None
+    destination_fd: int | None = None
+    destination_identity: tuple[int, int] | None = None
+    stage: Path | None = None
+    stage_fd: int | None = None
+    stage_identity: tuple[int, int] | None = None
+    owned_stage_entries: dict[str, tuple[int, int]] = {}
+    published: list[tuple[str, int, int]] = []
+    try:
+        try:
+            os.mkdir(lock_path)
+        except FileExistsError:
+            fail(f"promotion lock is already held: {lock_path}")
+        except OSError as exc:
+            fail(f"cannot acquire promotion lock {lock_path}: {exc}")
+
+        # Capture the lock inode immediately, then retain a directory fd so a
+        # replacement at the sibling path can never be mistaken for our lock.
+        try:
+            lock_path_stat = lock_path.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect promotion lock {lock_path}: {exc}")
+        if not stat.S_ISDIR(lock_path_stat.st_mode):
+            fail(f"promotion lock is not a directory: {lock_path}")
+        lock_identity = (lock_path_stat.st_dev, lock_path_stat.st_ino)
+        lock_fd, opened_lock_identity = open_owned_directory(
+            lock_path, "promotion lock"
+        )
+        if opened_lock_identity != lock_identity:
+            fail("promotion lock was replaced while opening")
+
+        (
+            final_inputs,
+            existing_prompts,
+            destination_fd,
+            destination_identity,
+        ) = validate_destination_for_promotion(destination, expected_prompts)
+        # The final destination fd was opened under our lock.  It must still
+        # identify the exact directory requested before any staging begins.
+        assert_owned_directory(
+            destination,
+            requested_destination_fd,
+            requested_destination_identity,
+            "requested destination",
+        )
+        if destination_identity != requested_destination_identity:
+            fail("promotion destination differs from requested destination")
+        for name in FIXED_INPUT_FILES:
+            if final_inputs["payloads"][name] != inputs["payloads"][name]:
+                fail(f"destination fixed input changed during promotion: {name}")
+
+        # The validator captured the destination inode under the lock.  A
+        # replacement made immediately after it returns is therefore rejected
+        # instead of receiving any publication links.
+        assert_owned_directory(
+            destination,
+            destination_fd,
+            destination_identity,
+            "promotion destination",
+        )
+
+        try:
+            stage = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.tmp-",
+                    dir=str(destination.parent),
+                )
+            )
+        except OSError as exc:
+            fail(f"cannot create sibling promotion staging directory: {exc}")
+
+        # Record the stage path inode immediately after mkdtemp, then compare
+        # it with the held O_DIRECTORY fd before using either identity.
+        try:
+            stage_path_stat = stage.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect promotion staging directory: {exc}")
+        if not stat.S_ISDIR(stage_path_stat.st_mode):
+            fail("promotion staging path is not a directory")
+        stage_identity = (stage_path_stat.st_dev, stage_path_stat.st_ino)
+        stage_fd, opened_stage_identity = open_owned_directory(
+            stage, "promotion staging directory"
+        )
+        if opened_stage_identity != stage_identity:
+            fail("promotion staging directory was replaced while opening")
+
+        for name in sorted(FIXED_INPUT_FILES):
+            write_stage_file(
+                stage,
+                name,
+                final_inputs["payloads"][name],
+                stage_fd,
+                owned_stage_entries,
+            )
+        for name, prompt_payload in sorted(expected_prompts.items()):
+            write_stage_file(
+                stage,
+                name,
+                prompt_payload,
+                stage_fd,
+                owned_stage_entries,
+            )
+        for name in sorted(PROMOTED_VECTOR_FILES):
+            write_stage_file(
+                stage,
+                name,
+                payloads[name],
+                stage_fd,
+                owned_stage_entries,
+            )
+        write_stage_file(
+            stage,
+            "yarn-8193.continuation.i32",
+            payloads["yarn-8193.continuation.i32"],
+            stage_fd,
+            owned_stage_entries,
+        )
+        write_stage_file(
+            stage,
+            "manifest.json",
+            manifest_payload,
+            stage_fd,
+            owned_stage_entries,
+        )
+
+        assert_owned_directory(
+            stage, stage_fd, stage_identity, "promotion stage directory"
         )
         verify_promoted(
-            temporary,
-            metal["runtime_commit"],
-            llama["runtime_commit"],
-            int(MODEL["size"]),
-            str(MODEL["sha256"]),
+            stage,
+            CONTRACT_COMMIT,
+            tokenizer_runtime_commit,
+            LLAMA_COMMIT,
+            capture["capture_sha256"],
+            PROMOTED_MODEL["size"],
+            PROMOTED_MODEL["sha256"],
         )
-        output_names = expected_promotion_outputs() - {"manifest.json"}
-        for name in sorted(output_names):
-            target = destination / name
-            os.replace(temporary / name, target)
-            published.append(target)
-        target = destination / "manifest.json"
-        os.replace(temporary / "manifest.json", target)
-        published.append(target)
-    except Exception:
-        for path in reversed(published):
+        assert_owned_directory(
+            stage, stage_fd, stage_identity, "promotion stage directory"
+        )
+
+        final_provenance = discover_tokenizer_provenance(ds4)
+        if final_provenance["head"] != tokenizer_runtime_commit:
+            fail("tokenizer repository HEAD changed during promotion")
+
+        assert_owned_directory(
+            lock_path, lock_fd, lock_identity, "promotion lock"
+        )
+        assert_owned_directory(
+            destination,
+            destination_fd,
+            destination_identity,
+            "promotion destination",
+        )
+        revalidate_existing_prompts(
+            destination,
+            destination_fd,
+            destination_identity,
+            expected_prompts,
+            existing_prompts,
+        )
+        assert_owned_directory(
+            lock_path, lock_fd, lock_identity, "promotion lock"
+        )
+
+        link_names = [
+            name for name in sorted(expected_prompts) if name not in existing_prompts
+        ]
+        link_names.extend(sorted(PROMOTED_VECTOR_FILES))
+        link_names.extend(["yarn-8193.continuation.i32", "manifest.json"])
+        for name in link_names:
+            # Both sibling resources must still be the inodes captured by this
+            # invocation immediately before every no-clobber link.
+            assert_owned_directory(lock_path, lock_fd, lock_identity, "promotion lock")
+            assert_owned_directory(
+                destination,
+                destination_fd,
+                destination_identity,
+                "promotion destination",
+            )
+            assert_owned_directory(
+                stage, stage_fd, stage_identity, "promotion stage directory"
+            )
+            if name == "manifest.json":
+                # Recheck every pre-existing prompt after all prior links and
+                # immediately before exposing the manifest.
+                revalidate_existing_prompts(
+                    destination,
+                    destination_fd,
+                    destination_identity,
+                    expected_prompts,
+                    existing_prompts,
+                )
+                revalidate_fixed_inputs(
+                    destination,
+                    destination_fd,
+                    destination_identity,
+                    final_inputs,
+                )
+                assert_owned_directory(lock_path, lock_fd, lock_identity, "promotion lock")
+                assert_owned_directory(
+                    destination,
+                    destination_fd,
+                    destination_identity,
+                    "promotion destination",
+                )
+                assert_owned_directory(
+                    stage, stage_fd, stage_identity, "promotion stage directory"
+                )
+            expected_identity = owned_stage_entries.get(name)
+            if expected_identity is None:
+                fail(f"staged output ownership is missing: {name}")
+            if stage_entry_identity(stage_fd, name) != expected_identity:
+                fail(f"staged output inode changed before publication: {name}")
             try:
-                path.unlink()
-            except OSError:
-                pass
+                os.link(
+                    name,
+                    name,
+                    src_dir_fd=stage_fd,
+                    dst_dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                # A wrapper or filesystem may report an error after creating
+                # the link.  Record it only if the destination names our
+                # staged inode; never claim an external inode as ours.
+                try:
+                    current = os.stat(
+                        name, dir_fd=destination_fd, follow_symlinks=False
+                    )
+                except OSError:
+                    current = None
+                if current is not None and (
+                    stat.S_ISREG(current.st_mode)
+                    and current.st_dev == expected_identity[0]
+                    and current.st_ino == expected_identity[1]
+                ):
+                    published.append((name, *expected_identity))
+                fail(f"publication link failed for {name}: {exc}")
+            try:
+                destination_stat = os.stat(
+                    name, dir_fd=destination_fd, follow_symlinks=False
+                )
+            except OSError as exc:
+                fail(f"publication link cannot inspect destination {name}: {exc}")
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or destination_stat.st_dev != expected_identity[0]
+                or destination_stat.st_ino != expected_identity[1]
+            ):
+                # If the source inode changed during os.link, the destination
+                # link was still created by this invocation.  Record only that
+                # actual destination inode so cleanup removes our link while
+                # preserving the externally supplied source replacement.
+                try:
+                    source_after_identity = stage_entry_identity(stage_fd, name)
+                except ContractError:
+                    source_after_identity = expected_identity
+                if source_after_identity != expected_identity and stat.S_ISREG(
+                    destination_stat.st_mode
+                ):
+                    published.append(
+                        (name, destination_stat.st_dev, destination_stat.st_ino)
+                    )
+                fail(f"publication link destination inode differs from staged inode for {name}")
+            published.append((name, *expected_identity))
+    except BaseException:
+        unlink_owned_links(published, destination_fd, destination)
         raise
     finally:
-        shutil.rmtree(temporary, ignore_errors=True)
+        cleanup_stage(stage, stage_fd, stage_identity, owned_stage_entries)
+        stage_fd = None
+        remove_owned_directory(lock_path, lock_fd, lock_identity)
+        lock_fd = None
+        if destination_fd is not None:
+            try:
+                os.close(destination_fd)
+            except OSError:
+                pass
+        try:
+            os.close(requested_destination_fd)
+        except OSError:
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify-promoted", type=Path)
-    parser.add_argument("--dwarfstar-commit")
+    parser.add_argument("--contract-commit")
+    parser.add_argument("--tokenizer-runtime-commit")
     parser.add_argument("--llama-commit")
+    parser.add_argument("--capture-manifest-sha256")
     parser.add_argument("--gguf-size", type=int)
     parser.add_argument("--gguf-sha256")
     parser.add_argument("--ds4", type=Path)
-    parser.add_argument("--metal", type=Path)
     parser.add_argument("--llama", type=Path)
     parser.add_argument("--promote", type=Path)
     return parser
@@ -1103,29 +1842,38 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     verify_mode = args.verify_promoted is not None
-    verify_values = (args.dwarfstar_commit, args.llama_commit, args.gguf_size, args.gguf_sha256)
-    promote_values = (args.ds4, args.metal, args.llama, args.promote)
+    verify_values = (
+        args.contract_commit,
+        args.tokenizer_runtime_commit,
+        args.llama_commit,
+        args.capture_manifest_sha256,
+        args.gguf_size,
+        args.gguf_sha256,
+    )
+    promote_values = (args.ds4, args.llama, args.promote)
     try:
         if verify_mode:
             if not all(value is not None for value in verify_values) or any(
                 value is not None for value in promote_values
             ):
-                fail("verify mode requires all identity arguments and no promotion arguments")
+                fail("verification mode requires the seven v2 identity arguments only")
             verify_promoted(
                 args.verify_promoted,
-                args.dwarfstar_commit,
+                args.contract_commit,
+                args.tokenizer_runtime_commit,
                 args.llama_commit,
+                args.capture_manifest_sha256,
                 args.gguf_size,
                 args.gguf_sha256,
             )
-            print(f"verified={args.verify_promoted} cases=4 vectors=8")
+            print(f"verified={args.verify_promoted} cases=4 vectors=4 oracle=poolside")
             return 0
         if not all(value is not None for value in promote_values) or any(
             value is not None for value in verify_values
         ):
-            fail("promotion mode requires --ds4, --metal, --llama, and --promote only")
-        promote(args.ds4, args.metal, args.llama, args.promote)
-        print(f"promoted={args.promote} cases=4 vectors=8")
+            fail("promotion mode requires --ds4, --llama, and --promote only")
+        promote(args.ds4, args.llama, args.promote)
+        print(f"promoted={args.promote} cases=4 vectors=4 oracle=poolside")
         return 0
     except ContractError as exc:
         mode = "verification" if verify_mode else "promotion"

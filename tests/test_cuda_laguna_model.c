@@ -88,6 +88,45 @@ static void laguna_policy_set_ssd_streaming(ds4_engine_options *options) {
     options->ssd_streaming = true;
 }
 
+static void laguna_policy_set_ssd_streaming_cold(ds4_engine_options *options) {
+    options->ssd_streaming_cold = true;
+}
+
+static void laguna_policy_set_ssd_cache_experts(ds4_engine_options *options) {
+    options->ssd_streaming_cache_experts = 2u;
+}
+
+static void laguna_policy_set_ssd_cache_bytes(ds4_engine_options *options) {
+    options->ssd_streaming_cache_bytes = UINT64_C(4096);
+}
+
+static void laguna_policy_set_ssd_full_layers(ds4_engine_options *options) {
+    options->ssd_streaming_full_layers = 2u;
+}
+
+static void laguna_policy_set_ssd_full_layers_set(ds4_engine_options *options) {
+    options->ssd_streaming_full_layers_set = true;
+}
+
+static void laguna_policy_set_ssd_preload_experts(ds4_engine_options *options) {
+    options->ssd_streaming_preload_experts = 2u;
+}
+
+static void laguna_policy_set_ssd_and_topology(ds4_engine_options *options) {
+    options->ssd_streaming = true;
+    options->tp.glm_token_prefill = true;
+}
+
+static void laguna_policy_set_ssd_and_advanced(ds4_engine_options *options) {
+    options->ssd_streaming = true;
+    options->dspark = true;
+}
+
+static void laguna_policy_set_topology_and_advanced(ds4_engine_options *options) {
+    options->tp.glm_token_prefill = true;
+    options->dspark = true;
+}
+
 static void laguna_policy_set_distributed_coordinator(ds4_engine_options *options) {
     options->distributed.role = DS4_DISTRIBUTED_COORDINATOR;
 }
@@ -124,12 +163,24 @@ static void laguna_policy_set_dspark(ds4_engine_options *options) {
     options->dspark = true;
 }
 
+static void laguna_policy_set_dspark_strict(ds4_engine_options *options) {
+    options->dspark_strict = true;
+}
+
+static void laguna_policy_set_dspark_confidence_threshold(ds4_engine_options *options) {
+    options->dspark_confidence_threshold_set = true;
+}
+
 static void laguna_policy_set_glm_mtp(ds4_engine_options *options) {
     options->glm_mtp = true;
 }
 
 static void laguna_policy_set_first_token_test(ds4_engine_options *options) {
     options->first_token_test = true;
+}
+
+static void laguna_policy_set_tp_glm_token_prefill(ds4_engine_options *options) {
+    options->tp.glm_token_prefill = true;
 }
 
 static void laguna_policy_set_tp_requested(ds4_engine_options *options) {
@@ -152,6 +203,11 @@ static bool run_laguna_admission_policy(void) {
         },
         {
             "native legacy CUDA", true, DS4_BACKEND_CUDA, false, NULL,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_LEGACY_LAYOUT,
+        },
+        {
+            "legacy layout before SSD", true, DS4_BACKEND_CUDA, false,
+            laguna_policy_set_ssd_streaming,
             false, false, 100, DS4_TEST_LAGUNA_SUPPORT_LEGACY_LAYOUT,
         },
         {
@@ -180,6 +236,46 @@ static bool run_laguna_admission_policy(void) {
             false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
         },
         {
+            "ssd_streaming_cold", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_streaming_cold,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "ssd_streaming_cache_experts", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_cache_experts,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "ssd_streaming_cache_bytes", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_cache_bytes,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "ssd_streaming_full_layers", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_full_layers,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "ssd_streaming_full_layers_set", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_full_layers_set,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "ssd_streaming_preload_experts", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_preload_experts,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "SSD before topology", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_and_topology,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
+            "SSD before advanced", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_ssd_and_advanced,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_SSD,
+        },
+        {
             "effective load_slice", true, DS4_BACKEND_CUDA, true, NULL,
             true, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
         },
@@ -191,6 +287,16 @@ static bool run_laguna_admission_policy(void) {
         {
             "TP leader role", true, DS4_BACKEND_CUDA, true,
             laguna_policy_set_tp_leader,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "tp.glm_token_prefill", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_tp_glm_token_prefill,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
+        },
+        {
+            "topology before advanced", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_topology_and_advanced,
             false, false, 100, DS4_TEST_LAGUNA_SUPPORT_TOPOLOGY,
         },
         {
@@ -236,6 +342,16 @@ static bool run_laguna_admission_policy(void) {
             false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
         },
         {
+            "dspark_strict", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_dspark_strict,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
+            "dspark_confidence_threshold_set", true, DS4_BACKEND_CUDA, true,
+            laguna_policy_set_dspark_confidence_threshold,
+            false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
+        },
+        {
             "glm_mtp", true, DS4_BACKEND_CUDA, true, laguna_policy_set_glm_mtp,
             false, false, 100, DS4_TEST_LAGUNA_SUPPORT_ADVANCED,
         },
@@ -261,9 +377,9 @@ static bool run_laguna_admission_policy(void) {
         },
     };
     const size_t row_count = sizeof(rows) / sizeof(rows[0]);
-    if (row_count != 25u) {
+    if (row_count != 38u) {
         fprintf(stderr,
-                "FAIL: Laguna admission policy row count=%zu expected=25\n",
+                "FAIL: Laguna admission policy row count=%zu expected=38\n",
                 row_count);
         return false;
     }
@@ -1079,6 +1195,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: open pinned Laguna model on explicit CUDA backend\n");
         return 1;
     }
+    ds4_tokens head_test_prompt = {0};
+    ds4_tokens_push(&head_test_prompt, 0);
+    if (ds4_engine_head_test(engine, &head_test_prompt) == 0) {
+        fprintf(stderr, "FAIL: Laguna head test unexpectedly accepted\n");
+        ds4_tokens_free(&head_test_prompt);
+        ds4_engine_close(engine);
+        free_fixtures(&fixtures);
+        return 1;
+    }
+    ds4_tokens_free(&head_test_prompt);
     if (ds4_engine_vocab_size(engine) != LAGUNA_VOCAB) {
         fprintf(stderr, "FAIL: Laguna vocabulary=%d expected=%d\n",
                 ds4_engine_vocab_size(engine), LAGUNA_VOCAB);

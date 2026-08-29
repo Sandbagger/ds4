@@ -47414,7 +47414,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     }
 
     fprintf(stderr,
-            "ds4: Laguna Metal graph: ctx=%u, prefill=%u, KV %.2f GiB, scratch %.2f MiB\n",
+            "ds4: Laguna graph: ctx=%u, prefill=%u, KV %.2f GiB, scratch %.2f MiB\n",
             ctx_size,
             g->prefill_cap,
             (double)g->kv_bytes / 1073741824.0,
@@ -47422,7 +47422,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     return true;
 
 fail:
-    fprintf(stderr, "ds4: failed to allocate Laguna Metal graph\n");
+    fprintf(stderr, "ds4: failed to allocate Laguna graph\n");
     laguna_graph_free(g);
     return false;
 }
@@ -48259,7 +48259,7 @@ static bool laguna_graph_forward_batch(
     return ok;
 }
 
-static int generate_laguna_metal_argmax(
+static int generate_laguna_argmax(
         const ds4_model   *model,
         const ds4_vocab   *vocab,
         const ds4_weights *weights,
@@ -48399,7 +48399,7 @@ static int generate_metal_graph_raw_swa(
                                          progress_ud);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        return generate_laguna_metal_argmax(model,
+        return generate_laguna_argmax(model,
                                             vocab,
                                             weights,
                                             prompt,
@@ -49327,6 +49327,77 @@ static bool ds4_native_cuda_build(void) {
 #else
     return false;
 #endif
+}
+
+typedef enum {
+    LAGUNA_SUPPORT_ACCEPT = 0,
+    LAGUNA_SUPPORT_BACKEND = 1,
+    LAGUNA_SUPPORT_LEGACY_LAYOUT = 2,
+    LAGUNA_SUPPORT_SSD = 3,
+    LAGUNA_SUPPORT_TOPOLOGY = 4,
+    LAGUNA_SUPPORT_ADVANCED = 5,
+} laguna_support_reason_code;
+
+/* Keep Laguna admission in one policy predicate.  The test hook below calls
+ * this same production decision with explicit build/layout inputs so policy
+ * tests cannot drift from engine startup. */
+static laguna_support_reason_code laguna_support_reason(
+        bool native_cuda_build,
+        ds4_backend backend,
+        bool revised_layout,
+        const ds4_engine_options *options,
+        bool effective_load_slice,
+        bool gpu_cfg_present,
+        int effective_power_percent) {
+    if (!options) return LAGUNA_SUPPORT_BACKEND;
+
+    if (backend == DS4_BACKEND_METAL) {
+        /* Metal supports both Laguna tensor recipes. */
+    } else if (backend == DS4_BACKEND_CUDA) {
+        if (!native_cuda_build) return LAGUNA_SUPPORT_BACKEND;
+        if (!revised_layout) return LAGUNA_SUPPORT_LEGACY_LAYOUT;
+    } else {
+        return LAGUNA_SUPPORT_BACKEND;
+    }
+
+    if (options->ssd_streaming ||
+        options->ssd_streaming_cold ||
+        options->ssd_streaming_cache_experts != 0 ||
+        options->ssd_streaming_cache_bytes != 0 ||
+        options->ssd_streaming_full_layers != 0 ||
+        options->ssd_streaming_full_layers_set ||
+        options->ssd_streaming_preload_experts != 0) {
+        return LAGUNA_SUPPORT_SSD;
+    }
+
+    if (effective_load_slice ||
+        options->distributed.role != DS4_DISTRIBUTED_NONE ||
+        options->distributed.layers.set ||
+        options->tp.role != DS4_TP_NONE ||
+        options->tp.requested ||
+        options->tp.glm_token_prefill ||
+        options->cuda_tensor_parallel ||
+        gpu_cfg_present) {
+        return LAGUNA_SUPPORT_TOPOLOGY;
+    }
+
+    if ((options->directional_steering_file &&
+         options->directional_steering_file[0]) ||
+        options->directional_steering_attn != 0.0f ||
+        options->directional_steering_ffn != 0.0f ||
+        effective_power_percent < 100 ||
+        options->prefill_chunk != 0 ||
+        (options->mtp_path && options->mtp_path[0]) ||
+        options->dspark ||
+        options->dspark_strict ||
+        options->dspark_confidence_threshold_set ||
+        options->glm_mtp ||
+        options->glm_mtp_timing ||
+        options->first_token_test) {
+        return LAGUNA_SUPPORT_ADVANCED;
+    }
+
+    return LAGUNA_SUPPORT_ACCEPT;
 }
 
 static int ds4_session_sync_mode(const ds4_session *s, const ds4_tokens *prompt) {
@@ -55294,6 +55365,10 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
         fprintf(stderr, "ds4: head test requires a non-empty prompt\n");
         return 1;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: head test is not supported for Laguna\n");
+        return 1;
+    }
 
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
@@ -57369,6 +57444,24 @@ const int *ds4_test_engine_placement(const ds4_engine *e) {
 /* Model-independent policy hooks.  They deliberately use explicit build
  * inputs so the matrix can exercise native CUDA, CPU, and ROCm negatives from
  * one CPU-only test binary without changing production admission. */
+ds4_test_laguna_support_category ds4_test_laguna_support_reason(
+        bool native_cuda_build,
+        ds4_backend backend,
+        bool revised_layout,
+        const ds4_engine_options *options,
+        bool load_slice,
+        bool gpu_cfg_present,
+        int effective_power_percent) {
+    return (ds4_test_laguna_support_category)laguna_support_reason(
+            native_cuda_build,
+            backend,
+            revised_layout,
+            options,
+            load_slice,
+            gpu_cfg_present,
+            effective_power_percent);
+}
+
 int ds4_test_logits_only_sync_mode(
         bool native_cuda_build,
         bool laguna, ds4_backend backend,
@@ -57644,41 +57737,60 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
-        if (e->backend != DS4_BACKEND_METAL) {
-            fprintf(stderr,
-                    "ds4: Laguna S 2.1 inference currently requires --metal\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (e->ssd_streaming) {
-            fprintf(stderr,
-                    "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
-            opt->tp.role != DS4_TP_NONE || gpu_cfg) {
-            fprintf(stderr,
-                    "ds4: Laguna S 2.1 does not yet support layer slicing, "
-                    "distributed inference, tensor parallelism, or multi-GPU placement\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if ((opt->directional_steering_file &&
-             opt->directional_steering_file[0]) ||
-            opt->directional_steering_attn != 0.0f ||
-            opt->directional_steering_ffn != 0.0f ||
-            e->power_percent < 100 ||
-            opt->prefill_chunk != 0 ||
-            (opt->mtp_path && opt->mtp_path[0]) ||
-            opt->dspark || opt->glm_mtp || opt->first_token_test) {
-            fprintf(stderr,
-                    "ds4: Laguna S 2.1 currently supports the standard Metal "
-                    "generation path only (no steering, power cap, custom "
-                    "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
+
+        /* weights_bind() has already validated the selected Laguna layout.  A
+         * sliced view may use an attention marker, but only a full model's
+         * token embedding is allowed to signal the revised CUDA recipe. */
+        const bool revised_layout =
+            e->weights.token_embd &&
+            e->weights.token_embd->type == DS4_TENSOR_Q8_0;
+        const laguna_support_reason_code support_reason =
+            laguna_support_reason(ds4_native_cuda_build(),
+                                  e->backend,
+                                  revised_layout,
+                                  opt,
+                                  load_slice,
+                                  gpu_cfg != NULL,
+                                  e->power_percent);
+        if (support_reason != LAGUNA_SUPPORT_ACCEPT) {
+            switch (support_reason) {
+            case LAGUNA_SUPPORT_BACKEND:
+                fprintf(stderr,
+                        "ds4: Laguna S 2.1 inference requires --metal or "
+                        "native Linux CUDA\n");
+                break;
+            case LAGUNA_SUPPORT_LEGACY_LAYOUT:
+                fprintf(stderr,
+                        "ds4: Laguna S 2.1 CUDA requires the revised Q8_0 "
+                        "signal/Q4_K routed layout; legacy F16/Q6 layout is "
+                        "unsupported\n");
+                break;
+            case LAGUNA_SUPPORT_SSD:
+                fprintf(stderr,
+                        "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
+                break;
+            case LAGUNA_SUPPORT_TOPOLOGY:
+                fprintf(stderr,
+                        "ds4: Laguna S 2.1 does not yet support layer slicing, "
+                        "distributed inference, tensor parallelism, or multi-GPU placement\n");
+                break;
+            case LAGUNA_SUPPORT_ADVANCED:
+                fprintf(stderr,
+                        "ds4: Laguna S 2.1 currently supports the standard "
+                        "single-GPU generation path only (no steering, power "
+                        "cap, custom prefill chunk, MTP/DSpark, or first-token "
+                        "diagnostic)\n");
+                break;
+            case LAGUNA_SUPPORT_ACCEPT:
+                break;
+            default:
+                /* The predicate is private and exhaustive; keep startup fail
+                 * closed if a future enum value is introduced without an
+                 * accompanying error mapping. */
+                fprintf(stderr,
+                        "ds4: Laguna S 2.1 admission policy rejected startup\n");
+                break;
+            }
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -58834,7 +58946,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
             fprintf(stderr,
-                    "ds4: %s sessions currently require the Metal graph backend\n",
+                    "ds4: %s sessions currently require the graph backend\n",
                     DS4_MODEL_SHAPE_NAME);
             return 1;
         }
@@ -61996,7 +62108,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         if ((uint32_t)s->checkpoint.len >= s->laguna_graph.ctx_size) {
             if (errlen) snprintf(err, errlen,
-                                 "Laguna Metal context reached (%u)",
+                                 "Laguna context reached (%u)",
                                  s->laguna_graph.ctx_size);
             return 1;
         }
@@ -62733,6 +62845,7 @@ static bool ds4_sessions_eval_batch_with_prefill_metal_supported(
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         ds4_session_is_cpu(prefill_session) ||
         ds4_session_is_glm(prefill_session) ||
+        ds4_session_is_laguna(prefill_session) ||
         prefill_session->distributed ||
         prefill_session->graph.ssd_streaming ||
         ds4_session_cancelled(prefill_session) ||
@@ -66235,6 +66348,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * while preserving the exact one-token kernels and per-session KV order. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_session_is_laguna(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
@@ -66383,6 +66497,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         native_requested &&
         e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(prefill_session) &&
+        !ds4_session_is_laguna(prefill_session) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prefill_prompt, start, prefill_rows,

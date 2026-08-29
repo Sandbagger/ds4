@@ -80,21 +80,56 @@ To inspect a local top-logprob dump manually:
 
 ## Laguna S 2.1 resident-CUDA oracle
 
-`laguna-resident/` defines a fail-closed, two-oracle model-parity contract for
-`poolside/Laguna-S-2.1-GGUF`. The admitted artifact is
-`laguna-s-2.1-Q4_K_M.gguf` at revision
-`706fa69799926b6afde1af9e24ca2a4923f110a1`, exactly `68248759648` bytes,
-with SHA-256
-`e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`.
-The independent Poolside reference is pinned to llama.cpp commit
-`04b2b72cb54048ead292884adbe11f284e3ec950`.
+`laguna-resident/` is a fail-closed full-model parity contract for
+`poolside/Laguna-S-2.1-GGUF` under the single-oracle policy
+`single-poolside-v1`. The pinned Poolside `llama.cpp` runtime supplies the
+expected final logits. There are exactly four promoted Poolside vectors:
+`short`, `swa-513`, `yarn-8193`, and `deep-32768`. The fixture also contains
+one eight-ID, teacher-forced continuation for `yarn-8193`.
 
-The checked-in inputs are `cases.json`, `short.txt`, the deterministic prompt
-generator, and its generated `benchmark-32768.txt` seed. Regenerate the seed
-and confirm the output before any capture. Their SHA-256 values are
+This is intentionally one full-model oracle. The scalar CUDA references in
+`tests/test_cuda_laguna_kernels.c` independently check RMSNorm/RoPE,
+attention, KV-ring, and routed-MoE primitives. The serialized-versus-batched
+and serialized-versus-mixed session checks in
+`tests/test_cuda_laguna_model.c` provide metamorphic assurance for scheduling
+and session isolation. Those scalar and metamorphic checks are complementary
+assurance layers, not a second full-model oracle.
+
+### Honest limitation and immutable pins
+
+The contract does not detect a model-level error shared by Poolside's runtime
+and the captured GGUF conversion. A genuinely independent runtime requires a
+new manifest schema and oracle policy; these vectors must not be reinterpreted
+as dual-runtime evidence.
+
+The capture, model, runtime, and contract identities are fixed:
+
+- Poolside capture directory:
+  `/home/will/artifacts/ds4/laguna-resident/a250e43/poolside-04b2b72`.
+- `capture.json` SHA-256 trust anchor:
+  `cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e`.
+- Model repository: `poolside/Laguna-S-2.1-GGUF`.
+- Model revision: `706fa69799926b6afde1af9e24ca2a4923f110a1`.
+- Model filename: `laguna-s-2.1-Q4_K_M.gguf`.
+- Model size: `68248759648` bytes.
+- Model SHA-256:
+  `e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a`.
+- Poolside `llama.cpp` runtime commit:
+  `04b2b72cb54048ead292884adbe11f284e3ec950`.
+- Immutable Laguna contract checkpoint:
+  `a250e43722945e293f6044bc7254c4806d5a7912`.
+- Tokenizer runtime commit captured by the immutable promoted manifest:
+  `78bac71d711aab39fbbce6afdcd5f710622aed26`.
+  Pass this exact value as `LAGUNA_TOKENIZER_RUNTIME_COMMIT`; do not substitute
+  a later branch `HEAD`. The verifier rejects any mismatch.
+
+The fixed source inputs are `cases.json`, `short.txt`,
+`generate_benchmark_prompt.py`, and `benchmark-32768.txt`, plus the three
+materialized raw prompts. The generator and benchmark SHA-256 values are
 `118f1223ad248f845acd0dcb69444f911a3a6843d548db866a73a1106d7c5e3d` and
 `aa352ad2890413cf112abc10d7349db3ef4be4c3722e2276f943e7b413a59206`,
-respectively:
+respectively. Regenerate and confirm only the deterministic seed before a
+separately authorized capture:
 
 ```sh
 python3 tests/test-vectors/laguna-resident/generate_benchmark_prompt.py \
@@ -103,57 +138,80 @@ sha256sum tests/test-vectors/laguna-resident/generate_benchmark_prompt.py \
   tests/test-vectors/laguna-resident/benchmark-32768.txt
 ```
 
-Build the pinned Poolside capture helper and materialize the exact 513, 8193,
-and 32768-token raw prompts from the shared seed:
+Each promoted vector is exactly 100,352 little-endian float32 values
+(`401408` bytes). The continuation is exactly eight little-endian signed
+int32 IDs (`32` bytes). No Metal vector is part of this fixture.
+
+### Promotion and verification
+
+The pinned Poolside capture is already validated at the path above. Do not
+perform an ordinary recapture. Re-capture is allowed only when the pinned
+capture fails provenance validation or the operator explicitly changes the
+model or runtime pins. The Laguna contract has no legacy Metal full-model
+capture or verification CLI; use the Poolside commands below.
+
+Promotion from the pinned capture uses the exact command and publishes the
+four vectors, one continuation, three materialized prompts, and manifest:
 
 ```sh
-make -C gguf-tools quality-laguna-logits \
-  LLAMA_CPP_DIR="$LLAMA_LAGUNA_DIR" \
-  LLAMA_CPP_BUILD="$LLAMA_LAGUNA_DIR/build"
-gguf-tools/quality-testing/dump_llama_logits \
-  --model "$LAGUNA_MODEL" \
-  --cases tests/test-vectors/laguna-resident/cases.json \
-  --seed-prompt tests/test-vectors/laguna-resident/benchmark-32768.txt \
-  --materialize-prompts tests/test-vectors/laguna-resident \
-  --out "$LAGUNA_LLAMA_OUT"
-```
-
-Capture the same four frontiers and eight teacher-forced continuation rows
-with DwarfStar Metal into `$LAGUNA_METAL_OUT`, then promote only when the two
-tokenizations, argmaxes, continuations, and fixed numeric gates agree:
-
-```sh
+LAGUNA_MODEL="$LAGUNA_MODEL" \
 python3 gguf-tools/quality-testing/compare_laguna_logits.py \
   --ds4 ./ds4 \
-  --metal "$LAGUNA_METAL_OUT" \
-  --llama "$LAGUNA_LLAMA_OUT" \
+  --llama /home/will/artifacts/ds4/laguna-resident/a250e43/poolside-04b2b72 \
   --promote tests/test-vectors/laguna-resident
 ```
 
-Promotion writes one Metal and one Poolside little-endian float32 vector for
-each of `short`, `swa-513`, `yarn-8193`, and `deep-32768`, plus the eight-ID
-little-endian continuation and `manifest.json`. It requires centered RMS
-`<= 0.02`, centered maximum absolute error `<= 0.10`, top-20 overlap `>= 18`,
-and exact argmax and continuation agreement. Materialized prompts and promoted
-vectors are intentionally absent until both independent captures pass.
+Expected output is exactly:
+`promoted=tests/test-vectors/laguna-resident cases=4 vectors=4 oracle=poolside`.
+Promotion is no-clobber and records the clean tokenizer runtime commit; do
+not use a synthetic checkout.
 
-Task 6 admission must run the non-mutating verifier with all runtime and GGUF
-pins supplied explicitly:
+Run the non-mutating verifier separately with every identity pin:
 
 ```sh
 python3 gguf-tools/quality-testing/compare_laguna_logits.py \
   --verify-promoted tests/test-vectors/laguna-resident \
-  --dwarfstar-commit "$LAGUNA_CONTRACT_COMMIT" \
+  --contract-commit a250e43722945e293f6044bc7254c4806d5a7912 \
+  --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
   --llama-commit 04b2b72cb54048ead292884adbe11f284e3ec950 \
+  --capture-manifest-sha256 cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e \
   --gguf-size 68248759648 \
   --gguf-sha256 e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
 ```
 
-Verification rejects missing or extra files, bad sizes or hashes, stale pins,
-token disagreement, or widened gates without modifying the fixture tree. The
-model-backed CUDA target is deliberately excluded from ordinary `make test`;
-run it explicitly with the verified local model:
+Expected output is exactly:
+`verified=tests/test-vectors/laguna-resident cases=4 vectors=4 oracle=poolside`.
+Verification rejects missing or extra files, stale provenance, bad sizes or
+hashes, token disagreement, and widened thresholds without modifying the
+fixture tree.
+
+### Ordered resident-CUDA admission gate
+
+The aggregate target requires the tokenizer runtime pin, verifies the fixture
+first, then runs the independent scalar CUDA suite with the graph override
+unset, and finally runs the model-backed session contract:
 
 ```sh
-DS4_TEST_MODEL="$LAGUNA_MODEL" make test-cuda-laguna-model
+LAGUNA_TOKENIZER_RUNTIME_COMMIT=78bac71d711aab39fbbce6afdcd5f710622aed26 \
+DS4_TEST_MODEL="$LAGUNA_MODEL" \
+make test-cuda-laguna-resident
 ```
+
+Its ordered commands are equivalent to:
+
+```sh
+python3 gguf-tools/quality-testing/compare_laguna_logits.py \
+  --verify-promoted tests/test-vectors/laguna-resident \
+  --contract-commit a250e43722945e293f6044bc7254c4806d5a7912 \
+  --tokenizer-runtime-commit "$LAGUNA_TOKENIZER_RUNTIME_COMMIT" \
+  --llama-commit 04b2b72cb54048ead292884adbe11f284e3ec950 \
+  --capture-manifest-sha256 cc4fb338556c0895ff985edb5435ae7801be7dcb98c2958dc96a56d34f2c848e \
+  --gguf-size 68248759648 \
+  --gguf-sha256 e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a
+env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
+DS4_TEST_MODEL="$DS4_TEST_MODEL" ./tests/test_cuda_laguna_model
+```
+
+Until resident CUDA engine admission lands, the model binary may stop only at
+the existing Laguna engine-admission gate after the verifier and scalar suite
+pass. No earlier fixture or policy failure is expected.

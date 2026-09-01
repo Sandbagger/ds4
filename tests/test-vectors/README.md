@@ -168,8 +168,12 @@ python3 gguf-tools/quality-testing/compare_laguna_logits.py \
 
 The aggregate target preserves the required gate order: promoted-fixture
 verification, unchanged scalar CUDA kernel tests, then the model-backed CUDA
-contract. It is deliberately excluded from ordinary `make test`. Run it with
-the verified local model:
+contract. The Q8 kernel stage contains both the pinned Poolside
+22-token-by-3072-by-128 projection and an independent 22-token-by-3072-by-73
+partial-row reference. The model harness also proves that Laguna rejects the
+DeepSeek-specific head diagnostic before incompatible model math. The target is
+deliberately excluded from ordinary `make test`. Run it with the verified local
+model:
 
 ```sh
 export LAGUNA_TOKENIZER_RUNTIME_COMMIT="$(

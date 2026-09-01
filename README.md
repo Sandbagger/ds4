@@ -175,12 +175,20 @@ file are not supported for GLM yet.
 
 Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
 The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
-weights. DwarfStar also accepts Poolside's earlier 70.01 GiB recipe with F16
-attention and mixed Q4_K/Q6_K experts. Laguna runs on Metal or one-device CUDA
-with full model residency. SSD streaming, distributed inference, tensor
-parallelism, multi-GPU placement, ROCm, and the DFlash draft model are rejected
-explicitly. CLI, agent, and server use Laguna's native chat, interleaved
-reasoning, and tagged tool-call formats:
+weights. Metal also accepts Poolside's earlier 70.01 GiB recipe with F16
+attention and mixed Q4_K/Q6_K experts. Native CUDA admits only the current
+Q8_0/Q4_K recipe; it rejects the legacy layout because its F16 and Q6_K Laguna
+kernels are incomplete. Both supported backends use full model residency. SSD
+streaming, distributed inference, tensor parallelism, multi-GPU placement,
+ROCm, and the DFlash draft model are rejected explicitly.
+
+On DGX Spark GB10 (`sm_121`), Q8_0 prefill deliberately bypasses the MMA path
+because it did not match the pinned Poolside oracle. The correctness-safe exact
+fallback remains enabled. On other CUDA targets, Q8 MMA still fails closed
+unless both the loaded binary and PTX target are at least 8.0. The head
+diagnostic is DeepSeek-specific and is also rejected for Laguna. CLI, agent,
+and server
+use Laguna's native chat, interleaved reasoning, and tagged tool-call formats:
 
 ```sh
 ./download_model.sh laguna-q4

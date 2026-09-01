@@ -178,9 +178,12 @@ The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
 weights. Metal also accepts Poolside's earlier 70.01 GiB recipe with F16
 attention and mixed Q4_K/Q6_K experts. Native CUDA admits only the current
 Q8_0/Q4_K recipe; it rejects the legacy layout because its F16 and Q6_K Laguna
-kernels are incomplete. Both supported backends use full model residency. SSD
-streaming, distributed inference, tensor parallelism, multi-GPU placement,
-ROCm, and the DFlash draft model are rejected explicitly.
+kernels are incomplete. Both supported backends use full model residency by
+default. Native CUDA also has a compact-runtime path when `--ssd-streaming` is
+paired with an exact `--ssd-streaming-cache-bytes` budget; the
+`test-cuda-laguna-streaming` gate covers that mode. SSD streaming without
+compact admission, distributed inference, tensor parallelism, multi-GPU
+placement, ROCm, and the DFlash draft model are rejected explicitly.
 
 On DGX Spark GB10 (`sm_121`), Q8_0 prefill deliberately bypasses the MMA path
 because it did not match the pinned Poolside oracle. The correctness-safe exact

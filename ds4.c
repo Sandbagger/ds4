@@ -57102,6 +57102,10 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
         fprintf(stderr, "ds4: head test requires a non-empty prompt\n");
         return 1;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: head test is not supported for Laguna\n");
+        return 1;
+    }
 
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;

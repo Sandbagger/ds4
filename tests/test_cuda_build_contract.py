@@ -4045,6 +4045,21 @@ class CudaBuildContractTest(unittest.TestCase):
         prerequisites = rule_prerequisites("tests/test_cuda_laguna_model").split()
         self.assertIn("ds4_qualification_control.o", prerequisites)
 
+    def test_q8_mma_requires_compatible_binary_and_ptx(self) -> None:
+        body = source_function_body(
+            CUDA_SOURCE,
+            "static int cuda_q8_mma_try_launch(",
+            "ds4_cuda.cu",
+        )
+        attributes = body.find("cudaFuncGetAttributes")
+        binary_guard = body.find("fn_attr.binaryVersion < 80")
+        ptx_guard = body.find("fn_attr.ptxVersion < 80")
+        disable = body.find("g_disable_cuda_q8_mma = 1")
+        self.assertGreaterEqual(attributes, 0)
+        self.assertGreater(binary_guard, attributes)
+        self.assertGreater(ptx_guard, attributes)
+        self.assertGreater(disable, max(binary_guard, ptx_guard))
+
     def test_request_counter_gate_enables_runtime_snapshots(self) -> None:
         body = source_function_body(
             LAGUNA_STREAM_TEST,

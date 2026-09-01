@@ -506,11 +506,11 @@ static void laguna_quantize_q8_0_reference(
             for (uint32_t i = 0; i < 32u; i++) {
                 max_abs = fmaxf(max_abs, fabsf(src[i]));
             }
-            const float scale = max_abs / 127.0f;
-            const float inv_scale = scale != 0.0f ? 1.0f / scale : 0.0f;
-            scales[(uint64_t)token * blocks + block] = scale;
+            const float id = max_abs != 0.0f ? 127.0f / max_abs : 0.0f;
+            const float d = id != 0.0f ? 1.0f / id : 0.0f;
+            scales[(uint64_t)token * blocks + block] = d;
             for (uint32_t i = 0; i < 32u; i++) {
-                long value = lrintf(src[i] * inv_scale);
+                int value = (int)roundf(src[i] * id);
                 if (value > 127) value = 127;
                 if (value < -128) value = -128;
                 quantized[((uint64_t)token * blocks + block) * 32u + i] = (int8_t)value;

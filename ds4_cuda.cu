@@ -10856,7 +10856,7 @@ static int cuda_q8_mma_try_launch(
         if (!cuda_q8_mma_attr_ready[dev][ti]) { \
             cudaFuncAttributes fn_attr; \
             if (cudaFuncGetAttributes(&fn_attr, matmul_q8_0_mma_exact_kernel<TT>) != cudaSuccess || \
-                fn_attr.binaryVersion < 80) { \
+                fn_attr.binaryVersion < 80 || fn_attr.ptxVersion < 80) { \
                 disabled = 1; \
                 return 0; \
             } \

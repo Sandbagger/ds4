@@ -4054,7 +4054,7 @@ class CudaBuildContractTest(unittest.TestCase):
         attributes = body.find("cudaFuncGetAttributes")
         binary_guard = body.find("fn_attr.binaryVersion < 80")
         ptx_guard = body.find("fn_attr.ptxVersion < 80")
-        disable = body.find("g_disable_cuda_q8_mma = 1")
+        disable = body.find("disabled = 1;", attributes)
         self.assertGreaterEqual(attributes, 0)
         self.assertGreater(binary_guard, attributes)
         self.assertGreater(ptx_guard, attributes)

@@ -4060,6 +4060,25 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertGreater(ptx_guard, attributes)
         self.assertGreater(disable, max(binary_guard, ptx_guard))
 
+    def test_laguna_head_test_rejects_before_deepseek_math(self) -> None:
+        body = source_function_body(
+            DS4_SOURCE,
+            "int ds4_engine_head_test(",
+            "ds4.c",
+        )
+        prompt_guard = body.find("head test requires a non-empty prompt")
+        family_guard = body.find(
+            "DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA"
+        )
+        model_math = body.find("const ds4_model *model = &e->model;")
+        self.assertGreaterEqual(prompt_guard, 0)
+        self.assertGreater(family_guard, prompt_guard)
+        self.assertGreater(model_math, family_guard)
+        self.assertIn(
+            "ds4_engine_head_test(engine, &head_test_prompt)",
+            LAGUNA_MODEL_TEST,
+        )
+
     def test_request_counter_gate_enables_runtime_snapshots(self) -> None:
         body = source_function_body(
             LAGUNA_STREAM_TEST,

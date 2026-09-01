@@ -1633,6 +1633,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: open pinned Laguna model on explicit CUDA backend\n");
         return 1;
     }
+    ds4_tokens head_test_prompt = {0};
+    ds4_tokens_push(&head_test_prompt, 0);
+    if (ds4_engine_head_test(engine, &head_test_prompt) == 0) {
+        fprintf(stderr, "FAIL: Laguna head test unexpectedly accepted\n");
+        ds4_tokens_free(&head_test_prompt);
+        ds4_engine_close(engine);
+        free_fixtures(&fixtures);
+        return 1;
+    }
+    ds4_tokens_free(&head_test_prompt);
     if (ds4_engine_vocab_size(engine) != LAGUNA_VOCAB) {
         fprintf(stderr, "FAIL: Laguna vocabulary=%d expected=%d\n",
                 ds4_engine_vocab_size(engine), LAGUNA_VOCAB);

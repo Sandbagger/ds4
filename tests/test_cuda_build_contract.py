@@ -4060,6 +4060,24 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertGreater(ptx_guard, attributes)
         self.assertGreater(disable, max(binary_guard, ptx_guard))
 
+    def test_q8_prefill_fixture_mirrors_runtime_quantizer(self) -> None:
+        body = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static void laguna_quantize_q8_0_reference(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        reciprocal = body.find(
+            "const float id = max_abs != 0.0f ? 127.0f / max_abs : 0.0f;"
+        )
+        recovered_scale = body.find(
+            "const float d = id != 0.0f ? 1.0f / id : 0.0f;"
+        )
+        rounded = body.find("(int)roundf(src[i] * id)")
+        self.assertGreaterEqual(reciprocal, 0)
+        self.assertGreater(recovered_scale, reciprocal)
+        self.assertGreater(rounded, recovered_scale)
+        self.assertNotIn("lrintf", body)
+
     def test_laguna_head_test_rejects_before_deepseek_math(self) -> None:
         body = source_function_body(
             DS4_SOURCE,

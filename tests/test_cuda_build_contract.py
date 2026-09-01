@@ -4041,6 +4041,10 @@ class CudaBuildContractTest(unittest.TestCase):
         prerequisites = rule_prerequisites("tests/test_cuda_mixed_batch").split()
         self.assertIn("ds4_qualification_control.o", prerequisites)
 
+    def test_laguna_model_links_qualification_control_runtime(self) -> None:
+        prerequisites = rule_prerequisites("tests/test_cuda_laguna_model").split()
+        self.assertIn("ds4_qualification_control.o", prerequisites)
+
     def test_request_counter_gate_enables_runtime_snapshots(self) -> None:
         body = source_function_body(
             LAGUNA_STREAM_TEST,

@@ -1449,6 +1449,20 @@ static int run_decode_attention_case(
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
         heads, key_cache, value_cache, q, k, v, gate, c->pos, c->cache_cap,
         c->key_start, c->key_count, c->n_head, c->n_head_kv, head_dim, scale);
+    const uint64_t vector_physical_rows =
+        ((uint64_t)c->key_count + 255u) & ~(uint64_t)255u;
+    if (wrapper_ok && c->n_head == 48u && c->n_head_kv == 8u &&
+        vector_physical_rows >= 384u &&
+        (uint64_t)c->key_start + vector_physical_rows <= c->cache_cap) {
+        /* The vector wrapper deliberately makes its non-logical V tail finite
+         * before the unconditional padded load.  Future stores replace it. */
+        for (uint64_t row = (uint64_t)c->key_start + c->key_count;
+             row < (uint64_t)c->key_start + vector_physical_rows; row++) {
+            const uint64_t base = row * kv_width;
+            memset(value_expected + base, 0,
+                   (size_t)kv_width * sizeof(*value_expected));
+        }
+    }
     /* Each case submits one KV-store + decode-attention pipeline. */
     const cudaError_t sync = cudaDeviceSynchronize();
     if (sync != cudaSuccess) {

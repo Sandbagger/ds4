@@ -582,6 +582,7 @@ class CudaBuildContractTest(unittest.TestCase):
             '"gqa6-token513-gate100.f32", 0.0f, 0.0f',
             "memcmp(actual, reference, (size_t)q_count * sizeof(*actual))",
             "value_expected[base + i] = 0x7e00u;",
+            "memset(value_expected + base, 0,",
             "const float q_input_scale = 1.0f / 23.0f;",
             "ds4_gpu_laguna_store_attention_tensor(",
         ):
@@ -627,10 +628,18 @@ class CudaBuildContractTest(unittest.TestCase):
             "(uint64_t)key_start + physical_rows <= cache_cap",
             "if (cache_vec_aligned && vector_decode_shape &&",
             "const uint64_t cache_offset = (uint64_t)key_start * kv_values;",
+            "const uint64_t value_padding_values =",
+            "(physical_rows - key_count) * kv_values",
+            "cudaMemsetAsync(",
+            '"laguna vector value padding clear"',
             "laguna_attention_decode_gqa_f16_kernel<<<n_head, 384>>>",
             "laguna_attention_decode_gqa_f16_scalar_kernel<<<",
         ):
             self.assertIn(required, wrapper)
+        self.assertLess(
+            wrapper.index("cudaMemsetAsync("),
+            wrapper.index("laguna_attention_decode_gqa_f16_kernel<<<n_head, 384>>>")
+        )
         self.assertNotIn("if (n_head == 72u", wrapper)
         self.assertNotIn("cudaMalloc", wrapper)
         self.assertNotIn("cudaFree", wrapper)

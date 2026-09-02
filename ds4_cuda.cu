@@ -36692,12 +36692,30 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
             if (cache_vec_aligned && vector_decode_shape &&
                 vector_cache_contiguous) {
                 const uint64_t cache_offset = (uint64_t)key_start * kv_values;
-                laguna_attention_decode_gqa_f16_kernel<<<n_head, 384>>>(
-                        (float *)heads->ptr, (const float *)q->ptr,
-                        (const __half *)key_cache->ptr + cache_offset,
-                        (const __half *)value_cache->ptr + cache_offset,
-                        (const float *)gate->ptr, key_count,
-                        physical_rows, scale);
+                /* Device allocation leaves unused physical rows uninitialised.
+                 * The vector schedule still loads padded V rows.  A zero
+                 * probability times an F16 NaN would poison the accumulator.
+                 * Clear only that non-logical tail; later KV stores replace
+                 * it before use. */
+                const uint64_t value_padding_values =
+                    (physical_rows - key_count) * kv_values;
+                if (value_padding_values != 0u) {
+                    ok = cuda_ok(cudaMemsetAsync(
+                            (__half *)value_cache->ptr + cache_offset +
+                                (uint64_t)key_count * kv_values,
+                            0,
+                            (size_t)(value_padding_values * sizeof(__half)),
+                            0),
+                        "laguna vector value padding clear");
+                }
+                if (ok) {
+                    laguna_attention_decode_gqa_f16_kernel<<<n_head, 384>>>(
+                            (float *)heads->ptr, (const float *)q->ptr,
+                            (const __half *)key_cache->ptr + cache_offset,
+                            (const __half *)value_cache->ptr + cache_offset,
+                            (const float *)gate->ptr, key_count,
+                            physical_rows, scale);
+                }
             } else {
                 /* Valid tensor views can preserve __half alignment without
                  * the 16-byte alignment required by the vector V load. */
@@ -36708,7 +36726,10 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
                         (const float *)gate->ptr, key_start, key_count,
                         cache_cap, n_head, n_head_kv, head_dim, scale);
             }
-            ok = cuda_ok(cudaGetLastError(), "laguna decode attention launch");
+            if (ok) {
+                ok = cuda_ok(cudaGetLastError(),
+                             "laguna decode attention launch");
+            }
         }
     }
     return ok;

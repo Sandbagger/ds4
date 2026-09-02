@@ -1211,6 +1211,17 @@ static int run_decode_attention_case(
         key_expected[i] = reference_f32_to_f16(key_value);
         value_expected[i] = reference_f32_to_f16(value_value);
     }
+    if (frozen_name) {
+        /* Padded physical rows are outside the logical softmax.  Poison them
+         * with F16 NaNs so a zero probability cannot hide an invalid V read. */
+        for (uint32_t row = c->key_count; row < c->cache_cap; row++) {
+            const uint64_t base = (uint64_t)row * kv_width;
+            for (uint64_t i = 0; i < kv_width; i++) {
+                key_expected[base + i] = 0x7e00u;
+                value_expected[base + i] = 0x7e00u;
+            }
+        }
+    }
     memcpy(key_actual, key_expected, (size_t)cache_values * sizeof(*key_actual));
     memcpy(value_actual, value_expected,
            (size_t)cache_values * sizeof(*value_actual));

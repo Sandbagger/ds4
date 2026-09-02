@@ -581,6 +581,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "48u, 8u, 768u, 512u, 0u, 513u",
             '"gqa6-token513-gate100.f32", 0.0f, 0.0f',
             "memcmp(actual, reference, (size_t)q_count * sizeof(*actual))",
+            "value_expected[base + i] = 0x7e00u;",
             "const float q_input_scale = 1.0f / 23.0f;",
             "ds4_gpu_laguna_store_attention_tensor(",
         ):

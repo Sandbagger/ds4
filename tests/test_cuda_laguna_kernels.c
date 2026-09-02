@@ -1113,6 +1113,40 @@ static int laguna_read_decode_vec_frozen(
     return ok;
 }
 
+static int run_decode_attention_unaligned_cache_case(
+        const laguna_decode_attention_case *c, ds4_gpu_tensor *heads,
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, const uint16_t *key_initial,
+        const uint16_t *value_initial, uint64_t cache_bytes, float scale) {
+    ds4_gpu_tensor *key_storage = ds4_gpu_tensor_alloc(cache_bytes + 2u);
+    ds4_gpu_tensor *value_storage = ds4_gpu_tensor_alloc(cache_bytes + 2u);
+    ds4_gpu_tensor *key_cache = key_storage ?
+        ds4_gpu_tensor_view(key_storage, 2u, cache_bytes) : NULL;
+    ds4_gpu_tensor *value_cache = value_storage ?
+        ds4_gpu_tensor_view(value_storage, 2u, cache_bytes) : NULL;
+    int ok = key_cache && value_cache &&
+        ds4_gpu_tensor_write(key_cache, 0, key_initial, cache_bytes) &&
+        ds4_gpu_tensor_write(value_cache, 0, value_initial, cache_bytes);
+    if (ok) {
+        ok = ds4_gpu_laguna_store_attention_tensor(
+            heads, key_cache, value_cache, q, k, v, gate, c->pos,
+            c->cache_cap, c->key_start, c->key_count, c->n_head,
+            c->n_head_kv, 128u, scale);
+    }
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (!ok || sync != cudaSuccess) {
+        fprintf(stderr,
+                "decode-attention/%s: 2-byte-aligned cache fallback failed: %s\n",
+                c->family, cudaGetErrorString(sync));
+        ok = 0;
+    }
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(value_storage);
+    ds4_gpu_tensor_free(key_storage);
+    return ok;
+}
+
 static int run_decode_attention_case(
         const laguna_decode_attention_case *c, const char *frozen_name,
         float frozen_max_abs, float frozen_rms) {
@@ -1365,6 +1399,15 @@ static int run_decode_attention_case(
         if (!laguna_tensor_matches_snapshot(&snapshots[i], c->family)) {
             goto cleanup;
         }
+    }
+
+    /* cudaMalloc is vector-aligned; offset two preserves valid __half alignment
+     * while forcing the production wrapper to avoid its __half2 path. */
+    if (c->n_head == 48u && c->key_count == 1u && c->gate == -20.0f &&
+        !run_decode_attention_unaligned_cache_case(
+            c, heads, q, k, v, gate, key_actual, value_actual,
+            cache_values * sizeof(*key_actual), scale)) {
+        goto cleanup;
     }
 
     const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(

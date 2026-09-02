@@ -586,6 +586,51 @@ class CudaBuildContractTest(unittest.TestCase):
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
 
+    def test_laguna_decode_vec_has_bounded_topology_and_alignment_fallback(
+        self,
+    ) -> None:
+        vector = function_body("laguna_attention_decode_gqa_f16_kernel(")
+        for required in (
+            "laguna_vec_warp_sum_8(",
+            "laguna_vec_warp_sum_32(",
+            "laguna_vec_warp_max_32(",
+            "constexpr uint32_t max_partitions = 4u;",
+            "__shared__ float scratch[max_partitions][2048];",
+            "__shared__ float partition_values[max_partitions][head_dim];",
+            "__shared__ float2 partition_meta[max_partitions];",
+            "if (!score_row_valid) dot = -INFINITY;",
+        ):
+            self.assertIn(required, vector)
+
+        wrapper = function_body(
+            'extern "C" int ds4_gpu_laguna_store_attention_tensor('
+        )
+        for required in (
+            "const bool cache_half2_aligned",
+            "alignof(__half2) - 1u",
+            "const uint64_t physical_rows =",
+            "((uint64_t)key_count + 255u) & ~(uint64_t)255u",
+            "uint32_t parallel_blocks = ntiles < 3u ? ntiles : 3u;",
+            "if (n_head == 72u && ntiles >= 4u) parallel_blocks = 4u;",
+            "n_head, parallel_blocks * 128u",
+            "laguna_attention_decode_gqa_f16_scalar_kernel<<<",
+        ):
+            self.assertIn(required, wrapper)
+        self.assertNotIn("cudaMalloc", wrapper)
+        self.assertNotIn("cudaFree", wrapper)
+
+        unaligned_case = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_decode_attention_unaligned_cache_case(",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn("ds4_gpu_tensor_view(key_storage, 2u, cache_bytes)", unaligned_case)
+        self.assertIn(
+            "ds4_gpu_tensor_view(value_storage, 2u, cache_bytes)", unaligned_case
+        )
+        self.assertIn("ds4_gpu_laguna_store_attention_tensor(", unaligned_case)
+        self.assertIn("cudaDeviceSynchronize()", unaligned_case)
+
     def test_laguna_attention_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

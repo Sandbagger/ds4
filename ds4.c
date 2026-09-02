@@ -65249,6 +65249,9 @@ static int ds4_session_sync_internal(ds4_session *s,
             if (n > s->laguna_graph.prefill_cap) {
                 n = s->laguna_graph.prefill_cap;
             }
+            if (!e->laguna_compact && n > 512u) {
+                n = 512u;
+            }
             if (e->laguna_compact && e->prefill_chunk != 0u &&
                 n > e->prefill_chunk) {
                 n = e->prefill_chunk;

@@ -1116,7 +1116,8 @@ static int laguna_read_decode_vec_frozen(
 static int run_decode_attention_unaligned_cache_case(
         const laguna_decode_attention_case *c, ds4_gpu_tensor *heads,
         ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
-        ds4_gpu_tensor *gate, const uint16_t *key_initial,
+        ds4_gpu_tensor *gate, float *actual, const float *reference,
+        uint64_t q_count, const uint16_t *key_initial,
         const uint16_t *value_initial, uint64_t cache_bytes,
         uint64_t cache_offset, float scale) {
     ds4_gpu_tensor *key_storage =
@@ -1143,6 +1144,21 @@ static int run_decode_attention_unaligned_cache_case(
                 c->family, (unsigned long long)cache_offset,
                 cudaGetErrorString(sync));
         ok = 0;
+    }
+    if (ok && !ds4_gpu_tensor_read(
+            heads, 0, actual, q_count * sizeof(*actual))) {
+        fprintf(stderr,
+                "decode-attention/%s: cache-offset-%llu output read failed\n",
+                c->family, (unsigned long long)cache_offset);
+        ok = 0;
+    }
+    if (ok) {
+        const laguna_parity_span span = {
+            "unaligned heads", actual, reference, q_count, c->n_head, 128u,
+            1.0e-3f, 2.0e-4f,
+        };
+        ok = laguna_parity_spans_within_limits(
+            c->family, &span, 1u, 1);
     }
     ds4_gpu_tensor_free(value_cache);
     ds4_gpu_tensor_free(key_cache);
@@ -1416,14 +1432,16 @@ static int run_decode_attention_case(
         }
     }
 
-    /* cudaMalloc is vector-aligned; offset two preserves valid __half alignment
-     * while forcing the production wrapper to avoid its __half2 path. */
-    if (c->n_head == 48u && c->key_count == 1u && c->gate == -20.0f &&
+    /* Exercise both legal but non-int4-aligned views on a shape and row count
+     * that would otherwise select the vector kernel. */
+    if (frozen_name &&
         (!run_decode_attention_unaligned_cache_case(
-             c, heads, q, k, v, gate, key_actual, value_actual,
+             c, heads, q, k, v, gate, actual, reference, q_count,
+             key_actual, value_actual,
              cache_values * sizeof(*key_actual), 2u, scale) ||
          !run_decode_attention_unaligned_cache_case(
-             c, heads, q, k, v, gate, key_actual, value_actual,
+             c, heads, q, k, v, gate, actual, reference, q_count,
+             key_actual, value_actual,
              cache_values * sizeof(*key_actual), 4u, scale))) {
         goto cleanup;
     }

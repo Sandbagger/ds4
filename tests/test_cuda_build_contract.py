@@ -594,13 +594,23 @@ class CudaBuildContractTest(unittest.TestCase):
             "laguna_vec_warp_sum_8(",
             "laguna_vec_warp_sum_32(",
             "laguna_vec_warp_max_32(",
-            "constexpr uint32_t max_partitions = 4u;",
+            "constexpr uint32_t max_partitions = 3u;",
+            "const uint32_t kv_head = head / 6u;",
+            "constexpr uint64_t kv_width = 8u * head_dim;",
             "__shared__ float scratch[max_partitions][2048];",
             "__shared__ float partition_values[max_partitions][head_dim];",
             "__shared__ float2 partition_meta[max_partitions];",
+            "tile0 += max_partitions * lanes_per_partition",
+            "laguna_vec_load_half2x4(",
             "if (!score_row_valid) dot = -INFINITY;",
         ):
             self.assertIn(required, vector)
+        self.assertNotIn("% cache_cap", vector)
+        self.assertIn(
+            "__global__ __launch_bounds__(384, 1) static void\n"
+            "laguna_attention_decode_gqa_f16_kernel(",
+            CUDA_SOURCE,
+        )
 
         wrapper = function_body(
             'extern "C" int ds4_gpu_laguna_store_attention_tensor('
@@ -609,11 +619,14 @@ class CudaBuildContractTest(unittest.TestCase):
             "const bool cache_vec_aligned",
             "alignof(int4) - 1u",
             "const bool vector_decode_shape = n_head == 48u && n_head_kv == 8u;",
-            "if (cache_vec_aligned && vector_decode_shape)",
             "const uint64_t physical_rows =",
             "((uint64_t)key_count + 255u) & ~(uint64_t)255u",
-            "uint32_t parallel_blocks = ntiles < 3u ? ntiles : 3u;",
-            "n_head, parallel_blocks * 128u",
+            "const bool vector_cache_contiguous",
+            "physical_rows >= 384u",
+            "(uint64_t)key_start + physical_rows <= cache_cap",
+            "if (cache_vec_aligned && vector_decode_shape &&",
+            "const uint64_t cache_offset = (uint64_t)key_start * kv_values;",
+            "laguna_attention_decode_gqa_f16_kernel<<<n_head, 384>>>",
             "laguna_attention_decode_gqa_f16_scalar_kernel<<<",
         ):
             self.assertIn(required, wrapper)

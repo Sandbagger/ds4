@@ -36388,6 +36388,14 @@ __global__ static void laguna_attention_decode_gqa_f16_scalar_kernel(
     }
 }
 
+__device__ __forceinline__ static void laguna_vec_load_half2x4(
+        __half2 * __restrict__ dst, const __half2 * __restrict__ src) {
+    /* Match Poolside's F16 V dequantizer: one aligned 16-byte transaction into
+     * registers before conversion.  The wrapper admits this path only when
+     * both cache bases preserve int4 alignment. */
+    ((int4 *)dst)[0] = ((const int4 *)src)[0];
+}
+
 __device__ __forceinline__ static float laguna_vec_warp_sum_8(float value) {
 #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
@@ -36418,15 +36426,14 @@ __device__ __forceinline__ static float laguna_vec_warp_max_32(float value) {
  * scaled-F32 Q dot products, offset online softmax, V accumulation order, and
  * final partition combine. Cohorts share one CUDA block so the production
  * wrapper needs no transient global scratch allocation. */
-__global__ __launch_bounds__(512, 1) static void
+__global__ __launch_bounds__(384, 1) static void
 laguna_attention_decode_gqa_f16_kernel(
         float *heads, const float *q, const __half *key_cache,
-        const __half *value_cache, const float *gate, uint32_t key_start,
-        uint32_t key_count, uint32_t cache_cap, uint32_t n_head,
-        uint32_t n_head_kv, uint32_t parallel_blocks, float scale) {
+        const __half *value_cache, const float *gate, uint32_t key_count,
+        uint64_t physical_rows, float scale) {
     constexpr uint32_t head_dim = 128u;
     constexpr uint32_t lanes_per_partition = 128u;
-    constexpr uint32_t max_partitions = 4u;
+    constexpr uint32_t max_partitions = 3u;
     constexpr float kq_max_offset = 3.0f * 0.6931f;
     const uint32_t global_tid = threadIdx.x;
     const uint32_t partition = global_tid / lanes_per_partition;
@@ -36434,11 +36441,8 @@ laguna_attention_decode_gqa_f16_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t head = blockIdx.x;
-    if (partition >= parallel_blocks || head >= n_head) return;
-
-    const uint32_t heads_per_kv = n_head / n_head_kv;
-    const uint32_t kv_head = head / heads_per_kv;
-    const uint64_t kv_width = (uint64_t)n_head_kv * head_dim;
+    const uint32_t kv_head = head / 6u;
+    constexpr uint64_t kv_width = 8u * head_dim;
     const float *query = q + (uint64_t)head * head_dim;
     float2 query_reg[8];
 #pragma unroll
@@ -36467,15 +36471,9 @@ laguna_attention_decode_gqa_f16_kernel(
     __shared__ float partition_values[max_partitions][head_dim];
     __shared__ float2 partition_meta[max_partitions];
 
-    const uint64_t physical_rows =
-        ((uint64_t)key_count + 255u) & ~(uint64_t)255u;
-    const uint32_t ntiles = (uint32_t)(physical_rows / lanes_per_partition);
-    const uint32_t rounds =
-        (ntiles + parallel_blocks - 1u) / parallel_blocks;
-    for (uint32_t round = 0u; round < rounds; round++) {
-        const uint32_t tile_index = partition + round * parallel_blocks;
-        const uint64_t tile0 = (uint64_t)tile_index * lanes_per_partition;
-        const bool tile_valid = tile_index < ntiles;
+    for (uint64_t tile0 = (uint64_t)partition * lanes_per_partition;
+         tile0 < physical_rows;
+         tile0 += max_partitions * lanes_per_partition) {
         float own_score = -INFINITY;
         float max_new = kq_max;
 #pragma unroll
@@ -36484,27 +36482,22 @@ laguna_attention_decode_gqa_f16_kernel(
             const uint32_t row_in_tile =
                 warp * 32u + (lane & ~7u) + row_in_group;
             const uint64_t logical_row = tile0 + row_in_tile;
-            const bool score_row_valid =
-                tile_valid && logical_row < key_count;
+            const bool score_row_valid = logical_row < key_count;
+            const uint64_t base = logical_row * kv_width +
+                (uint64_t)kv_head * head_dim;
             float dot = 0.0f;
-            if (score_row_valid) {
-                const uint32_t cache_row =
-                    (uint32_t)(((uint64_t)key_start + logical_row) % cache_cap);
-                const uint64_t base = (uint64_t)cache_row * kv_width +
-                    (uint64_t)kv_head * head_dim;
 #pragma unroll
-                for (uint32_t half0 = 0u; half0 < head_dim / 2u;
-                     half0 += 32u) {
-                    const uint32_t half_index =
-                        half0 + (lane % 8u) * 4u;
+            for (uint32_t half0 = 0u; half0 < head_dim / 2u;
+                 half0 += 32u) {
+                const uint32_t half_index =
+                    half0 + (lane % 8u) * 4u;
 #pragma unroll
-                    for (uint32_t j = 0u; j < 4u; j++) {
-                        const __half2 packed =
-                            ((const __half2 *)(key_cache + base))[half_index + j];
-                        const float2 value = __half22float2(packed);
-                        dot += value.x * query_reg[half0 / 8u + j].x;
-                        dot += value.y * query_reg[half0 / 8u + j].y;
-                    }
+                for (uint32_t j = 0u; j < 4u; j++) {
+                    const __half2 packed =
+                        ((const __half2 *)(key_cache + base))[half_index + j];
+                    const float2 value = __half22float2(packed);
+                    dot += value.x * query_reg[half0 / 8u + j].x;
+                    dot += value.y * query_reg[half0 / 8u + j].y;
                 }
             }
             /* The full warp must execute an intrinsic whose mask names all 32
@@ -36537,31 +36530,28 @@ laguna_attention_decode_gqa_f16_kernel(
             const uint32_t row_in_tile = warp * 32u + row0 + lane / 8u;
             const uint64_t logical_row = tile0 + row_in_tile;
             const float probability_k = scratch[partition][row_in_tile];
-            const bool row_valid = tile_valid && logical_row < key_count;
-            uint64_t base = 0u;
-            if (row_valid) {
-                const uint32_t cache_row =
-                    (uint32_t)(((uint64_t)key_start + logical_row) % cache_cap);
-                base = (uint64_t)cache_row * kv_width +
-                    (uint64_t)kv_head * head_dim;
-            }
+            const uint64_t base = logical_row * kv_width +
+                (uint64_t)kv_head * head_dim;
 #pragma unroll
             for (uint32_t half0 = 0u; half0 < head_dim / 2u;
                  half0 += 32u) {
                 const uint32_t half_index =
                     half0 + (lane % 8u) * 4u;
+                __align__(16) __half2 packed[4];
+                laguna_vec_load_half2x4(
+                    packed,
+                    (const __half2 *)(value_cache + base) + half_index);
+                float2 values[4];
 #pragma unroll
                 for (uint32_t j = 0u; j < 4u; j++) {
-                    float2 value = make_float2(0.0f, 0.0f);
-                    if (row_valid) {
-                        const __half2 packed =
-                            ((const __half2 *)(value_cache + base))[half_index + j];
-                        value = __half22float2(packed);
-                    }
+                    values[j] = __half22float2(packed[j]);
+                }
+#pragma unroll
+                for (uint32_t j = 0u; j < 4u; j++) {
                     accumulator[half0 / 8u + j].x +=
-                        value.x * probability_k;
+                        values[j].x * probability_k;
                     accumulator[half0 / 8u + j].y +=
-                        value.y * probability_k;
+                        values[j].y * probability_k;
                 }
             }
         }
@@ -36619,20 +36609,16 @@ laguna_attention_decode_gqa_f16_kernel(
         float combined_max = partition_meta[0].x;
 #pragma unroll
         for (uint32_t p = 1u; p < max_partitions; p++) {
-            if (p < parallel_blocks) {
-                combined_max = fmaxf(combined_max, partition_meta[p].x);
-            }
+            combined_max = fmaxf(combined_max, partition_meta[p].x);
         }
         float numerator = 0.0f;
         float denominator = 0.0f;
 #pragma unroll
         for (uint32_t p = 0u; p < max_partitions; p++) {
-            if (p < parallel_blocks) {
-                const float part_scale =
-                    expf(partition_meta[p].x - combined_max);
-                numerator += part_scale * partition_values[p][global_tid];
-                denominator += part_scale * partition_meta[p].y;
-            }
+            const float part_scale =
+                expf(partition_meta[p].x - combined_max);
+            numerator += part_scale * partition_values[p][global_tid];
+            denominator += part_scale * partition_meta[p].y;
         }
         const float gate_value = gate[head];
         const float gate_scale = gate_value > 0.0f ?
@@ -36694,28 +36680,27 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
                 (uint64_t)(pos % cache_cap), kv_values);
         ok = cuda_ok(cudaGetLastError(), "laguna KV store launch");
         if (ok) {
-            const bool cache_half2_aligned =
+            const bool cache_vec_aligned =
                 ((((uintptr_t)key_cache->ptr | (uintptr_t)value_cache->ptr) &
-                  (alignof(__half2) - 1u)) == 0u);
-            if (cache_half2_aligned) {
-                const uint64_t physical_rows =
-                    ((uint64_t)key_count + 255u) & ~(uint64_t)255u;
-                const uint32_t ntiles = (uint32_t)(physical_rows / 128u);
-                uint32_t parallel_blocks = ntiles < 3u ? ntiles : 3u;
-                /* On GB10, Poolside's 72-head SWA vector launch expands from
-                 * three-block occupancy to four partitions to remove the
-                 * second wave's tail. GQA6 reaches a full wave with three. */
-                if (n_head == 72u && ntiles >= 4u) parallel_blocks = 4u;
-                laguna_attention_decode_gqa_f16_kernel<<<
-                        n_head, parallel_blocks * 128u>>>(
+                  (alignof(int4) - 1u)) == 0u);
+            const bool vector_decode_shape = n_head == 48u && n_head_kv == 8u;
+            const uint64_t physical_rows =
+                ((uint64_t)key_count + 255u) & ~(uint64_t)255u;
+            const bool vector_cache_contiguous =
+                physical_rows >= 384u &&
+                (uint64_t)key_start + physical_rows <= cache_cap;
+            if (cache_vec_aligned && vector_decode_shape &&
+                vector_cache_contiguous) {
+                const uint64_t cache_offset = (uint64_t)key_start * kv_values;
+                laguna_attention_decode_gqa_f16_kernel<<<n_head, 384>>>(
                         (float *)heads->ptr, (const float *)q->ptr,
-                        (const __half *)key_cache->ptr,
-                        (const __half *)value_cache->ptr,
-                        (const float *)gate->ptr, key_start, key_count,
-                        cache_cap, n_head, n_head_kv, parallel_blocks, scale);
+                        (const __half *)key_cache->ptr + cache_offset,
+                        (const __half *)value_cache->ptr + cache_offset,
+                        (const float *)gate->ptr, key_count,
+                        physical_rows, scale);
             } else {
-                /* A tensor view may preserve __half alignment without the
-                 * stronger alignment required by the vectorized cache loads. */
+                /* Valid tensor views can preserve __half alignment without
+                 * the 16-byte alignment required by the vector V load. */
                 laguna_attention_decode_gqa_f16_scalar_kernel<<<n_head, 1>>>(
                         (float *)heads->ptr, (const float *)q->ptr,
                         (const __half *)key_cache->ptr,

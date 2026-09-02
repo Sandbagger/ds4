@@ -55,6 +55,15 @@ class LagunaLongAttentionContractTest(unittest.TestCase):
         scalar_launch = body.index("laguna_attention_prefill_gqa_f16_kernel<<<")
         self.assertLess(long_launch, scalar_launch)
 
+    def test_long_prefill_mma_does_not_cross_ring_capacity(self) -> None:
+        body = function_body("ds4_gpu_laguna_attention_prefill_tensor")
+
+        launch = "laguna_attention_prefill_auto_mma64_kernel<<<"
+        prefix, marker, _ = body.partition(launch)
+        self.assertTrue(marker, "missing Laguna long-prefill MMA dispatch")
+        branch = prefix.rsplit("} else if (", 1)[-1]
+        self.assertIn("cache_cap >= n_tokens", branch)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1071,7 +1071,51 @@ static float reference_softplus(float value) {
     return value > 0.0f ? value + log1pf(expf(-value)) : log1pf(expf(value));
 }
 
-static int run_decode_attention_case(const laguna_decode_attention_case *c) {
+#define LAGUNA_DECODE_VEC_FIXTURE_DIR \
+    "tests/test-vectors/laguna-attention-decode-vec"
+
+static int laguna_read_decode_vec_frozen(
+        const char *name, float *values, uint64_t count) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s", LAGUNA_DECODE_VEC_FIXTURE_DIR, name);
+    const uint64_t expected_bytes = count * sizeof(*values);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path) ||
+        sizeof(float) != 4u) {
+        fprintf(stderr, "decode-attention-frozen: invalid fixture contract\n");
+        return 0;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u) {
+        fprintf(stderr, "decode-attention-frozen: little-endian host is required\n");
+        return 0;
+    }
+    FILE *stream = fopen(path, "rb");
+    if (!stream || fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr, "decode-attention-frozen: cannot open %s\n", path);
+        if (stream) fclose(stream);
+        return 0;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (uint64_t)file_bytes != expected_bytes) {
+        fprintf(stderr, "decode-attention-frozen: %s bytes=%ld expected=%llu\n",
+                path, file_bytes, (unsigned long long)expected_bytes);
+        fclose(stream);
+        return 0;
+    }
+    rewind(stream);
+    const size_t read_count = fread(values, sizeof(*values), (size_t)count, stream);
+    const int ok = read_count == count && !ferror(stream);
+    fclose(stream);
+    if (!ok) {
+        fprintf(stderr, "decode-attention-frozen: cannot read %s\n", path);
+    }
+    return ok;
+}
+
+static int run_decode_attention_case(
+        const laguna_decode_attention_case *c, const char *frozen_name,
+        float frozen_max_abs, float frozen_rms) {
     const uint32_t head_dim = 128u;
     const uint64_t q_count = (uint64_t)c->n_head * head_dim;
     const uint64_t kv_width = (uint64_t)c->n_head_kv * head_dim;
@@ -1178,6 +1222,10 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
             reference[(uint64_t)h * head_dim + d] =
                 weighted_value / sum * gate_scale;
         }
+    }
+    if (frozen_name &&
+        !laguna_read_decode_vec_frozen(frozen_name, reference, q_count)) {
+        goto cleanup;
     }
     for (uint64_t i = 0; i < q_count; i++) {
         if (!isfinite(reference[i])) {
@@ -1353,7 +1401,8 @@ static int run_decode_attention_case(const laguna_decode_attention_case *c) {
     }
     const laguna_parity_span span = {
         "heads", actual, reference, q_count, c->n_head, head_dim,
-        1.0e-3f, 2.0e-4f,
+        frozen_name ? frozen_max_abs : 1.0e-3f,
+        frozen_name ? frozen_rms : 2.0e-4f,
     };
     if (!laguna_parity_spans_within_limits(
             c->family, &span, 1u, 1)) {
@@ -1398,7 +1447,7 @@ static int run_decode_attention_cases(void) {
                 "gqa6-global", 48u, 8u, 2048u, key_count - 1u, 0u,
                 key_count, gates[gate_i], false,
             };
-            if (run_decode_attention_case(&c) != 0) rc = 1;
+            if (run_decode_attention_case(&c, NULL, 0.0f, 0.0f) != 0) rc = 1;
         }
     }
     for (size_t pos_i = 0; pos_i < sizeof(swa_positions) / sizeof(swa_positions[0]); pos_i++) {
@@ -1409,7 +1458,7 @@ static int run_decode_attention_cases(void) {
                 "gqa9-swa", 72u, 8u, 512u, pos, pos + 1u - key_count,
                 key_count, gates[gate_i], false,
             };
-            if (run_decode_attention_case(&c) != 0) rc = 1;
+            if (run_decode_attention_case(&c, NULL, 0.0f, 0.0f) != 0) rc = 1;
         }
     }
     const laguna_decode_attention_case mutation_cases[] = {
@@ -1421,8 +1470,16 @@ static int run_decode_attention_cases(void) {
           0.0f, true },
     };
     for (size_t i = 0; i < sizeof(mutation_cases) / sizeof(mutation_cases[0]); i++) {
-        if (run_decode_attention_case(&mutation_cases[i]) != 0) rc = 1;
+        if (run_decode_attention_case(
+                &mutation_cases[i], NULL, 0.0f, 0.0f) != 0) rc = 1;
     }
+    const laguna_decode_attention_case frozen_vec = {
+        "gqa6-poolside-vec-token513", 48u, 8u, 768u, 512u, 0u, 513u,
+        100.0f, false,
+    };
+    if (run_decode_attention_case(
+            &frozen_vec, "gqa6-token513-gate100.f32", 5.0e-7f,
+            1.0e-7f) != 0) rc = 1;
     return rc;
 }
 

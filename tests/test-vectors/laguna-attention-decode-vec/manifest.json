@@ -1,0 +1,99 @@
+{
+  "schema": "laguna-attention-decode-vec-fixture/v1",
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "device": {
+    "name": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "target": "sm_121a"
+  },
+  "shape": {
+    "q": "[128,1,48,1] F32",
+    "k": "[128,768,8,1] F16",
+    "v": "[128,768,8,1] F16",
+    "kv_strides_bytes": [
+      2,
+      2048,
+      256
+    ],
+    "logical_rows": 513,
+    "physical_rows": 768,
+    "n_head": 48,
+    "n_head_kv": 8,
+    "head_dim": 128,
+    "position": 512,
+    "key_start": 0,
+    "key_count": 513,
+    "scale": "1/sqrtf(128)",
+    "gate": 100.0
+  },
+  "input_recipe": {
+    "q": "float32(((i * 17) % 41 - 20) / float32(23))",
+    "current_k": "float32(((i * 11) % 37 - 18) / float32(29))",
+    "current_v": "float32(((i * 23) % 43 - 21) / float32(31))",
+    "cache_k": "f16(float32(((i * 7) % 47 - 23) / float32(37))) then overwrite row 512 with current_k cast to F16",
+    "cache_v": "f16(float32(((i * 29) % 53 - 26) / float32(41))) then overwrite row 512 with current_v cast to F16",
+    "hashes": {
+      "q_f32": "823f5c4c623ceb72bdd1b5beaf60bc72168332202923b3356618570abdd93cfc",
+      "k_first_513_rows_f16": "045d8a1dfc0eeb3e9ae570f416d1aa3b69bae0c2d5dceff56dc0aa2382c583b3",
+      "v_first_513_rows_f16": "36c948445d3a45b02be0b26c7f94fd80905e163f2e5db52cbaac4a994603aa4c"
+    }
+  },
+  "oracle": {
+    "flash_attention": "AUTO",
+    "selected_kernel": "flash_attn_ext_vec<128,1,GGML_TYPE_F16,GGML_TYPE_F16,false>",
+    "launch": {
+      "grid": [
+        1,
+        3,
+        48
+      ],
+      "block": [
+        32,
+        4,
+        1
+      ],
+      "shared_memory_bytes": 0,
+      "parallel_blocks": 3
+    },
+    "combine_kernel": "flash_attn_combine_results<128>",
+    "combine_launch": {
+      "grid": [
+        1,
+        48,
+        1
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "shared_memory_bytes": 24
+    },
+    "ungated_sha256": "2bef62e42e794070e7264c85052e489776aae6b7d3f961a4e15f936e93a5211b",
+    "gate_postprocess": "each Poolside F32 result multiplied by exactly representable float32 100.0 with round-to-nearest-even",
+    "tolerance": {
+      "max_abs": 5e-07,
+      "per_head_rms": 1e-07
+    }
+  },
+  "producer": {
+    "source": "attention-microscope.cpp",
+    "source_sha256": "3c858395ec5b4678dc2c314557be038e15657a04601a9b1e111c174eb6db6079",
+    "binary_sha256": "ec56556f594db99c1c59714c66fea5dd383d12e455e84458f1385827b92e8fa5",
+    "poolside_sources": {
+      "ggml/src/ggml-cuda/fattn-vec.cuh": "f6305c9a667f438565ee0afff0e854cce335ddbd67e30fbee466cbc5672a9577",
+      "ggml/src/ggml-cuda/common.cuh": "a977b50f7479df092bf3c441ba88e4519803b5f0df5a640fd7fb0874e64b9b4c"
+    },
+    "libraries": {
+      "libggml-cuda.so": "d9ae9f38b2d85e90cb81a730e658053b864f7b2b83e6e95db7a1dd3efacd7276",
+      "libggml.so": "66180d2c8c2e1887b7582c157d323e17bf6fbe3bf53d1ce8c33cf51eb089b144",
+      "libggml-base.so": "e2c1c884490c39982784be6e4753245c3fb38be525dcaecd71aa65aa2484e1cd"
+    }
+  },
+  "files": {
+    "gqa6-token513-gate100.f32": {
+      "bytes": 24576,
+      "sha256": "73356960a94e5f9abef42f1b560b92f9821b69d206efd092c90fce81794e893c"
+    }
+  }
+}

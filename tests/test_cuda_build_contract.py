@@ -35,6 +35,15 @@ LAGUNA_KERNEL_TEST = (ROOT / "tests/test_cuda_laguna_kernels.c").read_text(
 LAGUNA_ATTENTION_AUTO_FIXTURE = (
     ROOT / "tests/test-vectors/laguna-attention-auto"
 )
+LAGUNA_DECODE_VEC_FIXTURE = (
+    ROOT / "tests/test-vectors/laguna-attention-decode-vec"
+)
+LAGUNA_DECODE_VEC_FILES = {
+    "gqa6-token513-gate100.f32": (
+        24576,
+        "73356960a94e5f9abef42f1b560b92f9821b69d206efd092c90fce81794e893c",
+    ),
+}
 LAGUNA_ATTENTION_AUTO_FILES = {
     "layer-00-q-proj-t21.f32": (
         24576,
@@ -499,6 +508,70 @@ class CudaBuildContractTest(unittest.TestCase):
             "\t$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)"
         )
         self.assertIn(cuda_link_rule, MAKEFILE)
+
+    def test_laguna_decode_vec_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_DECODE_VEC_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            manifest["schema"], "laguna-attention-decode-vec-fixture/v1"
+        )
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["shape"],
+            {
+                "q": "[128,1,48,1] F32",
+                "k": "[128,768,8,1] F16",
+                "v": "[128,768,8,1] F16",
+                "kv_strides_bytes": [2, 2048, 256],
+                "logical_rows": 513,
+                "physical_rows": 768,
+                "n_head": 48,
+                "n_head_kv": 8,
+                "head_dim": 128,
+                "position": 512,
+                "key_start": 0,
+                "key_count": 513,
+                "scale": "1/sqrtf(128)",
+                "gate": 100.0,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"]["launch"],
+            {
+                "grid": [1, 3, 48],
+                "block": [32, 4, 1],
+                "shared_memory_bytes": 0,
+                "parallel_blocks": 3,
+            },
+        )
+        self.assertEqual(
+            manifest["oracle"]["tolerance"],
+            {"max_abs": 5e-7, "per_head_rms": 1e-7},
+        )
+        self.assertEqual(set(manifest["files"]), set(LAGUNA_DECODE_VEC_FILES))
+        for name, (expected_size, expected_sha256) in LAGUNA_DECODE_VEC_FILES.items():
+            payload = (LAGUNA_DECODE_VEC_FIXTURE / name).read_bytes()
+            self.assertEqual(len(payload), expected_size)
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+            self.assertEqual(
+                manifest["files"][name],
+                {"bytes": expected_size, "sha256": expected_sha256},
+            )
+
+        for required in (
+            "LAGUNA_DECODE_VEC_FIXTURE_DIR",
+            '"gqa6-poolside-vec-token513"',
+            '"gqa6-token513-gate100.f32"',
+            "48u, 8u, 768u, 512u, 0u, 513u",
+            "5.0e-7f",
+            "1.0e-7f",
+            "ds4_gpu_laguna_store_attention_tensor(",
+        ):
+            self.assertIn(required, LAGUNA_KERNEL_TEST)
 
     def test_laguna_attention_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"

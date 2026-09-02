@@ -37149,7 +37149,8 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                         (const __half *)staged_value->ptr,
                         (const float *)gate->ptr, n_tokens, n_head,
                         n_head_kv, scale);
-            } else if (auto_mma64_eligible && n_tokens > 22u &&
+            } else if (auto_mma64_eligible && cache_cap >= n_tokens &&
+                       n_tokens > 22u &&
                        (n_head == 48u || n_head == 72u) &&
                        n_head_kv == 8u) {
                 const dim3 grid((n_tokens + 15u) / 16u, n_head, 1u);

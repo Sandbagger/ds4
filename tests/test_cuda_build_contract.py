@@ -579,8 +579,7 @@ class CudaBuildContractTest(unittest.TestCase):
             '"gqa6-poolside-vec-token513"',
             '"gqa6-token513-gate100.f32"',
             "48u, 8u, 768u, 512u, 0u, 513u",
-            "5.0e-7f",
-            "1.0e-7f",
+            '"gqa6-token513-gate100.f32", 0.0f, 0.0f',
             "const float q_input_scale = 1.0f / 23.0f;",
             "ds4_gpu_laguna_store_attention_tensor(",
         ):

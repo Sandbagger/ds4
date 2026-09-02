@@ -1521,9 +1521,11 @@ static int run_decode_attention_cases(void) {
         "gqa6-poolside-vec-token513", 48u, 8u, 768u, 512u, 0u, 513u,
         100.0f, false,
     };
+    /* The SM121 Poolside fixture is now the operation-level regression: the
+     * value-load schedule must preserve every output bit.  Full-model
+     * qualification remains a separate, mandatory oracle gate. */
     if (run_decode_attention_case(
-            &frozen_vec, "gqa6-token513-gate100.f32", 5.0e-7f,
-            1.0e-7f) != 0) rc = 1;
+            &frozen_vec, "gqa6-token513-gate100.f32", 0.0f, 0.0f) != 0) rc = 1;
     return rc;
 }
 

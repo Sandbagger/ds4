@@ -7,8 +7,10 @@ position 512 with 513 causal keys, 48 query heads, 8 KV heads, and head
 dimension 128.
 
 The input is generated in the CUDA test from integer formulas recorded in
-`manifest.json`; no model bytes are needed or tracked. The expected 6,144 F32
-values came from Poolside llama.cpp commit
+`manifest.json`; no model bytes are needed or tracked. Q uses an explicit
+rounded F32 reciprocal followed by multiplication, matching the production
+test binary's `-ffast-math` arithmetic without depending on an implicit compiler
+rewrite. The expected 6,144 F32 values came from Poolside llama.cpp commit
 `04b2b72cb54048ead292884adbe11f284e3ec950` on the NVIDIA GB10. The standalone
 GGML graph used Q `[128,1,48,1]` and padded K/V `[128,768,8,1]` views with byte
 strides `[2,2048,256]`. Runtime launch tracing proved AUTO selected

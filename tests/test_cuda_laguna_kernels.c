@@ -1159,8 +1159,9 @@ static int run_decode_attention_case(
         goto cleanup;
     }
 
+    const float q_input_scale = 1.0f / 23.0f;
     for (uint64_t i = 0; i < q_count; i++) {
-        q_host[i] = (float)((int)((i * 17u) % 41u) - 20) / 23.0f;
+        q_host[i] = (float)((int)((i * 17u) % 41u) - 20) * q_input_scale;
     }
     for (uint64_t i = 0; i < kv_width; i++) {
         k_host[i] = (float)((int)((i * 11u) % 37u) - 18) / 29.0f;

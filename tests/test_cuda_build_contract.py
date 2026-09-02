@@ -41,7 +41,7 @@ LAGUNA_DECODE_VEC_FIXTURE = (
 LAGUNA_DECODE_VEC_FILES = {
     "gqa6-token513-gate100.f32": (
         24576,
-        "73356960a94e5f9abef42f1b560b92f9821b69d206efd092c90fce81794e893c",
+        "d5e4039f79f9bdbfeb68c5d62ae5795c8ca2422dc5d4b54ea88c02582861aaac",
     ),
 }
 LAGUNA_ATTENTION_AUTO_FILES = {
@@ -540,6 +540,18 @@ class CudaBuildContractTest(unittest.TestCase):
             },
         )
         self.assertEqual(
+            manifest["input_recipe"]["hashes"],
+            {
+                "q_f32": "d7aae3abb6c03c6295f18469822503f61fc9868a13232257167537355079dbd0",
+                "k_first_513_rows_f16": "045d8a1dfc0eeb3e9ae570f416d1aa3b69bae0c2d5dceff56dc0aa2382c583b3",
+                "v_first_513_rows_f16": "36c948445d3a45b02be0b26c7f94fd80905e163f2e5db52cbaac4a994603aa4c",
+            },
+        )
+        self.assertIn(
+            "reciprocal is rounded before multiplication",
+            manifest["input_recipe"]["q"],
+        )
+        self.assertEqual(
             manifest["oracle"]["launch"],
             {
                 "grid": [1, 3, 48],
@@ -569,6 +581,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "48u, 8u, 768u, 512u, 0u, 513u",
             "5.0e-7f",
             "1.0e-7f",
+            "const float q_input_scale = 1.0f / 23.0f;",
             "ds4_gpu_laguna_store_attention_tensor(",
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)

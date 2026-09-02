@@ -27,13 +27,13 @@
     "gate": 100.0
   },
   "input_recipe": {
-    "q": "float32(((i * 17) % 41 - 20) / float32(23))",
+    "q": "float32(((i * 17) % 41 - 20)) * float32(1.0 / 23.0); reciprocal is rounded before multiplication",
     "current_k": "float32(((i * 11) % 37 - 18) / float32(29))",
     "current_v": "float32(((i * 23) % 43 - 21) / float32(31))",
     "cache_k": "f16(float32(((i * 7) % 47 - 23) / float32(37))) then overwrite row 512 with current_k cast to F16",
     "cache_v": "f16(float32(((i * 29) % 53 - 26) / float32(41))) then overwrite row 512 with current_v cast to F16",
     "hashes": {
-      "q_f32": "823f5c4c623ceb72bdd1b5beaf60bc72168332202923b3356618570abdd93cfc",
+      "q_f32": "d7aae3abb6c03c6295f18469822503f61fc9868a13232257167537355079dbd0",
       "k_first_513_rows_f16": "045d8a1dfc0eeb3e9ae570f416d1aa3b69bae0c2d5dceff56dc0aa2382c583b3",
       "v_first_513_rows_f16": "36c948445d3a45b02be0b26c7f94fd80905e163f2e5db52cbaac4a994603aa4c"
     }
@@ -69,7 +69,7 @@
       ],
       "shared_memory_bytes": 24
     },
-    "ungated_sha256": "2bef62e42e794070e7264c85052e489776aae6b7d3f961a4e15f936e93a5211b",
+    "ungated_sha256": "c7ec40a35031d0085a24357f13a1b9a8f3068bad77f468d1ccf51309f4c68287",
     "gate_postprocess": "each Poolside F32 result multiplied by exactly representable float32 100.0 with round-to-nearest-even",
     "tolerance": {
       "max_abs": 5e-07,
@@ -93,7 +93,7 @@
   "files": {
     "gqa6-token513-gate100.f32": {
       "bytes": 24576,
-      "sha256": "73356960a94e5f9abef42f1b560b92f9821b69d206efd092c90fce81794e893c"
+      "sha256": "d5e4039f79f9bdbfeb68c5d62ae5795c8ca2422dc5d4b54ea88c02582861aaac"
     }
   }
 }

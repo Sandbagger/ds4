@@ -586,7 +586,7 @@ class CudaBuildContractTest(unittest.TestCase):
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
 
-    def test_laguna_decode_vec_has_bounded_topology_and_alignment_fallback(
+    def test_laguna_decode_vec_has_bounded_topology_oracle_shape_and_alignment_fallback(
         self,
     ) -> None:
         vector = function_body("laguna_attention_decode_gqa_f16_kernel(")
@@ -608,14 +608,16 @@ class CudaBuildContractTest(unittest.TestCase):
         for required in (
             "const bool cache_half2_aligned",
             "alignof(__half2) - 1u",
+            "const bool vector_decode_shape = n_head == 48u && n_head_kv == 8u;",
+            "if (cache_half2_aligned && vector_decode_shape)",
             "const uint64_t physical_rows =",
             "((uint64_t)key_count + 255u) & ~(uint64_t)255u",
             "uint32_t parallel_blocks = ntiles < 3u ? ntiles : 3u;",
-            "if (n_head == 72u && ntiles >= 4u) parallel_blocks = 4u;",
             "n_head, parallel_blocks * 128u",
             "laguna_attention_decode_gqa_f16_scalar_kernel<<<",
         ):
             self.assertIn(required, wrapper)
+        self.assertNotIn("if (n_head == 72u", wrapper)
         self.assertNotIn("cudaMalloc", wrapper)
         self.assertNotIn("cudaFree", wrapper)
 

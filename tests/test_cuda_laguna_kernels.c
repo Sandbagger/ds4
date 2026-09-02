@@ -1459,6 +1459,13 @@ static int run_decode_attention_case(
             c->family, &span, 1u, 1)) {
         goto cleanup;
     }
+    if (frozen_name && frozen_max_abs == 0.0f && frozen_rms == 0.0f &&
+        memcmp(actual, reference, (size_t)q_count * sizeof(*actual)) != 0) {
+        fprintf(stderr,
+                "decode-attention/%s: exact frozen output differs by bits\n",
+                c->family);
+        goto cleanup;
+    }
     rc = 0;
 
 cleanup:

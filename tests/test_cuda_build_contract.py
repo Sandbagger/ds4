@@ -605,10 +605,10 @@ class CudaBuildContractTest(unittest.TestCase):
             'extern "C" int ds4_gpu_laguna_store_attention_tensor('
         )
         for required in (
-            "const bool cache_half2_aligned",
-            "alignof(__half2) - 1u",
+            "const bool cache_vec_aligned",
+            "alignof(int4) - 1u",
             "const bool vector_decode_shape = n_head == 48u && n_head_kv == 8u;",
-            "if (cache_half2_aligned && vector_decode_shape)",
+            "if (cache_vec_aligned && vector_decode_shape)",
             "const uint64_t physical_rows =",
             "((uint64_t)key_count + 255u) & ~(uint64_t)255u",
             "uint32_t parallel_blocks = ntiles < 3u ? ntiles : 3u;",
@@ -625,11 +625,18 @@ class CudaBuildContractTest(unittest.TestCase):
             "static int run_decode_attention_unaligned_cache_case(",
             "tests/test_cuda_laguna_kernels.c",
         )
-        self.assertIn("ds4_gpu_tensor_view(key_storage, 2u, cache_bytes)", unaligned_case)
         self.assertIn(
-            "ds4_gpu_tensor_view(value_storage, 2u, cache_bytes)", unaligned_case
+            "ds4_gpu_tensor_view(key_storage, cache_offset, cache_bytes)",
+            unaligned_case,
         )
+        self.assertIn(
+            "ds4_gpu_tensor_view(value_storage, cache_offset, cache_bytes)",
+            unaligned_case,
+        )
+        self.assertIn("cache_bytes + cache_offset", unaligned_case)
         self.assertIn("ds4_gpu_laguna_store_attention_tensor(", unaligned_case)
+        self.assertIn("cache_values * sizeof(*key_actual), 2u, scale", LAGUNA_KERNEL_TEST)
+        self.assertIn("cache_values * sizeof(*key_actual), 4u, scale", LAGUNA_KERNEL_TEST)
         self.assertIn("cudaDeviceSynchronize()", unaligned_case)
 
     def test_laguna_attention_auto_fixture_is_pinned_and_wired(self) -> None:

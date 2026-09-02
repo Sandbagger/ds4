@@ -1117,13 +1117,16 @@ static int run_decode_attention_unaligned_cache_case(
         const laguna_decode_attention_case *c, ds4_gpu_tensor *heads,
         ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
         ds4_gpu_tensor *gate, const uint16_t *key_initial,
-        const uint16_t *value_initial, uint64_t cache_bytes, float scale) {
-    ds4_gpu_tensor *key_storage = ds4_gpu_tensor_alloc(cache_bytes + 2u);
-    ds4_gpu_tensor *value_storage = ds4_gpu_tensor_alloc(cache_bytes + 2u);
+        const uint16_t *value_initial, uint64_t cache_bytes,
+        uint64_t cache_offset, float scale) {
+    ds4_gpu_tensor *key_storage =
+        ds4_gpu_tensor_alloc(cache_bytes + cache_offset);
+    ds4_gpu_tensor *value_storage =
+        ds4_gpu_tensor_alloc(cache_bytes + cache_offset);
     ds4_gpu_tensor *key_cache = key_storage ?
-        ds4_gpu_tensor_view(key_storage, 2u, cache_bytes) : NULL;
+        ds4_gpu_tensor_view(key_storage, cache_offset, cache_bytes) : NULL;
     ds4_gpu_tensor *value_cache = value_storage ?
-        ds4_gpu_tensor_view(value_storage, 2u, cache_bytes) : NULL;
+        ds4_gpu_tensor_view(value_storage, cache_offset, cache_bytes) : NULL;
     int ok = key_cache && value_cache &&
         ds4_gpu_tensor_write(key_cache, 0, key_initial, cache_bytes) &&
         ds4_gpu_tensor_write(value_cache, 0, value_initial, cache_bytes);
@@ -1136,8 +1139,9 @@ static int run_decode_attention_unaligned_cache_case(
     const cudaError_t sync = cudaDeviceSynchronize();
     if (!ok || sync != cudaSuccess) {
         fprintf(stderr,
-                "decode-attention/%s: 2-byte-aligned cache fallback failed: %s\n",
-                c->family, cudaGetErrorString(sync));
+                "decode-attention/%s: cache-offset-%llu fallback failed: %s\n",
+                c->family, (unsigned long long)cache_offset,
+                cudaGetErrorString(sync));
         ok = 0;
     }
     ds4_gpu_tensor_free(value_cache);
@@ -1404,9 +1408,12 @@ static int run_decode_attention_case(
     /* cudaMalloc is vector-aligned; offset two preserves valid __half alignment
      * while forcing the production wrapper to avoid its __half2 path. */
     if (c->n_head == 48u && c->key_count == 1u && c->gate == -20.0f &&
-        !run_decode_attention_unaligned_cache_case(
-            c, heads, q, k, v, gate, key_actual, value_actual,
-            cache_values * sizeof(*key_actual), scale)) {
+        (!run_decode_attention_unaligned_cache_case(
+             c, heads, q, k, v, gate, key_actual, value_actual,
+             cache_values * sizeof(*key_actual), 2u, scale) ||
+         !run_decode_attention_unaligned_cache_case(
+             c, heads, q, k, v, gate, key_actual, value_actual,
+             cache_values * sizeof(*key_actual), 4u, scale))) {
         goto cleanup;
     }
 

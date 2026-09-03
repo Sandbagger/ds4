@@ -379,6 +379,19 @@ def _sequence_digests(sequence: Path) -> tuple[str, str]:
     return manifest_digest, hashlib.sha256(raw).hexdigest()
 
 
+class BenchQualificationMakefileContractTest(unittest.TestCase):
+    def test_emitter_target_runs_in_aggregate_make_test(self) -> None:
+        lines = (ROOT / "Makefile").read_text(encoding="utf-8").splitlines()
+        start = next(
+            index for index, line in enumerate(lines) if line.startswith("test:")
+        )
+        dependencies = lines[start]
+        while dependencies.rstrip().endswith("\\"):
+            start += 1
+            dependencies += " " + lines[start].strip()
+        self.assertIn("test-bench-qualification-emitter", dependencies.split())
+
+
 class CScannerContractTest(unittest.TestCase):
     def test_brace_scanner_ignores_braces_in_c_literals(self) -> None:
         source = (

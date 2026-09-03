@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_build_info.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_bench_sequence.h"
@@ -709,6 +710,7 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     (!defined(DS4_NO_GPU) && !defined(__APPLE__) && \
      !defined(DS4_ROCM_BUILD))
 
+#if !defined(__linux__)
 static bool qualification_executable_path(
         char path[PATH_MAX], char *error, size_t error_size) {
     if (!path || PATH_MAX < 2) {
@@ -728,17 +730,6 @@ static bool qualification_executable_path(
         return false;
     }
     path[PATH_MAX - 1] = '\0';
-#elif defined(__linux__)
-    const ssize_t path_size = readlink("/proc/self/exe", path,
-                                       (size_t)PATH_MAX - 1u);
-    if (path_size < 0 || (size_t)path_size >= (size_t)PATH_MAX) {
-        if (error && error_size != 0u) {
-            (void)snprintf(error, error_size,
-                           "failed to resolve /proc/self/exe");
-        }
-        return false;
-    }
-    path[path_size] = '\0';
 #elif defined(_WIN32)
     const DWORD path_size = GetModuleFileNameA(
         NULL, path, (DWORD)PATH_MAX);
@@ -766,6 +757,7 @@ static bool qualification_executable_path(
     }
     return true;
 }
+#endif
 
 static int qualification_hex_value(char value) {
     if (value >= '0' && value <= '9') return value - '0';
@@ -785,10 +777,6 @@ static bool qualification_build_identity(
     }
     memset(identity, 0, DS4_RUNTIME_BUILD_IDENTITY_BYTES);
 
-    char path[PATH_MAX];
-    if (!qualification_executable_path(path, error, error_size)) {
-        return false;
-    }
     int flags = O_RDONLY;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
@@ -796,7 +784,15 @@ static bool qualification_build_identity(
 #ifdef O_BINARY
     flags |= O_BINARY;
 #endif
+#if defined(__linux__)
+    const int fd = open("/proc/self/exe", flags);
+#else
+    char path[PATH_MAX];
+    if (!qualification_executable_path(path, error, error_size)) {
+        return false;
+    }
     const int fd = open(path, flags);
+#endif
     if (fd < 0) {
         if (error && error_size != 0u) {
             (void)snprintf(error, error_size,

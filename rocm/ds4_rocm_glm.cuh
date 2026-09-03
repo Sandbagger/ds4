@@ -2745,7 +2745,9 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t n_expert,
         uint32_t layer_index,
         const ds4_gpu_tensor *x,
+        bool prefer_poolside_mmvq,
         bool force_resident) {
+    (void)prefer_poolside_mmvq;
     return glm_rocm_routed_moe_wrap(out, mid, model_map, model_size, gate_offset,
                                     up_offset, down_offset, gate_type, up_type,
                                     down_type, gate_expert_bytes, gate_row_bytes,
@@ -2784,7 +2786,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
         uint32_t mid_token_stride,
+        bool prefer_poolside_mmvq,
         bool force_resident) {
+    (void)prefer_poolside_mmvq;
     return glm_rocm_routed_moe_wrap(out, mid, model_map, model_size, gate_offset,
                                     up_offset, down_offset, gate_type, up_type,
                                     down_type, gate_expert_bytes, gate_row_bytes,

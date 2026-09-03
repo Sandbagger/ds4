@@ -398,6 +398,14 @@ extern "C" int ds4_gpu_matmul_q6_K_tensor(
     return 0;
 }
 
+extern "C" int ds4_gpu_laguna_router_f32_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, const ds4_gpu_tensor *x) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)x;
+    return 0;
+}
+
 extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
         ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
         ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,

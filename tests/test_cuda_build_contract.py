@@ -16,6 +16,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 CUDA_SOURCE = (ROOT / "ds4_cuda.cu").read_text(encoding="utf-8")
+ROCM_GLM_SOURCE = (ROOT / "rocm/ds4_rocm_glm.cuh").read_text(encoding="utf-8")
+ROCM_COMPAT_SOURCE = (ROOT / "ds4_rocm_compat.cu").read_text(encoding="utf-8")
+METAL_SOURCE = (ROOT / "ds4_metal.m").read_text(encoding="utf-8")
 DS4_HEADER = (ROOT / "ds4.h").read_text(encoding="utf-8")
 GPU_HEADER = (ROOT / "ds4_gpu.h").read_text(encoding="utf-8")
 GPU_MGPU_HEADER = (ROOT / "ds4_gpu_mgpu.h").read_text(encoding="utf-8")
@@ -1513,6 +1516,36 @@ class CudaBuildContractTest(unittest.TestCase):
             "ds4.c",
         )
         self.assertNotIn("ds4_gpu_laguna_router_f32_tensor(", laguna_batch)
+
+    def test_laguna_reduction_api_is_backend_complete(self) -> None:
+        for name in (
+            "ds4_gpu_glm_routed_moe_one_tensor",
+            "ds4_gpu_glm_routed_moe_batch_tensor",
+        ):
+            self.assertRegex(
+                ROCM_GLM_SOURCE,
+                rf'extern "C" int {name}\([\s\S]*?'
+                r"const ds4_gpu_tensor \*x,[\s\S]*?"
+                r"bool prefer_poolside_mmvq,[\s\S]*?"
+                r"bool force_resident\)",
+            )
+            body = source_function_body(
+                ROCM_GLM_SOURCE, f'extern "C" int {name}(', "ROCm GLM"
+            )
+            self.assertIn("(void)prefer_poolside_mmvq;", body)
+
+        rocm_router = source_function_body(
+            ROCM_COMPAT_SOURCE,
+            'extern "C" int ds4_gpu_laguna_router_f32_tensor(',
+            "ROCm compatibility",
+        )
+        self.assertIn("return 0;", rocm_router)
+        metal_router = source_function_body(
+            METAL_SOURCE,
+            "int ds4_gpu_laguna_router_f32_tensor(",
+            "Metal",
+        )
+        self.assertIn("return ds4_gpu_matmul_f32_tensor(", metal_router)
 
     def test_laguna_decode_poolside_mmvq_is_call_scoped(self) -> None:
         self.assertNotIn("DS4_MM_VQ_REDUCTION", CUDA_SOURCE)

@@ -60,7 +60,8 @@ LAGUNA_TEMPLATE_SHA256 = hashlib.sha256(
 PROMPT_TARGETS = (512, 2048, 8192, 28672)
 QUALIFICATION_SEQUENCE_SCHEMA = "ds4.qualification-sequence/v1"
 QUALIFICATION_SEQUENCE_LINE_COUNT = 24
-QUALIFICATION_SEQUENCE_MAX_BYTES = 16 << 20
+QUALIFICATION_SEQUENCE_MAX_INPUT_BYTES = 16 << 20
+QUALIFICATION_SEQUENCE_MAX_SERIALIZED_BYTES = 24 << 20
 PROFILE_SPECS = (
     ("cache-8gib", 8 << 30, (512, 2048, 28672, 8192)),
     ("cache-12gib", 12 << 30, (2048, 8192, 512, 28672)),
@@ -1296,8 +1297,11 @@ def build_qualification_sequence(
     )
     if len(rendered) != recorded_size:
         raise ValueError("qualification sequence rendered prompt size mismatch")
-    if len(rendered) > QUALIFICATION_SEQUENCE_MAX_BYTES:
-        raise ValueError("qualification sequence input exceeds the 16 MiB bound")
+    if len(rendered) > QUALIFICATION_SEQUENCE_MAX_INPUT_BYTES:
+        raise ValueError(
+            "qualification sequence decoded input exceeds the "
+            f"{QUALIFICATION_SEQUENCE_MAX_INPUT_BYTES >> 20} MiB bound"
+        )
     recorded_digest = _sha256(prompt["sha256"], f"prompts[{prompt_id}].sha256")
     if _sha256_bytes(rendered) != recorded_digest:
         raise ValueError("qualification sequence rendered prompt SHA-256 mismatch")
@@ -1342,8 +1346,13 @@ def write_qualification_sequence_atomic(
     target = Path(path)
     if not isinstance(payload, bytes):
         raise ValueError("qualification sequence payload must be bytes")
-    if not payload or len(payload) > QUALIFICATION_SEQUENCE_MAX_BYTES:
-        raise ValueError("qualification sequence payload is outside the 16 MiB bound")
+    if not payload or len(payload) > QUALIFICATION_SEQUENCE_MAX_SERIALIZED_BYTES:
+        if not payload:
+            raise ValueError("qualification sequence serialized payload is empty")
+        raise ValueError(
+            "qualification sequence serialized payload exceeds the "
+            f"{QUALIFICATION_SEQUENCE_MAX_SERIALIZED_BYTES >> 20} MiB bound"
+        )
     if not target.parent.is_dir():
         raise ValueError(
             f"qualification sequence output directory does not exist: {target.parent}"

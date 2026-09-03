@@ -14,7 +14,7 @@ extern "C" {
 #define DS4_BENCH_SEQUENCE_SHA256_HEX_LENGTH 64u
 #define DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE \
     (DS4_BENCH_SEQUENCE_SHA256_HEX_LENGTH + 1u)
-#define DS4_BENCH_SEQUENCE_MAX_FILE_BYTES (16u * 1024u * 1024u)
+#define DS4_BENCH_SEQUENCE_MAX_FILE_BYTES (24u * 1024u * 1024u)
 #define DS4_BENCH_SEQUENCE_MAX_INPUT_BYTES (16u * 1024u * 1024u)
 
 /* Owned result of one strict qualification-sequence parse.  All scalar

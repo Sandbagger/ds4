@@ -137,7 +137,7 @@ static bool read_sequence_file(const char *path,
     if (before.st_size <= 0 ||
         (uintmax_t)before.st_size > DS4_BENCH_SEQUENCE_MAX_FILE_BYTES) {
         set_error(error, error_size,
-                  "qualification sequence size is outside the %u-byte bound",
+                  "qualification sequence serialized size is outside the %u-byte bound",
                   DS4_BENCH_SEQUENCE_MAX_FILE_BYTES);
         goto cleanup;
     }
@@ -302,8 +302,9 @@ static bool next_line(ds4_bench_sequence_cursor *cursor,
     }
     if (length > DS4_BENCH_SEQUENCE_MAX_LINE_BYTES) {
         set_error(error, error_size,
-                  "qualification sequence line %zu exceeds its bound",
-                  cursor->line_number + 1u);
+                  "qualification sequence serialized line %zu exceeds the %u-byte bound",
+                  cursor->line_number + 1u,
+                  DS4_BENCH_SEQUENCE_MAX_LINE_BYTES);
         return false;
     }
     *line_out = cursor->bytes + start;
@@ -550,10 +551,15 @@ static bool decode_base64(const unsigned char *value,
     }
     const size_t decoded_size = groups * 3u - padding;
     if (decoded_size == 0 ||
-        decoded_size > DS4_BENCH_SEQUENCE_MAX_INPUT_BYTES ||
-        (uintmax_t)decoded_size != (uintmax_t)expected_size) {
+        decoded_size > DS4_BENCH_SEQUENCE_MAX_INPUT_BYTES) {
         set_error(error, error_size,
-                  "qualification sequence decoded input size does not match its bound");
+                  "qualification sequence decoded input size is outside the %u-byte bound",
+                  DS4_BENCH_SEQUENCE_MAX_INPUT_BYTES);
+        return false;
+    }
+    if ((uintmax_t)decoded_size != (uintmax_t)expected_size) {
+        set_error(error, error_size,
+                  "qualification sequence decoded input size does not match input_size_bytes");
         return false;
     }
     if (padding == 1u) {

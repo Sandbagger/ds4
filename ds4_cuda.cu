@@ -36344,6 +36344,14 @@ __global__ static void laguna_store_kv_f16_kernel(
     value_cache[dst] = __float2half_rn(v[i]);
 }
 
+__device__ __forceinline__ static float laguna_attention_softplus(
+        float value) {
+    /* Poolside CUDA unary.cu uses this exact non-log1p form.  The stable
+     * identity is numerically close but differs by several ULPs before the
+     * next Q8 projection. */
+    return value > 20.0f ? value : logf(1.0f + expf(value));
+}
+
 __global__ static void laguna_attention_decode_gqa_f16_scalar_kernel(
         float *heads, const float *q, const __half *key_cache,
         const __half *value_cache, const float *gate, uint32_t key_start,
@@ -36380,8 +36388,7 @@ __global__ static void laguna_attention_decode_gqa_f16_scalar_kernel(
         max_score = next_max;
     }
     const float gate_value = gate[head];
-    const float gate_scale = gate_value > 0.0f ?
-        gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    const float gate_scale = laguna_attention_softplus(gate_value);
     float *out = heads + (uint64_t)head * head_dim;
     for (uint32_t d = 0u; d < head_dim; d++) {
         out[d] = acc[d] / sum * gate_scale;
@@ -36621,9 +36628,7 @@ laguna_attention_decode_gqa_f16_kernel(
             denominator += part_scale * partition_meta[p].y;
         }
         const float gate_value = gate[head];
-        const float gate_scale = gate_value > 0.0f ?
-            gate_value + log1pf(expf(-gate_value)) :
-            log1pf(expf(gate_value));
+        const float gate_scale = laguna_attention_softplus(gate_value);
         heads[(uint64_t)head * head_dim + global_tid] =
             numerator / denominator * gate_scale;
     }
@@ -37299,7 +37304,7 @@ __global__ static void laguna_attention_prefill_gqa_f16_kernel(
         max_score = next_max;
     }
     const float gate_value = gate[(uint64_t)row * n_head + head];
-    const float gate_scale = gate_value > 0.0f ? gate_value + log1pf(expf(-gate_value)) : log1pf(expf(gate_value));
+    const float gate_scale = laguna_attention_softplus(gate_value);
     float *out = heads + ((uint64_t)row * n_head + head) * head_dim;
     for (uint32_t d = 0; d < head_dim; d++) out[d] = acc[d] / sum * gate_scale;
 }

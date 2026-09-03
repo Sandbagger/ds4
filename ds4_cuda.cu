@@ -19109,10 +19109,12 @@ extern "C" int ds4_gpu_laguna_router_f32_tensor(
     const char *weight_ptr = cuda_resolve_weight_ptr(
         model_map, weight_offset, weight_bytes, logical_tier,
         "Laguna F32 router");
-    if (!weight_ptr ||
-        ((((uintptr_t)weight_ptr | (uintptr_t)x->ptr) &
-          (alignof(float2) - 1u)) != 0u)) {
-        return 0;
+    if (!weight_ptr) return 0;
+    if ((((uintptr_t)weight_ptr | (uintptr_t)x->ptr) &
+         (alignof(float2) - 1u)) != 0u) {
+        return ds4_gpu_matmul_f32_tensor(
+            out, model_map, model_size, weight_offset,
+            in_dim, out_dim, x, 1u);
     }
     laguna_router_f32_poolside_kernel<<<256u, 256u,
             32u * sizeof(float)>>>(

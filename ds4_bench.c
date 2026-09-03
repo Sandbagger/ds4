@@ -4,6 +4,8 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_bench_sequence.h"
+#include "ds4_bench_qualification.h"
+#include "ds4_plan_io.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -16,6 +18,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -23,7 +26,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
 
@@ -469,12 +481,9 @@ static bench_config parse_options(int argc, char **argv) {
                     "--prompt-file or --chat-prompt-file\n");
             exit(2);
         }
-        if (c.backend != DS4_BACKEND_CUDA ||
-            (c.gpu_vram_arg && !strcmp(c.gpu_vram_arg, "0"))) {
-            fprintf(stderr,
-                    "ds4-bench: qualification sequence requires the CUDA backend\n");
-            exit(2);
-        }
+        /* The sequence is authenticated before backend availability is
+         * decided.  Unsupported builds fail closed at the post-parse
+         * boundary, before any model or engine access. */
         return c;
     }
 
@@ -696,6 +705,451 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
+#if defined(DS4_BENCH_QUALIFICATION_TEST_BACKEND) || \
+    (!defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+     !defined(DS4_ROCM_BUILD))
+
+static bool qualification_executable_path(
+        char path[PATH_MAX], char *error, size_t error_size) {
+    if (!path || PATH_MAX < 2) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "executable path buffer is unavailable");
+        }
+        return false;
+    }
+#if defined(__APPLE__)
+    uint32_t path_size = (uint32_t)PATH_MAX;
+    if (_NSGetExecutablePath(path, &path_size) != 0) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "failed to resolve the current executable path");
+        }
+        return false;
+    }
+    path[PATH_MAX - 1] = '\0';
+#elif defined(__linux__)
+    const ssize_t path_size = readlink("/proc/self/exe", path,
+                                       (size_t)PATH_MAX - 1u);
+    if (path_size < 0 || (size_t)path_size >= (size_t)PATH_MAX) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "failed to resolve /proc/self/exe");
+        }
+        return false;
+    }
+    path[path_size] = '\0';
+#elif defined(_WIN32)
+    const DWORD path_size = GetModuleFileNameA(
+        NULL, path, (DWORD)PATH_MAX);
+    if (path_size == 0u || path_size >= (DWORD)PATH_MAX) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "failed to resolve the current executable path");
+        }
+        return false;
+    }
+    path[path_size] = '\0';
+#else
+    if (error && error_size != 0u) {
+        (void)snprintf(error, error_size,
+                       "current executable path is unsupported on this platform");
+    }
+    return false;
+#endif
+    if (path[0] == '\0') {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "current executable path is empty");
+        }
+        return false;
+    }
+    return true;
+}
+
+static int qualification_hex_value(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+static bool qualification_build_identity(
+        uint8_t identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        char *error, size_t error_size) {
+    if (!identity) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "executable build identity output is null");
+        }
+        return false;
+    }
+    memset(identity, 0, DS4_RUNTIME_BUILD_IDENTITY_BYTES);
+
+    char path[PATH_MAX];
+    if (!qualification_executable_path(path, error, error_size)) {
+        return false;
+    }
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_BINARY
+    flags |= O_BINARY;
+#endif
+    const int fd = open(path, flags);
+    if (fd < 0) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "open current executable: %s", strerror(errno));
+        }
+        return false;
+    }
+
+    bool ok = false;
+    struct stat status;
+    char digest[DS4_PLAN_IO_SHA256_HEX_SIZE] = {0};
+    if (fstat(fd, &status) != 0) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "stat current executable: %s", strerror(errno));
+        }
+    } else if (!S_ISREG(status.st_mode) || status.st_size <= 0) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "current executable is not a non-empty regular file");
+        }
+    } else if (!ds4_plan_io_sha256_fd(
+                   fd, (uint64_t)status.st_size, digest,
+                   error, error_size)) {
+        /* ds4_plan_io_sha256_fd supplies the bounded diagnostic. */
+    } else {
+        ok = true;
+        for (size_t i = 0u;
+             i < DS4_RUNTIME_BUILD_IDENTITY_BYTES; i++) {
+            const int high = qualification_hex_value(digest[i * 2u]);
+            const int low = qualification_hex_value(digest[i * 2u + 1u]);
+            if (high < 0 || low < 0) {
+                ok = false;
+                if (error && error_size != 0u) {
+                    (void)snprintf(error, error_size,
+                                   "current executable SHA-256 is not hexadecimal");
+                }
+                break;
+            }
+            identity[i] = (uint8_t)((high << 4) | low);
+        }
+    }
+    if (close(fd) != 0 && ok) {
+        ok = false;
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "close current executable: %s", strerror(errno));
+        }
+    }
+    if (!ok) memset(identity, 0, DS4_RUNTIME_BUILD_IDENTITY_BYTES);
+    return ok;
+}
+
+static bool qualification_next_timestamp(
+        uint64_t *last_timestamp, uint64_t *timestamp_out) {
+    if (!last_timestamp || !timestamp_out) return false;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        now.tv_sec < 0 || now.tv_nsec < 0 || now.tv_nsec >= 1000000000L) {
+        return false;
+    }
+    const uint64_t seconds = (uint64_t)now.tv_sec;
+    const uint64_t nanos = (uint64_t)now.tv_nsec;
+    if (seconds > (UINT64_MAX - nanos) / UINT64_C(1000000000)) {
+        return false;
+    }
+    uint64_t timestamp = seconds * UINT64_C(1000000000) + nanos;
+    if (timestamp == 0u) timestamp = 1u;
+    if (timestamp <= *last_timestamp) {
+        if (*last_timestamp == UINT64_MAX) return false;
+        timestamp = *last_timestamp + 1u;
+    }
+    *last_timestamp = timestamp;
+    *timestamp_out = timestamp;
+    return true;
+}
+
+static int qualification_lifecycle_failure(
+        const char *operation, const char *detail) {
+    fprintf(stderr, "ds4-bench: qualification %s failed: %s\n",
+            operation ? operation : "operation",
+            detail && detail[0] ? detail : "backend returned failure");
+    return 1;
+}
+
+static bool qualification_copy_rendered_prompt(
+        const ds4_bench_sequence *sequence,
+        char **rendered_out,
+        char *error, size_t error_size) {
+    if (!sequence || !rendered_out || !sequence->input_bytes ||
+        sequence->input_size == 0u || sequence->input_size_bytes == 0u ||
+        sequence->input_size_bytes > (uint64_t)(SIZE_MAX - 1u) ||
+        sequence->input_size != (size_t)sequence->input_size_bytes) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "qualification sequence input span is invalid");
+        }
+        return false;
+    }
+    char *rendered = (char *)malloc(sequence->input_size + 1u);
+    if (!rendered) {
+        if (error && error_size != 0u) {
+            (void)snprintf(error, error_size,
+                           "allocate rendered qualification prompt: %s",
+                           strerror(errno));
+        }
+        return false;
+    }
+    memcpy(rendered, sequence->input_bytes, sequence->input_size);
+    rendered[sequence->input_size] = '\0';
+    *rendered_out = rendered;
+    return true;
+}
+
+/* Execute one authenticated, fixed-shape benchmark sequence.  The caller
+ * owns engine, prompt, rendered, and sequence; this runner owns each session
+ * only until its repetition reaches a terminal milestone or aborts. */
+static int run_qualification_lifecycle(
+        ds4_engine *engine,
+        const ds4_bench_sequence *sequence,
+        const ds4_tokens *prompt,
+        const ds4_gpu_nvml_inventory_snapshot *pre_child,
+        const uint8_t expected_build_identity[
+            DS4_RUNTIME_BUILD_IDENTITY_BYTES],
+        FILE *stream) {
+    if (!engine || !sequence || !prompt || !pre_child ||
+        !expected_build_identity || !stream) {
+        return qualification_lifecycle_failure(
+            "lifecycle", "invalid runner input");
+    }
+
+    uint64_t last_timestamp = 0u;
+    char error[256] = {0};
+    for (uint32_t repetition_index = 0;
+         repetition_index < 4;
+         repetition_index++) {
+        ds4_session *session = NULL;
+        ds4_runtime_request_context request;
+        ds4_runtime_request_metrics metrics;
+        ds4_runtime_wire_snapshot runtime_snapshot;
+        ds4_engine_laguna_external_checkpoint_observation observation;
+        uint64_t timestamp = 0u;
+        int rc = 0;
+        memset(&request, 0, sizeof(request));
+        memset(&metrics, 0, sizeof(metrics));
+        memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
+        memset(&observation, 0, sizeof(observation));
+        error[0] = '\0';
+
+        do {
+            if (ds4_session_create(&session, engine, 32768) != 0) {
+                rc = qualification_lifecycle_failure(
+                    "session create", "backend returned failure");
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "request timestamp", "monotonic clock failed");
+                break;
+            }
+            if (!ds4_runtime_request_begin(&request, timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "request begin", "request accounting rejected the request");
+                break;
+            }
+            if (!ds4_runtime_request_set_prompt_tokens(
+                    &request, (uint64_t)sequence->prompt_tokens)) {
+                rc = qualification_lifecycle_failure(
+                    "request prompt", "request accounting rejected prompt tokens");
+                break;
+            }
+
+            memset(&observation, 0, sizeof(observation));
+            if (ds4_engine_laguna_external_checkpoint(
+                    engine, pre_child, expected_build_identity,
+                    &observation) != DS4_RUNTIME_STATUS_OK) {
+                rc = qualification_lifecycle_failure(
+                    "accepted checkpoint", "external attribution rejected the checkpoint");
+                break;
+            }
+            memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
+            if (!ds4_engine_runtime_snapshot(engine, &runtime_snapshot)) {
+                rc = qualification_lifecycle_failure(
+                    "accepted snapshot", "runtime snapshot failed");
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "accepted timestamp", "monotonic clock failed");
+                break;
+            }
+            ds4_bench_qualification_record record = {
+                .sequence = sequence,
+                .event = DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED,
+                .request_id = request.request_id,
+                .repetition_index = repetition_index,
+                .monotonic_ns = timestamp,
+                .session_payload_bytes = ds4_session_payload_bytes(session),
+                .runtime_snapshot = &runtime_snapshot,
+                .request_metrics = NULL,
+            };
+            if (!ds4_bench_qualification_emit_record(
+                    stream, &record, error, sizeof(error))) {
+                rc = qualification_lifecycle_failure(
+                    "request_accepted", error);
+                break;
+            }
+
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                !ds4_runtime_request_mark_prefill_started(
+                    &request, timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "prefill start", "request accounting rejected prefill start");
+                break;
+            }
+            if (ds4_session_sync_attributed(
+                    session, prompt, &request, error, sizeof(error)) != 0) {
+                rc = qualification_lifecycle_failure("attributed prefill", error);
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                !ds4_runtime_request_mark_prefill_complete(
+                    &request, timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "prefill complete", "request accounting rejected prefill completion");
+                break;
+            }
+
+            const int token = ds4_session_argmax_excluding(
+                session, ds4_token_eos(engine));
+            if (token < 0) {
+                rc = qualification_lifecycle_failure(
+                    "token selection", "backend returned no non-EOS token");
+                break;
+            }
+            if (ds4_session_eval_attributed(
+                    session, token, &request, error, sizeof(error)) != 0) {
+                rc = qualification_lifecycle_failure("attributed decode", error);
+                break;
+            }
+            if (!ds4_runtime_request_add_generated_tokens(&request, 1u)) {
+                rc = qualification_lifecycle_failure(
+                    "generated accounting", "request accounting rejected generated token");
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                !ds4_runtime_request_record_visible_decoded(
+                    &request, 1u, timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "visible accounting", "request accounting rejected visible token");
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                !ds4_runtime_request_mark_first_visible_emitted(
+                    &request, timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "first-visible accounting", "request accounting rejected first visible token");
+                break;
+            }
+
+            memset(&observation, 0, sizeof(observation));
+            if (ds4_engine_laguna_external_checkpoint(
+                    engine, pre_child, expected_build_identity,
+                    &observation) != DS4_RUNTIME_STATUS_OK) {
+                rc = qualification_lifecycle_failure(
+                    "first-token checkpoint", "external attribution rejected the checkpoint");
+                break;
+            }
+            memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
+            if (!ds4_engine_runtime_snapshot(engine, &runtime_snapshot)) {
+                rc = qualification_lifecycle_failure(
+                    "first-token snapshot", "runtime snapshot failed");
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "first-token timestamp", "monotonic clock failed");
+                break;
+            }
+            record = (ds4_bench_qualification_record){
+                .sequence = sequence,
+                .event = DS4_BENCH_QUALIFICATION_EVENT_FIRST_TOKEN,
+                .request_id = request.request_id,
+                .repetition_index = repetition_index,
+                .monotonic_ns = timestamp,
+                .session_payload_bytes = ds4_session_payload_bytes(session),
+                .runtime_snapshot = &runtime_snapshot,
+                .request_metrics = NULL,
+            };
+            if (!ds4_bench_qualification_emit_record(
+                    stream, &record, error, sizeof(error))) {
+                rc = qualification_lifecycle_failure("first_token", error);
+                break;
+            }
+
+            if (ds4_session_request_barrier(
+                    session, &request, error, sizeof(error)) != 0) {
+                rc = qualification_lifecycle_failure("request barrier", error);
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                !ds4_runtime_request_finish(
+                    &request, DS4_RUNTIME_REQUEST_COMPLETED,
+                    timestamp, &metrics)) {
+                rc = qualification_lifecycle_failure(
+                    "request finish", "request accounting rejected completion");
+                break;
+            }
+
+            memset(&observation, 0, sizeof(observation));
+            if (ds4_engine_laguna_external_checkpoint(
+                    engine, pre_child, expected_build_identity,
+                    &observation) != DS4_RUNTIME_STATUS_OK) {
+                rc = qualification_lifecycle_failure(
+                    "completion checkpoint", "external attribution rejected the checkpoint");
+                break;
+            }
+            memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
+            if (!ds4_engine_runtime_snapshot(engine, &runtime_snapshot)) {
+                rc = qualification_lifecycle_failure(
+                    "completion snapshot", "runtime snapshot failed");
+                break;
+            }
+            if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
+                rc = qualification_lifecycle_failure(
+                    "completion timestamp", "monotonic clock failed");
+                break;
+            }
+            record = (ds4_bench_qualification_record){
+                .sequence = sequence,
+                .event = DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE,
+                .request_id = request.request_id,
+                .repetition_index = repetition_index,
+                .monotonic_ns = timestamp,
+                .session_payload_bytes = ds4_session_payload_bytes(session),
+                .runtime_snapshot = &runtime_snapshot,
+                .request_metrics = &metrics,
+            };
+            if (!ds4_bench_qualification_emit_record(
+                    stream, &record, error, sizeof(error))) {
+                rc = qualification_lifecycle_failure("request_complete", error);
+                break;
+            }
+        } while (false);
+
+        if (session) ds4_session_free(session);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+#endif
+
 int main(int argc, char **argv) {
     int version_handled = 0;
     const int version_rc = ds4_build_info_maybe_print_version(
@@ -727,11 +1181,108 @@ int main(int argc, char **argv) {
                     sequence_error[0] ? sequence_error : "invalid sequence");
             return 2;
         }
-        ds4_bench_sequence_free(&sequence);
+
+        ds4_engine *qualification_engine = NULL;
+        ds4_tokens qualification_prompt = {0};
+        char *qualification_rendered = NULL;
+        int qualification_rc = 2;
+#if defined(DS4_BENCH_QUALIFICATION_TEST_BACKEND) || \
+    (!defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+     !defined(DS4_ROCM_BUILD))
+        if (cfg.backend != DS4_BACKEND_CUDA ||
+            (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0"))) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence requires the CUDA backend\n");
+            goto qualification_cleanup;
+        }
+        if (!cfg.qualification_control_fd_set) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence requires an inherited "
+                    "--qualification-control-fd\n");
+            goto qualification_cleanup;
+        }
+        if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence cannot use a GPU layout; "
+                    "the canonical engine configuration is fixed\n");
+            goto qualification_cleanup;
+        }
+
+        uint8_t expected_build_identity[
+            DS4_RUNTIME_BUILD_IDENTITY_BYTES] = {0};
+        if (!qualification_build_identity(
+                expected_build_identity,
+                sequence_error, sizeof(sequence_error))) {
+            fprintf(stderr,
+                    "ds4-bench: qualification executable identity failed: %s\n",
+                    sequence_error[0] ? sequence_error : "unknown error");
+            goto qualification_cleanup;
+        }
+        ds4_gpu_nvml_inventory_snapshot pre_child = {0};
+        if (ds4_gpu_nvml_inventory_capture(&pre_child) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: qualification pre-child NVML inventory failed\n");
+            goto qualification_cleanup;
+        }
+
+        const ds4_engine_options qualification_options = {
+            .model_path = cfg.model_path,
+            .runtime_build_info = ds4_build_info_get(),
+            .backend = DS4_BACKEND_CUDA,
+            .context_size = 32768,
+            .prefill_chunk = 4096u,
+            .ssd_streaming_cache_bytes = sequence.cache_bytes,
+            .ssd_streaming_cache_bytes_set = true,
+            .ssd_streaming = true,
+            .placement_ctx_hint = 32768,
+            .session_slots = 1u,
+            .qualification_control_fd = cfg.qualification_control_fd,
+            .qualification_control_fd_set = true,
+        };
+        if (ds4_engine_open(&qualification_engine,
+                            &qualification_options) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: qualification engine open failed\n");
+            goto qualification_cleanup;
+        }
+        if (!qualification_copy_rendered_prompt(
+                &sequence, &qualification_rendered,
+                sequence_error, sizeof(sequence_error))) {
+            fprintf(stderr,
+                    "ds4-bench: qualification prompt rejected: %s\n",
+                    sequence_error[0] ? sequence_error : "invalid input");
+            goto qualification_cleanup;
+        }
+        ds4_tokenize_rendered_chat(
+            qualification_engine, qualification_rendered,
+            &qualification_prompt);
+        if (sequence.prompt_tokens > (uint32_t)INT_MAX ||
+            qualification_prompt.len != (int)sequence.prompt_tokens) {
+            fprintf(stderr,
+                    "ds4-bench: qualification prompt token count %d does not "
+                    "match sequence prompt_tokens=%u\n",
+                    qualification_prompt.len,
+                    sequence.prompt_tokens);
+            goto qualification_cleanup;
+        }
+        qualification_rc = run_qualification_lifecycle(
+            qualification_engine, &sequence, &qualification_prompt,
+            &pre_child, expected_build_identity, stdout);
+#else
         fprintf(stderr,
-                "ds4-bench: qualification sequence unsupported: "
-                "authenticated sequence execution requires the later lifecycle runner\n");
-        return 2;
+                "ds4-bench: qualification sequence unsupported on this build; "
+                "authenticated execution requires CUDA\n");
+        goto qualification_cleanup;
+#endif
+
+qualification_cleanup:
+        if (qualification_engine) {
+            ds4_engine_close(qualification_engine);
+        }
+        ds4_tokens_free(&qualification_prompt);
+        free(qualification_rendered);
+        ds4_bench_sequence_free(&sequence);
+        return qualification_rc;
     }
 
     /* Hint the packer at the largest ctx this bench run will exercise

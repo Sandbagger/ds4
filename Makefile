@@ -89,8 +89,8 @@ ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_BUILD_IN
 ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
 	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ) $(METAL_LDLIBS)
 
-ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o ds4_bench_sequence.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
-	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o ds4_bench_sequence.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ) $(METAL_LDLIBS)
+ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o ds4_bench_sequence.o ds4_bench_qualification.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
+	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o ds4_bench_sequence.o ds4_bench_qualification.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ) $(METAL_LDLIBS)
 
 ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
 	$(CC) $(CFLAGS) -o $@ ds4_eval.o ds4_help.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ) $(METAL_LDLIBS)
@@ -110,10 +110,10 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o ds4_bench_sequence.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o ds4_bench_sequence.o ds4_bench_qualification.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o ds4_bench_sequence.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o ds4_bench_sequence.o ds4_bench_qualification.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 
@@ -172,7 +172,7 @@ ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_BUILD_IN
 ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o ds4_bench_sequence.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
+ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o ds4_bench_sequence.o ds4_bench_qualification.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS) $(DS4_BUILD_INFO_OBJ)
@@ -184,10 +184,10 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_ar
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.o $(CORE_OBJS) rax.o
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o ds4_bench_sequence.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o ds4_bench_sequence.o ds4_bench_qualification.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o ds4_bench_sequence.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o ds4_bench_sequence.o ds4_bench_qualification.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_build_info_cpu.o $(LDLIBS)
 
@@ -238,7 +238,7 @@ ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 ds4_server.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_bench_sequence.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h
@@ -280,7 +280,7 @@ ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 ds4_server_cpu.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_bench_sequence.h
+ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h

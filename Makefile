@@ -785,7 +785,7 @@ test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_contro
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-server-contract \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_session_logits_only tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link \
-	tests/test_plan_io tests/test_laguna_plan $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_plan_io tests/test_laguna_plan test-bench-sequence $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test

@@ -109,6 +109,9 @@ static bool read_sequence_file(const char *path,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
+#ifdef O_NONBLOCK
+    flags |= O_NONBLOCK;
+#endif
     int fd = open(path, flags);
     if (fd < 0) {
         const int saved_errno = errno;

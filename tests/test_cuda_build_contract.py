@@ -1561,7 +1561,7 @@ class CudaBuildContractTest(unittest.TestCase):
         )
 
         launch = function_body("static int glm_poolside_routed_moe_q4_launch(")
-        self.assertIn("bool prefer_poolside_mmvq", launch)
+        self.assertIn("prefer_poolside_mmvq", launch)
         self.assertIn(
             "const bool poolside_mmvq = !mmq && n_tokens == 1u &&\n"
             "        n_total_expert == 256u && n_expert == 10u &&\n"
@@ -1602,7 +1602,7 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         glm_one = source_function_body(
             DS4_SOURCE,
-            "static bool glm_graph_encode_sparse_ffn_one(",
+            "static int glm_graph_routed_moe_one_dispatch(",
             "ds4.c",
         )
         self.assertIn(
@@ -1611,7 +1611,6 @@ class CudaBuildContractTest(unittest.TestCase):
             glm_one,
         )
         compact = function_body(
-            "static ds4_gpu_laguna_exec_result "
             "cuda_laguna_compact_routed_moe_batch_tensor_core("
         )
         self.assertIn(

@@ -3671,7 +3671,7 @@ static int laguna_glm_routed_moe_q4_call(
             LAGUNA_MOE_DIM, LAGUNA_MOE_DIM, LAGUNA_MOE_DIM,
             selected, router, LAGUNA_MOE_EXPERTS, LAGUNA_MOE_USED,
             0u, x, n_tokens, LAGUNA_MOE_USED * LAGUNA_MOE_DIM,
-            force_resident);
+            false, force_resident);
 }
 
 static void laguna_fill_routed_case(
@@ -3769,7 +3769,8 @@ static int run_routed_moe_selected_validation_case(void) {
             expert_bytes, row_bytes,
             LAGUNA_MOE_DIM, LAGUNA_MOE_DIM, LAGUNA_MOE_DIM,
             selected_t, router_t, LAGUNA_MOE_EXPERTS, LAGUNA_MOE_USED,
-            0u, x, 1u, LAGUNA_MOE_USED * LAGUNA_MOE_DIM, true)) {
+            0u, x, 1u, LAGUNA_MOE_USED * LAGUNA_MOE_DIM,
+            false, true)) {
         fprintf(stderr, "routed-moe/selected-validation: accepted invalid selected ID\n");
         goto cleanup;
     }

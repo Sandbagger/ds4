@@ -612,6 +612,7 @@ int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
         uint32_t              n_expert,
         uint32_t              layer_index,
         const ds4_gpu_tensor *x,
+        bool                  prefer_poolside_mmvq,
         bool                  force_resident);
 int ds4_gpu_test_glm_poolside_q4_l2_tensor(
         ds4_gpu_tensor *mid,
@@ -2810,6 +2811,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                n_expert,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
+        bool                    prefer_poolside_mmvq,
         bool                    force_resident);
 
 int ds4_gpu_glm_routed_moe_batch_tensor(
@@ -2840,6 +2842,7 @@ int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride,
+        bool                    prefer_poolside_mmvq,
         bool                    force_resident);
 
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(

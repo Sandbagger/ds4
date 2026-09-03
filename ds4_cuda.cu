@@ -136,7 +136,6 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
-static int g_cuda_poolside_mmvq;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
@@ -309,13 +308,6 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_exact_score_split_fuse_inv_rope =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL;
     g_cuda_moe_decode_graph = getenv("DS4_CUDA_MOE_DECODE_GRAPH") != NULL;
-    const char *reduction = getenv("DS4_MM_VQ_REDUCTION");
-    g_cuda_poolside_mmvq =
-        reduction && strcmp(reduction, "poolside") == 0;
-}
-
-static bool cuda_poolside_mmvq_requested(void) {
-    return g_cuda_poolside_mmvq != 0;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -32034,6 +32026,7 @@ static int glm_poolside_routed_moe_q4_launch(
         const ds4_gpu_tensor *input,
         uint32_t              n_tokens,
         uint32_t              mid_token_stride,
+        bool                  prefer_poolside_mmvq,
         const glm_poolside_q4_compact_launch *compact
 #ifdef DS4_TEST_HOOKS
         , ds4_gpu_tensor     *capture
@@ -32128,7 +32121,7 @@ static int glm_poolside_routed_moe_q4_launch(
     const bool poolside_mmvq = !mmq && n_tokens == 1u &&
         n_total_expert == 256u && n_expert == 10u &&
         expert_in_dim == 3072u && expert_mid_dim == 1024u &&
-        out_dim == 3072u && cuda_poolside_mmvq_requested();
+        out_dim == 3072u && prefer_poolside_mmvq;
     if ((mmq && ((((uintptr_t)input->ptr) & 15u) != 0u ||
                  (((uintptr_t)mid->ptr) & 15u) != 0u)) ||
         input_values > UINT32_MAX ||
@@ -33318,7 +33311,7 @@ cuda_laguna_compact_routed_moe_batch_tensor_core(
         expert_bytes, down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_selected,
-        x, n_tokens, n_selected * expert_mid_dim, &compact
+        x, n_tokens, n_selected * expert_mid_dim, true, &compact
 #ifdef DS4_TEST_HOOKS
         , NULL
 #endif
@@ -34245,6 +34238,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride,
+        bool                    prefer_poolside_mmvq,
         bool                    force_resident) {
     (void)layer_index;
     if (!out || !mid || !x || !selected || !weights || !model_map ||
@@ -34270,7 +34264,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim,
                 selected, weights, n_total_expert, n_expert,
-                x, n_tokens, mid_token_stride, NULL
+                x, n_tokens, mid_token_stride, prefer_poolside_mmvq, NULL
 #ifdef DS4_TEST_HOOKS
                 , NULL
 #endif
@@ -34621,6 +34615,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                n_expert,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
+        bool                    prefer_poolside_mmvq,
         bool                    force_resident) {
     return ds4_gpu_glm_routed_moe_batch_tensor(out, mid,
             model_map, model_size,
@@ -34631,7 +34626,8 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, layer_index,
-            x, 1, n_expert * expert_mid_dim, force_resident);
+            x, 1, n_expert * expert_mid_dim,
+            prefer_poolside_mmvq, force_resident);
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -34662,6 +34658,7 @@ extern "C" int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
         uint32_t              n_expert,
         uint32_t              layer_index,
         const ds4_gpu_tensor *x,
+        bool                  prefer_poolside_mmvq,
         bool                  force_resident) {
     if (!capture) {
         return ds4_gpu_glm_routed_moe_one_tensor(
@@ -34673,7 +34670,7 @@ extern "C" int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
                 down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim,
                 selected, weights, n_total_expert, n_expert,
-                layer_index, x, force_resident);
+                layer_index, x, prefer_poolside_mmvq, force_resident);
     }
     (void)layer_index;
     if (!force_resident || gate_type != 12u || up_type != 12u ||
@@ -34693,7 +34690,8 @@ extern "C" int ds4_gpu_test_glm_routed_moe_one_capture_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert,
-            x, 1u, n_expert * expert_mid_dim, NULL, capture);
+            x, 1u, n_expert * expert_mid_dim,
+            prefer_poolside_mmvq, NULL, capture);
 }
 #endif
 

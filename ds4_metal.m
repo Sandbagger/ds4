@@ -18465,6 +18465,14 @@ int ds4_gpu_matmul_f32_tensor(
     return 1;
 }
 
+int ds4_gpu_laguna_router_f32_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, const ds4_gpu_tensor *x) {
+    return ds4_gpu_matmul_f32_tensor(
+        out, model_map, model_size, weight_offset,
+        3072u, 256u, x, 1u);
+}
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,
@@ -33663,7 +33671,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                n_expert,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
+        bool                    prefer_poolside_mmvq,
         bool                    force_resident) {
+    (void)prefer_poolside_mmvq;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
@@ -35508,7 +35518,9 @@ int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride,
+        bool                    prefer_poolside_mmvq,
         bool                    force_resident) {
+    (void)prefer_poolside_mmvq;
     (void)force_resident;
     return ds4_gpu_glm_routed_moe_batch_tensor_impl(out,
                                                     mid,

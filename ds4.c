@@ -41029,6 +41029,7 @@ static int glm_graph_routed_moe_one_dispatch(
                                              DS4_N_EXPERT_USED,
                                              il,
                                              x,
+                                             false,
                                              force_resident);
 }
 
@@ -41200,6 +41201,7 @@ static int glm_graph_routed_moe_batch_dispatch(
             x,
             n_tokens,
             mid_token_stride,
+            false,
             force_resident);
 }
 
@@ -49127,6 +49129,7 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         il,
                         g->ffn_norm,
+                        true,
                         true) != 0;
             }
 #ifdef DS4_TEST_HOOKS
@@ -49778,6 +49781,7 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(
                             g->ffn_norm,
                             n_tokens,
                             DS4_N_EXPERT_USED * DS4_N_FF_EXP,
+                            false,
                             true) != 0;
                 }
             }

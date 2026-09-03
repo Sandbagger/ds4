@@ -1046,6 +1046,15 @@ class EvalCaseSchemaContractTest(unittest.TestCase):
         self.assertIn("UTF-8", schema["$comment"])
         self.assertIn("FIELD_NAME=DECIMAL_UTF8_BYTE_LENGTH:EXACT_UTF8_VALUE", schema["$comment"])
         self.assertIn("final LF", schema["$comment"])
+        self.assertEqual(len(schema["allOf"]), 2)
+        self.assertEqual(
+            schema["allOf"][0]["if"]["properties"]["terminal_status"]["const"],
+            "completed",
+        )
+        self.assertEqual(
+            schema["allOf"][1]["then"]["properties"]["grade"]["const"],
+            "not_graded",
+        )
 
         fixture = EVAL_CASE_FIXTURE_PATH.read_bytes()
         lines = fixture.splitlines(keepends=True)
@@ -1136,6 +1145,44 @@ class EvalCaseSchemaContractTest(unittest.TestCase):
         rejected(lambda value: value[0].__setitem__("evidence_sha256", "0" * 64), "zero digest")
         rejected(lambda value: value[0].__setitem__("evidence_sha256", records[0]["evidence_sha256"].upper()), "uppercase digest")
         rejected(lambda value: value[0].__setitem__("answer", "A"), "stale evidence digest")
+
+        def recomputed_payload(mutator: Any) -> bytes:
+            candidate = json.loads(json.dumps(records))
+            mutator(candidate)
+            for record in candidate:
+                record["evidence_sha256"] = _case_evidence_digest(record)
+            return _case_payload(candidate)
+
+        def mark_no_answer(value: list[dict[str, Any]]) -> None:
+            value[0]["answer"] = "?"
+            value[0]["grade"] = "failed"
+
+        no_answer = _run_case_validator(recomputed_payload(mark_no_answer))
+        self.assertEqual(no_answer.returncode, 0, no_answer.stderr.decode())
+
+        def mark_cancelled(value: list[dict[str, Any]]) -> None:
+            value[0]["terminal_status"] = "cancelled"
+            value[0]["grade"] = "not_graded"
+
+        cancelled = _run_case_validator(recomputed_payload(mark_cancelled))
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr.decode())
+
+        def semantically_rejected(mutator: Any, label: str) -> None:
+            result = _run_case_validator(recomputed_payload(mutator))
+            self.assertNotEqual(result.returncode, 0, label)
+
+        semantically_rejected(
+            lambda value: value[0].__setitem__("answer", "?"),
+            "completed wrong answer must not remain passed",
+        )
+        semantically_rejected(
+            lambda value: value[0].__setitem__("grade", "failed"),
+            "completed literal answer must remain passed",
+        )
+        semantically_rejected(
+            lambda value: value[0].__setitem__("terminal_status", "cancelled"),
+            "non-completed record must be not_graded",
+        )
         reordered_records = [records[1], records[0], records[2], records[3]]
         result = _run_case_validator(_case_payload(reordered_records))
         self.assertNotEqual(result.returncode, 0, "reordered selection")

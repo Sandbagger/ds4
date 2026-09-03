@@ -64,6 +64,36 @@
       "$ref": "#/$defs/sha256"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["terminal_status"],
+        "properties": {
+          "terminal_status": {"const": "completed"}
+        }
+      },
+      "then": {
+        "properties": {
+          "grade": {"enum": ["passed", "failed"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["terminal_status"],
+        "properties": {
+          "terminal_status": {
+            "enum": ["cancelled", "rejected", "recoverable_error", "unsafe_error"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "grade": {"const": "not_graded"}
+        }
+      }
+    }
+  ],
   "$defs": {
     "uuid": {
       "type": "string",

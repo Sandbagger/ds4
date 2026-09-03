@@ -41,6 +41,7 @@ CASE_IDS = (
     "aime2025-01",
     "compsec-076",
 )
+EXPECTED_ANSWERS = ("B", "C", "70", "17-20")
 GRADES = ("passed", "failed", "not_graded")
 TERMINAL_STATUSES = (
     "completed",
@@ -168,6 +169,15 @@ def validate_record(record: Any, *, expected_case_index: int | None = None) -> N
     terminal = _require_string(record, "terminal_status")
     if terminal not in TERMINAL_STATUSES:
         raise StrictJSONError("$.terminal_status: invalid enum")
+    expected_answer = EXPECTED_ANSWERS[CASE_IDS.index(case_id)]
+    expected_grade = (
+        ("passed" if answer == expected_answer else "failed")
+        if terminal == "completed" else "not_graded"
+    )
+    if grade != expected_grade:
+        raise StrictJSONError(
+            "$.grade: must be " + expected_grade + " for this answer/terminal_status"
+        )
 
     for key in ("request_id", "instance_id"):
         value = _require_string(record, key)

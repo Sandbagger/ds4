@@ -46,8 +46,18 @@ static const char *const expected_request_ids[] = {
     "123e4567-e89b-12d3-a456-426614174003",
     "123e4567-e89b-12d3-a456-426614174004",
 };
+static const char *const context_request_ids[] = {
+    "223e4567-e89b-12d3-a456-426614174001",
+    "223e4567-e89b-12d3-a456-426614174002",
+    "223e4567-e89b-12d3-a456-426614174003",
+    "223e4567-e89b-12d3-a456-426614174004",
+};
 static const char expected_instance_id[] =
     "123e4567-e89b-12d3-a456-426614174099";
+static const char context_instance_id[] =
+    "223e4567-e89b-12d3-a456-426614174099";
+static const char snapshot_instance_id[] =
+    "323e4567-e89b-12d3-a456-426614174099";
 static const char *const expected_snapshot_seq[] = {"1009", "2027", "4093", "8191"};
 
 /* This is fixture data, not a call to any production digest helper.  The
@@ -91,6 +101,8 @@ enum call_kind {
     CALL_FIRST_VISIBLE,
     CALL_REQUEST_BARRIER,
     CALL_REQUEST_FINISH,
+    CALL_ORDINARY_SYNC,
+    CALL_ORDINARY_EVAL,
     CALL_UNEXPECTED,
 };
 
@@ -125,9 +137,12 @@ typedef struct {
     int first_visible_count;
     int barrier_count;
     int finish_count;
+    int ordinary_sync_count;
+    int ordinary_eval_count;
     int active_case;
     int sample_phase;
     bool execution_started;
+    bool legacy_mode;
     ds4_session *sessions[MAX_SESSIONS];
     int session_repetitions[MAX_SESSIONS];
     ds4_runtime_request_context *requests[MAX_SESSIONS];
@@ -277,9 +292,10 @@ static bool fake_engine_runtime_snapshot(
         return false;
     }
     memset(out, 0, sizeof(*out));
-    snprintf(out->instance_id, sizeof(out->instance_id), "%s", expected_instance_id);
-    /* Deliberately not the request metrics sequence.  A case record must use
-     * the request-finish metrics, never this process snapshot as a proxy. */
+    snprintf(out->instance_id, sizeof(out->instance_id), "%s", snapshot_instance_id);
+    /* Deliberately use a distinct valid instance and sequence.  A case record
+     * must use the finalized request metrics, never this process snapshot as a
+     * proxy. */
     out->snapshot_seq = UINT64_C(60001);
     out->state = DS4_RUNTIME_WIRE_STATE_READY;
     return true;
@@ -362,15 +378,22 @@ static void fake_encode_chat_prompt(ds4_engine *engine, const char *system,
         fail_contract("chat encoding did not use the fake engine/output");
         return;
     }
-    if (state.session_create_count > 0) {
-        /* Context sizing occurs before session creation in the legacy main.
-         * Once a fake session exists, every encode is an execution prompt;
-         * this also catches implementations that encode before request begin. */
+    if (state.session_create_count > 0 && !state.legacy_mode) {
+        /* Context sizing occurs before session creation and legacy execution
+         * prompts are deliberately outside this machine-case call log.  Once
+         * a case-mode fake session exists, encoding is the execution prompt,
+         * part of the request call log, and must follow the current request begin. */
         const int slot = state.actual_prompt_encode_count;
-        record_call(CALL_CASE_ENCODE, slot, prompt_case, NULL, NULL, 0);
+        const int repetition = state.request_begin_count - 1;
+        record_call(CALL_CASE_ENCODE, repetition, prompt_case, NULL, NULL, 0);
         state.actual_prompt_encode_count++;
         if (state.actual_prompt_encode_count > (int)ARRAY_LEN(expected_case_indices))
             fail_contract("more than four selected prompt encodes");
+        if (repetition < 0 || repetition >= (int)ARRAY_LEN(expected_case_indices)) {
+            fail_contract("execution prompt encoded before request admission");
+        } else if (prompt_case != expected_case_for_repetition(repetition)) {
+            fail_contract("execution prompt did not match the admitted case order");
+        }
         if (prompt_case < 0) {
             fail_contract("selected prompt was not one of the four canonical cases");
         } else if (slot < (int)ARRAY_LEN(expected_case_indices)) {
@@ -514,19 +537,21 @@ static int fake_session_sync(ds4_session *session, const ds4_tokens *prompt,
     (void)prompt;
     (void)err;
     (void)errlen;
-    record_call(CALL_UNEXPECTED, request_repetition(NULL), state.active_case,
-                session, NULL, 0);
-    fail_contract("machine case path used ordinary ds4_session_sync");
+    state.ordinary_sync_count++;
+    record_call(CALL_ORDINARY_SYNC, -1, state.active_case, session, NULL, 0);
+    if (!state.legacy_mode)
+        fail_contract("machine case path used ordinary ds4_session_sync");
+    /* Controlled nonzero: stop legacy execution before any model work. */
     return 1;
 }
 
 static int fake_session_eval(ds4_session *session, int token, char *err, size_t errlen) {
-    (void)token;
     (void)err;
     (void)errlen;
-    record_call(CALL_UNEXPECTED, request_repetition(NULL), state.active_case,
-                session, NULL, token);
-    fail_contract("machine case path used ordinary ds4_session_eval");
+    state.ordinary_eval_count++;
+    record_call(CALL_ORDINARY_EVAL, -1, state.active_case, session, NULL, token);
+    if (!state.legacy_mode)
+        fail_contract("machine case path used ordinary ds4_session_eval");
     return 1;
 }
 
@@ -541,10 +566,12 @@ static bool fake_request_begin(ds4_runtime_request_context *request,
         return false;
     }
     memset(request, 0, sizeof(*request));
+    /* Deliberately differ from the finalized metrics and checked-in fixture.
+     * The machine record must read identity only from fake_request_finish(). */
     snprintf(request->request_id, sizeof(request->request_id), "%s",
-             expected_request_ids[repetition]);
+             context_request_ids[repetition]);
     snprintf(request->instance_id, sizeof(request->instance_id), "%s",
-             expected_instance_id);
+             context_instance_id);
     request->accepted_monotonic_ns = accepted_monotonic_ns ? accepted_monotonic_ns :
         UINT64_C(1000) + (uint64_t)repetition;
     request->initialized = true;
@@ -724,6 +751,8 @@ static bool fake_request_finish(ds4_runtime_request_context *request,
         return false;
     }
     memset(metrics, 0, sizeof(*metrics));
+    /* Only finalized request metrics carry the fixture identity.  Context and
+     * engine-snapshot identities above are intentionally different oracles. */
     snprintf(metrics->request_id, sizeof(metrics->request_id), "%s",
              expected_request_ids[repetition]);
     snprintf(metrics->instance_id, sizeof(metrics->instance_id), "%s",
@@ -851,6 +880,8 @@ static int check_machine_state(void) {
         state.visible_count != 4 || state.first_visible_count != 4 ||
         state.barrier_count != 4 || state.finish_count != 4)
         fail_contract("attributed operation counts were not four requests/two samples each");
+    if (state.ordinary_sync_count != 0 || state.ordinary_eval_count != 0)
+        fail_contract("machine mode used ordinary sync/eval instead of attributed calls");
     if (state.actual_prompt_encode_count != 4)
         fail_contract("machine path did not encode exactly four selected prompts");
     for (size_t index = 0; index < ARRAY_LEN(expected_case_indices); index++) {
@@ -866,6 +897,7 @@ static int check_machine_state(void) {
     for (int repetition = 0; repetition < (int)ARRAY_LEN(expected_case_indices);
          repetition++) {
         const int request = nth_call(CALL_REQUEST_BEGIN, repetition, 0);
+        const int encode = nth_call(CALL_CASE_ENCODE, repetition, 0);
         const int prompt = nth_call(CALL_REQUEST_PROMPT, repetition, 0);
         const int prefill_start = nth_call(CALL_PREFILL_START, repetition, 0);
         const int sync = nth_call(CALL_SYNC_ATTRIBUTED, repetition, 0);
@@ -877,7 +909,8 @@ static int check_machine_state(void) {
         const int first_visible = nth_call(CALL_FIRST_VISIBLE, repetition, 0);
         const int barrier = nth_call(CALL_REQUEST_BARRIER, repetition, 0);
         const int finish = nth_call(CALL_REQUEST_FINISH, repetition, 0);
-        require_order(request, prompt, "request prompt binding must follow request begin");
+        require_order(request, encode, "execution prompt encoding must follow request begin");
+        require_order(encode, prompt, "request prompt binding must follow execution prompt encoding");
         require_order(prompt, prefill_start, "prefill start must follow request prompt binding");
         require_order(prefill_start, sync, "attributed sync must follow prefill start");
         require_order(sync, prefill_complete, "prefill complete must follow attributed sync");
@@ -893,7 +926,9 @@ static int check_machine_state(void) {
         require_order(eos, barrier, "request barrier must follow generation termination");
     }
     for (size_t index = 0; index < state.call_count; index++) {
-        if (state.calls[index].kind == CALL_UNEXPECTED)
+        if (state.calls[index].kind == CALL_UNEXPECTED ||
+            state.calls[index].kind == CALL_ORDINARY_SYNC ||
+            state.calls[index].kind == CALL_ORDINARY_EVAL)
             fail_contract("ordinary/unattributed operation was used in machine mode");
     }
     return state.contract_failures;
@@ -943,6 +978,7 @@ static child_result run_cli_child(int argc, char **argv, bool valid_machine,
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
         reset_fake_state();
+        state.legacy_mode = legacy_smoke;
         if (!valid_machine && !legacy_smoke) atexit(invalid_selector_atexit);
         const int rc = ds4_eval_test_cli_main(argc, argv);
         fflush(NULL);
@@ -958,10 +994,22 @@ static child_result run_cli_child(int argc, char **argv, bool valid_machine,
         }
         if (legacy_smoke) {
             /* The fake engine/session are intentional here: this checks that
-             * ordinary parsing still reaches the legacy execution boundary,
-             * without opening a real model or accelerator. */
-            if (state.engine_open_count != 1) {
-                fprintf(stderr, "legacy invocation did not reach fake engine\n");
+             * ordinary parsing still reaches the legacy sync boundary, while
+             * the controlled ordinary-sync error prevents model work. */
+            if (state.engine_open_count != 1 || state.ordinary_sync_count != 1 ||
+                state.ordinary_eval_count != 0) {
+                fprintf(stderr,
+                        "legacy invocation did not reach exactly one ordinary sync boundary\n");
+                _exit(123);
+            }
+            if (state.request_begin_count != 0 || state.request_prompt_count != 0 ||
+                state.prefill_start_count != 0 || state.sync_count != 0 ||
+                state.prefill_complete_count != 0 || state.sample_count != 0 ||
+                state.eval_count != 0 || state.generated_count != 0 ||
+                state.visible_count != 0 || state.first_visible_count != 0 ||
+                state.barrier_count != 0 || state.finish_count != 0) {
+                fprintf(stderr,
+                        "legacy invocation used attributed request/model accounting\n");
                 _exit(123);
             }
             _exit(rc == 0 ? 124 : rc);

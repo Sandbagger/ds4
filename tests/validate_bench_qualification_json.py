@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -14,6 +15,17 @@ RUNTIME_SCHEMA_PATH = ROOT / "schemas/ds4-runtime-v1.schema.json"
 REQUEST_SCHEMA_PATH = ROOT / "schemas/ds4-runtime-request-v1.schema.json"
 UINT64_RE = re.compile(r"^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-4]|18446744073709551615)(?![\s\S])")
 UUID_RE = re.compile(r"^(?!00000000-0000-0000-0000-000000000000(?![\s\S]))[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])")
+PROFILE_CACHE_BYTES = {
+    "cache-8gib": str(8 << 30),
+    "cache-12gib": str(12 << 30),
+    "cache-16gib": str(16 << 30),
+}
+PROMPT_TOKENS = {
+    "native-512": 512,
+    "native-2048": 2048,
+    "native-8192": 8192,
+    "native-28672": 28672,
+}
 
 
 def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -125,6 +137,8 @@ def _validate(
         branch = schema.get("then") if _matches(value, schema["if"], document, document_path) else schema.get("else")
         if branch is not None:
             _validate(value, branch, path, document, document_path)
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError(f"{path}: non-finite number")
     if type(value) is str:
         if "minLength" in schema and len(value) < schema["minLength"]:
             raise ValueError(f"{path}: string is too short")
@@ -154,6 +168,10 @@ def _validate(
             if key in value:
                 _validate(value[key], child, f"{path}.{key}", document, document_path)
     if type(value) is list:
+        if schema.get("uniqueItems"):
+            encoded = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value]
+            if len(set(encoded)) != len(encoded):
+                raise ValueError(f"{path}: items must be unique")
         if "minItems" in schema and len(value) < schema["minItems"]:
             raise ValueError(f"{path}: too few items")
         if "maxItems" in schema and len(value) > schema["maxItems"]:
@@ -193,6 +211,86 @@ def _validate_wire_scalar_types(record: dict[str, Any]) -> None:
             raise ValueError(f"$.{key}: invalid identity")
 
 
+def _require_equal(record: dict[str, Any], key: str, expected: Any, source: str) -> None:
+    if record.get(key) != expected:
+        raise ValueError(f"$.{key}: does not match {source}")
+
+
+def _validate_flattened_bindings(record: dict[str, Any]) -> None:
+    runtime = record["runtime"]
+    allocations = runtime["allocations"]
+    categories = allocations["categories"]
+    reports = allocations["reports"]
+    qualification = allocations["qualification_total"]
+
+    _require_equal(record, "instance_id", runtime["instance_id"], "runtime.instance_id")
+    _require_equal(record, "snapshot_seq", runtime["snapshot_seq"], "runtime.snapshot_seq")
+    _require_equal(
+        record, "configured_prefill_rows", allocations["configured_prefill_rows"],
+        "runtime.allocations.configured_prefill_rows",
+    )
+    _require_equal(
+        record, "allocated_prefill_rows", allocations["allocated_prefill_rows"],
+        "runtime.allocations.allocated_prefill_rows",
+    )
+    _require_equal(
+        record, "expert_cache_limit_bytes",
+        runtime["limits"]["expert_cache_limit_bytes"],
+        "runtime.limits.expert_cache_limit_bytes",
+    )
+    _require_equal(
+        record, "kv_allocated_bytes", categories["kv_state"]["current_bytes"],
+        "runtime.allocations.categories.kv_state.current_bytes",
+    )
+    expert = categories["expert_cache_payload"]
+    for key, source_key in (
+        ("expert_cache_current_bytes", "current_bytes"),
+        ("expert_cache_peak_bytes", "peak_bytes"),
+    ):
+        _require_equal(record, key, expert[source_key], f"runtime.allocations.categories.expert_cache_payload.{source_key}")
+    for key, source_key in (
+        ("qualification_total_current_bytes", "current_bytes"),
+        ("qualification_total_bound_bytes", "bound_bytes"),
+        ("qualification_total_peak_bytes", "peak_bytes"),
+    ):
+        _require_equal(record, key, qualification[source_key], f"runtime.allocations.qualification_total.{source_key}")
+    _require_equal(
+        record, "model_inode_resident_bytes",
+        reports["model_source_resident"]["current_bytes"],
+        "runtime.allocations.reports.model_source_resident.current_bytes",
+    )
+    for key in (
+        "model_source_resident", "host_library_unattributed",
+        "cuda_library_unattributed",
+    ):
+        _require_equal(
+            record["external_attribution"], key,
+            reports[key]["current_bytes"],
+            f"runtime.allocations.reports.{key}.current_bytes",
+        )
+
+    expected_cache = PROFILE_CACHE_BYTES.get(record["profile_id"])
+    if expected_cache is None:
+        raise ValueError("$.profile_id: unknown cache profile")
+    for source, label in (
+        (record["expert_cache_limit_bytes"], "record expert cache limit"),
+        (runtime["limits"]["expert_cache_limit_bytes"], "runtime limits expert cache limit"),
+        (runtime["config"]["ssd_streaming_cache_bytes"], "runtime config cache bytes"),
+        (categories["expert_cache_payload"]["bound_bytes"], "expert cache bound"),
+    ):
+        if source != expected_cache:
+            raise ValueError(f"$.profile_id: {label} is not the pinned profile ceiling")
+
+    if record["event"] == "request_complete":
+        request = record["request_metrics"]
+        _require_equal(record, "request_id", request["request_id"], "request_metrics.request_id")
+        _require_equal(record, "instance_id", request["instance_id"], "request_metrics.instance_id")
+        _require_equal(record, "snapshot_seq", request["snapshot_seq"], "request_metrics.snapshot_seq")
+        expected_tokens = PROMPT_TOKENS.get(record["prompt_id"])
+        if expected_tokens is None or request["prompt_tokens"] != expected_tokens:
+            raise ValueError("$.prompt_id: does not match request_metrics.prompt_tokens")
+
+
 def validate_record(record: Any, *, complete: bool | None = None) -> None:
     schema = loads_strict(SCHEMA_PATH.read_bytes())
     _validate(record, schema, "$", schema, SCHEMA_PATH)
@@ -205,9 +303,39 @@ def validate_record(record: Any, *, complete: bool | None = None) -> None:
     }
     if set(record["external_attribution"]) != expected_external:
         raise ValueError("external_attribution is not closed")
+    _validate_flattened_bindings(record)
     if complete is True and record["event"] != "request_complete":
         raise ValueError("canned fixture must be a request_complete record")
 
+
+def _validate_lifecycle(records: list[Any]) -> None:
+    expected_events = ("request_accepted", "first_token", "request_complete")
+    if len(records) != 12:
+        raise ValueError("lifecycle JSONL must contain exactly 12 records")
+    previous_monotonic = -1
+    previous_snapshot = -1
+    request_ids: set[str] = set()
+    for index, record in enumerate(records):
+        expected_repetition = index // len(expected_events)
+        expected_event = expected_events[index % len(expected_events)]
+        if record.get("repetition_index") != expected_repetition:
+            raise ValueError(f"record {index + 1}: repetition_index is not {expected_repetition}")
+        if record.get("event") != expected_event:
+            raise ValueError(f"record {index + 1}: event is not {expected_event}")
+        monotonic = int(record["monotonic_ns"])
+        snapshot = int(record["runtime"]["snapshot_seq"])
+        if monotonic <= previous_monotonic:
+            raise ValueError(f"record {index + 1}: monotonic_ns is not strictly increasing")
+        if snapshot <= previous_snapshot:
+            raise ValueError(f"record {index + 1}: runtime snapshot_seq is not strictly increasing")
+        previous_monotonic = monotonic
+        previous_snapshot = snapshot
+        if index % len(expected_events) == 0:
+            request_ids.add(record["request_id"])
+        elif record["request_id"] != records[index - (index % len(expected_events))]["request_id"]:
+            raise ValueError(f"record {index + 1}: request_id changed within repetition")
+    if len(request_ids) != 4:
+        raise ValueError("request_id must be distinct across repetitions")
 
 def main() -> int:
     raw = sys.stdin.buffer.read()
@@ -227,20 +355,7 @@ def main() -> int:
         for index, record in enumerate(records):
             validate_record(record)
         if "--fixture" not in sys.argv:
-            expected_events = ("request_accepted", "first_token", "request_complete")
-            if len(records) != 12:
-                raise ValueError("lifecycle JSONL must contain exactly 12 records")
-            for index, record in enumerate(records):
-                expected_repetition = index // len(expected_events)
-                expected_event = expected_events[index % len(expected_events)]
-                if record.get("repetition_index") != expected_repetition:
-                    raise ValueError(
-                        f"record {index + 1}: repetition_index is not {expected_repetition}"
-                    )
-                if record.get("event") != expected_event:
-                    raise ValueError(
-                        f"record {index + 1}: event is not {expected_event}"
-                    )
+            _validate_lifecycle(records)
     except ValueError as exc:
         print(f"qualification-json: {exc}", file=sys.stderr)
         return 1

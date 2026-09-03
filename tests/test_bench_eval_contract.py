@@ -333,6 +333,33 @@ def _run_validator(
     )
 
 
+def _lifecycle_fixture() -> list[dict[str, Any]]:
+    base = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    events = ("request_accepted", "first_token", "request_complete")
+    records: list[dict[str, Any]] = []
+    for repetition in range(4):
+        request_id = f"123e4567-e89b-12d3-a456-42661417400{repetition + 1}"
+        for event in events:
+            record = json.loads(json.dumps(base))
+            record["event"] = event
+            record["repetition_index"] = repetition
+            record["request_id"] = request_id
+            record["monotonic_ns"] = str(1000000 + len(records))
+            snapshot_seq = str(100 + len(records))
+            record["snapshot_seq"] = snapshot_seq
+            record["runtime"]["snapshot_seq"] = snapshot_seq
+            if event == "request_complete":
+                request = record["request_metrics"]
+                request["request_id"] = request_id
+                request["instance_id"] = record["instance_id"]
+                request["snapshot_seq"] = snapshot_seq
+            else:
+                record.pop("request_metrics")
+                record.pop("terminal_status")
+            records.append(record)
+    return records
+
+
 class CScannerContractTest(unittest.TestCase):
     def test_brace_scanner_ignores_braces_in_c_literals(self) -> None:
         source = (
@@ -400,6 +427,39 @@ class BenchQualificationSchemaContractTest(unittest.TestCase):
         rejected(lambda value: value.__setitem__("snapshot_seq", 42))
         rejected(lambda value: value.__setitem__("repetition_index", "0"))
 
+    def test_canonical_bindings_and_lifecycle_invariants_are_rejected_when_tampered(self) -> None:
+        records = _lifecycle_fixture()
+        payload = ("\n".join(json.dumps(record, separators=(",", ":")) for record in records) + "\n").encode()
+        result = _run_validator(payload)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+        def rejected(mutator: Any) -> None:
+            candidate = json.loads(json.dumps(records))
+            mutator(candidate)
+            candidate_payload = ("\n".join(json.dumps(record, separators=(",", ":")) for record in candidate) + "\n").encode()
+            result = _run_validator(candidate_payload)
+            self.assertNotEqual(result.returncode, 0, result.stdout.decode())
+
+        rejected(lambda value: value[0].__setitem__("instance_id", "123e4567-e89b-12d3-a456-426614174099"))
+        rejected(lambda value: value[1].__setitem__("snapshot_seq", "999"))
+        rejected(lambda value: value[2].__setitem__("kv_allocated_bytes", "1"))
+        rejected(lambda value: value[2].__setitem__("expert_cache_current_bytes", "1"))
+        rejected(lambda value: value[2].__setitem__("qualification_total_current_bytes", "1"))
+        rejected(lambda value: value[2].__setitem__("model_inode_resident_bytes", "1"))
+        rejected(lambda value: value[2]["external_attribution"].__setitem__("model_source_resident", "1"))
+        rejected(lambda value: value[0].__setitem__("profile_id", "cache-12gib"))
+        rejected(lambda value: value[2].__setitem__("prompt_id", "native-2048"))
+        rejected(lambda value: value[2]["request_metrics"].__setitem__("request_id", "123e4567-e89b-12d3-a456-426614174099"))
+        rejected(lambda value: value[2]["request_metrics"].__setitem__("instance_id", "123e4567-e89b-12d3-a456-426614174099"))
+        rejected(lambda value: value[4].__setitem__("request_id", value[0]["request_id"]))
+        rejected(lambda value: value[1].__setitem__("request_id", "123e4567-e89b-12d3-a456-426614174099"))
+        rejected(lambda value: value[4].__setitem__("monotonic_ns", value[3]["monotonic_ns"]))
+        rejected(lambda value: value[4]["runtime"].__setitem__("snapshot_seq", value[3]["runtime"]["snapshot_seq"]))
+        rejected(lambda value: value[0]["runtime"]["build"]["features"].__setitem__(1, "laguna"))
+        rejected(lambda value: value[2]["request_metrics"].__setitem__("prefill_tokens_per_second", 1e999))
+        raw_overflow = payload.replace(b'"prefill_tokens_per_second":512.0', b'"prefill_tokens_per_second":1e999')
+        self.assertNotEqual(_run_validator(raw_overflow).returncode, 0)
+
 
 class BenchQualificationPreflightCliTest(unittest.TestCase):
     """Exercise the real host-only CLI without accepting CPU qualification."""
@@ -424,48 +484,59 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
         if not cls.bench.is_file():
             raise AssertionError(f"host build did not produce {cls.bench}")
 
-    def _generate_sequence(self, directory: Path) -> Path:
+    def _generate_sequence(
+        self,
+        directory: Path,
+        profile_id: str = "cache-8gib",
+        prompt_id: str = "native-512",
+    ) -> Path:
         """Use the production sequence builder with a tiny deterministic manifest.
 
         The checked-in production manifest is intentionally bound to a real
-        model and host.  This host-only gate supplies the builder's pure
-        sequence function with the same pinned profile constants and a compact
-        official-template prompt, while bypassing only manifest identity
-        validation.  No profile order or sequence line is duplicated here.
+        model and host. This host-only gate supplies the builder's pure
+        sequence function with the same pinned profile constants and compact
+        official-template prompts, while bypassing only manifest identity
+        validation. No profile order or sequence line is duplicated here.
         """
         spec = importlib.util.spec_from_file_location("task19_sequence_builder", BUILDER)
         self.assertIsNotNone(spec)
         assert spec is not None and spec.loader is not None
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
-        payload = b"task19 canonical prompt bytes"
-        rendered = builder.LAGUNA_TEMPLATE_PREFIX + payload + builder.LAGUNA_TEMPLATE_SUFFIX
-        prompt = {
-            "id": "native-512",
-            "token_count": 512,
-            "payload_prefix_bytes": str(len(payload)),
-            "rendered_size_bytes": str(len(rendered)),
-            "rendered_base64": base64.b64encode(rendered).decode("ascii"),
-            "sha256": hashlib.sha256(rendered).hexdigest(),
-        }
+        prompts = []
+        for target in builder.PROMPT_TARGETS:
+            prompt_id_for_target = f"native-{target}"
+            payload = b"task19 canonical prompt bytes " + str(target).encode("ascii")
+            rendered = builder.LAGUNA_TEMPLATE_PREFIX + payload + builder.LAGUNA_TEMPLATE_SUFFIX
+            prompts.append({
+                "id": prompt_id_for_target,
+                "token_count": target,
+                "payload_prefix_bytes": str(len(payload)),
+                "rendered_size_bytes": str(len(rendered)),
+                "rendered_base64": base64.b64encode(rendered).decode("ascii"),
+                "sha256": hashlib.sha256(rendered).hexdigest(),
+            })
         manifest = {
             "schema": builder.SCHEMA_ID,
-            "prompts": [prompt],
-            "profiles": [{
-                "profile_id": "cache-8gib",
-                "cache_bytes": str(8 << 30),
-                "prompt_order": [512, 2048, 28672, 8192],
-            }],
+            "prompts": prompts,
+            "profiles": [
+                {
+                    "profile_id": candidate_id,
+                    "cache_bytes": str(cache_bytes),
+                    "prompt_order": list(prompt_order),
+                }
+                for candidate_id, cache_bytes, prompt_order in builder.PROFILE_SPECS
+            ],
         }
         original_validator = builder.validate_manifest
         builder.validate_manifest = lambda _value: None
         try:
             sequence_bytes = builder.build_qualification_sequence(
-                manifest, "cache-8gib", "native-512"
+                manifest, profile_id, prompt_id
             )
         finally:
             builder.validate_manifest = original_validator
-        output = directory / "sequence.txt"
+        output = directory / f"sequence-{profile_id}-{prompt_id}.txt"
         output.write_bytes(sequence_bytes)
         self.assertEqual(sequence_bytes.count(b"\n"), builder.QUALIFICATION_SEQUENCE_LINE_COUNT)
         self.assertTrue(sequence_bytes.startswith(b"schema=ds4.qualification-sequence/v1\n"))
@@ -525,17 +596,31 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
             + stderr,
         )
 
-    def test_python_builder_sequence_reaches_post_parse_boundary_without_cpu(self) -> None:
+    def test_python_builder_all_profile_prompt_pairs_reach_post_parse_boundary(self) -> None:
+        spec = importlib.util.spec_from_file_location("task19_sequence_pairs", BUILDER)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        pairs = [
+            (profile_id, f"native-{target}")
+            for profile_id, _cache_bytes, _prompt_order in builder.PROFILE_SPECS
+            for target in builder.PROMPT_TARGETS
+        ]
+        self.assertEqual(len(pairs), 12)
         with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
             directory = Path(directory_name)
-            sequence = self._generate_sequence(directory)
-            result = self._invoke(
-                directory, (QUALIFICATION_SEQUENCE_OPTION, str(sequence))
-            )
-            # A host-only binary may reject the unavailable CUDA backend or the
-            # deliberately missing model. It must not accept CPU as qualification.
-            self.assertIn(result.returncode, (1, 2), result.stderr)
-            self._assert_reached_post_parse_boundary(result)
+            for profile_id, prompt_id in pairs:
+                with self.subTest(profile_id=profile_id, prompt_id=prompt_id):
+                    sequence = self._generate_sequence(directory, profile_id, prompt_id)
+                    result = self._invoke(
+                        directory, (QUALIFICATION_SEQUENCE_OPTION, str(sequence))
+                    )
+                    # A host-only binary may reject the unavailable CUDA backend or
+                    # the deliberately missing model. It must not accept CPU as
+                    # qualification.
+                    self.assertIn(result.returncode, (1, 2), result.stderr)
+                    self._assert_reached_post_parse_boundary(result)
 
     def test_malformed_empty_and_nul_decoded_inputs_reject_before_model_open(self) -> None:
         cases = (("empty-file", b""), ("empty-object", b"{}\n"), ("malformed", b"{\n"))

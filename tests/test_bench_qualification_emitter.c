@@ -5,6 +5,7 @@
  * direct, bounded build failure instead of weakening the test with a fake
  * implementation. */
 #include "ds4_bench_qualification.h"
+#include "ds4_bench_sequence.h"
 #include "ds4_runtime.h"
 
 #include <errno.h>
@@ -138,7 +139,6 @@ static void fill_runtime(ds4_runtime_wire_snapshot *snapshot) {
     snapshot->allocations.report_current[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 5000u;
     snapshot->allocations.report_current[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = 100u;
     snapshot->allocations.report_current[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 200u;
-    snapshot->allocations.external_sample.model_source_resident_bytes = 5000u;
     snapshot->allocations.external_sample.host_library_unattributed_bytes = 100u;
     snapshot->allocations.external_sample.cuda_library_unattributed_bytes = 200u;
     snapshot->allocations.external_sample.unrelated_process_inventory_stable = true;
@@ -177,19 +177,22 @@ int main(void) {
     fill_runtime(&runtime);
     fill_metrics(&metrics);
 
-    char runtime_json[DS4_RUNTIME_JSON_CAPACITY];
-    char metrics_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
-    size_t runtime_length = 0u;
-    size_t metrics_length = 0u;
-    CHECK(ds4_runtime_wire_snapshot_json(
-              &runtime, runtime_json, sizeof(runtime_json), &runtime_length),
-          "synthetic runtime snapshot serializes canonically");
-    CHECK(ds4_runtime_request_metrics_json(
-              &metrics, metrics_json, sizeof(metrics_json), &metrics_length),
-          "synthetic request metrics serialize canonically");
-    CHECK(runtime_length == strlen(runtime_json), "runtime JSON length is exact");
-    CHECK(metrics_length == strlen(metrics_json), "request JSON length is exact");
-    if (failures != 0) return 1;
+    unsigned char input_bytes[] = "task19 canonical prompt bytes";
+    ds4_bench_sequence sequence = {
+        .manifest_sha256 =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .profile_id = "cache-8gib",
+        .cache_bytes = UINT64_C(8589934592),
+        .prompt_order_index = 0u,
+        .prompt_id = "native-512",
+        .prompt_tokens = 512u,
+        .input_size_bytes = sizeof(input_bytes) - 1u,
+        .input_size = sizeof(input_bytes) - 1u,
+        .input_bytes = input_bytes,
+        .input_sha256 =
+            "f64f809b1c85b78d9e73cc74fc2c9c45bf8130640585b7d9d8663b7b043e5b15",
+    };
+    (void)sequence;
 
     int pipe_fds[2] = {-1, -1};
     CHECK(pipe(pipe_fds) == 0, "create lifecycle JSONL pipe");
@@ -205,30 +208,55 @@ int main(void) {
         return 1;
     }
 
-    static const char *const events[] = {
-        "request_accepted", "first_token", "request_complete",
+    static const ds4_bench_qualification_event events[] = {
+        DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED,
+        DS4_BENCH_QUALIFICATION_EVENT_FIRST_TOKEN,
+        DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE,
     };
-    const char *manifest_sha256 =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const char *input_sha256 =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    static const char *const request_ids[] = {
+        "123e4567-e89b-12d3-a456-426614174001",
+        "123e4567-e89b-12d3-a456-426614174002",
+        "123e4567-e89b-12d3-a456-426614174003",
+        "123e4567-e89b-12d3-a456-426614174004",
+    };
+    char runtime_json[DS4_RUNTIME_JSON_CAPACITY];
+    char metrics_json[DS4_RUNTIME_REQUEST_JSON_CAPACITY];
     char line[DS4_RUNTIME_JSON_CAPACITY * 2u];
     for (uint32_t repetition = 0u; repetition < 4u; repetition++) {
+        memcpy(metrics.request_id, request_ids[repetition],
+               sizeof(metrics.request_id));
         for (size_t event_index = 0u; event_index < 3u; event_index++) {
+            runtime.snapshot_seq =
+                UINT64_C(100) + repetition * 3u + event_index;
+            metrics.snapshot_seq = runtime.snapshot_seq;
+            size_t runtime_length = 0u;
+            size_t metrics_length = 0u;
+            CHECK(ds4_runtime_wire_snapshot_json(
+                      &runtime, runtime_json, sizeof(runtime_json), &runtime_length),
+                  "synthetic runtime snapshot serializes canonically");
+            if (event_index == 2u) {
+                CHECK(ds4_runtime_request_metrics_json(
+                          &metrics, metrics_json, sizeof(metrics_json), &metrics_length),
+                      "finished request metrics serialize canonically");
+            } else {
+                metrics_json[0] = '\0';
+            }
+            CHECK(runtime_length == strlen(runtime_json),
+                  "runtime JSON length is exact");
+            CHECK(event_index != 2u || metrics_length == strlen(metrics_json),
+                  "request JSON length is exact");
+            if (failures != 0) break;
+
             ds4_bench_qualification_record record = {
-                .manifest_sha256 = manifest_sha256,
-                .profile_id = "cache-8gib",
-                .prompt_order_index = 0u,
-                .prompt_id = "native-512",
-                .input_sha256 = input_sha256,
+                .sequence = &sequence,
                 .event = events[event_index],
+                .request_id = request_ids[repetition],
                 .repetition_index = repetition,
-                .monotonic_ns = UINT64_C(1000000) + repetition * 100u + event_index,
+                .monotonic_ns =
+                    UINT64_C(1000000) + repetition * 100u + event_index,
                 .session_payload_bytes = 9000u,
-                .kv_allocated_bytes = 0u,
-                .model_inode_resident_bytes = 5000u,
                 .runtime_snapshot = &runtime,
-                .request_metrics = &metrics,
+                .request_metrics = event_index == 2u ? &metrics : NULL,
             };
             char error[256] = {0};
             CHECK(ds4_bench_qualification_emit_record(

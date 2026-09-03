@@ -418,12 +418,14 @@ tests/test_bench_sequence_trusted: tests/test_bench_sequence_trusted.o ds4_bench
 test-bench-sequence-trusted: tests/test_bench_sequence_trusted
 	./tests/test_bench_sequence_trusted
 
-# RED-only Task 19 lifecycle seam.  The production emitter/header are
-# intentionally absent until the implementation slice lands.
-tests/test_bench_qualification_emitter.o: tests/test_bench_qualification_emitter.c ds4_runtime.h
+# Task 19 lifecycle JSONL emitter.
+ds4_bench_qualification.o: ds4_bench_qualification.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_bench_qualification_emitter: tests/test_bench_qualification_emitter.o ds4_runtime.o
+tests/test_bench_qualification_emitter.o: tests/test_bench_qualification_emitter.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_runtime.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_bench_qualification_emitter: tests/test_bench_qualification_emitter.o ds4_bench_qualification.o ds4_runtime.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test-bench-qualification-emitter: tests/test_bench_qualification_emitter
@@ -867,4 +869,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-server-test-hooks ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link tests/test_qualification_control tests/test_plan_io tests/test_bench_sequence tests/test_bench_sequence_trusted tests/test_laguna_plan tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_q4k_mmvq_microscope tests/test_cuda_f32_mmvf_microscope tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/probe_ds4_laguna_moe tests/probe_ds4_laguna_moe.o tests/probe_ds4_laguna_moe_release tests/probe_ds4_laguna_moe_release.o tests/probe_ds4_laguna_behavior tests/probe_ds4_laguna_behavior.o tests/test_cuda_laguna_stream tests/test_cuda_laguna_stream.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-server-test-hooks ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link tests/test_qualification_control tests/test_plan_io tests/test_bench_sequence tests/test_bench_sequence_trusted tests/test_laguna_plan tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_q4k_mmvq_microscope tests/test_cuda_f32_mmvf_microscope tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/test_bench_qualification_emitter tests/probe_ds4_laguna_moe tests/probe_ds4_laguna_moe.o tests/probe_ds4_laguna_moe_release tests/probe_ds4_laguna_moe_release.o tests/probe_ds4_laguna_behavior tests/probe_ds4_laguna_behavior.o tests/test_cuda_laguna_stream tests/test_cuda_laguna_stream.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

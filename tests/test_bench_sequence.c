@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #define DS4_BENCH_SEQUENCE_TEST_HOOKS 1
 
@@ -158,8 +161,13 @@ static bool parse_reject(const char *path,
 }
 
 static void mutate_after_first_read(int fd, void *context) {
-    (void)context;
-    (void)ftruncate(fd, 1);
+    (void)fd;
+    const char *path = (const char *)context;
+    int writer = open(path, O_WRONLY);
+    if (writer >= 0) {
+        (void)ftruncate(writer, 1);
+        (void)close(writer);
+    }
 }
 
 int main(void) {
@@ -259,6 +267,7 @@ int main(void) {
         {"prompt_tokens=", "prompt_tokens=2048", "wrong prompt token count is rejected"},
         {"mode=", "mode=resident", "wrong mode is rejected"},
         {"input_size_bytes=", "input_size_bytes=01", "noncanonical input size is rejected"},
+        {"input_size_bytes=", "input_size_bytes=bad", "bad input size is rejected"},
         {"input_size_bytes=", "input_size_bytes=16777217", "oversized input is rejected"},
         {"input_size_bytes=", "input_size_bytes=18446744073709551616", "overflow input size is rejected"},
         {"input_sha256=", "input_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "input hash mismatch is rejected"},
@@ -303,7 +312,7 @@ int main(void) {
     size = make_sequence(sequence, sizeof(sequence), 0, 0);
     CHECK(write_bytes(path, sequence, size), "write mutation fixture");
     ds4_bench_sequence_test_set_after_first_read_hook(
-        mutate_after_first_read, NULL);
+        mutate_after_first_read, path);
     memset(error, 0, sizeof(error));
     parsed = (ds4_bench_sequence){0};
     CHECK(!ds4_bench_sequence_parse_file(path, &parsed, error, sizeof(error)),

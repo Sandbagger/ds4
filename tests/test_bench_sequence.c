@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_failed;
@@ -170,6 +173,62 @@ static void mutate_after_first_read(int fd, void *context) {
     }
 }
 
+static double monotonic_seconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+static void check_fifo_rejected_promptly(const char *directory) {
+    char fifo_path[512];
+    (void)snprintf(fifo_path, sizeof(fifo_path), "%s/fifo", directory);
+    CHECK(mkfifo(fifo_path, 0600) == 0, "create FIFO fixture");
+    if (access(fifo_path, F_OK) != 0) return;
+
+    const pid_t child = fork();
+    CHECK(child >= 0, "fork FIFO parser probe");
+    if (child == 0) {
+        char error[256] = {0};
+        ds4_bench_sequence parsed = {0};
+        const bool accepted = ds4_bench_sequence_parse_file(
+            fifo_path, &parsed, error, sizeof(error));
+        ds4_bench_sequence_free(&parsed);
+        _exit(accepted ? 1 : 0);
+    }
+    if (child > 0) {
+        const double deadline = monotonic_seconds() + 0.5;
+        int status = 0;
+        bool reaped = false;
+        while (!reaped) {
+            const pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) {
+                reaped = true;
+                CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                      "FIFO parser rejects promptly before blocking");
+                break;
+            }
+            if (waited < 0 && errno != EINTR) {
+                CHECK(false, "wait for FIFO parser probe");
+                break;
+            }
+            if (monotonic_seconds() >= deadline) {
+                CHECK(false, "FIFO parser returned before the bounded deadline");
+                (void)kill(child, SIGKILL);
+                (void)waitpid(child, &status, 0);
+                reaped = true;
+                break;
+            }
+            const struct timespec delay = {0, 10000000L};
+            (void)nanosleep(&delay, NULL);
+        }
+        if (!reaped) {
+            (void)kill(child, SIGKILL);
+            (void)waitpid(child, &status, 0);
+        }
+    }
+    CHECK(unlink(fifo_path) == 0, "remove FIFO fixture");
+}
+
 int main(void) {
     char directory[] = "/tmp/ds4-bench-sequence-XXXXXX";
     CHECK(mkdtemp(directory) != NULL, "create temporary directory");
@@ -272,6 +331,7 @@ int main(void) {
         {"input_size_bytes=", "input_size_bytes=18446744073709551616", "overflow input size is rejected"},
         {"input_sha256=", "input_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "input hash mismatch is rejected"},
         {"input_base64=", "input_base64=aGVsbG8", "unpadded base64 is rejected"},
+        {"input_base64=", "input_base64=aGVsbG9=", "noncanonical base64 pad bits are rejected"},
         {"input_base64=", "input_base64=!!!!", "invalid base64 is rejected"},
         {"max_generated_tokens=", "max_generated_tokens=511", "wrong max tokens is rejected"},
         {"temperature=", "temperature=1", "wrong temperature is rejected"},
@@ -330,6 +390,7 @@ int main(void) {
           "non-regular sequence is rejected");
     ds4_bench_sequence_free(&parsed);
     CHECK(rmdir(directory_path) == 0, "remove non-regular fixture");
+    check_fifo_rejected_promptly(directory);
 
     int oversized = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     CHECK(oversized >= 0, "create oversized fixture");

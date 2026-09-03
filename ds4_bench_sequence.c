@@ -567,6 +567,12 @@ static bool decode_base64(const unsigned char *value,
                   "qualification sequence base64 decoder size mismatch");
         return false;
     }
+    if (memchr(decoded, '\0', decoded_size) != NULL) {
+        free(decoded);
+        set_error(error, error_size,
+                  "qualification sequence decoded input contains NUL");
+        return false;
+    }
     *bytes_out = decoded;
     *size_out = decoded_size;
     return true;

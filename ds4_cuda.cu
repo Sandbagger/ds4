@@ -36704,6 +36704,218 @@ laguna_attention_decode_gqa_f16_kernel(
     }
 }
 
+/* Poolside keeps Laguna SWA K/V in a padded 1024-slot cache and launches
+ * four 128-thread vector partitions. DS4 keeps only the active 512 rows;
+ * Poolside slot s maps to DS4 ring row s & 511. The modular-distance mask
+ * preserves Poolside's physical reduction order without extending cache state.
+ * Full-window admission guarantees every aliased DS4 row has been initialized,
+ * including rows whose Poolside physical slots are masked. */
+__global__ __launch_bounds__(512, 1) static void
+laguna_attention_decode_gqa_swa_f16_kernel(
+        float *heads, const float *q, const __half *key_cache,
+        const __half *value_cache, const float *gate, uint32_t key_start,
+        uint32_t key_count, uint64_t physical_rows, float scale) {
+    constexpr uint32_t head_dim = 128u;
+    constexpr uint32_t lanes_per_partition = 128u;
+    constexpr uint32_t max_partitions = 4u;
+    constexpr float kq_max_offset = 3.0f * 0.6931f;
+    const uint32_t global_tid = threadIdx.x;
+    const uint32_t partition = global_tid / lanes_per_partition;
+    const uint32_t tid = global_tid % lanes_per_partition;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t head = blockIdx.x;
+    const uint32_t kv_head = head / 9u;
+    constexpr uint64_t kv_width = 8u * head_dim;
+    const float *query = q + (uint64_t)head * head_dim;
+    float2 query_reg[8];
+#pragma unroll
+    for (uint32_t half0 = 0u; half0 < head_dim / 2u; half0 += 32u) {
+        const uint32_t half_index = half0 + (lane % 8u) * 4u;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; j++) {
+            const uint32_t d0 = 2u * (half_index + j);
+            float2 value = make_float2(query[d0], query[d0 + 1u]);
+            value.x *= scale;
+            value.y *= scale;
+            query_reg[half0 / 8u + j] = value;
+        }
+    }
+
+    float2 accumulator[8];
+#pragma unroll
+    for (uint32_t i = 0u; i < 8u; i++) {
+        accumulator[i] = make_float2(0.0f, 0.0f);
+    }
+    float kq_max = -FLT_MAX / 2.0f;
+    float kq_sum = 0.0f;
+    __shared__ float scratch[max_partitions][2048];
+    __shared__ float max_shared[max_partitions][32];
+    __shared__ float sum_shared[max_partitions][32];
+    __shared__ float partition_values[max_partitions][head_dim];
+    __shared__ float2 partition_meta[max_partitions];
+
+    for (uint64_t tile0 = (uint64_t)partition * lanes_per_partition;
+         tile0 < physical_rows;
+         tile0 += max_partitions * lanes_per_partition) {
+        float own_score = -INFINITY;
+        float max_new = kq_max;
+#pragma unroll
+        for (uint32_t row_in_group = 0u; row_in_group < 8u;
+             row_in_group++) {
+            const uint32_t row_in_tile =
+                warp * 32u + (lane & ~7u) + row_in_group;
+            const uint64_t poolside_row = tile0 + row_in_tile;
+            const uint32_t poolside_slot_start = key_start & 1023u;
+            const uint32_t slot_distance =
+                ((uint32_t)poolside_row - poolside_slot_start) & 1023u;
+            const bool score_row_valid = slot_distance < key_count;
+            const uint64_t cache_row = poolside_row & 511u;
+            const uint64_t base = cache_row * kv_width +
+                (uint64_t)kv_head * head_dim;
+            float dot = 0.0f;
+#pragma unroll
+            for (uint32_t half0 = 0u; half0 < head_dim / 2u;
+                 half0 += 32u) {
+                const uint32_t half_index =
+                    half0 + (lane % 8u) * 4u;
+#pragma unroll
+                for (uint32_t j = 0u; j < 4u; j++) {
+                    const __half2 packed =
+                        ((const __half2 *)(key_cache + base))[half_index + j];
+                    const float2 value = __half22float2(packed);
+                    dot += value.x * query_reg[half0 / 8u + j].x;
+                    dot += value.y * query_reg[half0 / 8u + j].y;
+                }
+            }
+            /* The full warp must execute an intrinsic whose mask names all 32
+             * lanes, even when only one 8-lane row group is logically valid. */
+            dot = laguna_vec_warp_sum_8(dot);
+            if (!score_row_valid) dot = -INFINITY;
+            max_new = fmaxf(max_new, dot + kq_max_offset);
+            if ((lane % 8u) == row_in_group) own_score = dot;
+        }
+#pragma unroll
+        for (int offset = 8; offset < 32; offset <<= 1) {
+            max_new = fmaxf(
+                max_new,
+                __shfl_xor_sync(0xffffffffu, max_new, offset, 32));
+        }
+        const float max_scale = expf(kq_max - max_new);
+        kq_max = max_new;
+        const float probability = expf(own_score - kq_max);
+        kq_sum = kq_sum * max_scale + probability;
+        scratch[partition][tid] = probability;
+#pragma unroll
+        for (uint32_t i = 0u; i < 8u; i++) {
+            accumulator[i].x *= max_scale;
+            accumulator[i].y *= max_scale;
+        }
+        __syncwarp();
+
+#pragma unroll
+        for (uint32_t row0 = 0u; row0 < 32u; row0 += 4u) {
+            const uint32_t row_in_tile = warp * 32u + row0 + lane / 8u;
+            const uint64_t poolside_row = tile0 + row_in_tile;
+            const float probability_k = scratch[partition][row_in_tile];
+            const uint64_t cache_row = poolside_row & 511u;
+            const uint64_t base = cache_row * kv_width +
+                (uint64_t)kv_head * head_dim;
+#pragma unroll
+            for (uint32_t half0 = 0u; half0 < head_dim / 2u;
+                 half0 += 32u) {
+                const uint32_t half_index =
+                    half0 + (lane % 8u) * 4u;
+                __align__(16) __half2 packed[4];
+                laguna_vec_load_half2x4(
+                    packed,
+                    (const __half2 *)(value_cache + base) + half_index);
+                float2 values[4];
+#pragma unroll
+                for (uint32_t j = 0u; j < 4u; j++) {
+                    values[j] = __half22float2(packed[j]);
+                }
+#pragma unroll
+                for (uint32_t j = 0u; j < 4u; j++) {
+                    accumulator[half0 / 8u + j].x +=
+                        values[j].x * probability_k;
+                    accumulator[half0 / 8u + j].y +=
+                        values[j].y * probability_k;
+                }
+            }
+        }
+    }
+
+    if (warp == 0u) {
+        max_shared[partition][lane] = -FLT_MAX / 2.0f;
+        sum_shared[partition][lane] = 0.0f;
+    }
+    __syncthreads();
+    if (lane == 0u) max_shared[partition][warp] = kq_max;
+    __syncthreads();
+    const float global_max =
+        laguna_vec_warp_max_32(max_shared[partition][lane]);
+    const float final_scale = expf(kq_max - global_max);
+#pragma unroll
+    for (uint32_t i = 0u; i < 8u; i++) {
+        accumulator[i].x *= final_scale;
+        accumulator[i].y *= final_scale;
+    }
+
+    float2 *partial = (float2 *)scratch[partition] +
+        warp * (4u * head_dim / 2u) + (lane / 8u) * (head_dim / 2u);
+#pragma unroll
+    for (uint32_t half0 = 0u; half0 < head_dim / 2u; half0 += 32u) {
+        const uint32_t half_index = half0 + (lane % 8u) * 4u;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; j++) {
+            partial[half_index + j] = accumulator[half0 / 8u + j];
+        }
+    }
+    kq_sum *= final_scale;
+    kq_sum = laguna_vec_warp_sum_32(kq_sum);
+    if (lane == 0u) sum_shared[partition][warp] = kq_sum;
+    __syncthreads();
+
+    const float total_sum =
+        laguna_vec_warp_sum_32(sum_shared[partition][lane]);
+    float partition_output = 0.0f;
+#pragma unroll
+    for (uint32_t source_warp = 0u; source_warp < 4u; source_warp++) {
+#pragma unroll
+        for (uint32_t lane_group = 0u; lane_group < 4u; lane_group++) {
+            partition_output += scratch[partition][
+                source_warp * 4u * head_dim + lane_group * head_dim + tid];
+        }
+    }
+    partition_values[partition][tid] = partition_output;
+    if (tid == 0u) {
+        partition_meta[partition] = make_float2(global_max, total_sum);
+    }
+    __syncthreads();
+
+    if (global_tid < head_dim) {
+        float combined_max = partition_meta[0].x;
+#pragma unroll
+        for (uint32_t p = 1u; p < max_partitions; p++) {
+            combined_max = fmaxf(combined_max, partition_meta[p].x);
+        }
+        float numerator = 0.0f;
+        float denominator = 0.0f;
+#pragma unroll
+        for (uint32_t p = 0u; p < max_partitions; p++) {
+            const float part_scale =
+                expf(partition_meta[p].x - combined_max);
+            numerator += part_scale * partition_values[p][global_tid];
+            denominator += part_scale * partition_meta[p].y;
+        }
+        const float gate_value = gate[head];
+        const float gate_scale = laguna_attention_softplus(gate_value);
+        heads[(uint64_t)head * head_dim + global_tid] =
+            numerator / denominator * gate_scale;
+    }
+}
+
 extern "C" int ds4_gpu_laguna_store_attention_tensor(
         ds4_gpu_tensor *heads, ds4_gpu_tensor *key_cache,
         ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *q,
@@ -36759,13 +36971,26 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
                 ((((uintptr_t)key_cache->ptr | (uintptr_t)value_cache->ptr) &
                   (alignof(int4) - 1u)) == 0u);
             const bool vector_decode_shape = n_head == 48u && n_head_kv == 8u;
+            const bool vector_swa_shape =
+                n_head == 72u && n_head_kv == 8u &&
+                cache_cap == 512u && key_count == cache_cap;
             const uint64_t physical_rows =
                 ((uint64_t)key_count + 255u) & ~(uint64_t)255u;
+            uint64_t swa_physical_rows =
+                ((uint64_t)pos + 1u + 255u) & ~(uint64_t)255u;
+            if (swa_physical_rows > 1024u) swa_physical_rows = 1024u;
             const bool vector_cache_contiguous =
                 physical_rows >= 384u &&
                 (uint64_t)key_start + physical_rows <= cache_cap;
-            if (cache_vec_aligned && vector_decode_shape &&
-                vector_cache_contiguous) {
+            if (cache_vec_aligned && vector_swa_shape) {
+                laguna_attention_decode_gqa_swa_f16_kernel<<<n_head, 512>>>(
+                        (float *)heads->ptr, (const float *)q->ptr,
+                        (const __half *)key_cache->ptr,
+                        (const __half *)value_cache->ptr,
+                        (const float *)gate->ptr, key_start, key_count,
+                        swa_physical_rows, scale);
+            } else if (cache_vec_aligned && vector_decode_shape &&
+                       vector_cache_contiguous) {
                 const uint64_t cache_offset = (uint64_t)key_start * kv_values;
                 /* Device allocation leaves unused physical rows uninitialised.
                  * The vector schedule still loads padded V rows.  A zero

@@ -416,6 +416,47 @@ static bool parse_uint64_decimal(const unsigned char *value,
     return true;
 }
 
+static bool validate_expected_sha256(const char *value,
+                                    const char *label,
+                                    char *error,
+                                    size_t error_size) {
+    if (value == NULL) {
+        set_error(error, error_size,
+                  "trusted %s SHA-256 must be non-null", label);
+        return false;
+    }
+    size_t length = 0;
+    while (length < DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE &&
+           value[length] != '\0') {
+        length++;
+    }
+    if (length != DS4_BENCH_SEQUENCE_SHA256_HEX_LENGTH) {
+        set_error(error, error_size,
+                  "trusted %s SHA-256 must be a canonical 64-character digest",
+                  label);
+        return false;
+    }
+    bool all_zero = true;
+    for (size_t i = 0; i < length; i++) {
+        const unsigned char c = (unsigned char)value[i];
+        const bool hex = (c >= '0' && c <= '9') ||
+                         (c >= 'a' && c <= 'f');
+        if (!hex) {
+            set_error(error, error_size,
+                      "trusted %s SHA-256 must be lowercase hexadecimal",
+                      label);
+            return false;
+        }
+        if (c != '0') all_zero = false;
+    }
+    if (all_zero) {
+        set_error(error, error_size,
+                  "trusted %s SHA-256 must not be all zero", label);
+        return false;
+    }
+    return true;
+}
+
 static bool parse_sha256(const unsigned char *value,
                          size_t value_length,
                          char output[DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE],
@@ -580,6 +621,7 @@ static bool decode_base64(const unsigned char *value,
 
 static bool parse_payload(const unsigned char *bytes,
                           size_t size,
+                          const char *expected_manifest_sha256,
                           ds4_bench_sequence *result,
                           char *error,
                           size_t error_size) {
@@ -606,6 +648,14 @@ static bool parse_payload(const unsigned char *bytes,
                     &value_length, 2u, error, error_size) ||
         !parse_sha256(value, value_length, result->manifest_sha256, 2u,
                       error, error_size)) return false;
+    if (expected_manifest_sha256 != NULL &&
+        memcmp(result->manifest_sha256,
+               expected_manifest_sha256,
+               DS4_BENCH_SEQUENCE_SHA256_HEX_LENGTH) != 0) {
+        set_error(error, error_size,
+                  "qualification sequence manifest SHA-256 does not match trusted digest");
+        return false;
+    }
 
     if (!next_line(&cursor, &line, &line_length, error, error_size) ||
         !line_value(line, line_length, "profile_id=", &value,
@@ -769,6 +819,56 @@ static bool parse_payload(const unsigned char *bytes,
     return true;
 }
 
+static bool parse_file_impl(const char *path,
+                            const char *expected_manifest_sha256,
+                            const char *expected_sequence_sha256,
+                            ds4_bench_sequence *sequence,
+                            char *error,
+                            size_t error_size) {
+    unsigned char *bytes = NULL;
+    size_t size = 0;
+    if (!read_sequence_file(path, &bytes, &size, error, error_size)) {
+        return false;
+    }
+
+    char sequence_sha256[DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE];
+    if (!ds4_plan_io_sha256(bytes,
+                            size,
+                            sequence_sha256,
+                            error,
+                            error_size)) {
+        free(bytes);
+        return false;
+    }
+    if (expected_sequence_sha256 != NULL &&
+        memcmp(sequence_sha256,
+               expected_sequence_sha256,
+               DS4_BENCH_SEQUENCE_SHA256_HEX_LENGTH) != 0) {
+        free(bytes);
+        set_error(error, error_size,
+                  "qualification sequence SHA-256 does not match trusted digest");
+        return false;
+    }
+
+    ds4_bench_sequence parsed = {0};
+    const bool ok = parse_payload(bytes,
+                                  size,
+                                  expected_manifest_sha256,
+                                  &parsed,
+                                  error,
+                                  error_size);
+    free(bytes);
+    if (!ok) {
+        ds4_bench_sequence_free(&parsed);
+        return false;
+    }
+    memcpy(parsed.sequence_sha256,
+           sequence_sha256,
+           sizeof(parsed.sequence_sha256));
+    *sequence = parsed;
+    return true;
+}
+
 bool ds4_bench_sequence_parse_file(const char *path,
                                    ds4_bench_sequence *sequence,
                                    char *error,
@@ -780,19 +880,42 @@ bool ds4_bench_sequence_parse_file(const char *path,
         return false;
     }
     ds4_bench_sequence_free(sequence);
+    return parse_file_impl(path,
+                           NULL,
+                           NULL,
+                           sequence,
+                           error,
+                           error_size);
+}
 
-    unsigned char *bytes = NULL;
-    size_t size = 0;
-    if (!read_sequence_file(path, &bytes, &size, error, error_size)) {
+bool ds4_bench_sequence_parse_file_trusted(
+        const char *path,
+        const char *expected_manifest_sha256,
+        const char *expected_sequence_sha256,
+        ds4_bench_sequence *sequence,
+        char *error,
+        size_t error_size) {
+    clear_error(error, error_size);
+    if (sequence == NULL) {
+        set_error(error, error_size,
+                  "qualification sequence output is null");
         return false;
     }
-    ds4_bench_sequence parsed = {0};
-    const bool ok = parse_payload(bytes, size, &parsed, error, error_size);
-    free(bytes);
-    if (!ok) {
-        ds4_bench_sequence_free(&parsed);
+    ds4_bench_sequence_free(sequence);
+    if (!validate_expected_sha256(expected_manifest_sha256,
+                                  "manifest",
+                                  error,
+                                  error_size) ||
+        !validate_expected_sha256(expected_sequence_sha256,
+                                  "sequence",
+                                  error,
+                                  error_size)) {
         return false;
     }
-    *sequence = parsed;
-    return true;
+    return parse_file_impl(path,
+                           expected_manifest_sha256,
+                           expected_sequence_sha256,
+                           sequence,
+                           error,
+                           error_size);
 }

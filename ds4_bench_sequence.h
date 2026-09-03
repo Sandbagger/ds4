@@ -31,6 +31,7 @@ typedef struct ds4_bench_sequence {
     size_t input_size;
     unsigned char *input_bytes;
     char input_sha256[DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE];
+    char sequence_sha256[DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE];
 } ds4_bench_sequence;
 
 /* Initialize or release an owned result.  The caller must initialize a result
@@ -46,6 +47,17 @@ bool ds4_bench_sequence_parse_file(const char *path,
                                    ds4_bench_sequence *sequence,
                                    char *error,
                                    size_t error_size);
+
+/* Parse and authenticate one sequence against trusted manifest and exact
+ * serialized-sequence SHA-256 digests.  Both expected digests must be
+ * canonical nonzero lowercase SHA-256 strings. */
+bool ds4_bench_sequence_parse_file_trusted(
+    const char *path,
+    const char *expected_manifest_sha256,
+    const char *expected_sequence_sha256,
+    ds4_bench_sequence *sequence,
+    char *error,
+    size_t error_size);
 
 #ifdef DS4_BENCH_SEQUENCE_TEST_HOOKS
 typedef void (*ds4_bench_sequence_test_after_first_read_hook)(

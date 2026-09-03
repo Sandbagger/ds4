@@ -391,6 +391,72 @@ class BenchQualificationMakefileContractTest(unittest.TestCase):
             dependencies += " " + lines[start].strip()
         self.assertIn("test-bench-qualification-emitter", dependencies.split())
 
+    def test_production_translation_unit_gate_is_direct_aggregate_and_cleaned(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        lines = makefile.splitlines()
+        phony = next(line for line in lines if line.startswith(".PHONY:"))
+        self.assertIn("test-bench-qualification-production-compile", phony.split())
+
+        target = re.search(
+            r"(?m)^test-bench-qualification-production-compile: (?P<deps>[^\n]+)\n"
+            r"(?P<recipe>\t[^\n]+)$",
+            makefile,
+        )
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.group("deps").split(), ["ds4_bench.c", "ds4_gpu.h"])
+        recipe = target.group("recipe")
+        for flag in (
+            "$(CC) $(CFLAGS)",
+            "-DDS4_NO_GPU",
+            "-DDS4_BENCH_QUALIFICATION_TEST_BACKEND",
+            "-Werror=implicit-function-declaration",
+        ):
+            self.assertIn(flag, recipe)
+        self.assertRegex(
+            recipe,
+            r"-c\s+-o\s+tests/test_bench_qualification_production_compile\.o\s+ds4_bench\.c$",
+        )
+        self.assertNotIn("test_bench_qualification_lifecycle.c", recipe)
+
+        start = next(index for index, line in enumerate(lines) if line.startswith("test:"))
+        dependencies = lines[start]
+        while dependencies.rstrip().endswith("\\"):
+            start += 1
+            dependencies += " " + lines[start].strip()
+        self.assertIn("test-bench-qualification-production-compile", dependencies.split())
+
+        clean = next(line for line in lines if line.startswith("\trm -f "))
+        self.assertIn("tests/test_bench_qualification_production_compile.o", clean)
+
+    def test_bench_directly_includes_gpu_api(self) -> None:
+        self.assertRegex(BENCH_SOURCE, r'(?m)^#include "ds4_gpu\.h"$')
+
+    def test_bench_object_rules_depend_on_gpu_api(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        for target_name in ("ds4_bench.o", "ds4_bench_cpu.o"):
+            with self.subTest(target=target_name):
+                rule = re.search(
+                    rf"(?m)^{re.escape(target_name)}: (?P<deps>[^\n]+)$",
+                    makefile,
+                )
+                self.assertIsNotNone(rule)
+                assert rule is not None
+                self.assertIn("ds4_gpu.h", rule.group("deps").split())
+
+    def test_linux_identity_hashes_proc_exe_directly(self) -> None:
+        identity = _function_body(
+            BENCH_SOURCE, "static bool qualification_build_identity("
+        )
+        self.assertRegex(
+            identity,
+            r'(?ms)#if\s+defined\(__linux__\)\s*\n\s*'
+            r'const int fd = open\("/proc/self/exe", flags\);',
+        )
+        self.assertNotRegex(
+            BENCH_SOURCE, r'\breadlink\s*\(\s*"/proc/self/exe"'
+        )
+
 
 class CScannerContractTest(unittest.TestCase):
     def test_brace_scanner_ignores_braces_in_c_literals(self) -> None:

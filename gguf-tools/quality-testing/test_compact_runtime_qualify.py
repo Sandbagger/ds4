@@ -1342,7 +1342,18 @@ print("[" + ",".join(["0"] * count) + "]")
             if line.startswith(b"input_base64=")
         )
         encoded_input = base64_line[len(b"input_base64=") : -1]
-        fixed_line_overhead = len(sample) - len(encoded_input)
+        input_size_line = next(
+            line for line in sample.splitlines(keepends=True)
+            if line.startswith(b"input_size_bytes=")
+        )
+        sample_input_size_digits = input_size_line[len(b"input_size_bytes=") : -1]
+        self.assertTrue(sample_input_size_digits.isdigit())
+        fixed_line_overhead = (
+            len(sample)
+            - len(encoded_input)
+            - len(sample_input_size_digits)
+            + len(str(max_input))
+        )
         worst_case_base64 = 4 * ((max_input + 2) // 3)
         self.assertLessEqual(
             worst_case_base64 + fixed_line_overhead,

@@ -786,7 +786,9 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                     self.assertNotIn(MISSING_PROMPT.lower(), stderr)
 
                 with self.subTest(case="empty", option=option):
-                    result = self._invoke(directory, authenticated + (option, ""))
+                    empty_args = list(authenticated)
+                    empty_args[empty_args.index(option) + 1] = ""
+                    result = self._invoke(directory, tuple(empty_args))
                     self.assertEqual(result.returncode, 2, result.stderr)
                     stderr = result.stderr.lower()
                     self.assertNotIn("unknown option", stderr)
@@ -915,6 +917,11 @@ class BenchQualificationAuthenticatedSequenceSourceContractTest(unittest.TestCas
         self.assertIn("qualification_manifest_sha256", source)
         self.assertIn("qualification_sequence_sha256", source)
         self.assertNotIn("json_parse", source)
+
+    def test_trusted_parser_is_declared_by_public_sequence_header(self) -> None:
+        header = (ROOT / "ds4_bench_sequence.h").read_text(encoding="utf-8")
+        self.assertIn("sequence_sha256", header)
+        self.assertIn("ds4_bench_sequence_parse_file_trusted(", header)
 
 
 class BenchQualificationLifecycleSourceContractTest(unittest.TestCase):

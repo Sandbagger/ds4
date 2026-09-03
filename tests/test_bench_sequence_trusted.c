@@ -16,16 +16,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* RED-only forward declaration: the authenticated parser and its sequence
- * digest field are intentionally absent until the implementation slice lands. */
-bool ds4_bench_sequence_parse_file_trusted(
-    const char *path,
-    const char *expected_manifest_sha256,
-    const char *expected_sequence_sha256,
-    ds4_bench_sequence *sequence,
-    char *error,
-    size_t error_size);
-
 static int failures;
 static int total;
 

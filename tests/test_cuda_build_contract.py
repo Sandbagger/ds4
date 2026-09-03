@@ -1511,19 +1511,9 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertNotIn("ds4_gpu_laguna_router_f32_tensor(", laguna_batch)
 
-    def test_laguna_decode_poolside_mmvq_is_opt_in_and_narrow(self) -> None:
-        selector = function_body(
-            "static bool cuda_poolside_mmvq_requested(void)"
-        )
-        self.assertIn("return g_cuda_poolside_mmvq != 0;", selector)
-        self.assertNotIn("getenv", selector)
-        refresh = function_body(
-            "static void cuda_decode_dispatch_env_refresh(void)"
-        )
-        self.assertIn('getenv("DS4_MM_VQ_REDUCTION")', refresh)
-        self.assertIn('strcmp(reduction, "poolside") == 0', refresh)
-        init = function_body('extern "C" int ds4_gpu_init_multi(')
-        self.assertIn("cuda_decode_dispatch_env_refresh();", init)
+    def test_laguna_decode_poolside_mmvq_is_call_scoped(self) -> None:
+        self.assertNotIn("DS4_MM_VQ_REDUCTION", CUDA_SOURCE)
+        self.assertNotIn("g_cuda_poolside_mmvq", CUDA_SOURCE)
 
         fragment_signature = (
             "dev_dot_q4_K_q8_1_poolside_mmvq_fragment("
@@ -1576,9 +1566,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "const bool poolside_mmvq = !mmq && n_tokens == 1u &&\n"
             "        n_total_expert == 256u && n_expert == 10u &&\n"
             "        expert_in_dim == 3072u && expert_mid_dim == 1024u &&\n"
-            "        out_dim == 3072u &&\n"
-            "        (prefer_poolside_mmvq || "
-            "cuda_poolside_mmvq_requested());",
+            "        out_dim == 3072u && prefer_poolside_mmvq;",
             launch,
         )
         self.assertIn(

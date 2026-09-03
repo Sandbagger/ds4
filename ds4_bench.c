@@ -3,6 +3,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_bench_sequence.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -29,6 +30,9 @@
 typedef struct {
     const char *model_path;
     const char *qualification_plan_path;
+    const char *qualification_sequence_path;
+    const char *qualification_manifest_sha256;
+    const char *qualification_sequence_sha256;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -62,6 +66,9 @@ typedef struct {
     bool ssd_streaming_cache_bytes_set;
     bool ssd_streaming_full_layers_set;
     bool qualification_plan_path_set;
+    bool qualification_sequence_path_set;
+    bool qualification_manifest_sha256_set;
+    bool qualification_sequence_sha256_set;
     bool qualification_control_fd_set;
     bool cuda_tensor_parallel;
     bool show_output;
@@ -243,6 +250,48 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--qualification-sequence")) {
+            if (c.qualification_sequence_path_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-sequence may only be specified once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            if (path[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-sequence requires a non-empty path\n");
+                exit(2);
+            }
+            c.qualification_sequence_path = path;
+            c.qualification_sequence_path_set = true;
+        } else if (!strcmp(arg, "--qualification-manifest-sha256")) {
+            if (c.qualification_manifest_sha256_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-manifest-sha256 may only be specified once\n");
+                exit(2);
+            }
+            const char *digest = need_arg(&i, argc, argv, arg);
+            if (digest[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-manifest-sha256 requires a non-empty digest\n");
+                exit(2);
+            }
+            c.qualification_manifest_sha256 = digest;
+            c.qualification_manifest_sha256_set = true;
+        } else if (!strcmp(arg, "--qualification-sequence-sha256")) {
+            if (c.qualification_sequence_sha256_set) {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-sequence-sha256 may only be specified once\n");
+                exit(2);
+            }
+            const char *digest = need_arg(&i, argc, argv, arg);
+            if (digest[0] == '\0') {
+                fprintf(stderr,
+                        "ds4-bench: --qualification-sequence-sha256 requires a non-empty digest\n");
+                exit(2);
+            }
+            c.qualification_sequence_sha256 = digest;
+            c.qualification_sequence_sha256_set = true;
         } else if (!strcmp(arg, "--qualification-plan")) {
             if (c.qualification_plan_path_set) {
                 fprintf(stderr,
@@ -390,6 +439,43 @@ static bench_config parse_options(int argc, char **argv) {
             usage(stderr, NULL);
             exit(2);
         }
+    }
+
+    const bool qualification_sequence_requested =
+        c.qualification_sequence_path_set ||
+        c.qualification_manifest_sha256_set ||
+        c.qualification_sequence_sha256_set;
+    if (qualification_sequence_requested) {
+        if (!c.qualification_sequence_path_set ||
+            !c.qualification_manifest_sha256_set ||
+            !c.qualification_sequence_sha256_set) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence requires exactly one complete "
+                    "triplet; missing one or more required options (each must occur "
+                    "once): --qualification-sequence, "
+                    "--qualification-manifest-sha256, and "
+                    "--qualification-sequence-sha256\n");
+            exit(2);
+        }
+        if (c.qualification_plan_path_set) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence cannot be combined with "
+                    "--qualification-plan\n");
+            exit(2);
+        }
+        if (c.prompt_path || c.chat_prompt_path) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence cannot be combined with "
+                    "--prompt-file or --chat-prompt-file\n");
+            exit(2);
+        }
+        if (c.backend != DS4_BACKEND_CUDA ||
+            (c.gpu_vram_arg && !strcmp(c.gpu_vram_arg, "0"))) {
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence requires the CUDA backend\n");
+            exit(2);
+        }
+        return c;
     }
 
     if (c.qualification_plan_path_set) return c;
@@ -624,6 +710,29 @@ int main(int argc, char **argv) {
         return qualification_argv_rc;
     }
     bench_config cfg = parse_options(argc, argv);
+
+    if (cfg.qualification_sequence_path_set) {
+        ds4_bench_sequence sequence = {0};
+        char sequence_error[256] = {0};
+        if (!ds4_bench_sequence_parse_file_trusted(
+                cfg.qualification_sequence_path,
+                cfg.qualification_manifest_sha256,
+                cfg.qualification_sequence_sha256,
+                &sequence,
+                sequence_error,
+                sizeof(sequence_error))) {
+            ds4_bench_sequence_free(&sequence);
+            fprintf(stderr,
+                    "ds4-bench: qualification sequence rejected: %s\n",
+                    sequence_error[0] ? sequence_error : "invalid sequence");
+            return 2;
+        }
+        ds4_bench_sequence_free(&sequence);
+        fprintf(stderr,
+                "ds4-bench: qualification sequence unsupported: "
+                "authenticated sequence execution requires the later lifecycle runner\n");
+        return 2;
+    }
 
     /* Hint the packer at the largest ctx this bench run will exercise
      * so per-layer KV bytes are priced for the real session size, not

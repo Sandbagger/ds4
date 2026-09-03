@@ -1480,9 +1480,13 @@ static int run_decode_attention_case(
         }
     }
 
-    /* Exercise both legal but non-int4-aligned views on a shape and row count
-     * that would otherwise select the vector kernel. */
-    if (frozen_name &&
+    /* Exercise both legal but non-int4-aligned views on every shape and row
+     * count that would otherwise select either exact vector kernel. */
+    const bool test_unaligned_cache =
+        frozen_name ||
+        (c->n_head == 72u && c->n_head_kv == 8u &&
+         c->cache_cap == 512u && c->key_count == c->cache_cap);
+    if (test_unaligned_cache &&
         (!run_decode_attention_unaligned_cache_case(
              c, heads, q, k, v, gate, actual, reference, q_count,
              key_actual, value_actual,

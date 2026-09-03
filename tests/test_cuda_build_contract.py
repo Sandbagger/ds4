@@ -881,6 +881,9 @@ class CudaBuildContractTest(unittest.TestCase):
             "memcmp(actual, expected, (size_t)q_bytes)",
         ):
             self.assertIn(required, runner)
+        self.assertIn(
+            "const bool test_unaligned_cache =", LAGUNA_KERNEL_TEST
+        )
         self.assertNotIn("laguna_parity_spans_within_limits", runner)
         self.assertIn(
             "if (run_decode_attention_gqa9_frozen_case() != 0) rc = 1;",
@@ -934,6 +937,8 @@ class CudaBuildContractTest(unittest.TestCase):
             "const bool vector_swa_shape =",
             "n_head == 72u && n_head_kv == 8u",
             "cache_cap == 512u && key_count == cache_cap",
+            "key_start > pos",
+            "key_count - 1u != pos - key_start",
             "uint64_t swa_physical_rows =",
             "((uint64_t)pos + 1u + 255u) & ~(uint64_t)255u",
             "if (swa_physical_rows > 1024u) swa_physical_rows = 1024u;",

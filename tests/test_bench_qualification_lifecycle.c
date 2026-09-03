@@ -33,8 +33,18 @@ typedef union {
 static fake_storage fake_engine_storage;
 static fake_storage fake_session_storage[4];
 static int fake_prompt_tokens[512];
-static const unsigned char literal_input[] = "task19 literal qualification prompt";
+#define LITERAL_RENDERED_SEQUENCE "task19 literal qualification prompt"
+static const unsigned char literal_input[] = LITERAL_RENDERED_SEQUENCE;
+/* The real strict parser owns raw, non-NUL input bytes. Keep a writable
+ * sentinel immediately after this fake's logical bytes so the fake can reject
+ * both a direct char * cast and an in-place terminator without an out-of-bounds
+ * comparison. */
+static unsigned char literal_sequence_input[] =
+    LITERAL_RENDERED_SEQUENCE "\x7f";
+
 static const uint32_t literal_prompt_tokens = 512u;
+/* Deliberately nonzero: a hard-coded common EOS value must not pass the fake. */
+static const int literal_eos_token = 17;
 static const uint64_t literal_cache_bytes = UINT64_C(8589934592);
 static const char literal_manifest_sha256[] =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -53,6 +63,8 @@ enum call_kind {
     CALL_SEQUENCE_FREE,
     CALL_ENGINE_OPEN,
     CALL_ENGINE_CLOSE,
+    CALL_NVML_CAPTURE,
+    CALL_TOKENIZE_RENDERED,
     CALL_SESSION_CREATE,
     CALL_SESSION_FREE,
     CALL_REQUEST_BEGIN,
@@ -91,6 +103,8 @@ typedef struct {
     int contract_failures;
     int engine_open_count;
     int engine_close_count;
+    int tokenize_rendered_count;
+    int nvml_capture_count;
     int session_create_count;
     int session_free_count;
     int request_begin_count;
@@ -112,6 +126,8 @@ typedef struct {
     bool inject_emitter_failure;
     bool emitter_failed;
     const ds4_bench_sequence *trusted_sequence;
+    const ds4_gpu_nvml_inventory_snapshot *captured_pre_child;
+    uint64_t last_emitted_monotonic_ns;
     ds4_runtime_request_context *requests[4];
     int request_repetition[4];
     ds4_session *sessions[4];
@@ -227,7 +243,7 @@ static bool fake_sequence_parse_file_trusted(
     literal.prompt_tokens = literal_prompt_tokens;
     literal.input_size_bytes = sizeof(literal_input) - 1u;
     literal.input_size = sizeof(literal_input) - 1u;
-    literal.input_bytes = (unsigned char *)(uintptr_t)literal_input;
+    literal.input_bytes = literal_sequence_input;
     memcpy(literal.input_sha256, literal_input_sha256,
            sizeof(literal.input_sha256));
     memcpy(literal.sequence_sha256, literal_sequence_sha256,
@@ -246,6 +262,44 @@ static void fake_sequence_free(ds4_bench_sequence *sequence) {
     /* The input is static in this fake.  Do not free or scrub it. */
 }
 
+static int fake_gpu_nvml_inventory_capture(
+        ds4_gpu_nvml_inventory_snapshot *out) {
+    record_call(CALL_NVML_CAPTURE, -1);
+    state.nvml_capture_count++;
+    if (!out) {
+        fail_contract("pre-engine NVML capture received a null output");
+        return 1;
+    }
+    if (state.nvml_capture_count != 1 || state.engine_open_count != 0) {
+        fail_contract("pre-child NVML inventory was not captured exactly once before engine open");
+    }
+    memset(out, 0, sizeof(*out));
+    out->api_version = 77u;
+    snprintf(out->api_identity, sizeof(out->api_identity), "task19-fake-nvml");
+    snprintf(out->library_version, sizeof(out->library_version), "task19-fake-library");
+    snprintf(out->device_uuid, sizeof(out->device_uuid), "GPU-task19-fake");
+    out->process_count = 1u;
+    out->processes[0].pid = 4242u;
+    out->processes[0].used_bytes = UINT64_C(123456);
+    out->processes[0].used_bytes_known = true;
+    state.captured_pre_child = out;
+    return 0;
+}
+
+static bool is_captured_pre_child_snapshot(
+        const ds4_gpu_nvml_inventory_snapshot *snapshot) {
+    return snapshot != NULL &&
+           snapshot == state.captured_pre_child &&
+           snapshot->api_version == 77u &&
+           strcmp(snapshot->api_identity, "task19-fake-nvml") == 0 &&
+           strcmp(snapshot->library_version, "task19-fake-library") == 0 &&
+           strcmp(snapshot->device_uuid, "GPU-task19-fake") == 0 &&
+           snapshot->process_count == 1u &&
+           snapshot->processes[0].pid == 4242u &&
+           snapshot->processes[0].used_bytes == UINT64_C(123456) &&
+           snapshot->processes[0].used_bytes_known;
+}
+
 static bool pinned_engine_options(const ds4_engine_options *options) {
     if (!options) return false;
     return options->model_path &&
@@ -257,6 +311,7 @@ static bool pinned_engine_options(const ds4_engine_options *options) {
            options->ssd_streaming &&
            options->ssd_streaming_cache_bytes == literal_cache_bytes &&
            options->ssd_streaming_cache_bytes_set &&
+           options->placement_ctx_hint == 32768 &&
            !options->quality &&
            !options->warm_weights &&
            !options->ssd_streaming_cold &&
@@ -271,6 +326,9 @@ static bool pinned_engine_options(const ds4_engine_options *options) {
 static int fake_engine_open(ds4_engine **out, const ds4_engine_options *options) {
     record_call(CALL_ENGINE_OPEN, -1);
     state.engine_open_count++;
+    if (state.nvml_capture_count != 1 || state.captured_pre_child == NULL) {
+        fail_contract("engine open was not preceded by exactly one pre-child NVML capture");
+    }
     if (!out || !pinned_engine_options(options)) {
         fail_contract("engine open did not receive the pinned qualification configuration");
         return 1;
@@ -350,12 +408,23 @@ static ds4_runtime_status fake_engine_laguna_external_checkpoint(
         const ds4_gpu_nvml_inventory_snapshot *pre_child,
         const uint8_t expected_build_identity[DS4_RUNTIME_BUILD_IDENTITY_BYTES],
         ds4_engine_laguna_external_checkpoint_observation *out) {
-    (void)pre_child;
-    (void)expected_build_identity;
     record_call(CALL_EXTERNAL_CHECKPOINT, -1);
     state.checkpoint_count++;
-    if (engine != fake_engine || !out) {
-        fail_contract("external checkpoint received an invalid engine/output");
+    bool build_identity_nonzero = false;
+    if (expected_build_identity != NULL) {
+        for (size_t i = 0; i < DS4_RUNTIME_BUILD_IDENTITY_BYTES; i++) {
+            if (expected_build_identity[i] != 0u) {
+                build_identity_nonzero = true;
+                break;
+            }
+        }
+    }
+    if (engine != fake_engine || !out ||
+        !is_captured_pre_child_snapshot(pre_child) ||
+        !build_identity_nonzero) {
+        fail_contract("external checkpoint did not use the captured pre-child inventory and trusted build identity");
+    }
+    if (!out) {
         return DS4_RUNTIME_STATUS_UNSAFE;
     }
     memset(out, 0, sizeof(*out));
@@ -413,23 +482,51 @@ static void fill_fake_tokens(ds4_tokens *out) {
 
 static void fake_tokenize_text(ds4_engine *engine, const char *text, ds4_tokens *out) {
     (void)engine;
-    if (!text || memcmp(text, literal_input, sizeof(literal_input) - 1u) != 0) {
-        fail_contract("qualification tokenizer did not receive the literal sequence input");
-    }
+    (void)text;
+    record_call(CALL_UNEXPECTED, -1);
+    fail_contract("qualification lifecycle used ds4_tokenize_text instead of rendered sequence input");
     fill_fake_tokens(out);
+}
+
+static bool is_exact_rendered_sequence_input(const char *text) {
+    /* The tokenizer API takes a C string. strcmp checks both the complete
+     * already-rendered payload and its terminating NUL without reading a fixed
+     * length from an arbitrary caller buffer. */
+    return text != NULL &&
+           literal_sequence_input[sizeof(literal_input) - 1u] == 0x7fu &&
+           text != (const char *)literal_sequence_input &&
+           strcmp(text, (const char *)literal_input) == 0;
 }
 
 static void fake_tokenize_rendered_chat(ds4_engine *engine, const char *text,
                                         ds4_tokens *out) {
-    fake_tokenize_text(engine, text, out);
+    record_call(CALL_TOKENIZE_RENDERED, -1);
+    state.tokenize_rendered_count++;
+    if (engine != fake_engine || !is_exact_rendered_sequence_input(text) ||
+        state.tokenize_rendered_count != 1 || state.engine_open_count != 1 ||
+        state.engine_close_count != 0 || state.session_create_count != 0) {
+        fail_contract("rendered sequence tokenization was not the one exact post-open pre-session operation");
+    }
+    if (!out) {
+        fail_contract("rendered sequence tokenizer received a null output");
+        return;
+    }
+    fill_fake_tokens(out);
+    if (out->len != (int)literal_prompt_tokens) {
+        fail_contract("rendered sequence tokenizer did not return the canonical prompt token count");
+    }
 }
 
 static void fake_encode_chat_prompt(ds4_engine *engine, const char *system,
                                     const char *prompt, ds4_think_mode mode,
                                     ds4_tokens *out) {
+    (void)engine;
     (void)system;
+    (void)prompt;
     (void)mode;
-    fake_tokenize_text(engine, prompt, out);
+    record_call(CALL_UNEXPECTED, -1);
+    fail_contract("qualification lifecycle used chat encoding instead of rendered sequence input");
+    fill_fake_tokens(out);
 }
 
 static void fake_tokens_free(ds4_tokens *tokens) {
@@ -442,20 +539,27 @@ static uint64_t fake_session_payload_bytes(ds4_session *session) {
 }
 
 static int fake_token_eos(ds4_engine *engine) {
-    (void)engine;
-    return 0;
+    if (engine != fake_engine) {
+        fail_contract("EOS lookup did not use the open fake engine");
+    }
+    return literal_eos_token;
 }
 
 static int fake_session_argmax_excluding(ds4_session *session, int excluded) {
     const int repetition = session_rep(session);
     record_pointer_call(CALL_TOKEN_CHOOSE, repetition, session, NULL);
     state.choose_count++;
-    if (excluded == 42) fail_contract("non-EOS chooser excluded the selected token");
+    if (repetition < 0 || repetition >= 4 || session != state.sessions[repetition] ||
+        excluded != literal_eos_token) {
+        fail_contract("non-EOS chooser did not exclude the exact fake engine EOS token");
+    }
     return 42;
 }
 
 static int fake_session_argmax(ds4_session *session) {
-    return fake_session_argmax_excluding(session, fake_token_eos(fake_engine));
+    record_pointer_call(CALL_UNEXPECTED, session_rep(session), session, NULL);
+    fail_contract("qualification lifecycle used ds4_session_argmax instead of ds4_session_argmax_excluding");
+    return 42;
 }
 
 static int fake_session_sync_attributed(
@@ -735,7 +839,15 @@ static bool fake_emit_record(
     char expected_request[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
     expected_request_id(expected_repetition, expected_request,
                         sizeof(expected_request));
+    ds4_session *current_session =
+        expected_repetition >= 0 && expected_repetition < state.session_create_count ?
+        state.sessions[expected_repetition] : NULL;
     if (!record || state.emit_count > 12 ||
+        record->monotonic_ns == 0u ||
+        record->monotonic_ns <= state.last_emitted_monotonic_ns ||
+        (current_session != NULL &&
+         record->session_payload_bytes != fake_session_payload_bytes(current_session)) ||
+        current_session == NULL ||
         record->sequence != state.trusted_sequence ||
         record->event != expected_event ||
         !check_repetition((int)record->repetition_index, expected_repetition,
@@ -746,6 +858,9 @@ static bool fake_emit_record(
         record->runtime_snapshot->snapshot_seq !=
             UINT64_C(100) + (uint64_t)state.emit_count) {
         fail_contract("emitter did not receive the exact ordered lifecycle record");
+    }
+    if (record && record->monotonic_ns > state.last_emitted_monotonic_ns) {
+        state.last_emitted_monotonic_ns = record->monotonic_ns;
     }
     if (record && record->event != DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE &&
         record->request_metrics != NULL) {
@@ -775,11 +890,15 @@ static bool fake_emit_record(
 
 /* Macro substitution is deliberately limited to the lifecycle-facing APIs. */
 #define main ds4_bench_test_cli_main
+/* Keep the CUDA-only qualification branch testable in this host-only fake
+ * backend while normal DS4_NO_GPU builds remain fail-closed. */
+#define DS4_BENCH_QUALIFICATION_TEST_BACKEND 1
 #define ds4_bench_sequence_parse_file_trusted fake_sequence_parse_file_trusted
 #define ds4_bench_sequence_free fake_sequence_free
 #define ds4_engine_open fake_engine_open
 #define ds4_engine_create_with_gpu_config fake_engine_create_with_gpu_config
 #define ds4_engine_close fake_engine_close
+#define ds4_gpu_nvml_inventory_capture fake_gpu_nvml_inventory_capture
 #define ds4_engine_vocab_size fake_engine_vocab_size
 #define ds4_engine_prefill_chunk fake_engine_prefill_chunk
 #define ds4_engine_routed_quant_bits fake_engine_routed_quant_bits
@@ -869,10 +988,21 @@ static void check_lifecycle_shape(void) {
     if (state.sequence_free_count != 1) {
         fail_contract("expected exactly one trusted sequence cleanup");
     }
+    if (state.nvml_capture_count != 1 || state.tokenize_rendered_count != 1) {
+        fail_contract("expected one pre-engine NVML capture and one rendered-input tokenization");
+    }
     const int engine_open = first_call(CALL_ENGINE_OPEN, -1);
+    const int nvml_capture = first_call(CALL_NVML_CAPTURE, -1);
+    const int rendered_tokenize = first_call(CALL_TOKENIZE_RENDERED, -1);
     const int first_session = first_call(CALL_SESSION_CREATE, -1);
     const int engine_close = first_call(CALL_ENGINE_CLOSE, -1);
     const int last_free = nth_call(CALL_SESSION_FREE, -1, 3);
+    require_call_order(nvml_capture, engine_open,
+                       "pre-child NVML capture must precede engine open");
+    require_call_order(engine_open, rendered_tokenize,
+                       "engine must open before rendered sequence tokenization");
+    require_call_order(rendered_tokenize, first_session,
+                       "rendered sequence tokenization must precede the first qualification session");
     require_call_order(engine_open, first_session,
                        "engine must open before the first qualification session");
     require_call_order(last_free, engine_close,
@@ -915,6 +1045,7 @@ static void check_lifecycle_shape(void) {
         const int complete_snapshot = nth_call(CALL_RUNTIME_SNAPSHOT, -1, repetition * 3 + 2);
         const int complete = nth_call(CALL_EMIT, repetition, 2);
         const int free = nth_call(CALL_SESSION_FREE, repetition, 0);
+        const int sequence_free = nth_call(CALL_SEQUENCE_FREE, -1, 0);
         require_call_order(request, prompt, "request prompt binding must follow request begin");
         require_call_order(prompt, accepted_checkpoint, "accepted checkpoint must follow request binding");
         require_call_order(accepted_checkpoint, accepted_snapshot, "accepted checkpoint must precede its runtime snapshot");
@@ -948,6 +1079,10 @@ static void check_lifecycle_shape(void) {
             fail_contract("completion emission was not made from one just-captured checkpoint/snapshot pair");
         }
         require_call_order(complete, free, "session free must follow completion emission");
+        if (repetition == 3) {
+            require_call_order(complete, sequence_free,
+                               "final completion event must precede trusted sequence cleanup");
+        }
         if (repetition > 0) {
             const int previous_free = nth_call(CALL_SESSION_FREE, repetition - 1, 0);
             require_call_order(previous_free, create,
@@ -969,6 +1104,7 @@ static void check_lifecycle_shape(void) {
 
 static void reset_fake_state(bool inject_emitter_failure) {
     memset(&state, 0, sizeof(state));
+    literal_sequence_input[sizeof(literal_input) - 1u] = 0x7fu;
     state.inject_emitter_failure = inject_emitter_failure;
 }
 
@@ -1021,6 +1157,9 @@ static void check_fail_closed_cleanup(void) {
     if (state.engine_open_count != 1 || state.engine_close_count != 1) {
         fail_contract("injected emitter failure did not close its one engine exactly once");
     }
+    if (state.sequence_free_count != 1) {
+        fail_contract("injected emitter failure did not free the trusted sequence exactly once");
+    }
     int failed_emit = -1;
     for (size_t i = 0; i < state.call_count; i++) {
         if (state.calls[i].kind == CALL_EMIT) {
@@ -1029,6 +1168,9 @@ static void check_fail_closed_cleanup(void) {
         }
     }
     if (failed_emit >= 0) {
+        const int sequence_free = first_call(CALL_SEQUENCE_FREE, -1);
+        require_call_order(failed_emit, sequence_free,
+                           "injected emitter failure must precede trusted sequence cleanup");
         for (size_t i = (size_t)failed_emit + 1u; i < state.call_count; i++) {
             const enum call_kind kind = state.calls[i].kind;
             if (kind != CALL_SESSION_FREE && kind != CALL_ENGINE_CLOSE &&

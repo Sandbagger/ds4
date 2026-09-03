@@ -1,0 +1,125 @@
+{
+  "capture": {
+    "diagnostic_archive": "layer9-cache-diagnostic-v33d-6494fdad9c34",
+    "diagnostic_manifest_sha256": "34f4bbd40386fc963e8d95574fdc45279ea102b737c6b381bb14d10c8e9ece1f",
+    "extractor_sha256": "ee7370d2b8500c2f01c0917d0d55be58247976cc88660af41a1ee90d8543c74a",
+    "probe_binary_sha256": "7f900688006d8a8ea0bdbd61e17946bb422c76517fcb5948fd91a2f4581dfce6",
+    "probe_source_sha256": "e0859c5974a8a3fc97c1e0fd13a675d5efd5d25ecf87bbf6b2271584bdb3f43e",
+    "runner_sha256": "6ba8eaaa8aec9cd467d7873853c5587e32397a8434bb96563f39fe9c7dbe97b1",
+    "source_files": {
+      "layer-09-attn-gated.f32": {
+        "byte_identical": false,
+        "bytes": 36864,
+        "ds4_sha256": "74bedb86b71339c6abdb26b36e7e5b54df00d618eb6a11e4054f565f477f4f52",
+        "poolside_sha256": "e25a66d9b2da2592de501243f8098950f1c9cdf08ddabb7df53ec5c3464a4c23"
+      },
+      "layer-09-gate-proj.f32": {
+        "byte_identical": true,
+        "bytes": 288,
+        "ds4_sha256": "d4847ab0601f7a6494254fcbc1c512d8c925cb404b9807f5263f1d5e83155241",
+        "poolside_sha256": "d4847ab0601f7a6494254fcbc1c512d8c925cb404b9807f5263f1d5e83155241"
+      },
+      "layer-09-key-cache.f16": {
+        "byte_identical": true,
+        "bytes": 1048576,
+        "ds4_sha256": "1fa000a0aaa037a7cfc804f94c6baf4afa5b473ec67eef38eb8e6625b4828787",
+        "poolside_sha256": "1fa000a0aaa037a7cfc804f94c6baf4afa5b473ec67eef38eb8e6625b4828787"
+      },
+      "layer-09-q-rope.f32": {
+        "byte_identical": true,
+        "bytes": 36864,
+        "ds4_sha256": "a9cb3242e9e2b955275b885726ef16cfef9cebd6cb68322ce2661ce32f1f431a",
+        "poolside_sha256": "a9cb3242e9e2b955275b885726ef16cfef9cebd6cb68322ce2661ce32f1f431a"
+      },
+      "layer-09-value-cache.f16": {
+        "byte_identical": true,
+        "bytes": 1048576,
+        "ds4_sha256": "ec36d91de252e8555bd3fd841819b648b893f6ad854fe745da2c9382dc1573a8",
+        "poolside_sha256": "ec36d91de252e8555bd3fd841819b648b893f6ad854fe745da2c9382dc1573a8"
+      }
+    },
+    "split": "512-token prefix followed by token 3612"
+  },
+  "files": {
+    "layer09-attn-gated-head0.f32": {
+      "bytes": 512,
+      "sha256": "79cae246377f665525c383e53b8f3d6e77df8c047ae576f8f4e9106d6fd94d7d"
+    },
+    "layer09-gate-head0.f32": {
+      "bytes": 4,
+      "sha256": "08c72a6387515495b3df4f7ea917cc4164d94a877f36f92dfae8d0ac4fa58d83"
+    },
+    "layer09-key-cache-kv0.f16": {
+      "bytes": 131072,
+      "sha256": "c948b53909111e88bf37367f7b9d227a8b7af2f7f464ef9d7082957760f668d6"
+    },
+    "layer09-q-rope-head0.f32": {
+      "bytes": 512,
+      "sha256": "d2bb598064ffdcfaca7a6168beb6a66f1af44ab9093c7213c376f6e104b1fea7"
+    },
+    "layer09-value-cache-kv0.f16": {
+      "bytes": 131072,
+      "sha256": "aa1dead930925e7de8fe49a48682e876c61f9998239803f1a5072080ea372853"
+    }
+  },
+  "limitations": [
+    "The compact fixture repeats one authenticated query/KV stream and does not test per-head diversity.",
+    "The pinned full-model oracle remains the only production qualification gate."
+  ],
+  "model_sha256": "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+  "oracle": {
+    "captured_head0_ds4_byte_mismatches": 133,
+    "captured_head0_ds4_lane_mismatches": 128,
+    "comparison": "bytewise exact",
+    "kernel": "flash_attn_ext_vec<128,1,GGML_TYPE_F16,GGML_TYPE_F16,false>",
+    "launch": {
+      "block": [
+        32,
+        4,
+        1
+      ],
+      "grid": [
+        1,
+        4,
+        72
+      ],
+      "parallel_blocks": 4
+    }
+  },
+  "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
+  "production_core": "6494fdad9c34fdb62cb2087e1a94386ca371c67d",
+  "replication": {
+    "expected": "Poolside head 0 repeated to 72 query heads",
+    "gate": "head 0 repeated to 72 query heads",
+    "gqa_ratio": 9,
+    "key_cache": "KV head 0 repeated to 8 KV heads per physical row",
+    "query": "head 0 repeated to 72 query heads",
+    "value_cache": "KV head 0 repeated to 8 KV heads per physical row"
+  },
+  "schema": "laguna-attention-decode-gqa9-fixture/v1",
+  "shape": {
+    "cache_cap": 512,
+    "ds4_ring_cache": "[512 rows,8 KV heads,128 dims] F16",
+    "head_dim": 128,
+    "key_count": 512,
+    "key_start": 1,
+    "n_head": 72,
+    "n_head_kv": 8,
+    "physical_strides_bytes": [
+      2,
+      256,
+      2048
+    ],
+    "poolside_active_rows": "absolute rows 1..512 normalized to DS4 rows 1..511,0",
+    "poolside_physical_cache_view": "[128,8,768,1] F16",
+    "position": 512,
+    "scale": "1/sqrtf(128)"
+  },
+  "source_kind": "authenticated Poolside 512+1 full-model diagnostic",
+  "store_contract": {
+    "current_kv": "decoded from authenticated post-store row 0 and re-encoded exactly",
+    "expected": "full physical cache after wrapper store is byte-identical to authenticated capture",
+    "initial_row0": "test-owned zero poison"
+  },
+  "tokenizer_commit": "15c9b92502fed6bc26842e98d11a6347caadb08e"
+}

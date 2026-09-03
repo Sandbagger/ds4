@@ -55,6 +55,32 @@ LAGUNA_DECODE_VEC_FILES = {
         "03ee96885ea69cf19375eeab14ffc34473f9640c4f4b0e58ae38ada6af7bd290",
     ),
 }
+LAGUNA_DECODE_GQA9_FIXTURE = (
+    ROOT / "tests/test-vectors/laguna-attention-decode-gqa9"
+)
+LAGUNA_DECODE_GQA9_FILES = {
+    "layer09-attn-gated-head0.f32": (
+        512,
+        "79cae246377f665525c383e53b8f3d6e77df8c047ae576f8f4e9106d6fd94d7d",
+    ),
+    "layer09-gate-head0.f32": (
+        4,
+        "08c72a6387515495b3df4f7ea917cc4164d94a877f36f92dfae8d0ac4fa58d83",
+    ),
+    "layer09-key-cache-kv0.f16": (
+        131072,
+        "c948b53909111e88bf37367f7b9d227a8b7af2f7f464ef9d7082957760f668d6",
+    ),
+    "layer09-q-rope-head0.f32": (
+        512,
+        "d2bb598064ffdcfaca7a6168beb6a66f1af44ab9093c7213c376f6e104b1fea7",
+    ),
+    "layer09-value-cache-kv0.f16": (
+        131072,
+        "aa1dead930925e7de8fe49a48682e876c61f9998239803f1a5072080ea372853",
+    ),
+}
+
 LAGUNA_ATTENTION_AUTO_FILES = {
     "layer-00-q-proj-t21.f32": (
         24576,
@@ -707,6 +733,218 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("cache_values * sizeof(*key_actual), 2u, scale", LAGUNA_KERNEL_TEST)
         self.assertIn("cache_values * sizeof(*key_actual), 4u, scale", LAGUNA_KERNEL_TEST)
         self.assertIn("cudaDeviceSynchronize()", unaligned_case)
+
+    def test_laguna_decode_gqa9_fixture_is_pinned_and_wired(self) -> None:
+        manifest_path = LAGUNA_DECODE_GQA9_FIXTURE / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["schema"], "laguna-attention-decode-gqa9-fixture/v1"
+        )
+        self.assertEqual(
+            manifest["poolside_commit"],
+            "04b2b72cb54048ead292884adbe11f284e3ec950",
+        )
+        self.assertEqual(
+            manifest["production_core"],
+            "6494fdad9c34fdb62cb2087e1a94386ca371c67d",
+        )
+        self.assertEqual(
+            manifest["tokenizer_commit"],
+            "15c9b92502fed6bc26842e98d11a6347caadb08e",
+        )
+        self.assertEqual(
+            manifest["model_sha256"],
+            "e163b2c98908809a71245d6bb68b2226994d9969cb2a438eccb72196a1c4147a",
+        )
+        self.assertEqual(
+            manifest["capture"]["diagnostic_archive"],
+            "layer9-cache-diagnostic-v33d-6494fdad9c34",
+        )
+        self.assertEqual(
+            manifest["capture"]["diagnostic_manifest_sha256"],
+            "34f4bbd40386fc963e8d95574fdc45279ea102b737c6b381bb14d10c8e9ece1f",
+        )
+        self.assertEqual(
+            manifest["capture"]["runner_sha256"],
+            "6ba8eaaa8aec9cd467d7873853c5587e32397a8434bb96563f39fe9c7dbe97b1",
+        )
+        self.assertEqual(
+            manifest["capture"]["extractor_sha256"],
+            "ee7370d2b8500c2f01c0917d0d55be58247976cc88660af41a1ee90d8543c74a",
+        )
+        self.assertEqual(
+            manifest["capture"]["probe_source_sha256"],
+            "e0859c5974a8a3fc97c1e0fd13a675d5efd5d25ecf87bbf6b2271584bdb3f43e",
+        )
+        self.assertEqual(
+            manifest["capture"]["probe_binary_sha256"],
+            "7f900688006d8a8ea0bdbd61e17946bb422c76517fcb5948fd91a2f4581dfce6",
+        )
+        self.assertEqual(
+            manifest["shape"],
+            {
+                "n_head": 72,
+                "n_head_kv": 8,
+                "head_dim": 128,
+                "position": 512,
+                "cache_cap": 512,
+                "key_start": 1,
+                "key_count": 512,
+                "ds4_ring_cache": "[512 rows,8 KV heads,128 dims] F16",
+                "poolside_physical_cache_view": "[128,8,768,1] F16",
+                "poolside_active_rows":
+                    "absolute rows 1..512 normalized to DS4 rows 1..511,0",
+                "physical_strides_bytes": [2, 256, 2048],
+                "scale": "1/sqrtf(128)",
+            },
+        )
+        self.assertEqual(manifest["replication"]["gqa_ratio"], 9)
+        self.assertEqual(
+            manifest["oracle"]["launch"],
+            {"grid": [1, 4, 72], "block": [32, 4, 1], "parallel_blocks": 4},
+        )
+        self.assertEqual(manifest["oracle"]["comparison"], "bytewise exact")
+        self.assertGreater(
+            manifest["oracle"]["captured_head0_ds4_lane_mismatches"], 0
+        )
+        source_files = manifest["capture"]["source_files"]
+        self.assertEqual(
+            source_files["layer-09-key-cache.f16"],
+            {
+                "bytes": 1048576,
+                "poolside_sha256":
+                    "1fa000a0aaa037a7cfc804f94c6baf4afa5b473ec67eef38eb8e6625b4828787",
+                "ds4_sha256":
+                    "1fa000a0aaa037a7cfc804f94c6baf4afa5b473ec67eef38eb8e6625b4828787",
+                "byte_identical": True,
+            },
+        )
+        self.assertEqual(
+            source_files["layer-09-value-cache.f16"],
+            {
+                "bytes": 1048576,
+                "poolside_sha256":
+                    "ec36d91de252e8555bd3fd841819b648b893f6ad854fe745da2c9382dc1573a8",
+                "ds4_sha256":
+                    "ec36d91de252e8555bd3fd841819b648b893f6ad854fe745da2c9382dc1573a8",
+                "byte_identical": True,
+            },
+        )
+        self.assertEqual(
+            manifest["limitations"],
+            [
+                "The compact fixture repeats one authenticated query/KV "
+                "stream and does not test per-head diversity.",
+                "The pinned full-model oracle remains the only production "
+                "qualification gate.",
+            ],
+        )
+        self.assertEqual(set(manifest["files"]), set(LAGUNA_DECODE_GQA9_FILES))
+        for name, (expected_size, expected_sha256) in LAGUNA_DECODE_GQA9_FILES.items():
+            payload = (LAGUNA_DECODE_GQA9_FIXTURE / name).read_bytes()
+            self.assertEqual(len(payload), expected_size)
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), expected_sha256)
+            self.assertEqual(
+                manifest["files"][name],
+                {"bytes": expected_size, "sha256": expected_sha256},
+            )
+
+        runner = source_function_body(
+            LAGUNA_KERNEL_TEST,
+            "static int run_decode_attention_gqa9_frozen_case(void)",
+            "tests/test_cuda_laguna_kernels.c",
+        )
+        self.assertIn("LAGUNA_DECODE_GQA9_FIXTURE_DIR", LAGUNA_KERNEL_TEST)
+        for required in (
+            "layer09-q-rope-head0.f32",
+            "layer09-key-cache-kv0.f16",
+            "layer09-value-cache-kv0.f16",
+            "layer09-gate-head0.f32",
+            "layer09-attn-gated-head0.f32",
+            "const uint32_t n_head = 72u;",
+            "const uint32_t n_head_kv = 8u;",
+            "const uint32_t cache_cap = 512u;",
+            "const uint32_t pos = 512u;",
+            "const uint32_t key_start = 1u;",
+            "const uint32_t key_count = 512u;",
+            "memset(key_initial, 0,",
+            "memset(value_initial, 0,",
+            "memcmp(key_initial, key_expected,",
+            "memcmp(value_initial, value_expected,",
+            "row-0 poison is not observable",
+            "reference_f16_to_f32(key_seed[d])",
+            "reference_f32_to_f16(k_host[i])",
+            "ds4_gpu_laguna_store_attention_tensor(",
+            "cudaDeviceSynchronize()",
+            "memcmp(key_actual, key_expected, (size_t)cache_bytes)",
+            "memcmp(value_actual, value_expected, (size_t)cache_bytes)",
+            "memcmp(actual, expected, (size_t)q_bytes)",
+        ):
+            self.assertIn(required, runner)
+        self.assertNotIn("laguna_parity_spans_within_limits", runner)
+        self.assertIn(
+            "if (run_decode_attention_gqa9_frozen_case() != 0) rc = 1;",
+            LAGUNA_KERNEL_TEST,
+        )
+        for existing in (
+            '"gqa6-poolside-vec-token513"',
+            '"gqa6-token513-gate100.f32"',
+            '"gqa6-token513-runtime-gates.f32"',
+            '"gqa6-token513-runtime-gated.f32"',
+        ):
+            self.assertIn(existing, LAGUNA_KERNEL_TEST)
+
+    def test_laguna_decode_gqa9_has_four_partition_poolside_route(self) -> None:
+        qualified = function_body("laguna_attention_decode_gqa_f16_kernel(")
+        self.assertEqual(
+            hashlib.sha256(qualified.encode("utf-8")).hexdigest(),
+            "4e37382e56f34babb9ae2efa8781e2194fc098eecbe129f0ae5bf62d03933358",
+            "the separately qualified 48/8 vector kernel must not drift",
+        )
+        vector = function_body("laguna_attention_decode_gqa_swa_f16_kernel(")
+        for required in (
+            "laguna_vec_warp_sum_8(",
+            "laguna_vec_warp_sum_32(",
+            "laguna_vec_warp_max_32(",
+            "constexpr uint32_t max_partitions = 4u;",
+            "const uint32_t kv_head = head / 9u;",
+            "constexpr uint64_t kv_width = 8u * head_dim;",
+            "__shared__ float scratch[max_partitions][2048];",
+            "__shared__ float partition_values[max_partitions][head_dim];",
+            "__shared__ float2 partition_meta[max_partitions];",
+            "tile0 += max_partitions * lanes_per_partition",
+            "laguna_vec_load_half2x4(",
+            "if (!score_row_valid) dot = -INFINITY;",
+            "const uint32_t poolside_slot_start = key_start & 1023u;",
+            "const uint32_t slot_distance =",
+            "((uint32_t)poolside_row - poolside_slot_start) & 1023u;",
+            "const uint64_t cache_row = poolside_row & 511u;",
+        ):
+            self.assertIn(required, vector)
+        self.assertNotIn("% cache_cap", vector)
+        self.assertIn(
+            "__global__ __launch_bounds__(512, 1) static void\n"
+            "laguna_attention_decode_gqa_swa_f16_kernel(",
+            CUDA_SOURCE,
+        )
+        wrapper = function_body(
+            'extern "C" int ds4_gpu_laguna_store_attention_tensor('
+        )
+        for required in (
+            "const bool vector_swa_shape =",
+            "n_head == 72u && n_head_kv == 8u",
+            "cache_cap == 512u && key_count == cache_cap",
+            "uint64_t swa_physical_rows =",
+            "((uint64_t)pos + 1u + 255u) & ~(uint64_t)255u",
+            "if (swa_physical_rows > 1024u) swa_physical_rows = 1024u;",
+            "if (cache_vec_aligned && vector_swa_shape)",
+            "laguna_attention_decode_gqa_swa_f16_kernel<<<n_head, 512>>>",
+            "laguna_attention_decode_gqa_f16_scalar_kernel<<<",
+        ):
+            self.assertIn(required, wrapper)
+        self.assertNotIn("cudaMalloc", wrapper)
+        self.assertNotIn("cudaFree", wrapper)
+
 
     def test_laguna_attention_auto_fixture_is_pinned_and_wired(self) -> None:
         manifest_path = LAGUNA_ATTENTION_AUTO_FIXTURE / "manifest.json"

@@ -1113,6 +1113,49 @@ static int laguna_read_decode_vec_frozen(
     return ok;
 }
 
+#define LAGUNA_DECODE_GQA9_FIXTURE_DIR \
+    "tests/test-vectors/laguna-attention-decode-gqa9"
+
+static int laguna_read_decode_gqa9_frozen(
+        const char *name, void *values, uint64_t expected_bytes) {
+    char path[512];
+    const int path_length = snprintf(
+        path, sizeof(path), "%s/%s", LAGUNA_DECODE_GQA9_FIXTURE_DIR, name);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path) ||
+        sizeof(float) != 4u || sizeof(uint16_t) != 2u) {
+        fprintf(stderr, "decode-attention-gqa9-frozen: invalid fixture contract\n");
+        return 0;
+    }
+    const uint16_t endian_probe = 1u;
+    if (*(const uint8_t *)&endian_probe != 1u) {
+        fprintf(stderr,
+                "decode-attention-gqa9-frozen: little-endian host is required\n");
+        return 0;
+    }
+    FILE *stream = fopen(path, "rb");
+    if (!stream || fseek(stream, 0, SEEK_END) != 0) {
+        fprintf(stderr, "decode-attention-gqa9-frozen: cannot open %s\n", path);
+        if (stream) fclose(stream);
+        return 0;
+    }
+    const long file_bytes = ftell(stream);
+    if (file_bytes < 0 || (uint64_t)file_bytes != expected_bytes) {
+        fprintf(stderr,
+                "decode-attention-gqa9-frozen: %s bytes=%ld expected=%llu\n",
+                path, file_bytes, (unsigned long long)expected_bytes);
+        fclose(stream);
+        return 0;
+    }
+    rewind(stream);
+    const size_t read_count = fread(values, 1u, (size_t)expected_bytes, stream);
+    const int ok = read_count == expected_bytes && !ferror(stream);
+    fclose(stream);
+    if (!ok) {
+        fprintf(stderr, "decode-attention-gqa9-frozen: cannot read %s\n", path);
+    }
+    return ok;
+}
+
 static int run_decode_attention_unaligned_cache_case(
         const laguna_decode_attention_case *c, ds4_gpu_tensor *heads,
         ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
@@ -1541,6 +1584,195 @@ cleanup:
     return rc;
 }
 
+static int run_decode_attention_gqa9_frozen_case(void) {
+    const uint32_t head_dim = 128u;
+    const uint32_t n_head = 72u;
+    const uint32_t n_head_kv = 8u;
+    const uint32_t cache_cap = 512u;
+    const uint32_t pos = 512u;
+    const uint32_t key_start = 1u;
+    const uint32_t key_count = 512u;
+    const uint64_t q_values = (uint64_t)n_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_head_kv * head_dim;
+    const uint64_t cache_values = (uint64_t)cache_cap * kv_values;
+    const uint64_t seed_cache_values = (uint64_t)cache_cap * head_dim;
+    const uint64_t q_bytes = q_values * sizeof(float);
+    const uint64_t kv_bytes = kv_values * sizeof(float);
+    const uint64_t cache_bytes = cache_values * sizeof(uint16_t);
+    float q_seed[head_dim];
+    float gate_seed = NAN;
+    float expected_seed[head_dim];
+    uint16_t *key_seed = NULL, *value_seed = NULL;
+    float *q_host = NULL, *k_host = NULL, *v_host = NULL, *gate_host = NULL;
+    float *actual = NULL, *expected = NULL;
+    uint16_t *key_initial = NULL, *value_initial = NULL;
+    uint16_t *key_expected = NULL, *value_expected = NULL;
+    uint16_t *key_actual = NULL, *value_actual = NULL;
+    ds4_gpu_tensor *heads = NULL, *key_cache = NULL, *value_cache = NULL;
+    ds4_gpu_tensor *q = NULL, *k = NULL, *v = NULL, *gate = NULL;
+    int rc = 1;
+
+    key_seed = (uint16_t *)malloc((size_t)seed_cache_values * sizeof(*key_seed));
+    value_seed = (uint16_t *)malloc((size_t)seed_cache_values * sizeof(*value_seed));
+    q_host = (float *)malloc((size_t)q_bytes);
+    k_host = (float *)malloc((size_t)kv_bytes);
+    v_host = (float *)malloc((size_t)kv_bytes);
+    gate_host = (float *)malloc((size_t)n_head * sizeof(*gate_host));
+    actual = (float *)malloc((size_t)q_bytes);
+    expected = (float *)malloc((size_t)q_bytes);
+    key_initial = (uint16_t *)malloc((size_t)cache_bytes);
+    value_initial = (uint16_t *)malloc((size_t)cache_bytes);
+    key_expected = (uint16_t *)malloc((size_t)cache_bytes);
+    value_expected = (uint16_t *)malloc((size_t)cache_bytes);
+    key_actual = (uint16_t *)malloc((size_t)cache_bytes);
+    value_actual = (uint16_t *)malloc((size_t)cache_bytes);
+    if (!key_seed || !value_seed || !q_host || !k_host || !v_host ||
+        !gate_host || !actual || !expected || !key_initial || !value_initial ||
+        !key_expected || !value_expected || !key_actual || !value_actual ||
+        !laguna_read_decode_gqa9_frozen(
+            "layer09-q-rope-head0.f32", q_seed, sizeof(q_seed)) ||
+        !laguna_read_decode_gqa9_frozen(
+            "layer09-key-cache-kv0.f16", key_seed,
+            seed_cache_values * sizeof(*key_seed)) ||
+        !laguna_read_decode_gqa9_frozen(
+            "layer09-value-cache-kv0.f16", value_seed,
+            seed_cache_values * sizeof(*value_seed)) ||
+        !laguna_read_decode_gqa9_frozen(
+            "layer09-gate-head0.f32", &gate_seed, sizeof(gate_seed)) ||
+        !laguna_read_decode_gqa9_frozen(
+            "layer09-attn-gated-head0.f32", expected_seed,
+            sizeof(expected_seed))) {
+        fprintf(stderr, "decode-attention/gqa9-poolside-token513: fixture setup failed\n");
+        goto cleanup;
+    }
+
+    for (uint32_t head = 0; head < n_head; head++) {
+        memcpy(q_host + (uint64_t)head * head_dim, q_seed, sizeof(q_seed));
+        memcpy(expected + (uint64_t)head * head_dim,
+               expected_seed, sizeof(expected_seed));
+        gate_host[head] = gate_seed;
+    }
+    for (uint32_t row = 0; row < cache_cap; row++) {
+        for (uint32_t kv_head = 0; kv_head < n_head_kv; kv_head++) {
+            const uint64_t dst = ((uint64_t)row * n_head_kv + kv_head) * head_dim;
+            const uint64_t src = (uint64_t)row * head_dim;
+            memcpy(key_expected + dst, key_seed + src,
+                   (size_t)head_dim * sizeof(*key_expected));
+            memcpy(value_expected + dst, value_seed + src,
+                   (size_t)head_dim * sizeof(*value_expected));
+        }
+    }
+    memcpy(key_initial, key_expected, (size_t)cache_bytes);
+    memcpy(value_initial, value_expected, (size_t)cache_bytes);
+    memset(key_initial, 0, (size_t)kv_values * sizeof(*key_initial));
+    memset(value_initial, 0, (size_t)kv_values * sizeof(*value_initial));
+    if (memcmp(key_initial, key_expected,
+               (size_t)kv_values * sizeof(*key_initial)) == 0 ||
+        memcmp(value_initial, value_expected,
+               (size_t)kv_values * sizeof(*value_initial)) == 0) {
+        fprintf(stderr,
+                "decode-attention/gqa9-poolside-token513: "
+                "row-0 poison is not observable\n");
+        goto cleanup;
+    }
+    for (uint32_t kv_head = 0; kv_head < n_head_kv; kv_head++) {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            const uint64_t i = (uint64_t)kv_head * head_dim + d;
+            k_host[i] = reference_f16_to_f32(key_seed[d]);
+            v_host[i] = reference_f16_to_f32(value_seed[d]);
+            if (reference_f32_to_f16(k_host[i]) != key_expected[i] ||
+                reference_f32_to_f16(v_host[i]) != value_expected[i]) {
+                fprintf(stderr,
+                        "decode-attention/gqa9-poolside-token513: row-0 F16 roundtrip failed\n");
+                goto cleanup;
+            }
+        }
+    }
+    for (uint64_t i = 0; i < q_values; i++) actual[i] = NAN;
+
+    heads = ds4_gpu_tensor_alloc(q_bytes);
+    key_cache = ds4_gpu_tensor_alloc(cache_bytes);
+    value_cache = ds4_gpu_tensor_alloc(cache_bytes);
+    q = ds4_gpu_tensor_alloc(q_bytes);
+    k = ds4_gpu_tensor_alloc(kv_bytes);
+    v = ds4_gpu_tensor_alloc(kv_bytes);
+    gate = ds4_gpu_tensor_alloc((uint64_t)n_head * sizeof(float));
+    if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+        !ds4_gpu_tensor_write(heads, 0, actual, q_bytes) ||
+        !ds4_gpu_tensor_write(key_cache, 0, key_initial, cache_bytes) ||
+        !ds4_gpu_tensor_write(value_cache, 0, value_initial, cache_bytes) ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_bytes) ||
+        !ds4_gpu_tensor_write(k, 0, k_host, kv_bytes) ||
+        !ds4_gpu_tensor_write(v, 0, v_host, kv_bytes) ||
+        !ds4_gpu_tensor_write(gate, 0, gate_host,
+                              (uint64_t)n_head * sizeof(float))) {
+        fprintf(stderr, "decode-attention/gqa9-poolside-token513: tensor setup failed\n");
+        goto cleanup;
+    }
+    const int wrapper_ok = ds4_gpu_laguna_store_attention_tensor(
+            heads, key_cache, value_cache, q, k, v, gate, pos, cache_cap,
+            key_start, key_count, n_head, n_head_kv, head_dim,
+            1.0f / sqrtf((float)head_dim));
+    const cudaError_t sync = cudaDeviceSynchronize();
+    if (!wrapper_ok || sync != cudaSuccess ||
+        !ds4_gpu_tensor_read(heads, 0, actual, q_bytes) ||
+        !ds4_gpu_tensor_read(key_cache, 0, key_actual, cache_bytes) ||
+        !ds4_gpu_tensor_read(value_cache, 0, value_actual, cache_bytes)) {
+        fprintf(stderr,
+                "decode-attention/gqa9-poolside-token513: wrapper=%d sync=%s\n",
+                wrapper_ok, cudaGetErrorString(sync));
+        goto cleanup;
+    }
+    if (memcmp(key_actual, key_expected, (size_t)cache_bytes) != 0 ||
+        memcmp(value_actual, value_expected, (size_t)cache_bytes) != 0) {
+        fprintf(stderr,
+                "decode-attention/gqa9-poolside-token513: KV store mismatch\n");
+        goto cleanup;
+    }
+    if (memcmp(actual, expected, (size_t)q_bytes) != 0) {
+        uint64_t first = 0;
+        while (first < q_values &&
+               memcmp(actual + first, expected + first, sizeof(float)) == 0) {
+            first++;
+        }
+        uint32_t actual_bits = 0u, expected_bits = 0u;
+        if (first < q_values) {
+            memcpy(&actual_bits, actual + first, sizeof(actual_bits));
+            memcpy(&expected_bits, expected + first, sizeof(expected_bits));
+        }
+        fprintf(stderr,
+                "decode-attention/gqa9-poolside-token513: exact output mismatch "
+                "lane=%llu actual=0x%08x expected=0x%08x\n",
+                (unsigned long long)first, actual_bits, expected_bits);
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    free(value_actual);
+    free(key_actual);
+    free(value_expected);
+    free(key_expected);
+    free(value_initial);
+    free(key_initial);
+    free(expected);
+    free(actual);
+    free(gate_host);
+    free(v_host);
+    free(k_host);
+    free(q_host);
+    free(value_seed);
+    free(key_seed);
+    return rc;
+}
+
 static int run_decode_attention_cases(void) {
     static const float gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
     const uint32_t global_counts[] = { 1u, 1023u, 1024u, 1025u };
@@ -1599,6 +1831,7 @@ static int run_decode_attention_cases(void) {
     if (run_decode_attention_case(
             &frozen_runtime_gate, "gqa6-token513-runtime-gated.f32",
             "gqa6-token513-runtime-gates.f32", 0.0f, 0.0f) != 0) rc = 1;
+    if (run_decode_attention_gqa9_frozen_case() != 0) rc = 1;
     return rc;
 }
 

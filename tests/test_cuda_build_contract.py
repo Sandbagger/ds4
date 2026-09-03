@@ -918,13 +918,15 @@ class CudaBuildContractTest(unittest.TestCase):
             "tile0 += max_partitions * lanes_per_partition",
             "laguna_vec_load_half2x4(",
             "if (!score_row_valid) dot = -INFINITY;",
-            "const uint32_t poolside_slot_start = key_start & 1023u;",
-            "const uint32_t slot_distance =",
-            "((uint32_t)poolside_row - poolside_slot_start) & 1023u;",
+            "const bool score_row_valid =",
+            "poolside_row >= (uint64_t)key_start",
+            "poolside_row < (uint64_t)key_start + key_count",
             "const uint64_t cache_row = poolside_row & 511u;",
         ):
             self.assertIn(required, vector)
         self.assertNotIn("% cache_cap", vector)
+        self.assertNotIn("& 1023u", vector)
+        self.assertNotIn("slot_distance", vector)
         self.assertIn(
             "__global__ __launch_bounds__(512, 1) static void\n"
             "laguna_attention_decode_gqa_swa_f16_kernel(",
@@ -941,12 +943,12 @@ class CudaBuildContractTest(unittest.TestCase):
             "key_count - 1u != pos - key_start",
             "uint64_t swa_physical_rows =",
             "((uint64_t)pos + 1u + 255u) & ~(uint64_t)255u",
-            "if (swa_physical_rows > 1024u) swa_physical_rows = 1024u;",
             "if (cache_vec_aligned && vector_swa_shape)",
             "laguna_attention_decode_gqa_swa_f16_kernel<<<n_head, 512>>>",
             "laguna_attention_decode_gqa_f16_scalar_kernel<<<",
         ):
             self.assertIn(required, wrapper)
+        self.assertNotIn("swa_physical_rows > 1024u", wrapper)
         self.assertNotIn("cudaMalloc", wrapper)
         self.assertNotIn("cudaFree", wrapper)
 

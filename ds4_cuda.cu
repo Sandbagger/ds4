@@ -33313,7 +33313,7 @@ cuda_laguna_compact_routed_moe_batch_tensor_core(
         expert_bytes, down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim,
         selected, weights, n_total_expert, n_selected,
-        x, n_tokens, n_selected * expert_mid_dim, true, &compact
+        x, n_tokens, n_selected * expert_mid_dim, false, &compact
 #ifdef DS4_TEST_HOOKS
         , NULL
 #endif

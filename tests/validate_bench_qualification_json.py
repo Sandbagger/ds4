@@ -194,7 +194,7 @@ def _validate(
 
 def _validate_wire_scalar_types(record: dict[str, Any]) -> None:
     for key in (
-        "manifest_sha256", "input_sha256",
+        "manifest_sha256", "sequence_sha256", "input_sha256",
         "snapshot_seq", "monotonic_ns",
         "session_payload_bytes", "kv_allocated_bytes",
         "expert_cache_limit_bytes", "expert_cache_current_bytes",

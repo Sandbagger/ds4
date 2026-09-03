@@ -7,6 +7,7 @@
   "required": [
     "schema",
     "manifest_sha256",
+    "sequence_sha256",
     "profile_id",
     "prompt_order_index",
     "prompt_id",
@@ -37,6 +38,9 @@
       "const": "ds4.bench.qualification/v1"
     },
     "manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sequence_sha256": {
       "$ref": "#/$defs/sha256"
     },
     "profile_id": {

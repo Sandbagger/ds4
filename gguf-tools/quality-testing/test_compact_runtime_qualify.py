@@ -1323,6 +1323,48 @@ print("[" + ",".join(["0"] * count) + "]")
             ):
                 TOOL.build_qualification_sequence(self.manifest, profile_id, prompt_id)
 
+    def test_sequence_bounds_cover_worst_case_canonical_base64_without_giant_buffers(self) -> None:
+        max_input = getattr(TOOL, "QUALIFICATION_SEQUENCE_MAX_INPUT_BYTES", None)
+        max_serialized = getattr(
+            TOOL, "QUALIFICATION_SEQUENCE_MAX_SERIALIZED_BYTES", None
+        )
+        self.assertIsNotNone(max_input)
+        self.assertIsNotNone(max_serialized)
+        if max_input is None or max_serialized is None:
+            return
+
+        sample = TOOL.build_qualification_sequence(
+            self.manifest, "cache-8gib", "native-512"
+        )
+        self.assertEqual(sample.count(b"\n"), TOOL.QUALIFICATION_SEQUENCE_LINE_COUNT)
+        base64_line = next(
+            line for line in sample.splitlines(keepends=True)
+            if line.startswith(b"input_base64=")
+        )
+        encoded_input = base64_line[len(b"input_base64=") : -1]
+        fixed_line_overhead = len(sample) - len(encoded_input)
+        worst_case_base64 = 4 * ((max_input + 2) // 3)
+        self.assertLessEqual(
+            worst_case_base64 + fixed_line_overhead,
+            max_serialized,
+            "24-line sequence overhead plus canonical base64 must fit",
+        )
+        self.assertGreater(max_serialized, max_input)
+
+        header = (ROOT / "ds4_bench_sequence.h").read_text(encoding="utf-8")
+
+        def header_bound(macro: str) -> int:
+            match = re.search(
+                rf"#define\s+{macro}\s+\((\d+)u\s*\*\s*1024u\s*\*\s*1024u\)",
+                header,
+            )
+            self.assertIsNotNone(match, f"missing byte bound macro {macro}")
+            assert match is not None
+            return int(match.group(1)) << 20
+
+        self.assertEqual(max_input, header_bound("DS4_BENCH_SEQUENCE_MAX_INPUT_BYTES"))
+        self.assertEqual(max_serialized, header_bound("DS4_BENCH_SEQUENCE_MAX_FILE_BYTES"))
+
     def test_sequence_build_cli_is_atomic_no_replace_and_model_free(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

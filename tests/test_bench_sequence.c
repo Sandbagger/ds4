@@ -311,6 +311,20 @@ int main(void) {
     sequence[10] = '\0';
     parse_reject(path, sequence, size, "embedded NUL is rejected");
 
+    size = make_sequence(sequence, sizeof(sequence), 0, 0);
+    CHECK(replace_line(sequence, &size, sizeof(sequence),
+                       "input_size_bytes=", "input_size_bytes=6"),
+          "make decoded embedded-NUL size");
+    CHECK(replace_line(sequence, &size, sizeof(sequence),
+                       "input_sha256=",
+                       "input_sha256=82db3a65fb6f3031935e36fa60db64cf0c4d37a8151a498432c0907b3df65fdd"),
+          "make decoded embedded-NUL digest");
+    CHECK(replace_line(sequence, &size, sizeof(sequence),
+                       "input_base64=", "input_base64=aGUAbGxv"),
+          "make decoded embedded-NUL base64");
+    parse_reject(path, sequence, size,
+                 "embedded NUL in decoded input is rejected");
+
     const struct {
         const char *prefix;
         const char *replacement;

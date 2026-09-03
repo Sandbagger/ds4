@@ -37,6 +37,8 @@ SCHEMA_PATH = ROOT / "schemas/ds4-bench-qualification-v1.schema.json"
 FIXTURE_PATH = ROOT / "tests/fixtures/ds4-bench-qualification-v1.jsonl"
 VALIDATOR = ROOT / "tests/validate_bench_qualification_json.py"
 QUALIFICATION_SEQUENCE_OPTION = "--qualification-sequence"
+QUALIFICATION_MANIFEST_SHA256_OPTION = "--qualification-manifest-sha256"
+QUALIFICATION_SEQUENCE_SHA256_OPTION = "--qualification-sequence-sha256"
 MISSING_MODEL = "/definitely/missing/task19-model.gguf"
 MISSING_PROMPT = "/definitely/missing/task19-prompt.txt"
 NUL_RENDERED_SIZE = 59
@@ -52,6 +54,7 @@ EXTERNAL_ATTRIBUTION_FIELDS = (
 BASE_SCHEMA_FIELDS = (
     "schema",
     "manifest_sha256",
+    "sequence_sha256",
     "profile_id",
     "prompt_order_index",
     "prompt_id",
@@ -366,6 +369,16 @@ def _lifecycle_fixture() -> list[dict[str, Any]]:
     return records
 
 
+def _sequence_digests(sequence: Path) -> tuple[str, str]:
+    raw = sequence.read_bytes()
+    manifest_digest = next(
+        line.split(b"=", 1)[1].decode("ascii")
+        for line in raw.splitlines()
+        if line.startswith(b"manifest_sha256=")
+    )
+    return manifest_digest, hashlib.sha256(raw).hexdigest()
+
+
 class CScannerContractTest(unittest.TestCase):
     def test_brace_scanner_ignores_braces_in_c_literals(self) -> None:
         source = (
@@ -405,6 +418,15 @@ class BenchQualificationSchemaContractTest(unittest.TestCase):
             schema["properties"]["request_metrics"]["$ref"],
             "ds4-runtime-request-v1.schema.json",
         )
+        self.assertEqual(
+            schema["properties"]["sequence_sha256"]["$ref"],
+            "#/$defs/sha256",
+        )
+        fixture_record = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        self.assertRegex(
+            fixture_record["sequence_sha256"],
+            r"^(?!0{64}$)[0-9a-f]{64}$",
+        )
         conditional = json.dumps(schema["allOf"])
         for marker in ("request_complete", "terminal_status", "request_metrics"):
             self.assertIn(marker, conditional)
@@ -430,6 +452,9 @@ class BenchQualificationSchemaContractTest(unittest.TestCase):
         rejected(lambda value: value.__setitem__("terminal_status", None))
         rejected(lambda value: value.__setitem__("event", "first_token"))
         rejected(lambda value: value.__setitem__("monotonic_ns", "NaN"))
+        rejected(lambda value: value.__setitem__("sequence_sha256", "A" * 64))
+        rejected(lambda value: value.__setitem__("sequence_sha256", "0" * 64))
+        rejected(lambda value: value.pop("sequence_sha256"))
         rejected(lambda value: value.__setitem__("snapshot_seq", 42))
         rejected(lambda value: value.__setitem__("repetition_index", "0"))
 
@@ -555,6 +580,17 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
         self.assertTrue(sequence_bytes.endswith(b"repetition=3:warm-3\n"))
         return output
 
+    def _authenticated_sequence_args(self, sequence: Path) -> tuple[str, ...]:
+        manifest_digest, sequence_digest = _sequence_digests(sequence)
+        return (
+            QUALIFICATION_SEQUENCE_OPTION,
+            str(sequence),
+            QUALIFICATION_MANIFEST_SHA256_OPTION,
+            manifest_digest,
+            QUALIFICATION_SEQUENCE_SHA256_OPTION,
+            sequence_digest,
+        )
+
     def _invoke(
         self,
         directory: Path,
@@ -626,7 +662,7 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                 with self.subTest(profile_id=profile_id, prompt_id=prompt_id):
                     sequence = self._generate_sequence(directory, profile_id, prompt_id)
                     result = self._invoke(
-                        directory, (QUALIFICATION_SEQUENCE_OPTION, str(sequence))
+                        directory, self._authenticated_sequence_args(sequence)
                     )
                     # A host-only binary may reject the unavailable CUDA backend or
                     # the deliberately missing model. It must not accept CPU as
@@ -644,7 +680,15 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                 sequence = directory / f"{label}.txt"
                 sequence.write_bytes(payload)
                 self._assert_rejected_before_model_or_prompt_open(
-                    directory, (QUALIFICATION_SEQUENCE_OPTION, str(sequence))
+                    directory,
+                    (
+                        QUALIFICATION_SEQUENCE_OPTION,
+                        str(sequence),
+                        QUALIFICATION_MANIFEST_SHA256_OPTION,
+                        "a" * 64,
+                        QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                        "b" * 64,
+                    ),
                 )
 
         with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
@@ -679,26 +723,139 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
             nul_sequence = directory / "decoded-nul.txt"
             nul_sequence.write_bytes(b"\n".join(mutated) + b"\n")
             self._assert_rejected_before_model_or_prompt_open(
-                directory, (QUALIFICATION_SEQUENCE_OPTION, str(nul_sequence))
+                directory, self._authenticated_sequence_args(nul_sequence)
             )
+
+    def test_authenticated_sequence_digest_options_are_valid_and_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
+            directory = Path(directory_name)
+            sequence = self._generate_sequence(directory)
+            manifest_digest, sequence_digest = _sequence_digests(sequence)
+            authenticated = (
+                QUALIFICATION_SEQUENCE_OPTION,
+                str(sequence),
+                QUALIFICATION_MANIFEST_SHA256_OPTION,
+                manifest_digest,
+                QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                sequence_digest,
+            )
+            valid = self._invoke(directory, authenticated)
+            self.assertIn(valid.returncode, (1, 2), valid.stderr)
+            self._assert_reached_post_parse_boundary(valid)
+
+            for omitted, args in (
+                (
+                    QUALIFICATION_MANIFEST_SHA256_OPTION,
+                    (
+                        QUALIFICATION_SEQUENCE_OPTION,
+                        str(sequence),
+                        QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                        sequence_digest,
+                    ),
+                ),
+                (
+                    QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                    (
+                        QUALIFICATION_SEQUENCE_OPTION,
+                        str(sequence),
+                        QUALIFICATION_MANIFEST_SHA256_OPTION,
+                        manifest_digest,
+                    ),
+                ),
+            ):
+                with self.subTest(case="missing", option=omitted):
+                    result = self._invoke(directory, args)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    stderr = result.stderr.lower()
+                    self.assertNotIn("unknown option", stderr)
+                    self.assertRegex(stderr, r"required|missing|once|digest")
+                    self.assertNotIn(MISSING_MODEL.lower(), stderr)
+                    self.assertNotIn(MISSING_PROMPT.lower(), stderr)
+
+            for option, value in (
+                (QUALIFICATION_MANIFEST_SHA256_OPTION, manifest_digest),
+                (QUALIFICATION_SEQUENCE_SHA256_OPTION, sequence_digest),
+            ):
+                with self.subTest(case="duplicate", option=option):
+                    result = self._invoke(directory, authenticated + (option, value))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    stderr = result.stderr.lower()
+                    self.assertNotIn("unknown option", stderr)
+                    self.assertRegex(stderr, r"duplicate|once|only")
+                    self.assertNotIn(MISSING_MODEL.lower(), stderr)
+                    self.assertNotIn(MISSING_PROMPT.lower(), stderr)
+
+                with self.subTest(case="empty", option=option):
+                    result = self._invoke(directory, authenticated + (option, ""))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    stderr = result.stderr.lower()
+                    self.assertNotIn("unknown option", stderr)
+                    self.assertRegex(stderr, r"empty|non-empty|digest")
+                    self.assertNotIn(MISSING_MODEL.lower(), stderr)
+                    self.assertNotIn(MISSING_PROMPT.lower(), stderr)
+
+    def test_authenticated_digest_mismatch_rejects_before_model_prompt_or_engine_access(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
+            directory = Path(directory_name)
+            sequence = self._generate_sequence(directory)
+            manifest_digest, sequence_digest = _sequence_digests(sequence)
+            wrong_manifest = "f" * 64 if manifest_digest != "f" * 64 else "e" * 64
+            wrong_sequence = "f" * 64 if sequence_digest != "f" * 64 else "e" * 64
+            cases = (
+                (
+                    "manifest",
+                    wrong_manifest,
+                    sequence_digest,
+                ),
+                (
+                    "sequence",
+                    manifest_digest,
+                    wrong_sequence,
+                ),
+            )
+            for label, expected_manifest, expected_sequence in cases:
+                with self.subTest(digest=label):
+                    result = self._invoke(
+                        directory,
+                        (
+                            QUALIFICATION_SEQUENCE_OPTION,
+                            str(sequence),
+                            QUALIFICATION_MANIFEST_SHA256_OPTION,
+                            expected_manifest,
+                            QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                            expected_sequence,
+                        ),
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    stderr = result.stderr.lower()
+                    self.assertNotIn("unknown option", stderr)
+                    self.assertRegex(stderr, r"manifest|sequence|digest|sha-256|mismatch")
+                    self.assertNotIn("cannot open model", stderr)
+                    self.assertNotIn("failed to open model", stderr)
+                    self.assertNotIn(MISSING_MODEL.lower(), stderr)
+                    self.assertNotIn(MISSING_PROMPT.lower(), stderr)
 
     def test_duplicate_and_empty_sequence_options_have_stable_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
             directory = Path(directory_name)
             sequence = self._generate_sequence(directory)
+            authenticated = self._authenticated_sequence_args(sequence)
             duplicate = self._assert_rejected_before_model_or_prompt_open(
                 directory,
-                (
-                    QUALIFICATION_SEQUENCE_OPTION,
-                    str(sequence),
-                    QUALIFICATION_SEQUENCE_OPTION,
-                    str(sequence),
-                ),
+                authenticated + (QUALIFICATION_SEQUENCE_OPTION, str(sequence)),
             )
             self.assertRegex(duplicate.stderr.lower(), r"duplicate|once|only")
 
             empty = self._assert_rejected_before_model_or_prompt_open(
-                directory, (QUALIFICATION_SEQUENCE_OPTION, "")
+                directory,
+                (
+                    QUALIFICATION_SEQUENCE_OPTION,
+                    "",
+                    QUALIFICATION_MANIFEST_SHA256_OPTION,
+                    "a" * 64,
+                    QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                    "b" * 64,
+                ),
             )
             self.assertRegex(empty.stderr.lower(), r"empty|requires|path|invalid")
 
@@ -713,7 +870,7 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                 with self.subTest(extra=extra):
                     result = self._invoke(
                         directory,
-                        (QUALIFICATION_SEQUENCE_OPTION, str(sequence)),
+                        self._authenticated_sequence_args(sequence),
                         extra,
                     )
                     self.assertEqual(result.returncode, 2, result.stderr)
@@ -721,6 +878,43 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                     self.assertRegex(result.stderr.lower(), pattern)
                     self.assertNotIn(MISSING_MODEL.lower(), result.stderr.lower())
                     self.assertNotIn(MISSING_PROMPT.lower(), result.stderr.lower())
+
+
+class BenchQualificationAuthenticatedSequenceSourceContractTest(unittest.TestCase):
+    def test_bench_parser_requires_one_nonempty_digest_value_for_each_option(self) -> None:
+        parse_body = _function_body(
+            BENCH_SOURCE,
+            "static bench_config parse_options(int argc, char **argv)",
+        )
+        for option, field in (
+            (
+                QUALIFICATION_MANIFEST_SHA256_OPTION,
+                "qualification_manifest_sha256",
+            ),
+            (
+                QUALIFICATION_SEQUENCE_SHA256_OPTION,
+                "qualification_sequence_sha256",
+            ),
+        ):
+            with self.subTest(option=option):
+                marker = f'!strcmp(arg, "{option}")'
+                start = parse_body.find(marker)
+                self.assertGreaterEqual(start, 0, f"missing parser branch for {option}")
+                end = parse_body.find("} else if", start)
+                self.assertGreater(end, start, f"unterminated parser branch for {option}")
+                branch = parse_body[start:end]
+                self.assertIn(f"if (c.{field}_set)", branch)
+                self.assertIn("may only be specified once", branch)
+                self.assertIn("non-empty", branch)
+                self.assertRegex(branch, rf"c\.{field}\s*=")
+                self.assertRegex(branch, rf"c\.{field}_set\s*=\s*true")
+
+    def test_bench_wires_both_trusted_digest_fields_without_json_sequence_parsing(self) -> None:
+        source = _c_code_view(BENCH_SOURCE)
+        self.assertIn("ds4_bench_sequence_parse_file_trusted(", source)
+        self.assertIn("qualification_manifest_sha256", source)
+        self.assertIn("qualification_sequence_sha256", source)
+        self.assertNotIn("json_parse", source)
 
 
 class BenchQualificationLifecycleSourceContractTest(unittest.TestCase):

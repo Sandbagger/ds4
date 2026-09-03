@@ -181,6 +181,8 @@ int main(void) {
     ds4_bench_sequence sequence = {
         .manifest_sha256 =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .sequence_sha256 =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         .profile_id = "cache-8gib",
         .cache_bytes = UINT64_C(8589934592),
         .prompt_order_index = 0u,
@@ -275,6 +277,9 @@ int main(void) {
             CHECK(!has_nonfinite_text(line), "lifecycle record has no non-finite values");
             CHECK(strstr(line, "\"unrelated_process_inventory_stable\":true") != NULL,
                   "external inventory stability comes from runtime snapshot");
+            CHECK(strstr(line,
+                         "\"sequence_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"") != NULL,
+                  "lifecycle record carries exact sequence digest");
             CHECK(strstr(line, runtime_json) != NULL,
                   "lifecycle record reuses canonical nested runtime JSON");
             if (event_index == 2u) {

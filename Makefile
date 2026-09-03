@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-qualification-emitter test-bench-eval-contract
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-qualification-emitter test-bench-eval-contract
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -406,6 +406,18 @@ tests/test_bench_sequence: tests/test_bench_sequence.o ds4_bench_sequence_test_h
 
 test-bench-sequence: tests/test_bench_sequence
 	./tests/test_bench_sequence
+
+# RED-only authenticated sequence seam.  The trusted parser/API is
+# intentionally absent until the implementation slice lands; this target is
+# separate so the established parser target remains independently runnable.
+tests/test_bench_sequence_trusted.o: tests/test_bench_sequence_trusted.c ds4_bench_sequence.h ds4_plan_io.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_bench_sequence_trusted: tests/test_bench_sequence_trusted.o ds4_bench_sequence.o ds4_plan_io.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-bench-sequence-trusted: tests/test_bench_sequence_trusted
+	./tests/test_bench_sequence_trusted
 
 # RED-only Task 19 lifecycle seam.  The production emitter/header are
 # intentionally absent until the implementation slice lands.

@@ -58,6 +58,9 @@ LAGUNA_TEMPLATE_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 PROMPT_TARGETS = (512, 2048, 8192, 28672)
+QUALIFICATION_SEQUENCE_SCHEMA = "ds4.qualification-sequence/v1"
+QUALIFICATION_SEQUENCE_LINE_COUNT = 24
+QUALIFICATION_SEQUENCE_MAX_BYTES = 16 << 20
 PROFILE_SPECS = (
     ("cache-8gib", 8 << 30, (512, 2048, 28672, 8192)),
     ("cache-12gib", 12 << 30, (2048, 8192, 512, 28672)),
@@ -1236,6 +1239,154 @@ def validate_manifest(value: Mapping[str, Any]) -> None:
 def manifest_sha256(value: Mapping[str, Any]) -> str:
     validate_manifest(value)
     return _sha256_bytes(_canonical_bytes(value))
+
+
+def build_qualification_sequence(
+    manifest: Mapping[str, Any],
+    profile_id: str,
+    prompt_id: str,
+) -> bytes:
+    """Build one strict, deterministic qualification sequence.
+
+    This is intentionally an immutable bridge for the benchmark frontend, not
+    a general JSON or text parser.  Validation is repeated at this boundary so
+    callers cannot substitute profile, prompt, sampling, or prompt-byte data.
+    """
+    if not isinstance(manifest, Mapping):
+        raise ValueError("qualification sequence manifest must be an object")
+    validate_manifest(manifest)
+    if type(profile_id) is not str or not profile_id:
+        raise ValueError("qualification sequence profile_id must be a nonempty string")
+    if type(prompt_id) is not str or not prompt_id:
+        raise ValueError("qualification sequence prompt_id must be a nonempty string")
+
+    selected_profile: tuple[str, int, tuple[int, ...]] | None = None
+    for candidate in PROFILE_SPECS:
+        if candidate[0] == profile_id:
+            selected_profile = candidate
+            break
+    if selected_profile is None:
+        raise ValueError(f"unknown qualification sequence profile_id: {profile_id}")
+    _, cache_bytes, prompt_order = selected_profile
+    try:
+        prompt_order_index = prompt_order.index(
+            int(prompt_id.removeprefix("native-"))
+            if prompt_id.startswith("native-")
+            else -1
+        )
+    except ValueError:
+        prompt_order_index = -1
+    expected_prompt_id = ""
+    if prompt_order_index >= 0:
+        expected_prompt_id = f"native-{prompt_order[prompt_order_index]}"
+    if prompt_id != expected_prompt_id:
+        raise ValueError(
+            "qualification sequence prompt_id does not match profile prompt order"
+        )
+
+    prompt = next(
+        (item for item in manifest["prompts"] if item["id"] == prompt_id),
+        None,
+    )
+    if prompt is None:
+        raise ValueError(f"qualification sequence prompt is absent: {prompt_id}")
+    rendered = _base64(prompt["rendered_base64"], f"prompts[{prompt_id}].rendered_base64")
+    recorded_size = int(
+        _decimal(prompt["rendered_size_bytes"], f"prompts[{prompt_id}].rendered_size_bytes", positive=True)
+    )
+    if len(rendered) != recorded_size:
+        raise ValueError("qualification sequence rendered prompt size mismatch")
+    if len(rendered) > QUALIFICATION_SEQUENCE_MAX_BYTES:
+        raise ValueError("qualification sequence input exceeds the 16 MiB bound")
+    recorded_digest = _sha256(prompt["sha256"], f"prompts[{prompt_id}].sha256")
+    if _sha256_bytes(rendered) != recorded_digest:
+        raise ValueError("qualification sequence rendered prompt SHA-256 mismatch")
+
+    manifest_digest = manifest_sha256(manifest)
+    lines = [
+        f"schema={QUALIFICATION_SEQUENCE_SCHEMA}",
+        f"manifest_sha256={manifest_digest}",
+        f"profile_id={profile_id}",
+        f"cache_bytes={cache_bytes}",
+        f"prompt_order_index={prompt_order_index}",
+        f"prompt_id={prompt_id}",
+        f"prompt_tokens={prompt_order[prompt_order_index]}",
+        "mode=streamed",
+        f"input_size_bytes={len(rendered)}",
+        f"input_sha256={_sha256_bytes(rendered)}",
+        f"input_base64={base64.b64encode(rendered).decode('ascii')}",
+        "max_generated_tokens=512",
+        "temperature=0",
+        "top_k=0",
+        "top_p=1",
+        "min_p=0.05",
+        "seed=1",
+        "stop_sequences_count=0",
+        "stop_token_policy=model-native",
+        "repetition_count=4",
+        "repetition=0:cold",
+        "repetition=1:warm-1",
+        "repetition=2:warm-2",
+        "repetition=3:warm-3",
+    ]
+    if len(lines) != QUALIFICATION_SEQUENCE_LINE_COUNT:
+        raise AssertionError("qualification sequence line contract drifted")
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def write_qualification_sequence_atomic(
+    path: Path | str,
+    payload: bytes,
+) -> None:
+    """Durably create one sequence without replacing a prior output."""
+    target = Path(path)
+    if not isinstance(payload, bytes):
+        raise ValueError("qualification sequence payload must be bytes")
+    if not payload or len(payload) > QUALIFICATION_SEQUENCE_MAX_BYTES:
+        raise ValueError("qualification sequence payload is outside the 16 MiB bound")
+    if not target.parent.is_dir():
+        raise ValueError(
+            f"qualification sequence output directory does not exist: {target.parent}"
+        )
+    descriptor = -1
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise ValueError(
+                f"immutable qualification sequence output already exists: {target}"
+            ) from exc
+        temporary.unlink()
+        temporary = None
+        directory = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        raise ValueError(
+            f"cannot atomically write qualification sequence {target}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _render_seed_prefix(seed: bytes, prefix_bytes: int) -> bytes:
@@ -3452,12 +3603,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     verify = actions.add_parser("verify", help="verify an immutable reference manifest")
     verify.add_argument("--manifest", required=True, type=Path)
+
+    sequence = commands.add_parser(
+        "sequence", help="build one immutable qualification input sequence"
+    )
+    sequence_actions = sequence.add_subparsers(dest="action", required=True)
+    sequence_build = sequence_actions.add_parser(
+        "build", help="build one qualification sequence from a manifest"
+    )
+    sequence_build.add_argument("--manifest", required=True, type=Path)
+    sequence_build.add_argument("--profile-id", required=True)
+    sequence_build.add_argument("--prompt-id", required=True)
+    sequence_build.add_argument("--output", required=True, type=Path)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if args.command == "sequence":
+            value = load_manifest(args.manifest)
+            payload = build_qualification_sequence(
+                value, args.profile_id, args.prompt_id
+            )
+            write_qualification_sequence_atomic(args.output, payload)
+            print(
+                f"manifest_sha256={manifest_sha256(value)} "
+                f"profile_id={args.profile_id} prompt_id={args.prompt_id} "
+                f"output={args.output}"
+            )
+            return 0
         if args.action == "build":
             prepared = prepare_manifest(args.model)
             cold_preparation = cold_prepare_from_plan(

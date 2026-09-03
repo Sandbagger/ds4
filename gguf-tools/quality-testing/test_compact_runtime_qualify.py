@@ -1353,6 +1353,24 @@ print("[" + ",".join(["0"] * count) + "]")
             self.assertRegex(stderr.getvalue(), "already exists|replace")
             self.assertEqual(sorted(path.name for path in directory.iterdir()), ["manifest.json", "sequence"])
 
+    def test_sequence_atomic_writer_never_replaces_a_raced_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "sequence"
+            payload = b"candidate-sequence\n"
+            real_link = os.link
+
+            def race(source: os.PathLike | str | bytes,
+                     target: os.PathLike | str | bytes,
+                     **kwargs: object) -> None:
+                Path(target).write_bytes(b"racing-sequence\n")
+                real_link(source, target, **kwargs)
+
+            with mock.patch.object(TOOL.os, "link", side_effect=race):
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    TOOL.write_qualification_sequence_atomic(output, payload)
+            self.assertEqual(output.read_bytes(), b"racing-sequence\n")
+            self.assertEqual(sorted(path.name for path in Path(tmp).iterdir()), ["sequence"])
+
 class WarmStabilityContractTest(unittest.TestCase):
     def test_freezes_warm_stability_constants_and_accepts_boundary_evidence(self) -> None:
         self.assertEqual(TOOL.WARM_STABILITY_REPETITIONS, 3)

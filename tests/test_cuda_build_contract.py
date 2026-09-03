@@ -1617,7 +1617,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "cuda_laguna_compact_routed_moe_batch_tensor_core("
         )
         self.assertIn(
-            "n_tokens, n_selected * expert_mid_dim, true, &compact",
+            "n_tokens, n_selected * expert_mid_dim, false, &compact",
             compact,
         )
 

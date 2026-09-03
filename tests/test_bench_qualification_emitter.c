@@ -227,8 +227,9 @@ int main(void) {
                sizeof(metrics.request_id));
         for (size_t event_index = 0u; event_index < 3u; event_index++) {
             runtime.snapshot_seq =
-                UINT64_C(100) + repetition * 3u + event_index;
-            metrics.snapshot_seq = runtime.snapshot_seq;
+                UINT64_C(100) + repetition * 4u +
+                (event_index == 2u ? 3u : event_index);
+            metrics.snapshot_seq = runtime.snapshot_seq - 1u;
             size_t runtime_length = 0u;
             size_t metrics_length = 0u;
             CHECK(ds4_runtime_wire_snapshot_json(
@@ -272,6 +273,8 @@ int main(void) {
                       strlen(line) >= 3u && line[strlen(line) - 2u] == '}',
                   "lifecycle record is one closed JSON object line");
             CHECK(!has_nonfinite_text(line), "lifecycle record has no non-finite values");
+            CHECK(strstr(line, "\"unrelated_process_inventory_stable\":true") != NULL,
+                  "external inventory stability comes from runtime snapshot");
             CHECK(strstr(line, runtime_json) != NULL,
                   "lifecycle record reuses canonical nested runtime JSON");
             if (event_index == 2u) {
@@ -280,7 +283,7 @@ int main(void) {
                 CHECK(strstr(line, "\"terminal_status\"") != NULL,
                       "request_complete carries terminal_status");
             } else {
-                CHECK(strstr(line, metrics_json) == NULL,
+                CHECK(strstr(line, "\"request_metrics\"") == NULL,
                       "pre-terminal lifecycle records omit request metrics");
                 CHECK(strstr(line, "\"terminal_status\"") == NULL,
                       "pre-terminal lifecycle records omit terminal_status");

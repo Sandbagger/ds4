@@ -26,6 +26,11 @@ PROMPT_TOKENS = {
     "native-8192": 8192,
     "native-28672": 28672,
 }
+PROFILE_PROMPT_ORDER = {
+    "cache-8gib": ("native-512", "native-2048", "native-28672", "native-8192"),
+    "cache-12gib": ("native-2048", "native-8192", "native-512", "native-28672"),
+    "cache-16gib": ("native-8192", "native-28672", "native-2048", "native-512"),
+}
 
 
 def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -270,8 +275,11 @@ def _validate_flattened_bindings(record: dict[str, Any]) -> None:
         )
 
     expected_cache = PROFILE_CACHE_BYTES.get(record["profile_id"])
-    if expected_cache is None:
+    expected_order = PROFILE_PROMPT_ORDER.get(record["profile_id"])
+    if expected_cache is None or expected_order is None:
         raise ValueError("$.profile_id: unknown cache profile")
+    if record["prompt_id"] != expected_order[record["prompt_order_index"]]:
+        raise ValueError("$.prompt_order_index: does not match profile prompt order")
     for source, label in (
         (record["expert_cache_limit_bytes"], "record expert cache limit"),
         (runtime["limits"]["expert_cache_limit_bytes"], "runtime limits expert cache limit"),
@@ -281,11 +289,33 @@ def _validate_flattened_bindings(record: dict[str, Any]) -> None:
         if source != expected_cache:
             raise ValueError(f"$.profile_id: {label} is not the pinned profile ceiling")
 
+    config = runtime["config"]
+    limits = runtime["limits"]
+    expected_config = {
+        "context_tokens": 32768,
+        "prefill_chunk_tokens": 4096,
+        "session_slots": 1,
+        "ssd_streaming": True,
+        "ssd_streaming_cache_bytes": expected_cache,
+    }
+    expected_limits = {
+        "effective_context_tokens": 32768,
+        "effective_prefill_chunk_tokens": 4096,
+        "effective_session_slots": 1,
+        "expert_cache_limit_bytes": expected_cache,
+    }
+    if config != expected_config:
+        raise ValueError("$.runtime.config: qualification settings are not pinned")
+    if limits != expected_limits:
+        raise ValueError("$.runtime.limits: qualification settings are not pinned")
+
     if record["event"] == "request_complete":
         request = record["request_metrics"]
         _require_equal(record, "request_id", request["request_id"], "request_metrics.request_id")
         _require_equal(record, "instance_id", request["instance_id"], "request_metrics.instance_id")
-        _require_equal(record, "snapshot_seq", request["snapshot_seq"], "request_metrics.snapshot_seq")
+        if int(request["snapshot_seq"]) + 1 != int(record["snapshot_seq"]):
+            raise ValueError("$.request_metrics.snapshot_seq: must immediately precede runtime snapshot_seq")
+        _require_equal(record, "terminal_status", request["terminal_status"], "request_metrics.terminal_status")
         expected_tokens = PROMPT_TOKENS.get(record["prompt_id"])
         if expected_tokens is None or request["prompt_tokens"] != expected_tokens:
             raise ValueError("$.prompt_id: does not match request_metrics.prompt_tokens")
@@ -303,6 +333,8 @@ def validate_record(record: Any, *, complete: bool | None = None) -> None:
     }
     if set(record["external_attribution"]) != expected_external:
         raise ValueError("external_attribution is not closed")
+    if record["external_attribution"]["unrelated_process_inventory_stable"] is not True:
+        raise ValueError("$.external_attribution.unrelated_process_inventory_stable must be true")
     _validate_flattened_bindings(record)
     if complete is True and record["event"] != "request_complete":
         raise ValueError("canned fixture must be a request_complete record")
@@ -330,10 +362,20 @@ def _validate_lifecycle(records: list[Any]) -> None:
             raise ValueError(f"record {index + 1}: runtime snapshot_seq is not strictly increasing")
         previous_monotonic = monotonic
         previous_snapshot = snapshot
+        repetition_start = expected_repetition * len(expected_events)
+        if record["request_id"] != records[repetition_start]["request_id"]:
+            raise ValueError(f"record {index + 1}: request_id changed within repetition")
         if index % len(expected_events) == 0:
             request_ids.add(record["request_id"])
-        elif record["request_id"] != records[index - (index % len(expected_events))]["request_id"]:
-            raise ValueError(f"record {index + 1}: request_id changed within repetition")
+        if index % len(expected_events) == 2:
+            accepted_seq = int(records[repetition_start]["runtime"]["snapshot_seq"])
+            first_seq = int(records[repetition_start + 1]["runtime"]["snapshot_seq"])
+            complete_seq = snapshot
+            metrics_seq = int(record["request_metrics"]["snapshot_seq"])
+            if first_seq != accepted_seq + 1:
+                raise ValueError(f"record {index + 1}: accepted/first runtime snapshots are not consecutive")
+            if metrics_seq + 1 != complete_seq or metrics_seq != first_seq + 1:
+                raise ValueError(f"record {index + 1}: request-finish sequence gap is invalid")
     if len(request_ids) != 4:
         raise ValueError("request_id must be distinct across repetitions")
 

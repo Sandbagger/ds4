@@ -96,6 +96,11 @@ INTEGER_FIELDS = (
     "configured_prefill_rows",
     "allocated_prefill_rows",
 )
+PROFILE_PROMPT_ORDER = {
+    "cache-8gib": ("native-512", "native-2048", "native-28672", "native-8192"),
+    "cache-12gib": ("native-2048", "native-8192", "native-512", "native-28672"),
+    "cache-16gib": ("native-8192", "native-28672", "native-2048", "native-512"),
+}
 POST_PARSE_DIAGNOSTICS = (
     re.compile(r"cannot\s+(?:open|stat)\s+model", re.I),
     re.compile(r"failed\s+to\s+open\s+model", re.I),
@@ -339,20 +344,21 @@ def _lifecycle_fixture() -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for repetition in range(4):
         request_id = f"123e4567-e89b-12d3-a456-42661417400{repetition + 1}"
-        for event in events:
+        for event_index, event in enumerate(events):
             record = json.loads(json.dumps(base))
             record["event"] = event
             record["repetition_index"] = repetition
             record["request_id"] = request_id
             record["monotonic_ns"] = str(1000000 + len(records))
-            snapshot_seq = str(100 + len(records))
+            runtime_seq = 100 + repetition * 4 + (3 if event == "request_complete" else event_index)
+            snapshot_seq = str(runtime_seq)
             record["snapshot_seq"] = snapshot_seq
             record["runtime"]["snapshot_seq"] = snapshot_seq
             if event == "request_complete":
                 request = record["request_metrics"]
                 request["request_id"] = request_id
                 request["instance_id"] = record["instance_id"]
-                request["snapshot_seq"] = snapshot_seq
+                request["snapshot_seq"] = str(runtime_seq - 1)
             else:
                 record.pop("request_metrics")
                 record.pop("terminal_status")
@@ -448,6 +454,8 @@ class BenchQualificationSchemaContractTest(unittest.TestCase):
         rejected(lambda value: value[2].__setitem__("model_inode_resident_bytes", "1"))
         rejected(lambda value: value[2]["external_attribution"].__setitem__("model_source_resident", "1"))
         rejected(lambda value: value[0].__setitem__("profile_id", "cache-12gib"))
+        rejected(lambda value: value[0].__setitem__("prompt_id", "native-2048"))
+        rejected(lambda value: value[0].__setitem__("prompt_order_index", 1))
         rejected(lambda value: value[2].__setitem__("prompt_id", "native-2048"))
         rejected(lambda value: value[2]["request_metrics"].__setitem__("request_id", "123e4567-e89b-12d3-a456-426614174099"))
         rejected(lambda value: value[2]["request_metrics"].__setitem__("instance_id", "123e4567-e89b-12d3-a456-426614174099"))
@@ -456,6 +464,10 @@ class BenchQualificationSchemaContractTest(unittest.TestCase):
         rejected(lambda value: value[4].__setitem__("monotonic_ns", value[3]["monotonic_ns"]))
         rejected(lambda value: value[4]["runtime"].__setitem__("snapshot_seq", value[3]["runtime"]["snapshot_seq"]))
         rejected(lambda value: value[0]["runtime"]["build"]["features"].__setitem__(1, "laguna"))
+        rejected(lambda value: value[2].__setitem__("terminal_status", "cancelled"))
+        rejected(lambda value: value[0]["runtime"]["config"].__setitem__("context_tokens", 1))
+        rejected(lambda value: value[0]["runtime"]["config"].__setitem__("ssd_streaming", False))
+        rejected(lambda value: value[0]["runtime"]["limits"].__setitem__("effective_prefill_chunk_tokens", 1))
         rejected(lambda value: value[2]["request_metrics"].__setitem__("prefill_tokens_per_second", 1e999))
         raw_overflow = payload.replace(b'"prefill_tokens_per_second":512.0', b'"prefill_tokens_per_second":1e999')
         self.assertNotEqual(_run_validator(raw_overflow).returncode, 0)

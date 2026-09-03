@@ -238,7 +238,8 @@ static int case_index_from_prompt(const char *prompt) {
         return 1;
     if (strstr(prompt, "Find the sum of all integer bases $b>9"))
         return 2;
-    if (strstr(prompt, "rpcsec_gss_validate()")) return 75;
+    /* This literal is in build_question_prompt()->question, not tc->title. */
+    if (strstr(prompt, "static bool check_rpcsec_packet")) return 75;
     return -1;
 }
 

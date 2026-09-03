@@ -68,14 +68,21 @@ int main(void) {
     float *weight = read_fixture("weight-row.f32", ROW_BYTES);
     float *router_weights = calloc(ROUTER_ROWS, ROW_BYTES);
     float *router_values = malloc(ROUTER_ROWS * sizeof(*router_values));
+    float *generic_values = malloc(ROUTER_ROWS * sizeof(*generic_values));
+    float *fallback_values = malloc(ROUTER_ROWS * sizeof(*fallback_values));
     ds4_gpu_tensor *activation_t = NULL;
+    ds4_gpu_tensor *activation_unaligned_storage_t = NULL;
+    ds4_gpu_tensor *activation_unaligned_t = NULL;
     ds4_gpu_tensor *weight_t = NULL;
     ds4_gpu_tensor *values_t = NULL;
     ds4_gpu_tensor *router_values_t = NULL;
+    ds4_gpu_tensor *generic_values_t = NULL;
+    ds4_gpu_tensor *fallback_values_t = NULL;
     float values[2] = {NAN, NAN};
     int rc = 1;
 
-    if (!activation || !weight || !router_weights || !router_values) {
+    if (!activation || !weight || !router_weights || !router_values ||
+        !generic_values || !fallback_values) {
         fprintf(stderr, "f32-mmvf-microscope: fixture load failed\n");
         goto cleanup;
     }
@@ -88,23 +95,50 @@ int main(void) {
         goto cleanup;
     }
     activation_t = ds4_gpu_tensor_alloc(ROW_BYTES);
+    activation_unaligned_storage_t = ds4_gpu_tensor_alloc(
+        ROW_BYTES + sizeof(float));
+    if (activation_unaligned_storage_t) {
+        activation_unaligned_t = ds4_gpu_tensor_view(
+            activation_unaligned_storage_t, sizeof(float), ROW_BYTES);
+    }
     weight_t = ds4_gpu_tensor_alloc(ROW_BYTES);
     values_t = ds4_gpu_tensor_alloc(sizeof(values));
     router_values_t = ds4_gpu_tensor_alloc(
         ROUTER_ROWS * sizeof(*router_values));
-    if (!activation_t || !weight_t || !values_t || !router_values_t ||
+    generic_values_t = ds4_gpu_tensor_alloc(
+        ROUTER_ROWS * sizeof(*generic_values));
+    fallback_values_t = ds4_gpu_tensor_alloc(
+        ROUTER_ROWS * sizeof(*fallback_values));
+    if (!activation_t || !activation_unaligned_storage_t ||
+        !activation_unaligned_t || !weight_t || !values_t ||
+        !router_values_t || !generic_values_t || !fallback_values_t ||
         !ds4_gpu_tensor_write(activation_t, 0, activation, ROW_BYTES) ||
+        !ds4_gpu_tensor_write(
+            activation_unaligned_storage_t, sizeof(float),
+            activation, ROW_BYTES) ||
         !ds4_gpu_tensor_write(weight_t, 0, weight, ROW_BYTES) ||
         !ds4_gpu_test_f32_mmvf_microscope_tensor(
             values_t, weight_t, activation_t, INPUT_ELEMENTS) ||
         !ds4_gpu_laguna_router_f32_tensor(
             router_values_t, router_weights, ROUTER_BYTES, 0u,
             activation_t) ||
+        !ds4_gpu_matmul_f32_tensor(
+            generic_values_t, router_weights, ROUTER_BYTES, 0u,
+            INPUT_ELEMENTS, ROUTER_ROWS, activation_t, 1u) ||
+        !ds4_gpu_laguna_router_f32_tensor(
+            fallback_values_t, router_weights, ROUTER_BYTES, 0u,
+            activation_unaligned_t) ||
         cudaDeviceSynchronize() != cudaSuccess ||
         !ds4_gpu_tensor_read(values_t, 0, values, sizeof(values)) ||
         !ds4_gpu_tensor_read(
             router_values_t, 0, router_values,
-            ROUTER_ROWS * sizeof(*router_values))) {
+            ROUTER_ROWS * sizeof(*router_values)) ||
+        !ds4_gpu_tensor_read(
+            generic_values_t, 0, generic_values,
+            ROUTER_ROWS * sizeof(*generic_values)) ||
+        !ds4_gpu_tensor_read(
+            fallback_values_t, 0, fallback_values,
+            ROUTER_ROWS * sizeof(*fallback_values))) {
         fprintf(stderr, "f32-mmvf-microscope: CUDA execution failed\n");
         goto cleanup;
     }
@@ -143,6 +177,17 @@ int main(void) {
                     POOLSIDE_EXPECTED_BITS);
             goto cleanup;
         }
+        if (f32_bits(generic_values[row]) != DS4_SERIAL_EXPECTED_BITS ||
+            f32_bits(fallback_values[row]) != DS4_SERIAL_EXPECTED_BITS) {
+            fprintf(stderr,
+                    "f32-mmvf-microscope: fallback row=%u "
+                    "generic_bits=0x%08x unaligned_bits=0x%08x "
+                    "expected_bits=0x%08x\n",
+                    row, f32_bits(generic_values[row]),
+                    f32_bits(fallback_values[row]),
+                    DS4_SERIAL_EXPECTED_BITS);
+            goto cleanup;
+        }
     }
     if (f32_bits(values[0]) == f32_bits(values[1])) {
         fprintf(stderr,
@@ -159,11 +204,17 @@ int main(void) {
     rc = 0;
 
 cleanup:
+    ds4_gpu_tensor_free(fallback_values_t);
+    ds4_gpu_tensor_free(generic_values_t);
     ds4_gpu_tensor_free(router_values_t);
     ds4_gpu_tensor_free(values_t);
     ds4_gpu_tensor_free(weight_t);
+    ds4_gpu_tensor_free(activation_unaligned_t);
+    ds4_gpu_tensor_free(activation_unaligned_storage_t);
     ds4_gpu_tensor_free(activation_t);
     ds4_gpu_cleanup();
+    free(fallback_values);
+    free(generic_values);
     free(router_values);
     free(router_weights);
     free(weight);

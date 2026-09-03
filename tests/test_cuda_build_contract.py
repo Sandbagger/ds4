@@ -1443,6 +1443,8 @@ class CudaBuildContractTest(unittest.TestCase):
         for required in (
             "ds4_gpu_test_f32_mmvf_microscope_tensor(",
             "ds4_gpu_laguna_router_f32_tensor(",
+            "ds4_gpu_matmul_f32_tensor(",
+            "activation_unaligned_t",
             "ROUTER_ROWS = 256",
             "DS4_SERIAL_EXPECTED_BITS",
             "POOLSIDE_EXPECTED_BITS",
@@ -1494,6 +1496,7 @@ class CudaBuildContractTest(unittest.TestCase):
             "laguna_router_f32_poolside_kernel<<<256u, 256u,",
             router_api,
         )
+        self.assertIn("return ds4_gpu_matmul_f32_tensor(", router_api)
         generic_api = function_body(
             'extern "C" int ds4_gpu_matmul_f32_tensor('
         )

@@ -9297,6 +9297,43 @@ __global__ static void matmul_f32_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+/* Poolside F32 MMVF schedule used only by the explicit Laguna decode-router
+ * API below.  Pairwise loads and XOR reductions are bit-significant. */
+__global__ static void laguna_router_f32_poolside_kernel(
+        float *out, const float *w, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= out_dim || tid >= 256u) return;
+    const float2 *weight2 = (const float2 *)(w + (uint64_t)row * in_dim);
+    const float2 *activation2 = (const float2 *)x;
+    const uint32_t input_pairs = in_dim / 2u;
+    float sum = 0.0f;
+    for (uint32_t col2 = tid; col2 < input_pairs; col2 += 256u) {
+        const float2 weight = weight2[col2];
+        const float2 activation = activation2[col2];
+        sum += weight.x * activation.x;
+        sum += weight.y * activation.y;
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    }
+    extern __shared__ float warp_sums[];
+    if (tid < 32u) warp_sums[tid] = 0.0f;
+    __syncthreads();
+    if ((tid & 31u) == 0u) warp_sums[tid / 32u] = sum;
+    __syncthreads();
+    if (tid < 32u) {
+        sum = warp_sums[tid];
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+        }
+        if (tid == 0u) out[row] = sum;
+    }
+}
+
 __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_hc;
@@ -19057,6 +19094,39 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
+}
+
+extern "C" int ds4_gpu_laguna_router_f32_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, const ds4_gpu_tensor *x) {
+    const uint32_t in_dim = 3072u;
+    const uint32_t out_dim = 256u;
+    const uint64_t weight_bytes =
+        (uint64_t)in_dim * out_dim * sizeof(float);
+    if (!out || !x || !model_map || !out->ptr || !x->ptr ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const char *weight_ptr = cuda_resolve_weight_ptr(
+        model_map, weight_offset, weight_bytes, logical_tier,
+        "Laguna F32 router");
+    if (!weight_ptr ||
+        ((((uintptr_t)weight_ptr | (uintptr_t)x->ptr) &
+          (alignof(float2) - 1u)) != 0u)) {
+        return 0;
+    }
+    laguna_router_f32_poolside_kernel<<<256u, 256u,
+            32u * sizeof(float)>>>(
+        (float *)out->ptr, (const float *)weight_ptr,
+        (const float *)x->ptr, in_dim, out_dim);
+    return cuda_ok(cudaGetLastError(), "Laguna F32 router launch");
 }
 
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {

@@ -1324,6 +1324,15 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Laguna decode-only 3072x256 F32 router projection.  This explicit API keeps
+ * Poolside's reduction order out of unrelated shape-compatible matmuls. */
+int ds4_gpu_laguna_router_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

@@ -49012,14 +49012,12 @@ static ds4_gpu_laguna_exec_result laguna_graph_forward_token(
                                         DS4_N_EMBD) != 0;
             }
         } else if (ok) {
-            ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
-                                            model->map,
-                                            model->size,
-                                            l->ffn_gate_inp->abs_offset,
-                                            DS4_N_EMBD,
-                                            DS4_N_EXPERT,
-                                            g->ffn_norm,
-                                            1) != 0;
+            ok = ds4_gpu_laguna_router_f32_tensor(
+                    g->router_logits,
+                    model->map,
+                    model->size,
+                    l->ffn_gate_inp->abs_offset,
+                    g->ffn_norm) != 0;
             if (ok && il == (uint32_t)detail_layer) {
                 ok = laguna_graph_diag_checkpoint(
                         g->router_logits,

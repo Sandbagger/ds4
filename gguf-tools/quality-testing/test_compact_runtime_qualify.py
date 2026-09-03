@@ -1241,7 +1241,12 @@ print("[" + ",".join(["0"] * count) + "]")
     def test_build_qualification_sequence_is_byte_exact_for_all_profile_orders(self) -> None:
         original = copy.deepcopy(self.manifest)
         digest = TOOL.manifest_sha256(self.manifest)
-        for profile_id, cache_bytes, order in TOOL.PROFILE_SPECS:
+        expected_profiles = (
+            ("cache-8gib", 8589934592, (512, 2048, 28672, 8192)),
+            ("cache-12gib", 12884901888, (2048, 8192, 512, 28672)),
+            ("cache-16gib", 17179869184, (8192, 28672, 2048, 512)),
+        )
+        for profile_id, cache_bytes, order in expected_profiles:
             for order_index, token_count in enumerate(order):
                 prompt_id = f"native-{token_count}"
                 with self.subTest(profile_id=profile_id, prompt_id=prompt_id):

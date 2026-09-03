@@ -1,5 +1,5 @@
 {
-  "schema": "laguna-attention-decode-vec-fixture/v1",
+  "schema": "laguna-attention-decode-vec-fixture/v2",
   "poolside_commit": "04b2b72cb54048ead292884adbe11f284e3ec950",
   "device": {
     "name": "NVIDIA GB10",
@@ -24,7 +24,7 @@
     "key_start": 0,
     "key_count": 513,
     "scale": "1/sqrtf(128)",
-    "gate": 100.0
+    "gate": "100.0 and captured 48-head runtime gate vector"
   },
   "input_recipe": {
     "q": "float32(((i * 17) % 41 - 20)) * float32(1.0 / 23.0); reciprocal is rounded before multiplication",
@@ -70,10 +70,19 @@
       "shared_memory_bytes": 24
     },
     "ungated_sha256": "c7ec40a35031d0085a24357f13a1b9a8f3068bad77f468d1ccf51309f4c68287",
-    "gate_postprocess": "each Poolside F32 result multiplied by exactly representable float32 100.0 with round-to-nearest-even",
+    "gate_postprocess": "two exact cases: F32 multiply by 100.0; and Poolside CUDA op_softplus(x) = x > 20 ? x : logf(1.0f + expf(x)) followed by F32 multiply",
     "tolerance": {
-      "max_abs": 5e-07,
-      "per_head_rms": 1e-07
+      "max_abs": 0.0,
+      "per_head_rms": 0.0,
+      "bytewise": true
+    },
+    "runtime_gate_case": {
+      "gate_input_sha256": "1aaa72d9f8846b2e1071d3c52399304d71cda5ede433f59fd250935fed6b4baa",
+      "gate_softplus_sha256": "cf05c4a7910a17e0812019c0e06eb2e49159823810edfbd53fe1628acf2d2e2f",
+      "ungated_sha256": "c7ec40a35031d0085a24357f13a1b9a8f3068bad77f468d1ccf51309f4c68287",
+      "gated_sha256": "03ee96885ea69cf19375eeab14ffc34473f9640c4f4b0e58ae38ada6af7bd290",
+      "poolside_unary_source": "ggml/src/ggml-cuda/unary.cu",
+      "poolside_unary_source_sha256": "6a33da7846f011fe300f995f6fc4f145f20989d34371dbdeed7b3f1be9c2ce84"
     }
   },
   "producer": {
@@ -82,7 +91,8 @@
     "binary_sha256": "ec56556f594db99c1c59714c66fea5dd383d12e455e84458f1385827b92e8fa5",
     "poolside_sources": {
       "ggml/src/ggml-cuda/fattn-vec.cuh": "f6305c9a667f438565ee0afff0e854cce335ddbd67e30fbee466cbc5672a9577",
-      "ggml/src/ggml-cuda/common.cuh": "a977b50f7479df092bf3c441ba88e4519803b5f0df5a640fd7fb0874e64b9b4c"
+      "ggml/src/ggml-cuda/common.cuh": "a977b50f7479df092bf3c441ba88e4519803b5f0df5a640fd7fb0874e64b9b4c",
+      "ggml/src/ggml-cuda/unary.cu": "6a33da7846f011fe300f995f6fc4f145f20989d34371dbdeed7b3f1be9c2ce84"
     },
     "libraries": {
       "libggml-cuda.so": "d9ae9f38b2d85e90cb81a730e658053b864f7b2b83e6e95db7a1dd3efacd7276",
@@ -94,6 +104,14 @@
     "gqa6-token513-gate100.f32": {
       "bytes": 24576,
       "sha256": "d5e4039f79f9bdbfeb68c5d62ae5795c8ca2422dc5d4b54ea88c02582861aaac"
+    },
+    "gqa6-token513-runtime-gates.f32": {
+      "bytes": 192,
+      "sha256": "1aaa72d9f8846b2e1071d3c52399304d71cda5ede433f59fd250935fed6b4baa"
+    },
+    "gqa6-token513-runtime-gated.f32": {
+      "bytes": 24576,
+      "sha256": "03ee96885ea69cf19375eeab14ffc34473f9640c4f4b0e58ae38ada6af7bd290"
     }
   }
 }

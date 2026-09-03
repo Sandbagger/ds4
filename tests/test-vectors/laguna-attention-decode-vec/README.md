@@ -21,10 +21,16 @@ Only rows 0 through 512 are logical. The 255-row padded tail is masked. The
 wrapper stores the deterministic current K/V into row 512 before attention, so
 the test covers the real KV-store-plus-decode boundary. Gate 100 is exactly
 representable and amplifies the tiny reduction-order seam without changing the
-attention topology. The frozen output is Poolside's ungated F32 output followed
-by one round-to-nearest F32 multiplication by 100. `manifest.json` pins all
-input hashes, producer/source/library identities, launch geometry, and the
-promoted file hash.
+attention topology. The first frozen output is Poolside's ungated F32 output
+followed by one round-to-nearest F32 multiplication by 100.
+
+The second exact case reuses that Poolside ungated output with the 48 raw gate
+values captured from the authenticated token-513 layer-4 graph. Its expected
+output uses the captured Poolside softplus values, then one F32 multiplication.
+This locks the CUDA unary contract `x > 20 ? x : logf(1.0f + expf(x))` from
+Poolside `unary.cu`; the numerically stable `log1pf` form differs by several
+ULPs for these real gates. `manifest.json` pins the two input vectors, both
+outputs, producer/source/library identities, and launch geometry.
 
 This synthetic vector is a regression microscope, not a substitute for the
 pinned Laguna full-model oracle. A green fixture only proves this wrapper shape;

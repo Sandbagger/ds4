@@ -43,6 +43,14 @@ LAGUNA_DECODE_VEC_FILES = {
         24576,
         "d5e4039f79f9bdbfeb68c5d62ae5795c8ca2422dc5d4b54ea88c02582861aaac",
     ),
+    "gqa6-token513-runtime-gates.f32": (
+        192,
+        "1aaa72d9f8846b2e1071d3c52399304d71cda5ede433f59fd250935fed6b4baa",
+    ),
+    "gqa6-token513-runtime-gated.f32": (
+        24576,
+        "03ee96885ea69cf19375eeab14ffc34473f9640c4f4b0e58ae38ada6af7bd290",
+    ),
 }
 LAGUNA_ATTENTION_AUTO_FILES = {
     "layer-00-q-proj-t21.f32": (
@@ -514,7 +522,7 @@ class CudaBuildContractTest(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertEqual(
-            manifest["schema"], "laguna-attention-decode-vec-fixture/v1"
+            manifest["schema"], "laguna-attention-decode-vec-fixture/v2"
         )
         self.assertEqual(
             manifest["poolside_commit"],
@@ -536,7 +544,7 @@ class CudaBuildContractTest(unittest.TestCase):
                 "key_start": 0,
                 "key_count": 513,
                 "scale": "1/sqrtf(128)",
-                "gate": 100.0,
+                "gate": "100.0 and captured 48-head runtime gate vector",
             },
         )
         self.assertEqual(
@@ -562,7 +570,21 @@ class CudaBuildContractTest(unittest.TestCase):
         )
         self.assertEqual(
             manifest["oracle"]["tolerance"],
-            {"max_abs": 5e-7, "per_head_rms": 1e-7},
+            {"max_abs": 0.0, "per_head_rms": 0.0, "bytewise": True},
+        )
+        self.assertEqual(
+            manifest["oracle"]["runtime_gate_case"],
+            {
+                "gate_input_sha256": "1aaa72d9f8846b2e1071d3c52399304d71cda5ede433f59fd250935fed6b4baa",
+                "gate_softplus_sha256":
+                    "cf05c4a7910a17e0812019c0e06eb2e49159823810edfbd53fe1628acf2d2e2f",
+                "ungated_sha256":
+                    "c7ec40a35031d0085a24357f13a1b9a8f3068bad77f468d1ccf51309f4c68287",
+                "gated_sha256": "03ee96885ea69cf19375eeab14ffc34473f9640c4f4b0e58ae38ada6af7bd290",
+                "poolside_unary_source": "ggml/src/ggml-cuda/unary.cu",
+                "poolside_unary_source_sha256":
+                    "6a33da7846f011fe300f995f6fc4f145f20989d34371dbdeed7b3f1be9c2ce84",
+            },
         )
         self.assertEqual(set(manifest["files"]), set(LAGUNA_DECODE_VEC_FILES))
         for name, (expected_size, expected_sha256) in LAGUNA_DECODE_VEC_FILES.items():
@@ -579,7 +601,9 @@ class CudaBuildContractTest(unittest.TestCase):
             '"gqa6-poolside-vec-token513"',
             '"gqa6-token513-gate100.f32"',
             "48u, 8u, 768u, 512u, 0u, 513u",
-            '"gqa6-token513-gate100.f32", 0.0f, 0.0f',
+            '"gqa6-token513-gate100.f32", NULL, 0.0f',
+            '"gqa6-token513-runtime-gates.f32"',
+            '"gqa6-token513-runtime-gated.f32"',
             "memcmp(actual, reference, (size_t)q_count * sizeof(*actual))",
             "value_expected[base + i] = 0x7e00u;",
             "memset(value_expected + base, 0,",
@@ -587,6 +611,20 @@ class CudaBuildContractTest(unittest.TestCase):
             "ds4_gpu_laguna_store_attention_tensor(",
         ):
             self.assertIn(required, LAGUNA_KERNEL_TEST)
+
+    def test_laguna_attention_gate_matches_poolside_cuda_softplus(self) -> None:
+        softplus = function_body("laguna_attention_softplus(")
+        self.assertIn("value > 20.0f", softplus)
+        self.assertIn("logf(1.0f + expf(value))", softplus)
+        self.assertNotIn("log1pf", softplus)
+        for kernel_name in (
+            "laguna_attention_decode_gqa_f16_scalar_kernel(",
+            "laguna_attention_decode_gqa_f16_kernel(",
+            "laguna_attention_prefill_gqa_f16_kernel(",
+        ):
+            kernel = function_body(kernel_name)
+            self.assertIn("laguna_attention_softplus(gate_value)", kernel)
+            self.assertNotIn("log1pf(expf", kernel)
 
     def test_laguna_decode_vec_has_bounded_topology_oracle_shape_and_alignment_fallback(
         self,

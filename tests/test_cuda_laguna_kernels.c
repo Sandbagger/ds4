@@ -1169,7 +1169,8 @@ static int run_decode_attention_unaligned_cache_case(
 
 static int run_decode_attention_case(
         const laguna_decode_attention_case *c, const char *frozen_name,
-        float frozen_max_abs, float frozen_rms) {
+        const char *frozen_gate_name, float frozen_max_abs,
+        float frozen_rms) {
     const uint32_t head_dim = 128u;
     const uint64_t q_count = (uint64_t)c->n_head * head_dim;
     const uint64_t kv_width = (uint64_t)c->n_head_kv * head_dim;
@@ -1249,6 +1250,10 @@ static int run_decode_attention_case(
     static const float mixed_gates[] = { -20.0f, -2.0f, 0.0f, 2.0f, 20.0f };
     for (uint32_t h = 0; h < c->n_head; h++) {
         gate_host[h] = c->mixed_gates ? mixed_gates[h % 5u] : c->gate;
+    }
+    if (frozen_gate_name && !laguna_read_decode_vec_frozen(
+            frozen_gate_name, gate_host, c->n_head)) {
+        goto cleanup;
     }
 
     const uint32_t heads_per_kv = c->n_head / c->n_head_kv;
@@ -1548,7 +1553,7 @@ static int run_decode_attention_cases(void) {
                 "gqa6-global", 48u, 8u, 2048u, key_count - 1u, 0u,
                 key_count, gates[gate_i], false,
             };
-            if (run_decode_attention_case(&c, NULL, 0.0f, 0.0f) != 0) rc = 1;
+            if (run_decode_attention_case(&c, NULL, NULL, 0.0f, 0.0f) != 0) rc = 1;
         }
     }
     for (size_t pos_i = 0; pos_i < sizeof(swa_positions) / sizeof(swa_positions[0]); pos_i++) {
@@ -1559,7 +1564,7 @@ static int run_decode_attention_cases(void) {
                 "gqa9-swa", 72u, 8u, 512u, pos, pos + 1u - key_count,
                 key_count, gates[gate_i], false,
             };
-            if (run_decode_attention_case(&c, NULL, 0.0f, 0.0f) != 0) rc = 1;
+            if (run_decode_attention_case(&c, NULL, NULL, 0.0f, 0.0f) != 0) rc = 1;
         }
     }
     const laguna_decode_attention_case mutation_cases[] = {
@@ -1572,7 +1577,7 @@ static int run_decode_attention_cases(void) {
     };
     for (size_t i = 0; i < sizeof(mutation_cases) / sizeof(mutation_cases[0]); i++) {
         if (run_decode_attention_case(
-                &mutation_cases[i], NULL, 0.0f, 0.0f) != 0) rc = 1;
+                &mutation_cases[i], NULL, NULL, 0.0f, 0.0f) != 0) rc = 1;
     }
     const laguna_decode_attention_case frozen_vec = {
         "gqa6-poolside-vec-token513", 48u, 8u, 768u, 512u, 0u, 513u,
@@ -1582,7 +1587,18 @@ static int run_decode_attention_cases(void) {
      * value-load schedule must preserve every output bit.  Full-model
      * qualification remains a separate, mandatory oracle gate. */
     if (run_decode_attention_case(
-            &frozen_vec, "gqa6-token513-gate100.f32", 0.0f, 0.0f) != 0) rc = 1;
+            &frozen_vec, "gqa6-token513-gate100.f32", NULL, 0.0f,
+            0.0f) != 0) rc = 1;
+    const laguna_decode_attention_case frozen_runtime_gate = {
+        "gqa6-poolside-vec-token513-runtime-gate",
+        48u, 8u, 768u, 512u, 0u, 513u, 0.0f, false,
+    };
+    /* Gate 100 isolates attention arithmetic.  These captured runtime gates
+     * additionally bind the fused softplus-multiply to Poolside's CUDA unary
+     * contract, which is not bit-equivalent to the stable log1p form. */
+    if (run_decode_attention_case(
+            &frozen_runtime_gate, "gqa6-token513-runtime-gated.f32",
+            "gqa6-token513-runtime-gates.f32", 0.0f, 0.0f) != 0) rc = 1;
     return rc;
 }
 

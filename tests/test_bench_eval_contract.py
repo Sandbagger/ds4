@@ -1,31 +1,61 @@
 #!/usr/bin/env python3
-"""Host-only RED contract for Task 19 Step 1 benchmark evidence.
+"""Host-only RED gates for Task 19 benchmark lifecycle integration.
 
-The current revision has no model-free lifecycle stdio seam.  The qualification
-preflight cases therefore build and invoke the real host-only ``ds4-bench``
-CLI, while the lifecycle checks stay bounded to a concrete emitter/loop source
-seam that the CLI must call.  They do not run a model, allocate a GPU, open a
-network socket, or inspect live output.  The later model-free executable hook
-remains the authoritative green target; this source contract only makes the
-missing public behavior fail loudly first.
+The CLI cases build the host-only benchmark once, feed it an exact sequence
+produced by the checked-in Python builder, and stop at a missing-model or
+qualification-only compatibility boundary.  They never load a model, open a
+prompt file, initialize a GPU, or open a network connection.
+
+The JSONL schema and canned fixture are checked with the dependency-free
+validator beside this file.  The model-free C emitter target intentionally
+names the next production header/API; it is a separate RED boundary until that
+module exists.  Source inspection is limited to the engine/session ownership
+shape.  It is not used as evidence for emitted event ordering or field values.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import importlib.util
+import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BENCH_SOURCE = (ROOT / "ds4_bench.c").read_text(encoding="utf-8")
+BENCH_SOURCE_PATH = ROOT / "ds4_bench.c"
+BENCH_SOURCE = BENCH_SOURCE_PATH.read_text(encoding="utf-8")
+BUILDER = ROOT / "gguf-tools/quality-testing/compact_runtime_qualify.py"
+SCHEMA_PATH = ROOT / "schemas/ds4-bench-qualification-v1.schema.json"
+FIXTURE_PATH = ROOT / "tests/fixtures/ds4-bench-qualification-v1.jsonl"
+VALIDATOR = ROOT / "tests/validate_bench_qualification_json.py"
 QUALIFICATION_SEQUENCE_OPTION = "--qualification-sequence"
+MISSING_MODEL = "/definitely/missing/task19-model.gguf"
+MISSING_PROMPT = "/definitely/missing/task19-prompt.txt"
+NUL_RENDERED_SIZE = 59
+NUL_RENDERED_SHA256 = "c6f7134b47f7fb0ed0693100ca855fec1ab9c5ba626007777f4c020c141d71d9"
+NUL_RENDERED_BASE64 = "44CIfEVPU3zjgIk8dXNlcj5vZmZpY2lhbABwcm9tcHQ8L3VzZXI+Cjxhc3Npc3RhbnQ+PC90aGluaz4="
 LIFECYCLE_EVENTS = ("request_accepted", "first_token", "request_complete")
-REQUIRED_SAMPLE_FIELDS = (
+EXTERNAL_ATTRIBUTION_FIELDS = (
+    "model_source_resident",
+    "host_library_unattributed",
+    "cuda_library_unattributed",
+    "unrelated_process_inventory_stable",
+)
+BASE_SCHEMA_FIELDS = (
     "schema",
+    "manifest_sha256",
+    "profile_id",
+    "prompt_order_index",
+    "prompt_id",
+    "input_sha256",
     "event",
     "request_id",
     "instance_id",
@@ -45,17 +75,9 @@ REQUIRED_SAMPLE_FIELDS = (
     "qualification_total_peak_bytes",
     "model_inode_resident_bytes",
     "external_attribution",
+    "runtime",
 )
-EXTERNAL_ATTRIBUTION_FIELDS = (
-    "model_source_resident",
-    "host_library_unattributed",
-    "cuda_library_unattributed",
-    "unrelated_process_inventory_stable",
-)
-# These values are uint64-like on the wire and must be JSON strings.  Prefill
-# row counts and repetition_index are intentionally excluded: the existing
-# ds4.runtime/v1 ABI defines those as JSON integers.
-UINT64_SAMPLE_FIELDS = (
+UINT64_FIELDS = (
     "snapshot_seq",
     "monotonic_ns",
     "session_payload_bytes",
@@ -68,153 +90,324 @@ UINT64_SAMPLE_FIELDS = (
     "qualification_total_peak_bytes",
     "model_inode_resident_bytes",
 )
-INTEGER_SAMPLE_FIELDS = (
+INTEGER_FIELDS = (
+    "prompt_order_index",
+    "repetition_index",
     "configured_prefill_rows",
     "allocated_prefill_rows",
-    "repetition_index",
 )
-MISSING_MODEL = "/definitely/missing/task19-model.gguf"
-MISSING_PROMPT = "/definitely/missing/task19-prompt.txt"
+POST_PARSE_DIAGNOSTICS = (
+    re.compile(r"cannot\s+(?:open|stat)\s+model", re.I),
+    re.compile(r"failed\s+to\s+open\s+model", re.I),
+    re.compile(r"qualification(?:[- ]only)?[^\n]*(?:requires|supports|incompatible|unsupported)", re.I),
+    re.compile(r"(?:requires|unsupported|unavailable|incompatible)[^\n]*(?:cuda|streaming|qualification)", re.I),
+    re.compile(r"(?:cuda|streaming)[^\n]*(?:requires|unsupported|unavailable|incompatible)", re.I),
+)
+
+
+def _matching_brace(source: str, brace: int) -> int:
+    """Find a C brace pair while ignoring comments, strings, and chars."""
+
+    if brace < 0 or brace >= len(source) or source[brace] != "{":
+        raise AssertionError("brace scanner did not start at an opening brace")
+    depth = 0
+    index = brace
+    state = "code"
+    while index < len(source):
+        byte = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if byte == "/" and following == "/":
+                state = "line-comment"
+                index += 2
+                continue
+            if byte == "/" and following == "*":
+                state = "block-comment"
+                index += 2
+                continue
+            if byte == '"':
+                state = "string"
+                index += 1
+                continue
+            if byte == "'":
+                state = "char"
+                index += 1
+                continue
+            if byte == "{":
+                depth += 1
+            elif byte == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+            index += 1
+            continue
+        if state == "line-comment":
+            if byte in "\r\n":
+                state = "code"
+            index += 1
+            continue
+        if state == "block-comment":
+            if byte == "*" and following == "/":
+                state = "code"
+                index += 2
+            else:
+                index += 1
+            continue
+        if byte == "\\":
+            index += 2
+        elif byte == '"' and state == "string":
+            state = "code"
+            index += 1
+        elif byte == "'" and state == "char":
+            state = "code"
+            index += 1
+        else:
+            index += 1
+    raise AssertionError("unterminated C brace body")
+
+
+def _first_code_brace(source: str, start: int) -> int:
+    """Return the first opening brace after start outside C lexical literals."""
+
+    index = start
+    state = "code"
+    while index < len(source):
+        byte = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if byte == "/" and following == "/":
+                state = "line-comment"
+                index += 2
+                continue
+            if byte == "/" and following == "*":
+                state = "block-comment"
+                index += 2
+                continue
+            if byte == '"':
+                state = "string"
+                index += 1
+                continue
+            if byte == "'":
+                state = "char"
+                index += 1
+                continue
+            if byte == "{":
+                return index
+            index += 1
+            continue
+        if state == "line-comment":
+            if byte in "\r\n":
+                state = "code"
+            index += 1
+            continue
+        if state == "block-comment":
+            if byte == "*" and following == "/":
+                state = "code"
+                index += 2
+            else:
+                index += 1
+            continue
+        if byte == "\\":
+            index += 2
+        elif (state == "string" and byte == '"') or (state == "char" and byte == "'"):
+            state = "code"
+            index += 1
+        else:
+            index += 1
+    raise AssertionError("no code brace after function signature")
 
 
 def _function_body(source: str, signature: str) -> str:
-    """Return one braced C function body without requiring a compiler."""
-
     start = source.find(signature)
     if start < 0:
         raise AssertionError(f"missing source function {signature}")
-    brace = source.find("{", start)
-    if brace < 0:
-        raise AssertionError(f"missing function body for {signature}")
-    depth = 0
-    for index in range(brace, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return source[brace + 1 : index]
-    raise AssertionError(f"unterminated function {signature}")
+    brace = _first_code_brace(source, start + len(signature))
+    end = _matching_brace(source, brace)
+    return source[brace + 1 : end]
 
 
 def _function_bodies(source: str) -> list[tuple[str, str]]:
-    """Return top-level-looking C function names and bodies.
-
-    This deliberately only supports the small source seam used here.  It is
-    not a C parser and is never used to infer behavior from unrelated text.
-    """
+    """Find simple function definitions and scan bodies lexically."""
 
     pattern = re.compile(
         r"(?ms)^(?:static\s+)?[A-Za-z_][^;{}]*?\b"
         r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*?\)\s*\{"
     )
     functions: list[tuple[str, str]] = []
-    keywords = {"if", "for", "while", "switch"}
     for match in pattern.finditer(source):
         name = match.group("name")
-        if name in keywords:
+        if name in {"if", "for", "while", "switch"}:
             continue
         brace = match.end() - 1
-        depth = 0
-        for index in range(brace, len(source)):
-            if source[index] == "{":
-                depth += 1
-            elif source[index] == "}":
-                depth -= 1
-                if depth == 0:
-                    functions.append((name, source[brace + 1 : index]))
-                    break
-        else:
-            raise AssertionError(f"unterminated function {name}")
+        end = _matching_brace(source, brace)
+        functions.append((name, source[brace + 1 : end]))
     return functions
 
 
+def _strip_c_comments(source: str) -> str:
+    """Remove comments without interpreting comment markers in string literals."""
+
+    output: list[str] = []
+    index = 0
+    state = "code"
+    while index < len(source):
+        byte = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if byte == "/" and following == "/":
+                output.extend((" ", " "))
+                state = "line-comment"
+                index += 2
+            elif byte == "/" and following == "*":
+                output.extend((" ", " "))
+                state = "block-comment"
+                index += 2
+            elif byte == '"':
+                output.append(byte)
+                state = "string"
+                index += 1
+            elif byte == "'":
+                output.append(byte)
+                state = "char"
+                index += 1
+            else:
+                output.append(byte)
+                index += 1
+            continue
+        if state == "line-comment":
+            if byte in "\r\n":
+                output.append(byte)
+                state = "code"
+            else:
+                output.append(" ")
+            index += 1
+            continue
+        if state == "block-comment":
+            if byte == "*" and following == "/":
+                output.extend((" ", " "))
+                state = "code"
+                index += 2
+            else:
+                output.append("\n" if byte in "\r\n" else " ")
+                index += 1
+            continue
+        output.append(byte)
+        if byte == "\\" and index + 1 < len(source):
+            output.append(source[index + 1])
+            index += 2
+        elif (state == "string" and byte == '"') or (state == "char" and byte == "'"):
+            state = "code"
+            index += 1
+        else:
+            index += 1
+    return "".join(output)
+
+
 def _c_code_view(source: str) -> str:
-    """Return a bounded C view with comments removed and JSON unescaped."""
+    return _strip_c_comments(source).replace(r'\"', '"')
 
-    without_comments = re.sub(
-        r"(?s)/\*.*?\*/|//[^\r\n]*",
-        "",
-        source,
+
+def _loop_body_with_four_repetitions(source: str) -> tuple[str, str] | None:
+    for match in re.finditer(r"\bfor\s*\((?P<header>[^{}]*)\)\s*\{", source, re.S):
+        header = match.group("header")
+        if not re.search(r"\brepetition_index\s*=\s*0\b", header):
+            continue
+        if not re.search(r"\brepetition_index\s*<\s*4\b", header):
+            continue
+        brace = match.end() - 1
+        end = _matching_brace(source, brace)
+        return header, source[brace + 1 : end]
+    return None
+
+
+def _run_validator(
+    payload: bytes, args: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(VALIDATOR), *args],
+        cwd=ROOT,
+        input=payload,
+        capture_output=True,
+        timeout=10,
+        check=False,
     )
-    return without_comments.replace(r'\"', '"')
 
 
-def _qualification_option_branch(parser: str) -> str:
-    start = parser.find(QUALIFICATION_SEQUENCE_OPTION)
-    if start < 0:
-        return ""
-    end = parser.find("} else if", start)
-    if end < 0:
-        end = parser.find("} else {", start)
-    return parser[start:] if end < 0 else parser[start:end]
-
-
-def _qualification_emitters() -> list[tuple[str, str]]:
-    """Find concrete functions that own all lifecycle literals and flushing."""
-
-    emitters = []
-    for name, body in _function_bodies(BENCH_SOURCE):
-        view = _c_code_view(body)
-        if (
-            all(f'"{event}"' in view for event in LIFECYCLE_EVENTS)
-            and re.search(r"\b(?:fprintf|fputs|fwrite)\s*\(", body)
-            and re.search(r"\bfflush\s*\(", body)
-        ):
-            emitters.append((name, body))
-    return emitters
-
-
-class BenchQualificationSequenceContractTest(unittest.TestCase):
-    """RED source contract for the qualification-only sequence frontend."""
-
-    def test_sequence_parser_precedes_engine_open_in_main(self) -> None:
-        parser = _c_code_view(
-            _function_body(BENCH_SOURCE, "static bench_config parse_options")
+class CScannerContractTest(unittest.TestCase):
+    def test_brace_scanner_ignores_braces_in_c_literals(self) -> None:
+        source = (
+            'static int example(void) {\n'
+            '  puts("{ a string brace } and \\\" quote");\n'
+            '  if (1) { puts("}"); }\n'
+            '  return 0;\n'
+            '}\n'
         )
-        self.assertTrue(
-            QUALIFICATION_SEQUENCE_OPTION in parser,
-            "ds4-bench has no qualification-only --qualification-sequence FILE option",
-        )
-        branch = _qualification_option_branch(parser)
-        self.assertTrue(branch, "qualification-sequence parser branch is missing")
-        self.assertRegex(
-            branch,
-            r"(?:exit\s*\(\s*2\s*\)|return\s+2|invalid|reject)",
-            "invalid qualification sequences must be rejected by the CLI",
-        )
+        body = _function_body(source, "static int example(void)")
+        self.assertIn('puts("{ a string brace }', body)
+        self.assertIn('if (1) {', body)
+        self.assertNotIn("unterminated", body)
 
-        main = _c_code_view(
-            _function_body(BENCH_SOURCE, "int main(int argc, char **argv)")
+
+class BenchQualificationSchemaContractTest(unittest.TestCase):
+    def test_closed_schema_and_canonical_canned_jsonl_fixture(self) -> None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(schema["$id"], "ds4.bench.qualification/v1")
+        self.assertIs(schema["additionalProperties"], False)
+        self.assertEqual(tuple(schema["required"]), BASE_SCHEMA_FIELDS)
+        self.assertEqual(
+            set(schema["properties"]),
+            set(BASE_SCHEMA_FIELDS) | {"request_metrics", "terminal_status"},
         )
-        opens = [
-            position
-            for marker in (
-                "ds4_engine_create_with_gpu_config(",
-                "ds4_engine_open(",
+        external = schema["$defs"]["external_attribution"]
+        self.assertIs(external["additionalProperties"], False)
+        self.assertEqual(set(external["required"]), set(EXTERNAL_ATTRIBUTION_FIELDS))
+        self.assertEqual(
+            set(external["properties"]), set(EXTERNAL_ATTRIBUTION_FIELDS)
+        )
+        self.assertEqual(
+            schema["properties"]["runtime"]["$ref"],
+            "ds4-runtime-v1.schema.json",
+        )
+        self.assertEqual(
+            schema["properties"]["request_metrics"]["$ref"],
+            "ds4-runtime-request-v1.schema.json",
+        )
+        conditional = json.dumps(schema["allOf"])
+        for marker in ("request_complete", "terminal_status", "request_metrics"):
+            self.assertIn(marker, conditional)
+
+        fixture = FIXTURE_PATH.read_bytes()
+        result = _run_validator(fixture, ("--fixture",))
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_schema_rejects_extra_fields_terminal_early_nonfinite_and_wrong_kinds(self) -> None:
+        record = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+        def rejected(mutator: Any) -> None:
+            candidate = json.loads(json.dumps(record))
+            mutator(candidate)
+            result = _run_validator(
+                (json.dumps(candidate, separators=(",", ":")) + "\n").encode(),
+                ("--fixture",),
             )
-            for position in [main.find(marker)]
-            if position >= 0
-        ]
-        self.assertTrue(opens, "benchmark has no engine-open boundary")
-        parse_position = main.find("parse_options(argc, argv)")
-        self.assertGreaterEqual(parse_position, 0, "main does not parse benchmark options")
-        self.assertLess(
-            parse_position,
-            min(opens),
-            "qualification input must be validated before model allocation",
-        )
+            self.assertNotEqual(result.returncode, 0, result.stdout.decode())
+
+        rejected(lambda value: value.__setitem__("unexpected", 1))
+        rejected(lambda value: value["external_attribution"].__setitem__("extra", "0"))
+        rejected(lambda value: value.__setitem__("terminal_status", None))
+        rejected(lambda value: value.__setitem__("event", "first_token"))
+        rejected(lambda value: value.__setitem__("monotonic_ns", "NaN"))
+        rejected(lambda value: value.__setitem__("snapshot_seq", 42))
+        rejected(lambda value: value.__setitem__("repetition_index", "0"))
 
 
 class BenchQualificationPreflightCliTest(unittest.TestCase):
-    """Exercise the real CLI's model-free invalid-sequence boundary."""
+    """Exercise the real host-only CLI without accepting CPU qualification."""
 
     bench = ROOT / "ds4-bench"
 
     @classmethod
     def setUpClass(cls) -> None:
-        # ``cpu`` is the repository's normal host-only build target.  Build once
-        # for this class, then every case reaches parse/preflight only.
         result = subprocess.run(
             ["make", "cpu"],
             cwd=ROOT,
@@ -231,22 +424,71 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
         if not cls.bench.is_file():
             raise AssertionError(f"host build did not produce {cls.bench}")
 
+    def _generate_sequence(self, directory: Path) -> Path:
+        """Use the production sequence builder with a tiny deterministic manifest.
+
+        The checked-in production manifest is intentionally bound to a real
+        model and host.  This host-only gate supplies the builder's pure
+        sequence function with the same pinned profile constants and a compact
+        official-template prompt, while bypassing only manifest identity
+        validation.  No profile order or sequence line is duplicated here.
+        """
+        spec = importlib.util.spec_from_file_location("task19_sequence_builder", BUILDER)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        payload = b"task19 canonical prompt bytes"
+        rendered = builder.LAGUNA_TEMPLATE_PREFIX + payload + builder.LAGUNA_TEMPLATE_SUFFIX
+        prompt = {
+            "id": "native-512",
+            "token_count": 512,
+            "payload_prefix_bytes": str(len(payload)),
+            "rendered_size_bytes": str(len(rendered)),
+            "rendered_base64": base64.b64encode(rendered).decode("ascii"),
+            "sha256": hashlib.sha256(rendered).hexdigest(),
+        }
+        manifest = {
+            "schema": builder.SCHEMA_ID,
+            "prompts": [prompt],
+            "profiles": [{
+                "profile_id": "cache-8gib",
+                "cache_bytes": str(8 << 30),
+                "prompt_order": [512, 2048, 28672, 8192],
+            }],
+        }
+        original_validator = builder.validate_manifest
+        builder.validate_manifest = lambda _value: None
+        try:
+            sequence_bytes = builder.build_qualification_sequence(
+                manifest, "cache-8gib", "native-512"
+            )
+        finally:
+            builder.validate_manifest = original_validator
+        output = directory / "sequence.txt"
+        output.write_bytes(sequence_bytes)
+        self.assertEqual(sequence_bytes.count(b"\n"), builder.QUALIFICATION_SEQUENCE_LINE_COUNT)
+        self.assertTrue(sequence_bytes.startswith(b"schema=ds4.qualification-sequence/v1\n"))
+        self.assertTrue(sequence_bytes.endswith(b"repetition=3:warm-3\n"))
+        return output
+
     def _invoke(
         self,
-        temporary: Path,
-        sequence_argv: tuple[str, ...],
+        directory: Path,
+        sequence_args: tuple[str, ...],
+        extra: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
-        environment["DS4_LOCK_FILE"] = str(temporary / "private-task19.lock")
+        environment["DS4_LOCK_FILE"] = str(directory / "task19-private.lock")
         return subprocess.run(
             [
                 str(self.bench),
-                *sequence_argv,
+                *sequence_args,
                 "--model",
                 MISSING_MODEL,
-                "--prompt-file",
-                MISSING_PROMPT,
-                "--cpu",
+                "--backend",
+                "cuda",
+                *extra,
             ],
             cwd=ROOT,
             env=environment,
@@ -256,50 +498,99 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
             check=False,
         )
 
-    def _assert_sequence_rejected_before_model_or_prompt_open(
+    def _assert_rejected_before_model_or_prompt_open(
         self,
-        temporary: Path,
-        sequence_argv: tuple[str, ...],
+        directory: Path,
+        sequence_args: tuple[str, ...],
     ) -> subprocess.CompletedProcess[str]:
-        result = self._invoke(temporary, sequence_argv)
+        result = self._invoke(directory, sequence_args)
         stderr = result.stderr.lower()
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertNotIn(
-            "unknown option",
-            stderr,
-            "the planned option must not take the current unknown-option path",
-        )
-        self.assertRegex(
-            stderr,
-            r"qualification[- ]sequence",
-            "invalid sequence must produce a qualification-sequence diagnostic",
-        )
+        self.assertNotIn("unknown option", stderr)
+        self.assertRegex(stderr, r"qualification[- ]sequence")
         self.assertNotIn("cannot open model", stderr)
         self.assertNotIn("failed to open model", stderr)
-        self.assertNotIn("failed to open", stderr)
+        self.assertNotIn(MISSING_MODEL.lower(), stderr)
         self.assertNotIn(MISSING_PROMPT.lower(), stderr)
         return result
 
-    def test_malformed_and_empty_manifest_slice_reject_before_model_open(self) -> None:
-        for label, payload in (("malformed", "{\n"), ("empty-object", "{}\n")):
+    def _assert_reached_post_parse_boundary(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> None:
+        stderr = result.stderr
+        self.assertNotIn("unknown option", stderr.lower(), stderr)
+        self.assertTrue(
+            any(pattern.search(stderr) for pattern in POST_PARSE_DIAGNOSTICS),
+            "valid sequence did not reach a distinct model/compatibility boundary:\n"
+            + stderr,
+        )
+
+    def test_python_builder_sequence_reaches_post_parse_boundary_without_cpu(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
+            directory = Path(directory_name)
+            sequence = self._generate_sequence(directory)
+            result = self._invoke(
+                directory, (QUALIFICATION_SEQUENCE_OPTION, str(sequence))
+            )
+            # A host-only binary may reject the unavailable CUDA backend or the
+            # deliberately missing model. It must not accept CPU as qualification.
+            self.assertIn(result.returncode, (1, 2), result.stderr)
+            self._assert_reached_post_parse_boundary(result)
+
+    def test_malformed_empty_and_nul_decoded_inputs_reject_before_model_open(self) -> None:
+        cases = (("empty-file", b""), ("empty-object", b"{}\n"), ("malformed", b"{\n"))
+        for label, payload in cases:
             with self.subTest(sequence=label), tempfile.TemporaryDirectory(
                 prefix="task19-sequence-"
-            ) as directory:
-                temporary = Path(directory)
-                sequence = temporary / f"{label}.json"
-                sequence.write_text(payload, encoding="utf-8")
-                self._assert_sequence_rejected_before_model_or_prompt_open(
-                    temporary,
-                    (QUALIFICATION_SEQUENCE_OPTION, str(sequence)),
+            ) as directory_name:
+                directory = Path(directory_name)
+                sequence = directory / f"{label}.txt"
+                sequence.write_bytes(payload)
+                self._assert_rejected_before_model_or_prompt_open(
+                    directory, (QUALIFICATION_SEQUENCE_OPTION, str(sequence))
                 )
 
-    def test_duplicate_and_empty_sequence_options_reject_before_model_open(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory:
-            temporary = Path(directory)
-            sequence = temporary / "duplicate.json"
-            sequence.write_text("{}\n", encoding="utf-8")
-            duplicate = self._assert_sequence_rejected_before_model_or_prompt_open(
-                temporary,
+        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
+            directory = Path(directory_name)
+            sequence = self._generate_sequence(directory)
+            lines = sequence.read_bytes().splitlines()
+            canonical = next(line.split(b"=", 1)[1] for line in lines if line.startswith(b"input_base64="))
+            canonical_rendered = base64.b64decode(canonical, validate=True)
+            nul_payload = (
+                b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>"
+                + b"official\x00prompt"
+                + b"</user>\n<assistant></think>"
+            )
+            self.assertEqual(canonical_rendered[: len(b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>")], b"\xe3\x80\x88|EOS|\xe3\x80\x89<user>")
+            self.assertEqual(canonical_rendered[-len(b"</user>\n<assistant></think>"):], b"</user>\n<assistant></think>")
+            self.assertEqual(len(nul_payload), NUL_RENDERED_SIZE)
+            self.assertEqual(hashlib.sha256(nul_payload).hexdigest(), NUL_RENDERED_SHA256)
+            self.assertEqual(base64.b64encode(nul_payload).decode("ascii"), NUL_RENDERED_BASE64)
+            self.assertIn(b"\x00", base64.b64decode(NUL_RENDERED_BASE64, validate=True))
+            replacements = {
+                b"input_size_bytes=": f"input_size_bytes={NUL_RENDERED_SIZE}".encode(),
+                b"input_sha256=": b"input_sha256=" + NUL_RENDERED_SHA256.encode(),
+                b"input_base64=": b"input_base64=" + NUL_RENDERED_BASE64.encode(),
+            }
+            mutated: list[bytes] = []
+            for line in lines:
+                replacement = next(
+                    (value for key, value in replacements.items() if line.startswith(key)),
+                    None,
+                )
+                mutated.append(replacement if replacement is not None else line)
+            nul_sequence = directory / "decoded-nul.txt"
+            nul_sequence.write_bytes(b"\n".join(mutated) + b"\n")
+            self._assert_rejected_before_model_or_prompt_open(
+                directory, (QUALIFICATION_SEQUENCE_OPTION, str(nul_sequence))
+            )
+
+    def test_duplicate_and_empty_sequence_options_have_stable_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
+            directory = Path(directory_name)
+            sequence = self._generate_sequence(directory)
+            duplicate = self._assert_rejected_before_model_or_prompt_open(
+                directory,
                 (
                     QUALIFICATION_SEQUENCE_OPTION,
                     str(sequence),
@@ -307,188 +598,78 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                     str(sequence),
                 ),
             )
-            self.assertRegex(
-                duplicate.stderr.lower(),
-                r"(?:duplicate|once|only)",
-                "duplicate qualification sequence options need a stable diagnostic",
+            self.assertRegex(duplicate.stderr.lower(), r"duplicate|once|only")
+
+            empty = self._assert_rejected_before_model_or_prompt_open(
+                directory, (QUALIFICATION_SEQUENCE_OPTION, "")
             )
+            self.assertRegex(empty.stderr.lower(), r"empty|requires|path|invalid")
 
-            empty = self._assert_sequence_rejected_before_model_or_prompt_open(
-                temporary,
-                (QUALIFICATION_SEQUENCE_OPTION, ""),
-            )
-            self.assertRegex(
-                empty.stderr.lower(),
-                r"(?:empty|requires|path|invalid)",
-                "an empty qualification sequence path needs a stable diagnostic",
-            )
-
-
-class BenchQualificationEvidenceContractTest(unittest.TestCase):
-    def test_every_qualification_sample_has_the_closed_runtime_field_set(self) -> None:
-        view = _c_code_view(BENCH_SOURCE)
-        missing = [
-            field
-            for field in REQUIRED_SAMPLE_FIELDS
-            if f'"{field}"' not in view
-        ]
-        self.assertEqual(
-            missing,
-            [],
-            "qualification samples are missing closed fields: " + ", ".join(missing),
-        )
-        missing_external = [
-            field
-            for field in EXTERNAL_ATTRIBUTION_FIELDS
-            if f'"{field}"' not in view
-        ]
-        self.assertEqual(
-            missing_external,
-            [],
-            "external_attribution is missing closed fields: "
-            + ", ".join(missing_external),
-        )
-
-        # The legacy CSV label described a serialized snapshot payload as live
-        # KV.  It must not remain in the machine-readable benchmark header.
-        headers = re.findall(
-            r'fprintf\s*\(\s*out\s*,\s*"([^"]*ctx_tokens[^"]*)"',
-            BENCH_SOURCE,
-        )
-        self.assertTrue(headers, "benchmark has no machine-readable sample header")
-        self.assertFalse(
-            any("kvcache_bytes" in header for header in headers),
-            "ambiguous kvcache_bytes remains in the machine-readable header",
-        )
-
-        # Runtime-owned accounting is read from the existing APIs, not inferred
-        # by differencing unrelated snapshots.
-        for marker in (
-            "ds4_engine_runtime_snapshot(",
-            "ds4_runtime_request_metrics_json(",
-            "ds4_engine_laguna_external_checkpoint(",
-            "ds4_session_payload_bytes(",
-        ):
-            self.assertIn(marker, BENCH_SOURCE, f"benchmark does not use {marker}")
-
-        # Byte/time fields are canonical decimal JSON strings.  Row counts and
-        # repetition_index intentionally use the integer ABI instead.
-        for field in UINT64_SAMPLE_FIELDS:
-            position = view.find(f'"{field}"')
-            self.assertGreaterEqual(position, 0)
-            self.assertRegex(
-                view[position : position + 512],
-                r"(?:PRIu64|%llu|json_u64)",
-                f"{field} is not emitted through a uint64 JSON writer",
-            )
-        for field in INTEGER_SAMPLE_FIELDS:
-            position = view.find(f'"{field}"')
-            self.assertGreaterEqual(position, 0)
-            self.assertRegex(
-                view[position : position + 512],
-                r"(?:PRIu32|%u|%d|json_u32|integer)",
-                f"{field} is not emitted as an integer JSON value",
-            )
-
-    def test_lifecycle_emitter_and_loop_are_concrete_but_provisional(self) -> None:
-        """Bind provisional source checks to live call seams, not dead text."""
-
-        emitters = _qualification_emitters()
-        self.assertEqual(
-            len(emitters),
-            1,
-            "qualification lifecycle needs one concrete emitter with all events and fflush",
-        )
-        emitter_name, emitter_body = emitters[0]
-        emitter_view = _c_code_view(emitter_body)
-        for event in LIFECYCLE_EVENTS:
-            self.assertIn(f'"{event}"', emitter_view)
-        self.assertRegex(emitter_body, r"\bfflush\s*\(")
-        last_event = max(
-            emitter_view.find(f'"{event}"') for event in LIFECYCLE_EVENTS
-        )
-        first_flush = emitter_view.find("fflush")
-        self.assertGreater(
-            first_flush,
-            last_event,
-            "the concrete emitter must flush after constructing each record",
-        )
-
-        # terminal_status belongs only to request_complete.  This source check
-        # is intentionally narrow; the future model-free hook must validate the
-        # same rule against actual JSONL records.
-        complete = emitter_view.find('"request_complete"')
-        terminal = emitter_view.find('"terminal_status"')
-        self.assertGreaterEqual(complete, 0)
-        self.assertGreaterEqual(terminal, 0)
-        self.assertGreater(
-            terminal,
-            complete,
-            "terminal_status must be gated by request_complete",
-        )
-        for earlier in ("request_accepted", "first_token"):
-            self.assertNotIn(
-                '"terminal_status"',
-                emitter_view[emitter_view.find(f'"{earlier}"') : complete],
-                f"{earlier} must not claim terminal_status",
-            )
-
-        main = _function_body(BENCH_SOURCE, "int main(int argc, char **argv)")
-        main_view = _c_code_view(main)
-        emitter_call = re.search(
-            rf"\b{re.escape(emitter_name)}\s*\(", main_view
-        )
-        self.assertIsNotNone(
-            emitter_call,
-            "main does not call the qualification lifecycle emitter",
-        )
-
-        loops = []
-        for name, body in _function_bodies(BENCH_SOURCE):
-            code = _c_code_view(body)
-            if not re.search(
-                r"for\s*\(\s*(?:int\s+)?repetition_index\s*=\s*0\s*;"
-                r"[^;]*<\s*4\b",
-                code,
+    def test_cpu_and_prompt_file_are_explicitly_incompatible_with_qualification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="task19-sequence-") as directory_name:
+            directory = Path(directory_name)
+            sequence = self._generate_sequence(directory)
+            for extra, pattern in (
+                (("--cpu",), r"cpu|backend|qualification"),
+                (("--prompt-file", MISSING_PROMPT), r"prompt|qualification|sequence"),
             ):
+                with self.subTest(extra=extra):
+                    result = self._invoke(
+                        directory,
+                        (QUALIFICATION_SEQUENCE_OPTION, str(sequence)),
+                        extra,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("unknown option", result.stderr.lower())
+                    self.assertRegex(result.stderr.lower(), pattern)
+                    self.assertNotIn(MISSING_MODEL.lower(), result.stderr.lower())
+                    self.assertNotIn(MISSING_PROMPT.lower(), result.stderr.lower())
+
+
+class BenchQualificationLifecycleSourceContractTest(unittest.TestCase):
+    """Keep only the engine/session ownership guard in source inspection."""
+
+    def test_one_engine_encloses_qualification_runner_with_fresh_sessions(self) -> None:
+        functions = _function_bodies(BENCH_SOURCE)
+        runners: list[tuple[str, str, str]] = []
+        for name, body in functions:
+            loop = _loop_body_with_four_repetitions(body)
+            if loop is None:
                 continue
-            if re.search(rf"\b{re.escape(emitter_name)}\s*\(", code):
-                loops.append((name, body))
+            _header, loop_body = loop
+            code = _c_code_view(loop_body)
+            if "ds4_session_create(" in code and "ds4_session_free(" in code:
+                runners.append((name, body, loop_body))
         self.assertEqual(
-            len(loops),
+            len(runners),
             1,
-            "qualification loop must emit cold plus three warm records through the live emitter",
+            "qualification runner must create and free a fresh session in each 0..3 repetition",
         )
-        loop_name, loop_body = loops[0]
-        self.assertRegex(
-            _c_code_view(loop_body),
-            r"repetition_index",
-            "qualification loop does not bind repetition_index 0..3",
-        )
-        if loop_name != "main":
-            loop_call = re.search(
-                rf"\b{re.escape(loop_name)}\s*\(",
-                main_view,
+        runner_name, _runner_body, loop_body = runners[0]
+        loop_code = _c_code_view(loop_body)
+        self.assertRegex(loop_code, r"\brepetition_index\b")
+        self.assertIn("ds4_session_create(", loop_code)
+        self.assertIn("ds4_session_free(", loop_code)
+
+        main = _c_code_view(_function_body(BENCH_SOURCE, "int main(int argc, char **argv)"))
+        opens = [
+            position
+            for marker in (
+                "ds4_engine_create_with_gpu_config(",
+                "ds4_engine_open(",
             )
-            self.assertIsNotNone(
-                loop_call,
-                "main does not call the concrete qualification loop",
-            )
-            open_positions = [
-                main_view.find(marker)
-                for marker in (
-                    "ds4_engine_create_with_gpu_config(",
-                    "ds4_engine_open(",
-                )
-                if main_view.find(marker) >= 0
-            ]
-            engine_close = main_view.rfind("ds4_engine_close(")
-            self.assertTrue(open_positions, "main has no engine-open boundary")
-            self.assertGreaterEqual(engine_close, 0, "main has no engine-close boundary")
-            assert loop_call is not None
-            self.assertLess(min(open_positions), loop_call.start())
-            self.assertLess(loop_call.start(), engine_close)
+            for position in (main.find(marker),)
+            if position >= 0
+        ]
+        self.assertTrue(opens, "benchmark has no engine-open boundary")
+        engine_close = main.rfind("ds4_engine_close(")
+        self.assertGreaterEqual(engine_close, 0, "benchmark has no engine-close boundary")
+        runner_call = re.search(rf"\b{re.escape(runner_name)}\s*\(", main)
+        self.assertIsNotNone(runner_call, "main does not call qualification runner")
+        assert runner_call is not None
+        self.assertLess(min(opens), runner_call.start())
+        self.assertLess(runner_call.start(), engine_close)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

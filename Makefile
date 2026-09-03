@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-qualification-emitter test-bench-eval-contract
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -406,6 +406,22 @@ tests/test_bench_sequence: tests/test_bench_sequence.o ds4_bench_sequence_test_h
 
 test-bench-sequence: tests/test_bench_sequence
 	./tests/test_bench_sequence
+
+# RED-only Task 19 lifecycle seam.  The production emitter/header are
+# intentionally absent until the implementation slice lands.
+tests/test_bench_qualification_emitter.o: tests/test_bench_qualification_emitter.c ds4_runtime.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_bench_qualification_emitter: tests/test_bench_qualification_emitter.o ds4_runtime.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-bench-qualification-emitter: tests/test_bench_qualification_emitter
+	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/ds4-qualification.XXXXXX"); trap 'rm -f "$$tmp"' EXIT; \
+	./tests/test_bench_qualification_emitter >"$$tmp" && \
+	python3 tests/validate_bench_qualification_json.py <"$$tmp"
+
+test-bench-eval-contract:
+	python3 tests/test_bench_eval_contract.py -v
 
 ds4_plan_io.o: ds4_plan_io.c ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_plan_io.c

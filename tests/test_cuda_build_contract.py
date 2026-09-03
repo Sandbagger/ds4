@@ -1571,11 +1571,14 @@ class CudaBuildContractTest(unittest.TestCase):
         )
 
         launch = function_body("static int glm_poolside_routed_moe_q4_launch(")
+        self.assertIn("bool prefer_poolside_mmvq", launch)
         self.assertIn(
             "const bool poolside_mmvq = !mmq && n_tokens == 1u &&\n"
             "        n_total_expert == 256u && n_expert == 10u &&\n"
             "        expert_in_dim == 3072u && expert_mid_dim == 1024u &&\n"
-            "        out_dim == 3072u && cuda_poolside_mmvq_requested();",
+            "        out_dim == 3072u &&\n"
+            "        (prefer_poolside_mmvq || "
+            "cuda_poolside_mmvq_requested());",
             launch,
         )
         self.assertIn(
@@ -1587,6 +1590,46 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn("glm_poolside_q4_gate_up_kernel<<<", launch)
         self.assertIn("glm_poolside_q4_down_kernel<<<", launch)
         self.assertGreaterEqual(launch.count("dim3(32, 4, 1)"), 2)
+        self.assertIn("bool                    prefer_poolside_mmvq", GPU_HEADER)
+
+        laguna_token = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "ds4.c",
+        )
+        self.assertIn(
+            "g->ffn_norm,\n                        true,\n                        true",
+            laguna_token,
+        )
+        laguna_batch = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
+            "ds4.c",
+        )
+        self.assertIn(
+            "DS4_N_EXPERT_USED * DS4_N_FF_EXP,\n"
+            "                            false,\n"
+            "                            true",
+            laguna_batch,
+        )
+        glm_one = source_function_body(
+            DS4_SOURCE,
+            "static bool glm_graph_encode_sparse_ffn_one(",
+            "ds4.c",
+        )
+        self.assertIn(
+            "x,\n                                             false,\n"
+            "                                             force_resident",
+            glm_one,
+        )
+        compact = function_body(
+            "static ds4_gpu_laguna_exec_result "
+            "cuda_laguna_compact_routed_moe_batch_tensor_core("
+        )
+        self.assertIn(
+            "n_tokens, n_selected * expert_mid_dim, true, &compact",
+            compact,
+        )
 
     def test_laguna_c7_oracle_producer_is_self_contained(self) -> None:
         self.assertEqual(

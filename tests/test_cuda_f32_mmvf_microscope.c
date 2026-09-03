@@ -15,7 +15,9 @@
 
 enum {
     INPUT_ELEMENTS = 3072,
+    ROUTER_ROWS = 256,
     ROW_BYTES = INPUT_ELEMENTS * sizeof(float),
+    ROUTER_BYTES = ROUTER_ROWS * ROW_BYTES,
 };
 
 static void *read_fixture(const char *name, size_t expected_bytes) {
@@ -64,15 +66,22 @@ static double f32_dot_reference(
 int main(void) {
     float *activation = read_fixture(INPUT_FILE, ROW_BYTES);
     float *weight = read_fixture("weight-row.f32", ROW_BYTES);
+    float *router_weights = calloc(ROUTER_ROWS, ROW_BYTES);
+    float *router_values = malloc(ROUTER_ROWS * sizeof(*router_values));
     ds4_gpu_tensor *activation_t = NULL;
     ds4_gpu_tensor *weight_t = NULL;
     ds4_gpu_tensor *values_t = NULL;
+    ds4_gpu_tensor *router_values_t = NULL;
     float values[2] = {NAN, NAN};
     int rc = 1;
 
-    if (!activation || !weight) {
+    if (!activation || !weight || !router_weights || !router_values) {
         fprintf(stderr, "f32-mmvf-microscope: fixture load failed\n");
         goto cleanup;
+    }
+    for (uint32_t row = 0u; row < ROUTER_ROWS; row++) {
+        memcpy(router_weights + (uint64_t)row * INPUT_ELEMENTS,
+               weight, ROW_BYTES);
     }
     if (!ds4_gpu_init()) {
         fprintf(stderr, "f32-mmvf-microscope: CUDA init failed\n");
@@ -81,13 +90,21 @@ int main(void) {
     activation_t = ds4_gpu_tensor_alloc(ROW_BYTES);
     weight_t = ds4_gpu_tensor_alloc(ROW_BYTES);
     values_t = ds4_gpu_tensor_alloc(sizeof(values));
-    if (!activation_t || !weight_t || !values_t ||
+    router_values_t = ds4_gpu_tensor_alloc(
+        ROUTER_ROWS * sizeof(*router_values));
+    if (!activation_t || !weight_t || !values_t || !router_values_t ||
         !ds4_gpu_tensor_write(activation_t, 0, activation, ROW_BYTES) ||
         !ds4_gpu_tensor_write(weight_t, 0, weight, ROW_BYTES) ||
         !ds4_gpu_test_f32_mmvf_microscope_tensor(
             values_t, weight_t, activation_t, INPUT_ELEMENTS) ||
+        !ds4_gpu_laguna_router_f32_tensor(
+            router_values_t, router_weights, ROUTER_BYTES, 0u,
+            activation_t) ||
         cudaDeviceSynchronize() != cudaSuccess ||
-        !ds4_gpu_tensor_read(values_t, 0, values, sizeof(values))) {
+        !ds4_gpu_tensor_read(values_t, 0, values, sizeof(values)) ||
+        !ds4_gpu_tensor_read(
+            router_values_t, 0, router_values,
+            ROUTER_ROWS * sizeof(*router_values))) {
         fprintf(stderr, "f32-mmvf-microscope: CUDA execution failed\n");
         goto cleanup;
     }
@@ -117,6 +134,16 @@ int main(void) {
                 POOLSIDE_EXPECTED_BITS);
         goto cleanup;
     }
+    for (uint32_t row = 0u; row < ROUTER_ROWS; row++) {
+        if (f32_bits(router_values[row]) != POOLSIDE_EXPECTED_BITS) {
+            fprintf(stderr,
+                    "f32-mmvf-microscope: Laguna router row=%u "
+                    "got=%a bits=0x%08x expected_bits=0x%08x\n",
+                    row, router_values[row], f32_bits(router_values[row]),
+                    POOLSIDE_EXPECTED_BITS);
+            goto cleanup;
+        }
+    }
     if (f32_bits(values[0]) == f32_bits(values[1])) {
         fprintf(stderr,
                 "f32-mmvf-microscope: reduction orders unexpectedly agree\n");
@@ -132,10 +159,13 @@ int main(void) {
     rc = 0;
 
 cleanup:
+    ds4_gpu_tensor_free(router_values_t);
     ds4_gpu_tensor_free(values_t);
     ds4_gpu_tensor_free(weight_t);
     ds4_gpu_tensor_free(activation_t);
     ds4_gpu_cleanup();
+    free(router_values);
+    free(router_weights);
     free(weight);
     free(activation);
     return rc;

@@ -1440,9 +1440,10 @@ class CudaBuildContractTest(unittest.TestCase):
         )
 
         source = test_path.read_text(encoding="utf-8")
-        self.assertNotIn("laguna", source.lower())
         for required in (
             "ds4_gpu_test_f32_mmvf_microscope_tensor(",
+            "ds4_gpu_laguna_router_f32_tensor(",
+            "ROUTER_ROWS = 256",
             "DS4_SERIAL_EXPECTED_BITS",
             "POOLSIDE_EXPECTED_BITS",
             '"weight-row.f32"',
@@ -1455,6 +1456,7 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn(
             "ds4_gpu_test_f32_mmvf_microscope_tensor(", GPU_HEADER
         )
+        self.assertIn("ds4_gpu_laguna_router_f32_tensor(", GPU_HEADER)
 
         poolside_kernel = function_body(
             "__global__ static void f32_mmvf_poolside_microscope_kernel("
@@ -1474,6 +1476,40 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn(
             "f32_mmvf_poolside_microscope_kernel<<<1, 256, ", hook
         )
+
+        router_kernel = function_body(
+            "__global__ static void laguna_router_f32_poolside_kernel("
+        )
+        self.assertIn("const float2 *weight2", router_kernel)
+        self.assertIn("const float2 *activation2", router_kernel)
+        self.assertRegex(router_kernel, r"col2\s*\+=\s*256u")
+        self.assertIn("__shfl_xor_sync(0xffffffffu", router_kernel)
+        router_api = function_body(
+            'extern "C" int ds4_gpu_laguna_router_f32_tensor('
+        )
+        self.assertIn("in_dim = 3072u", router_api)
+        self.assertIn("out_dim = 256u", router_api)
+        self.assertIn("alignof(float2)", router_api)
+        self.assertIn(
+            "laguna_router_f32_poolside_kernel<<<256u, 256u,",
+            router_api,
+        )
+        generic_api = function_body(
+            'extern "C" int ds4_gpu_matmul_f32_tensor('
+        )
+        self.assertNotIn("laguna_router_f32_poolside_kernel", generic_api)
+        laguna_token = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_token(",
+            "ds4.c",
+        )
+        self.assertIn("ds4_gpu_laguna_router_f32_tensor(", laguna_token)
+        laguna_batch = source_function_body(
+            DS4_SOURCE,
+            "static ds4_gpu_laguna_exec_result laguna_graph_forward_batch(",
+            "ds4.c",
+        )
+        self.assertNotIn("ds4_gpu_laguna_router_f32_tensor(", laguna_batch)
 
     def test_laguna_decode_poolside_mmvq_is_opt_in_and_narrow(self) -> None:
         selector = function_body(

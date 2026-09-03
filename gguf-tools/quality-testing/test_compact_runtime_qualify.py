@@ -1185,7 +1185,7 @@ print("[" + ",".join(["0"] * count) + "]")
         with self.assertRaisesRegex(ValueError, "exactly 513 native-template tokens"):
             TOOL.select_rendered_prompt(SEED[:1024], 513, impossible)
 
-    def test_parser_exposes_only_the_two_manifest_commands(self) -> None:
+    def test_parser_exposes_manifest_and_sequence_commands(self) -> None:
         build = TOOL.parse_args([
             "manifest", "build", "--model", "/m", "--output", "/o",
             "--qualification-plan", "/p",
@@ -1196,6 +1196,15 @@ print("[" + ",".join(["0"] * count) + "]")
         self.assertEqual(build.qualification_plan, Path("/p"))
         self.assertEqual(build.trusted_qualification_plan_sha256, "c" * 64)
         self.assertEqual((verify.command, verify.action), ("manifest", "verify"))
+        sequence = TOOL.parse_args([
+            "sequence", "build", "--manifest", "/m", "--profile-id", "cache-8gib",
+            "--prompt-id", "native-512", "--output", "/o",
+        ])
+        self.assertEqual((sequence.command, sequence.action), ("sequence", "build"))
+        self.assertEqual(sequence.manifest, Path("/m"))
+        self.assertEqual(sequence.profile_id, "cache-8gib")
+        self.assertEqual(sequence.prompt_id, "native-512")
+        self.assertEqual(sequence.output, Path("/o"))
         for missing in (
             "--qualification-plan",
             "--trusted-qualification-plan-sha256",
@@ -1228,6 +1237,116 @@ print("[" + ",".join(["0"] * count) + "]")
         with self.assertRaises(SystemExit):
             TOOL.parse_args(["run"])
 
+
+    def test_build_qualification_sequence_is_byte_exact_for_all_profile_orders(self) -> None:
+        original = copy.deepcopy(self.manifest)
+        digest = TOOL.manifest_sha256(self.manifest)
+        for profile_id, cache_bytes, order in TOOL.PROFILE_SPECS:
+            for order_index, token_count in enumerate(order):
+                prompt_id = f"native-{token_count}"
+                with self.subTest(profile_id=profile_id, prompt_id=prompt_id):
+                    rendered = base64.b64decode(
+                        next(
+                            item for item in self.manifest["prompts"]
+                            if item["id"] == prompt_id
+                        )["rendered_base64"],
+                        validate=True,
+                    )
+                    expected = "\n".join([
+                        "schema=ds4.qualification-sequence/v1",
+                        f"manifest_sha256={digest}",
+                        f"profile_id={profile_id}",
+                        f"cache_bytes={cache_bytes}",
+                        f"prompt_order_index={order_index}",
+                        f"prompt_id={prompt_id}",
+                        f"prompt_tokens={token_count}",
+                        "mode=streamed",
+                        f"input_size_bytes={len(rendered)}",
+                        f"input_sha256={hashlib.sha256(rendered).hexdigest()}",
+                        f"input_base64={base64.b64encode(rendered).decode('ascii')}",
+                        "max_generated_tokens=512",
+                        "temperature=0",
+                        "top_k=0",
+                        "top_p=1",
+                        "min_p=0.05",
+                        "seed=1",
+                        "stop_sequences_count=0",
+                        "stop_token_policy=model-native",
+                        "repetition_count=4",
+                        "repetition=0:cold",
+                        "repetition=1:warm-1",
+                        "repetition=2:warm-2",
+                        "repetition=3:warm-3",
+                    ]).encode("ascii") + b"\n"
+                    self.assertEqual(
+                        TOOL.build_qualification_sequence(
+                            self.manifest, profile_id, prompt_id
+                        ),
+                        expected,
+                    )
+        self.assertEqual(self.manifest, original)
+
+    def test_build_qualification_sequence_validates_manifest_and_rejects_mutation(self) -> None:
+        mutations: list[tuple[str, Callable[[dict], None]]] = [
+            ("unknown top-level key", lambda value: value.__setitem__("extra", 1)),
+            ("missing sampling", lambda value: value.__delitem__("sampling")),
+            (
+                "reordered profile",
+                lambda value: value["profiles"].__setitem__(
+                    0, {**value["profiles"][0], "prompt_order": [2048, 512, 28672, 8192]}
+                ),
+            ),
+            (
+                "stale prompt bytes",
+                lambda value: value["prompts"][0].__setitem__(
+                    "rendered_base64", base64.b64encode(b"changed").decode("ascii")
+                ),
+            ),
+            (
+                "wrong sampling",
+                lambda value: value["sampling"].__setitem__("temperature", 1),
+            ),
+        ]
+        for label, mutate in mutations:
+            changed = copy.deepcopy(self.manifest)
+            mutate(changed)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                TOOL.build_qualification_sequence(changed, "cache-8gib", "native-512")
+        for profile_id, prompt_id in (("cache-4gib", "native-512"), ("cache-8gib", "native-999")):
+            with self.subTest(profile_id=profile_id, prompt_id=prompt_id), self.assertRaisesRegex(
+                ValueError, "profile|prompt"
+            ):
+                TOOL.build_qualification_sequence(self.manifest, profile_id, prompt_id)
+
+    def test_sequence_build_cli_is_atomic_no_replace_and_model_free(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            manifest_path = directory / "manifest.json"
+            output = directory / "sequence"
+            TOOL.write_manifest_atomic(manifest_path, self.manifest)
+            expected = TOOL.build_qualification_sequence(
+                self.manifest, "cache-8gib", "native-512"
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            argv = [
+                "sequence", "build",
+                "--manifest", str(manifest_path),
+                "--profile-id", "cache-8gib",
+                "--prompt-id", "native-512",
+                "--output", str(output),
+            ]
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(TOOL.main(argv), 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(output.read_bytes(), expected)
+            self.assertIn(f"manifest_sha256={TOOL.manifest_sha256(self.manifest)}", stdout.getvalue())
+            first = output.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr := io.StringIO()):
+                self.assertEqual(TOOL.main(argv), 1)
+            self.assertEqual(output.read_bytes(), first)
+            self.assertRegex(stderr.getvalue(), "already exists|replace")
+            self.assertEqual(sorted(path.name for path in directory.iterdir()), ["manifest.json", "sequence"])
 
 class WarmStabilityContractTest(unittest.TestCase):
     def test_freezes_warm_stability_constants_and_accepts_boundary_evidence(self) -> None:

@@ -6,11 +6,12 @@ produced by the checked-in Python builder, and stop at a missing-model or
 qualification-only compatibility boundary.  They never load a model, open a
 prompt file, initialize a GPU, or open a network connection.
 
-The JSONL schema and canned fixture are checked with the dependency-free
-validator beside this file.  The model-free C emitter target intentionally
-names the next production header/API; it is a separate RED boundary until that
-module exists.  Source inspection is limited to the engine/session ownership
-shape.  It is not used as evidence for emitted event ordering or field values.
+The JSONL schemas and canned fixtures are checked with dependency-free
+validators beside this file.  The model-free C lifecycle and stable case-ID
+harnesses intentionally name the next production API boundaries; their RED
+results are separate from schema self-tests.  Source inspection is limited to
+engine/session ownership and the stable-eval wiring shape.  It is not used as
+evidence for emitted field values.
 """
 
 from __future__ import annotations
@@ -32,10 +33,33 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 BENCH_SOURCE_PATH = ROOT / "ds4_bench.c"
 BENCH_SOURCE = BENCH_SOURCE_PATH.read_text(encoding="utf-8")
+EVAL_SOURCE_PATH = ROOT / "ds4_eval.c"
+EVAL_SOURCE = EVAL_SOURCE_PATH.read_text(encoding="utf-8")
 BUILDER = ROOT / "gguf-tools/quality-testing/compact_runtime_qualify.py"
 SCHEMA_PATH = ROOT / "schemas/ds4-bench-qualification-v1.schema.json"
 FIXTURE_PATH = ROOT / "tests/fixtures/ds4-bench-qualification-v1.jsonl"
 VALIDATOR = ROOT / "tests/validate_bench_qualification_json.py"
+EVAL_CASE_SCHEMA_PATH = ROOT / "schemas/ds4-eval-case-v1.schema.json"
+EVAL_CASE_FIXTURE_PATH = ROOT / "tests/fixtures/ds4-eval-case-v1.jsonl"
+EVAL_CASE_VALIDATOR = ROOT / "tests/validate_eval_case_json.py"
+EVAL_CASE_KEYS = (
+    "schema",
+    "case_id",
+    "answer",
+    "grade",
+    "terminal_status",
+    "request_id",
+    "instance_id",
+    "snapshot_seq",
+    "evidence_sha256",
+)
+EVAL_CASE_IDS = (
+    "recNu3MXkvWUzHZr9",
+    "001b51d76b4d422988f2c11f104a2c6c",
+    "aime2025-01",
+    "compsec-076",
+)
+EVAL_CASE_UUID = "123e4567-e89b-12d3-a456-426614174099"
 QUALIFICATION_SEQUENCE_OPTION = "--qualification-sequence"
 QUALIFICATION_MANIFEST_SHA256_OPTION = "--qualification-manifest-sha256"
 QUALIFICATION_SEQUENCE_SHA256_OPTION = "--qualification-sequence-sha256"
@@ -339,6 +363,43 @@ def _run_validator(
         timeout=10,
         check=False,
     )
+
+
+def _run_case_validator(
+    payload: bytes, args: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [sys.executable, str(EVAL_CASE_VALIDATOR), *args],
+        cwd=ROOT,
+        input=payload,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def _case_fixture_records() -> list[dict[str, Any]]:
+    return [json.loads(line) for line in
+            EVAL_CASE_FIXTURE_PATH.read_text(encoding="utf-8").splitlines()]
+
+
+def _case_payload(records: list[dict[str, Any]]) -> bytes:
+    return ("\n".join(json.dumps(record, separators=(",", ":"))
+                       for record in records) + "\n").encode("utf-8")
+
+
+def _case_evidence_digest(record: dict[str, Any]) -> str:
+    """Independent fixture oracle for the closed case evidence preimage."""
+    preimage = bytearray(b"ds4.eval.case.evidence/v1\n")
+    for key in EVAL_CASE_KEYS[:-1]:
+        value = record[key].encode("utf-8")
+        preimage.extend(key.encode("ascii"))
+        preimage.extend(b"=")
+        preimage.extend(str(len(value)).encode("ascii"))
+        preimage.extend(b":")
+        preimage.extend(value)
+        preimage.extend(b"\n")
+    return hashlib.sha256(preimage).hexdigest()
 
 
 def _lifecycle_fixture() -> list[dict[str, Any]]:
@@ -959,6 +1020,185 @@ class BenchQualificationPreflightCliTest(unittest.TestCase):
                     self.assertRegex(result.stderr.lower(), pattern)
                     self.assertNotIn(MISSING_MODEL.lower(), result.stderr.lower())
                     self.assertNotIn(MISSING_PROMPT.lower(), result.stderr.lower())
+
+
+class EvalCaseSchemaContractTest(unittest.TestCase):
+    """Validate the closed stable-ID result wire format independently."""
+
+    def test_closed_schema_and_literal_four_line_fixture(self) -> None:
+        schema = json.loads(EVAL_CASE_SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(schema["$id"], "ds4.eval.case/v1")
+        self.assertEqual(schema["type"], "object")
+        self.assertIs(schema["additionalProperties"], False)
+        self.assertEqual(tuple(schema["required"]), EVAL_CASE_KEYS)
+        self.assertEqual(tuple(schema["properties"]), EVAL_CASE_KEYS)
+        self.assertEqual(
+            schema["properties"]["case_id"]["enum"], list(EVAL_CASE_IDS)
+        )
+        self.assertEqual(
+            schema["properties"]["grade"]["enum"],
+            ["passed", "failed", "not_graded"],
+        )
+        self.assertEqual(
+            schema["properties"]["terminal_status"]["enum"],
+            ["completed", "cancelled", "rejected", "recoverable_error", "unsafe_error"],
+        )
+        self.assertIn("UTF-8", schema["$comment"])
+        self.assertIn("FIELD_NAME=DECIMAL_UTF8_BYTE_LENGTH:EXACT_UTF8_VALUE", schema["$comment"])
+        self.assertIn("final LF", schema["$comment"])
+
+        fixture = EVAL_CASE_FIXTURE_PATH.read_bytes()
+        lines = fixture.splitlines(keepends=True)
+        self.assertEqual(len(lines), 4)
+        self.assertTrue(all(line.endswith(b"\n") and not line.endswith(b"\r\n") for line in lines))
+        records = _case_fixture_records()
+        self.assertEqual([record["case_id"] for record in records], list(EVAL_CASE_IDS))
+        self.assertEqual(
+            [record["answer"] for record in records], ["B", "C", "70", "17-20"]
+        )
+        self.assertEqual({record["grade"] for record in records}, {"passed"})
+        self.assertEqual({record["terminal_status"] for record in records}, {"completed"})
+        self.assertEqual(
+            [record["instance_id"] for record in records], [EVAL_CASE_UUID] * 4
+        )
+        result = _run_case_validator(fixture, ("--fixture",))
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_fixture_hashes_match_independent_named_field_preimage(self) -> None:
+        records = _case_fixture_records()
+        first_preimage = (
+            b"ds4.eval.case.evidence/v1\n"
+            b"schema=16:ds4.eval.case/v1\n"
+            b"case_id=17:recNu3MXkvWUzHZr9\n"
+            b"answer=1:B\n"
+            b"grade=6:passed\n"
+            b"terminal_status=9:completed\n"
+            b"request_id=36:123e4567-e89b-12d3-a456-426614174001\n"
+            b"instance_id=36:123e4567-e89b-12d3-a456-426614174099\n"
+            b"snapshot_seq=4:1009\n"
+        )
+        self.assertEqual(
+            hashlib.sha256(first_preimage).hexdigest(), records[0]["evidence_sha256"]
+        )
+        for record in records:
+            self.assertEqual(_case_evidence_digest(record), record["evidence_sha256"])
+
+    def test_validator_rejects_line_shape_keys_and_duplicate_keys(self) -> None:
+        fixture = EVAL_CASE_FIXTURE_PATH.read_bytes()
+        records = _case_fixture_records()
+
+        def rejected(payload: bytes, label: str) -> None:
+            result = _run_case_validator(payload)
+            self.assertNotEqual(result.returncode, 0, label)
+
+        rejected(b"", "empty input")
+        rejected(b"\n", "blank line")
+        rejected(fixture[:-1], "truncated final LF")
+        rejected(b"\n".join(fixture.splitlines()), "missing final LF")
+        first_line = fixture.splitlines()[0]
+        duplicate = first_line.replace(
+            b'{"schema":"ds4.eval.case/v1"',
+            b'{"schema":"ds4.eval.case/v1","schema":"ds4.eval.case/v1"',
+            1,
+        )
+        rejected(duplicate + b"\n" + b"\n".join(fixture.splitlines()[1:]), "duplicate key")
+
+        extra = dict(records[0])
+        extra["extra"] = 1
+        rejected(_case_payload([extra] + records[1:]), "extra key")
+        missing = dict(records[0])
+        del missing["evidence_sha256"]
+        rejected(_case_payload([missing] + records[1:]), "missing key")
+        reordered = {key: records[0][key] for key in reversed(EVAL_CASE_KEYS)}
+        rejected(_case_payload([reordered] + records[1:]), "reordered keys")
+
+    def test_validator_rejects_types_enums_ids_sequence_and_digest_mutations(self) -> None:
+        fixture = EVAL_CASE_FIXTURE_PATH.read_bytes()
+        records = _case_fixture_records()
+
+        def rejected(mutator: Any, label: str) -> None:
+            candidate = json.loads(json.dumps(records))
+            mutator(candidate)
+            result = _run_case_validator(_case_payload(candidate))
+            self.assertNotEqual(result.returncode, 0, label)
+
+        rejected(lambda value: value[0].__setitem__("case_id", "unknown"), "unknown ID")
+        rejected(lambda value: value[0].__setitem__("case_id", 7), "case ID type")
+        rejected(lambda value: value[0].__setitem__("answer", None), "answer type")
+        rejected(lambda value: value[0].__setitem__("grade", "pending"), "grade enum")
+        rejected(lambda value: value[0].__setitem__("terminal_status", "running"), "terminal enum")
+        rejected(lambda value: value[0].__setitem__("request_id", "A23e4567-e89b-12d3-a456-426614174001"), "UUID case")
+        rejected(lambda value: value[0].__setitem__("request_id", "00000000-0000-0000-0000-000000000000"), "nil UUID")
+        rejected(lambda value: value[0].__setitem__("instance_id", []), "instance ID type")
+        rejected(lambda value: value[0].__setitem__("snapshot_seq", 1009), "snapshot type")
+        rejected(lambda value: value[0].__setitem__("snapshot_seq", "01009"), "leading-zero sequence")
+        rejected(lambda value: value[0].__setitem__("snapshot_seq", "0"), "zero sequence")
+        rejected(lambda value: value[0].__setitem__("evidence_sha256", "0" * 64), "zero digest")
+        rejected(lambda value: value[0].__setitem__("evidence_sha256", records[0]["evidence_sha256"].upper()), "uppercase digest")
+        rejected(lambda value: value[0].__setitem__("answer", "A"), "stale evidence digest")
+        reordered_records = [records[1], records[0], records[2], records[3]]
+        result = _run_case_validator(_case_payload(reordered_records))
+        self.assertNotEqual(result.returncode, 0, "reordered selection")
+        duplicate_records = json.loads(json.dumps(records))
+        duplicate_records[1]["case_id"] = duplicate_records[0]["case_id"]
+        result = _run_case_validator(_case_payload(duplicate_records))
+        self.assertNotEqual(result.returncode, 0, "duplicate selection")
+        nonfinite = fixture.replace(b'"answer":"B"', b'"answer":NaN', 1)
+        result = _run_case_validator(nonfinite)
+        self.assertNotEqual(result.returncode, 0, "nonfinite value")
+
+
+class EvalCaseSourceAndMakefileContractTest(unittest.TestCase):
+    """The production source/API boundary remains a deliberate RED."""
+
+    def test_makefile_wires_unavoidable_host_only_case_target(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        phony = next(line for line in makefile.splitlines() if line.startswith(".PHONY:"))
+        self.assertIn("test-eval-case-contract", phony.split())
+        self.assertRegex(
+            makefile,
+            r"(?m)^tests/test_eval_case_contract: tests/test_eval_case_contract\.o ds4_help\.o .*\$\(CPU_CORE_OBJS\) \$\(CPU_BUILD_INFO_OBJ\)$",
+        )
+        self.assertRegex(
+            makefile,
+            r"(?m)^test-eval-case-contract: tests/test_eval_case_contract\n\t\./tests/test_eval_case_contract$",
+        )
+        self.assertRegex(
+            makefile,
+            r"(?m)^test-bench-eval-contract: test-eval-case-contract\n\tpython3 tests/test_bench_eval_contract\.py -v$",
+        )
+        test_line = next(index for index, line in enumerate(makefile.splitlines()) if line.startswith("test:"))
+        aggregate = makefile.splitlines()[test_line]
+        while aggregate.rstrip().endswith("\\"):
+            test_line += 1
+            aggregate += " " + makefile.splitlines()[test_line].strip()
+        self.assertIn("test-bench-eval-contract", aggregate.split())
+        clean = next(line for line in makefile.splitlines() if line.startswith("\trm -f "))
+        self.assertIn("tests/test_eval_case_contract", clean)
+        self.assertIn("tests/test_eval_case_contract.o", clean)
+
+    def test_eval_source_declares_stable_case_mode_and_attributed_lifecycle(self) -> None:
+        source = _c_code_view(EVAL_SOURCE)
+        self.assertTrue(
+            '"--case-id"' in source,
+            "stable --case-id parser is not present (intentional Task 19 RED)",
+        )
+        for marker in (
+            "case_id",
+            "ds4_session_sync_attributed(",
+            "ds4_session_eval_attributed(",
+            "ds4_runtime_request_add_generated_tokens(",
+            "ds4_runtime_request_record_visible_decoded(",
+            "ds4_runtime_request_mark_first_visible_emitted(",
+            "ds4_session_request_barrier(",
+            "ds4_runtime_request_finish(",
+            "evidence_sha256",
+        ):
+            self.assertIn(marker, source)
+        self.assertIn("recNu3MXkvWUzHZr9", source)
+        self.assertIn("001b51d76b4d422988f2c11f104a2c6c", source)
+        self.assertIn("aime2025-01", source)
+        self.assertIn("compsec-076", source)
 
 
 class BenchQualificationAuthenticatedSequenceSourceContractTest(unittest.TestCase):

@@ -36704,12 +36704,11 @@ laguna_attention_decode_gqa_f16_kernel(
     }
 }
 
-/* Poolside keeps Laguna SWA K/V in a padded 1024-slot cache and launches
- * four 128-thread vector partitions. DS4 keeps only the active 512 rows;
- * Poolside slot s maps to DS4 ring row s & 511. The modular-distance mask
- * preserves Poolside's physical reduction order without extending cache state.
- * Full-window admission guarantees every aliased DS4 row has been initialized,
- * including rows whose Poolside physical slots are masked. */
+/* Poolside launches four 128-thread vector partitions over the padded
+ * physical attention view. DS4 keeps only the active 512 rows; Poolside
+ * absolute row s maps to DS4 ring row s & 511. Full-window admission
+ * guarantees every aliased DS4 row has been initialized, including rows whose
+ * Poolside physical positions are masked. */
 __global__ __launch_bounds__(512, 1) static void
 laguna_attention_decode_gqa_swa_f16_kernel(
         float *heads, const float *q, const __half *key_cache,
@@ -36766,10 +36765,9 @@ laguna_attention_decode_gqa_swa_f16_kernel(
             const uint32_t row_in_tile =
                 warp * 32u + (lane & ~7u) + row_in_group;
             const uint64_t poolside_row = tile0 + row_in_tile;
-            const uint32_t poolside_slot_start = key_start & 1023u;
-            const uint32_t slot_distance =
-                ((uint32_t)poolside_row - poolside_slot_start) & 1023u;
-            const bool score_row_valid = slot_distance < key_count;
+            const bool score_row_valid =
+                poolside_row >= (uint64_t)key_start &&
+                poolside_row < (uint64_t)key_start + key_count;
             const uint64_t cache_row = poolside_row & 511u;
             const uint64_t base = cache_row * kv_width +
                 (uint64_t)kv_head * head_dim;
@@ -36976,9 +36974,8 @@ extern "C" int ds4_gpu_laguna_store_attention_tensor(
                 cache_cap == 512u && key_count == cache_cap;
             const uint64_t physical_rows =
                 ((uint64_t)key_count + 255u) & ~(uint64_t)255u;
-            uint64_t swa_physical_rows =
+            const uint64_t swa_physical_rows =
                 ((uint64_t)pos + 1u + 255u) & ~(uint64_t)255u;
-            if (swa_physical_rows > 1024u) swa_physical_rows = 1024u;
             const bool vector_cache_contiguous =
                 physical_rows >= 384u &&
                 (uint64_t)key_start + physical_rows <= cache_cap;

@@ -152,7 +152,9 @@ static bool read_sequence_file(const char *path,
     }
 
     size_t offset = 0;
+#ifdef DS4_BENCH_SEQUENCE_TEST_HOOKS
     bool first_read_hook_ran = false;
+#endif
     while (offset < expected_size) {
         size_t chunk = expected_size - offset;
         if (chunk > DS4_BENCH_SEQUENCE_READ_CHUNK) {

@@ -1134,6 +1134,29 @@ class EvalCaseSchemaContractTest(unittest.TestCase):
         for record in records:
             self.assertEqual(_case_evidence_digest(record), record["evidence_sha256"])
 
+    def test_validator_uses_audited_compsec_line_set_for_grade(self) -> None:
+        records = _case_fixture_records()
+
+        def recomputed_payload(answer: str, grade: str) -> bytes:
+            candidate = json.loads(json.dumps(records))
+            candidate[3]["answer"] = answer
+            candidate[3]["grade"] = grade
+            for record in candidate:
+                record["evidence_sha256"] = _case_evidence_digest(record)
+            return _case_payload(candidate)
+
+        for answer, grade, should_accept in (
+            ("20", "passed", True),
+            ("21", "failed", True),
+            ("20", "failed", False),
+        ):
+            with self.subTest(answer=answer, grade=grade):
+                result = _run_case_validator(recomputed_payload(answer, grade))
+                if should_accept:
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout.decode())
+
     def test_validator_rejects_line_shape_keys_and_duplicate_keys(self) -> None:
         fixture = EVAL_CASE_FIXTURE_PATH.read_bytes()
         records = _case_fixture_records()

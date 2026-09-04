@@ -3859,6 +3859,25 @@ def _smoke_eval_digest(record: dict[str, object]) -> str:
     return hashlib.sha256(preimage).hexdigest()
 
 
+def _smoke_eval_line_set(spec: str) -> set[int]:
+    """Mirror the audited COMPSEC line-set matcher without calling TOOL."""
+    lines: set[int] = set()
+    for token in re.findall(r"[0-9]+(?:-[0-9]*)?", spec):
+        bounds = token.split("-")
+        lower = int(bounds[0])
+        upper = lower if len(bounds) == 1 else int(bounds[1] or 0)
+        lower, upper = sorted((lower, upper))
+        lines.update(range(max(lower, 0), min(upper, 255) + 1))
+    return lines
+
+
+def _smoke_eval_answer_matches(expected: str, answer: str) -> bool:
+    if expected != "17-20":
+        return answer == expected
+    answer_lines = _smoke_eval_line_set(answer)
+    return bool(answer_lines) and answer_lines <= _smoke_eval_line_set(expected)
+
+
 def _smoke_eval_records(raw: bytes) -> list[dict[str, object]]:
     """Independent strict oracle for literal child bytes; never calls TOOL."""
     lines = raw.splitlines(keepends=True)
@@ -3901,7 +3920,9 @@ def _smoke_eval_records(raw: bytes) -> list[dict[str, object]]:
         if value["evidence_sha256"] != _smoke_eval_digest(value):
             raise ValueError("evidence digest is stale")
         expected = SMOKE_EVAL_EXPECTED_ANSWERS[SMOKE_EVAL_IDS.index(value["case_id"])]
-        if value["grade"] != ("passed" if value["answer"] == expected else "failed"):
+        if value["grade"] != (
+            "passed" if _smoke_eval_answer_matches(expected, value["answer"]) else "failed"
+        ):
             raise ValueError("fixture answer/grade relation is invalid")
         records.append(value)
     if tuple(record["case_id"] for record in records) != SMOKE_EVAL_IDS:
@@ -4014,6 +4035,45 @@ class CompactRuntimeSmokeEvalContractTest(unittest.TestCase):
                 child = subprocess.run([str(fixture["fake"]), *args], env=fixture["env"], capture_output=True, check=False, timeout=10)
                 self.assertEqual(child.returncode, 0, child.stderr.decode())
                 self.assertEqual(child.stdout, expected)
+
+    def test_smoke_eval_compsec_range_evidence_uses_audited_set_matching(self) -> None:
+        accepted = _smoke_eval_rewrite_record(
+            SMOKE_EVAL_RESIDENT, 3, answer="20", grade="passed"
+        )
+        accepted_records = _smoke_eval_records(accepted)
+        self.assertEqual(
+            (accepted_records[3]["answer"], accepted_records[3]["grade"]),
+            ("20", "passed"),
+        )
+        self.assertEqual(
+            accepted_records[3]["evidence_sha256"],
+            "d583a02a08b78a64a17222e6ee88444d369a889356d9d0fc6fea0f16c3f2b45a",
+        )
+        self.assertEqual(
+            hashlib.sha256(accepted).hexdigest(),
+            "58aed37ae8a1fa4485be50e90f0f2866f4f73cec8500d4eaf065125389c893ca",
+        )
+
+        outside = _smoke_eval_rewrite_record(
+            SMOKE_EVAL_RESIDENT, 3, answer="21", grade="failed"
+        )
+        self.assertEqual(_smoke_eval_records(outside)[3]["grade"], "failed")
+
+        wrong_grade = _smoke_eval_rewrite_record(
+            SMOKE_EVAL_RESIDENT, 3, answer="20", grade="failed"
+        )
+        with self.assertRaisesRegex(ValueError, "answer/grade relation"):
+            _smoke_eval_records(wrong_grade)
+
+        # RED until the production qualifier uses the same audited COMPSEC set.
+        try:
+            qualified = TOOL.validate_smoke_eval_evidence(accepted)
+        except ValueError as exc:
+            self.fail(f"validate_smoke_eval_evidence rejected range evidence: {exc}")
+        self.assertEqual(
+            qualified.vectors[3],
+            ("20", "passed", "completed"),
+        )
 
     def test_smoke_eval_runs_resident_then_streamed_with_exact_argv_and_summary(self) -> None:
         with self._fake_environment() as fixture:

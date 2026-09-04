@@ -433,7 +433,7 @@ test-bench-qualification-emitter: tests/test_bench_qualification_emitter
 	./tests/test_bench_qualification_emitter >"$$tmp" && \
 	python3 tests/validate_bench_qualification_json.py <"$$tmp"
 
-# Model-free Task 19 lifecycle RED target.  The harness includes ds4_bench.c
+# Model-free Task 19 lifecycle green target.  The harness includes ds4_bench.c
 # with main renamed and supplies only lifecycle-facing fake operations; all
 # ordinary benchmark symbols come from the host CPU objects.
 tests/test_bench_qualification_lifecycle.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4.h ds4_runtime.h
@@ -445,10 +445,10 @@ tests/test_bench_qualification_lifecycle: tests/test_bench_qualification_lifecyc
 test-bench-qualification-lifecycle: tests/test_bench_qualification_lifecycle
 	./tests/test_bench_qualification_lifecycle
 
-# Model-free composition RED target.  Rebuild the same renamed-main fake
+# Model-free composition green target.  Rebuild the same renamed-main fake
 # backend with the structural observer chained to the linked production
-# qualification emitter.  The current fake runtime snapshots intentionally
-# stop at the emitter's validation boundary.
+# qualification emitter.  Literal fake runtime snapshots satisfy the
+# emitter's validation boundary.
 tests/test_bench_qualification_composition.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_BENCH_LIFECYCLE_REAL_EMITTER -Wno-unused-function -I. -c -o $@ $<
 

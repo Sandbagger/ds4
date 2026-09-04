@@ -1,5 +1,5 @@
 /*
- * Host-only RED test for the Task 19 benchmark qualification lifecycle.
+ * Host-only test for the Task 19 benchmark qualification lifecycle.
  *
  * This harness includes the real ds4-bench translation unit with its CLI main
  * renamed.  The authenticated sequence parser, engine/session operations,
@@ -389,8 +389,30 @@ static bool fake_engine_runtime_snapshot(
     memset(out, 0, sizeof(*out));
     snprintf(out->instance_id, sizeof(out->instance_id), "%s",
              literal_instance_id);
-    out->snapshot_seq = UINT64_C(100) + (uint64_t)state.snapshot_count;
+    /* Finalization consumes the intervening publication sequence before the
+     * completion snapshot, matching the independent JSONL lifecycle oracle. */
+    out->snapshot_seq = UINT64_C(99) + (uint64_t)state.snapshot_count +
+        (uint64_t)(state.snapshot_count / 3);
     out->state = DS4_RUNTIME_WIRE_STATE_READY;
+
+    /* Keep this an independent literal snapshot rather than borrowing the
+     * production snapshot serializer or the standalone emitter fixture. */
+    memcpy(out->build.revision,
+           "1111111111111111111111111111111111111111", sizeof(out->build.revision));
+    out->build.dirty = false;
+    memcpy(out->build.backend, "cuda", sizeof("cuda"));
+    memcpy(out->build.features[0], "laguna", sizeof("laguna"));
+    memcpy(out->build.features[1], "ssd_streaming", sizeof("ssd_streaming"));
+    out->build.feature_count = 2u;
+    out->executable = (ds4_runtime_file_identity){
+        .device = 1u, .inode = 2u, .size_bytes = 3u, .mtime_ns = 4u,
+    };
+    out->model = (ds4_runtime_file_identity){
+        .device = 5u, .inode = 6u, .size_bytes = 7u, .mtime_ns = 8u,
+    };
+    memcpy(out->model_id, "laguna-s-2.1", sizeof("laguna-s-2.1"));
+    memcpy(out->model_family, "laguna", sizeof("laguna"));
+
     out->configured_context_tokens = 32768u;
     out->configured_prefill_chunk_tokens = 4096u;
     out->configured_session_slots = 1u;
@@ -400,6 +422,71 @@ static bool fake_engine_runtime_snapshot(
     out->effective_prefill_chunk_tokens = 4096u;
     out->effective_session_slots = 1u;
     out->expert_cache_limit_bytes = literal_cache_bytes;
+    out->configured_prefill_rows = 4096u;
+    out->allocated_prefill_rows = 4096u;
+
+    /* Every measurement is finite and ordered current <= peak <= bound. */
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 256u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 512u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 4096u;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = 1000u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = 2000u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = literal_cache_bytes;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 128u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 256u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 4096u;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_KV_STATE] = 512u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_KV_STATE] = 1024u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_KV_STATE] = 4096u;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] = 128u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] = 256u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] = 4096u;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_PINNED_STAGING] = 64u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_PINNED_STAGING] = 128u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_PINNED_STAGING] = 4096u;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 32u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 64u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_HOST] = 4096u;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 32u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 64u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 4096u;
+    out->allocations.owned_total_current = 2152u;
+    out->allocations.owned_total_peak = 4304u;
+    out->allocations.owned_total_bound_bytes = UINT64_C(8589963264);
+
+    out->allocations.report_current[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] = 4096u;
+    out->allocations.report_peak[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] = 8192u;
+    out->allocations.report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] = 16384u;
+    out->allocations.report_current[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 4096u;
+    out->allocations.report_peak[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 8192u;
+    out->allocations.report_bounds[DS4_RUNTIME_REPORT_MODEL_MAPPING_REGISTERED] = 16384u;
+    out->allocations.report_current[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 5000u;
+    out->allocations.report_peak[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 6000u;
+    out->allocations.report_bounds[DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] = 8192u;
+    out->allocations.report_current[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = 100u;
+    out->allocations.report_peak[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = 200u;
+    out->allocations.report_bounds[DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] = 4096u;
+    out->allocations.report_current[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 200u;
+    out->allocations.report_peak[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 400u;
+    out->allocations.report_bounds[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 4096u;
+    out->allocations.qualification_total_current = 7452u;
+    out->allocations.qualification_total_peak = 10904u;
+    out->allocations.qualification_total_bound_bytes = UINT64_C(8589979648);
+    out->allocations.external_sample.host_library_unattributed_bytes = 100u;
+    out->allocations.external_sample.cuda_library_unattributed_bytes = 200u;
+    out->allocations.external_sample.unrelated_process_inventory_stable = true;
+
+    out->counters.cache_acquire_hits = 1u;
+    out->counters.cache_acquire_misses = 2u;
+    out->counters.cache_evictions = 3u;
+    out->counters.model_file_read_operations = 4u;
+    out->counters.model_file_read_bytes = 5u;
+    out->counters.model_file_read_ns = 6u;
+    out->counters.host_to_device_bytes = 7u;
+    out->counters.host_to_device_ns = 8u;
+    out->counters.page_advice_attempts = 9u;
+    out->counters.page_advice_bytes = 10u;
+    out->counters.page_advice_failures = 11u;
     return true;
 }
 
@@ -809,7 +896,8 @@ static bool fake_request_finish(
              request->instance_id);
     metrics->prompt_tokens = literal_prompt_tokens;
     metrics->generated_tokens = 1u;
-    metrics->snapshot_seq = UINT64_C(100) + (uint64_t)state.snapshot_count;
+    metrics->snapshot_seq = UINT64_C(99) + (uint64_t)state.snapshot_count +
+        (uint64_t)(state.snapshot_count / 3) + 1u;
     metrics->terminal_status = status;
     request->terminal = true;
     return true;
@@ -856,7 +944,8 @@ static bool fake_emit_record(
         !record->runtime_snapshot ||
         strcmp(record->runtime_snapshot->instance_id, literal_instance_id) != 0 ||
         record->runtime_snapshot->snapshot_seq !=
-            UINT64_C(100) + (uint64_t)state.emit_count) {
+            UINT64_C(99) + (uint64_t)state.emit_count +
+                (uint64_t)(state.emit_count / 3)) {
         fail_contract("emitter did not receive the exact ordered lifecycle record");
     }
     if (record && record->monotonic_ns > state.last_emitted_monotonic_ns) {
@@ -892,8 +981,8 @@ static bool fake_emit_record(
 /* Compose the existing structural observer with the linked production emitter.
  * The runner's exact record, stream, and error arguments pass through without
  * reconstruction.  Keeping the observer first preserves pointer/order/
- * lifetime checks while the intentionally partial fake snapshots remain a
- * deliberate RED at the real emitter boundary. */
+ * lifetime checks while the literal fake snapshots satisfy the production
+ * emitter ABI at the real emitter boundary. */
 static bool lifecycle_real_emit_record(
         FILE *stream,
         const ds4_bench_qualification_record *record,

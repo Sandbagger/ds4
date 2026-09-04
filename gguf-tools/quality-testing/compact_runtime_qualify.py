@@ -21,6 +21,7 @@ import os
 import platform
 import re
 import select
+import signal
 import socket
 import stat
 import struct
@@ -97,6 +98,8 @@ SMOKE_EVAL_TERMINAL_STATUSES = (
 SMOKE_EVAL_STREAMED_CACHE_BYTES = 8 << 30
 SMOKE_EVAL_TIMEOUT_SECONDS = 2700
 SMOKE_EVAL_MAX_STDOUT_BYTES = 4096
+SMOKE_EVAL_MAX_STDERR_BYTES = 65536
+SMOKE_EVAL_TERMINATION_GRACE_SECONDS = 1.0
 SMOKE_EVAL_UUID_RE = re.compile(
     r"^(?!00000000-0000-0000-0000-000000000000$)"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -3940,49 +3943,296 @@ def _smoke_eval_child_argv(
 
 
 def _run_smoke_eval_child(command: Sequence[str], mode: str) -> bytes:
-    """Run one child with bounded file-backed stdout and separately captured stderr."""
-    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
-        mode="w+b"
-    ) as stderr_file:
+    """Run one child while draining both output pipes within fixed bounds."""
+    buffers = {
+        "stdout": bytearray(),
+        "stderr": bytearray(),
+    }
+    limits = {
+        "stdout": SMOKE_EVAL_MAX_STDOUT_BYTES,
+        "stderr": SMOKE_EVAL_MAX_STDERR_BYTES,
+    }
+    child: subprocess.Popen[bytes] | None = None
+    streams: dict[int, tuple[str, Any]] = {}
+    stable_error: ValueError | None = None
+    needs_cleanup = True
+    status: int | None = None
+
+    def close_stream(fd: int) -> None:
+        entry = streams.pop(fd, None)
+        if entry is None:
+            return
+        try:
+            entry[1].close()
+        except (OSError, ValueError):
+            pass
+
+    def stream_error(stream: str) -> ValueError:
+        return ValueError(f"{mode} {stream} could not be read")
+
+    def drain_stream(fd: int) -> ValueError | None:
+        entry = streams.get(fd)
+        if entry is None:
+            return None
+        stream, _ = entry
+        limit = limits[stream]
+        room = limit + 1 - len(buffers[stream])
+        if room <= 0:
+            return ValueError(f"{mode} {stream} exceeds {limit}-byte limit")
+        try:
+            chunk = os.read(fd, room)
+        except InterruptedError:
+            return None
+        except BlockingIOError:
+            return None
+        except OSError as exc:
+            if exc.errno in (errno.EBADF, errno.EPIPE):
+                close_stream(fd)
+                return None
+            raise stream_error(stream) from exc
+        if not chunk:
+            close_stream(fd)
+            return None
+        # os.read honors the requested size.  Keep the slice as a defensive
+        # bound for unusual descriptor wrappers used by embedders and tests.
+        buffers[stream].extend(chunk[:room])
+        if len(buffers[stream]) > limit:
+            return ValueError(f"{mode} {stream} exceeds {limit}-byte limit")
+        return None
+
+    def group_exists(pgid: int) -> bool:
+        if pgid <= 0:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            if exc.errno in (errno.ESRCH, errno.EBADF):
+                return False
+            # Permission and other races are handled conservatively.  This
+            # helper is used only to decide whether a final SIGKILL is needed.
+            return True
+        return True
+
+    def signal_group(pgid: int, signal_number: int) -> None:
+        if pgid <= 0:
+            return
+        try:
+            own_pgid = os.getpgrp()
+        except OSError:
+            own_pgid = -1
+        if pgid == own_pgid:
+            return
+        for _ in range(2):
+            try:
+                os.killpg(pgid, signal_number)
+                return
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                # ESRCH, EBADF, and ProcessLookupError are normal exit races;
+                # all other cleanup errors must not replace the stable reason.
+                return
+
+    def reap_direct(until: float) -> None:
+        if child is None:
+            return
+        while True:
+            try:
+                if child.poll() is not None:
+                    return
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                return
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                child.wait(timeout=min(remaining, 0.05))
+                return
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                return
+
+    def terminate_child_group() -> None:
+        if child is None:
+            return
+        if os.name == "posix" and hasattr(os, "killpg"):
+            signal_group(child.pid, signal.SIGTERM)
+            try:
+                grace = max(0.0, float(SMOKE_EVAL_TERMINATION_GRACE_SECONDS))
+            except (TypeError, ValueError):
+                grace = 0.0
+            grace_deadline = time.monotonic() + grace
+            while time.monotonic() < grace_deadline:
+                reap_direct(time.monotonic() + 0.05)
+                if not group_exists(child.pid):
+                    break
+                remaining = grace_deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(0.05, remaining))
+            if group_exists(child.pid):
+                signal_group(child.pid, signal.SIGKILL)
+                reap_direct(time.monotonic() + max(0.1, grace))
+            else:
+                reap_direct(time.monotonic() + 0.05)
+            return
+
+        # A non-POSIX fallback cannot address descendants as a group.  It
+        # still bounds direct-child cleanup and never lets a race mask the
+        # original invocation, output, or timeout error.
+        try:
+            child.terminate()
+        except OSError:
+            pass
+        try:
+            grace = max(0.0, float(SMOKE_EVAL_TERMINATION_GRACE_SECONDS))
+        except (TypeError, ValueError):
+            grace = 0.0
+        reap_direct(time.monotonic() + grace)
+        try:
+            if child.poll() is None:
+                child.kill()
+        except OSError:
+            pass
+        reap_direct(time.monotonic() + max(0.1, grace))
+
+    try:
         try:
             child = subprocess.Popen(
                 list(command),
                 stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 shell=False,
                 start_new_session=True,
             )
         except OSError as exc:
             raise ValueError(f"{mode} eval invocation failed: {exc}") from exc
 
+        if child.stdout is None or child.stderr is None:
+            stable_error = ValueError(f"{mode} eval output could not be read")
+            raise stable_error
         try:
-            status = child.wait(timeout=SMOKE_EVAL_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired as exc:
-            try:
-                child.kill()
-            except OSError:
-                pass
-            try:
-                child.wait()
-            except OSError:
-                pass
-            raise ValueError(
-                f"{mode} eval timed out after {SMOKE_EVAL_TIMEOUT_SECONDS} seconds"
-            ) from exc
-        if status != 0:
-            raise ValueError(f"{mode} eval exited with status {status}")
+            stdout_fd = child.stdout.fileno()
+            stderr_fd = child.stderr.fileno()
+            if os.name == "posix":
+                os.set_blocking(stdout_fd, False)
+                os.set_blocking(stderr_fd, False)
+        except (OSError, ValueError) as exc:
+            stable_error = ValueError(f"{mode} eval output could not be read")
+            raise stable_error from exc
 
-        try:
-            stdout_file.seek(0)
-            raw = stdout_file.read(SMOKE_EVAL_MAX_STDOUT_BYTES + 1)
-        except OSError as exc:
-            raise ValueError(f"{mode} stdout could not be read") from exc
-        if len(raw) > SMOKE_EVAL_MAX_STDOUT_BYTES:
-            raise ValueError(
-                f"{mode} stdout exceeds {SMOKE_EVAL_MAX_STDOUT_BYTES}-byte limit"
-            )
-        return raw
+        streams[stdout_fd] = ("stdout", child.stdout)
+        streams[stderr_fd] = ("stderr", child.stderr)
+        deadline = time.monotonic() + SMOKE_EVAL_TIMEOUT_SECONDS
+
+        while stable_error is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stable_error = ValueError(
+                    f"{mode} eval timed out after {SMOKE_EVAL_TIMEOUT_SECONDS} seconds"
+                )
+                break
+
+            try:
+                status = child.poll()
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                stable_error = ValueError(f"{mode} eval output could not be read")
+                break
+
+            if streams:
+                try:
+                    ready, _, _ = select.select(
+                        list(streams), [], [], min(remaining, 0.1)
+                    )
+                except InterruptedError:
+                    continue
+                except (OSError, ValueError) as exc:
+                    if isinstance(exc, OSError) and exc.errno == errno.EINTR:
+                        continue
+                    if isinstance(exc, OSError) and exc.errno == errno.EBADF:
+                        removed = False
+                        for fd in tuple(streams):
+                            try:
+                                os.fstat(fd)
+                            except OSError as check:
+                                if check.errno == errno.EBADF:
+                                    close_stream(fd)
+                                    removed = True
+                        if removed:
+                            continue
+                        stable_error = ValueError(
+                            f"{mode} eval output could not be read"
+                        )
+                        break
+                    stable_error = ValueError(f"{mode} eval output could not be read")
+                    break
+
+                for fd in ready:
+                    try:
+                        stable_error = drain_stream(fd)
+                    except ValueError as exc:
+                        stable_error = exc
+                    if stable_error is not None:
+                        break
+            else:
+                # With no parent endpoints left, use a short bounded sleep to
+                # observe the direct child without spinning.
+                try:
+                    select.select([], [], [], min(remaining, 0.05))
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    stable_error = ValueError(f"{mode} eval output could not be read")
+                    break
+
+            if stable_error is not None:
+                break
+
+            try:
+                status = child.poll()
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                stable_error = ValueError(f"{mode} eval output could not be read")
+                break
+
+            if status is not None and status != 0:
+                stable_error = ValueError(f"{mode} eval exited with status {status}")
+                # If descendants retain an endpoint, terminate their group as
+                # well rather than waiting for them to close it indefinitely.
+                break
+            if status == 0 and not streams:
+                needs_cleanup = False
+                return bytes(buffers["stdout"])
+
+        if stable_error is None:
+            stable_error = ValueError(f"{mode} eval output could not be read")
+        raise stable_error
+    finally:
+        if child is not None and needs_cleanup:
+            try:
+                terminate_child_group()
+            except BaseException:
+                # Cleanup races must never mask the stable operation error.
+                pass
+        for stream in (getattr(child, "stdin", None), getattr(child, "stdout", None), getattr(child, "stderr", None)):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        streams.clear()
 
 
 def compare_smoke_eval_vectors(

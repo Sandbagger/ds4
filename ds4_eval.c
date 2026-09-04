@@ -31,6 +31,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -44,6 +45,7 @@
 #include <strings.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -1786,6 +1788,16 @@ static eval_config parse_options(int argc, char **argv) {
             }
         }
         c.case_id_mode = true;
+    }
+    if (c.case_id_mode && c.self_test_extractors) {
+        fprintf(stderr,
+                "ds4-eval: --case-id cannot be combined with --self-test-extractors\n");
+        exit(2);
+    }
+    if (c.case_id_mode && c.regrade_trace_path) {
+        fprintf(stderr,
+                "ds4-eval: --case-id cannot be combined with --regrade-trace\n");
+        exit(2);
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
 
@@ -4638,6 +4650,58 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+static FILE *eval_open_machine_trace(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) {
+        fprintf(stderr, "ds4-eval: cannot open trace '%s': %s\n",
+                path, strerror(errno));
+        return NULL;
+    }
+
+    struct stat trace_stat;
+    if (fstat(fd, &trace_stat) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        fprintf(stderr, "ds4-eval: cannot stat trace '%s': %s\n",
+                path, strerror(saved_errno));
+        return NULL;
+    }
+
+    struct stat stdout_stat;
+    if (fstat(STDOUT_FILENO, &stdout_stat) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        fprintf(stderr, "ds4-eval: cannot stat stdout for trace '%s': %s\n",
+                path, strerror(saved_errno));
+        return NULL;
+    }
+
+    if (trace_stat.st_dev == stdout_stat.st_dev &&
+        trace_stat.st_ino == stdout_stat.st_ino) {
+        close(fd);
+        fprintf(stderr, "ds4-eval: trace '%s' aliases stdout\n", path);
+        return NULL;
+    }
+
+    if (S_ISREG(trace_stat.st_mode) && ftruncate(fd, 0) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        fprintf(stderr, "ds4-eval: cannot truncate trace '%s': %s\n",
+                path, strerror(saved_errno));
+        return NULL;
+    }
+
+    FILE *trace = fdopen(fd, "w");
+    if (!trace) {
+        const int saved_errno = errno;
+        close(fd);
+        fprintf(stderr, "ds4-eval: cannot create trace stream '%s': %s\n",
+                path, strerror(saved_errno));
+        return NULL;
+    }
+    return trace;
+}
+
 int main(int argc, char **argv) {
     int version_handled = 0;
     const int version_rc = ds4_build_info_maybe_print_version(
@@ -4732,10 +4796,16 @@ int main(int argc, char **argv) {
 
     FILE *trace = NULL;
     if (cfg.trace_path) {
-        trace = fopen(cfg.trace_path, "w");
+        if (cfg.case_id_mode) {
+            trace = eval_open_machine_trace(cfg.trace_path);
+        } else {
+            trace = fopen(cfg.trace_path, "w");
+            if (!trace) {
+                fprintf(stderr, "ds4-eval: cannot open trace '%s': %s\n",
+                        cfg.trace_path, strerror(errno));
+            }
+        }
         if (!trace) {
-            fprintf(stderr, "ds4-eval: cannot open trace '%s': %s\n",
-                    cfg.trace_path, strerror(errno));
             free(case_sequence);
             return 2;
         }

@@ -241,7 +241,7 @@ ds4_server.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds
 ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
-ds4_eval.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h
+ds4_eval.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_plan_io.h ds4_runtime.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
 ds4_agent.o: ds4_agent.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
@@ -283,7 +283,7 @@ ds4_server_cpu.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.
 ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
-ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h
+ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_plan_io.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h

@@ -18,6 +18,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -3776,6 +3777,305 @@ class QualificationControlParentContractTest(unittest.TestCase):
                 child.close()
                 os.close(descriptor)
 
+
+# Task 19 RED: model-free resident/streamed eval evidence.  The records are
+# literal bytes (the first fixture mirrors tests/fixtures/ds4-eval-case-v1.jsonl).
+SMOKE_EVAL_KEYS = (
+    "schema", "case_id", "answer", "grade", "terminal_status",
+    "request_id", "instance_id", "snapshot_seq", "evidence_sha256",
+)
+SMOKE_EVAL_IDS = (
+    "recNu3MXkvWUzHZr9", "001b51d76b4d422988f2c11f104a2c6c",
+    "aime2025-01", "compsec-076",
+)
+SMOKE_EVAL_EXPECTED_ANSWERS = ("B", "C", "70", "17-20")
+SMOKE_EVAL_MAX_STDOUT_BYTES = 4096
+SMOKE_EVAL_RESIDENT = (
+    b'{"schema":"ds4.eval.case/v1","case_id":"recNu3MXkvWUzHZr9","answer":"B","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174001","instance_id":"123e4567-e89b-12d3-a456-426614174099","snapshot_seq":"1009","evidence_sha256":"efc5cc823d2c62525f7f2dce7ed0e89ed2a4831096d2774b9356659ffd62bb7f"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"001b51d76b4d422988f2c11f104a2c6c","answer":"wrong","grade":"failed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174002","instance_id":"123e4567-e89b-12d3-a456-426614174099","snapshot_seq":"2027","evidence_sha256":"5796c633738a636a7fe4d453f6a31056196b34e7200ee9bace1014a64059a7b8"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"aime2025-01","answer":"70","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174003","instance_id":"123e4567-e89b-12d3-a456-426614174099","snapshot_seq":"4093","evidence_sha256":"4fc1d1f128b9b74a9bd29c0ad5784cc0e60c59bd0759eed70cd56b54ec194c44"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"compsec-076","answer":"17-20","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174004","instance_id":"123e4567-e89b-12d3-a456-426614174099","snapshot_seq":"8191","evidence_sha256":"39ffdab240cb634f3c83238c81c98745163820f6ae9d2786f1042e6515d6adb6"}\n'
+)
+SMOKE_EVAL_STREAMED = (
+    b'{"schema":"ds4.eval.case/v1","case_id":"recNu3MXkvWUzHZr9","answer":"B","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174101","instance_id":"123e4567-e89b-12d3-a456-426614174199","snapshot_seq":"1109","evidence_sha256":"387e93f1f05e9498b11d62a24b5ba8b5073eb9ae7f6b1902ed8fef593a44f503"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"001b51d76b4d422988f2c11f104a2c6c","answer":"wrong","grade":"failed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174102","instance_id":"123e4567-e89b-12d3-a456-426614174199","snapshot_seq":"2127","evidence_sha256":"c75ddc469f635db5e4561c799f2c40311689dd20a197d349913669991908f71f"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"aime2025-01","answer":"70","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174103","instance_id":"123e4567-e89b-12d3-a456-426614174199","snapshot_seq":"4193","evidence_sha256":"9dc29caeb6e461a92e71142111eae3c5ff87e585d403f64bc9d8521be8871b9c"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"compsec-076","answer":"17-20","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174104","instance_id":"123e4567-e89b-12d3-a456-426614174199","snapshot_seq":"8291","evidence_sha256":"9d73456e9703cfc655299eea33a2280d6144b6e5af1022accbb60dc953108909"}\n'
+)
+SMOKE_EVAL_MISMATCH = (
+    b'{"schema":"ds4.eval.case/v1","case_id":"recNu3MXkvWUzHZr9","answer":"B","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174201","instance_id":"123e4567-e89b-12d3-a456-426614174299","snapshot_seq":"1209","evidence_sha256":"5ff8e1682986136670163cd18b8899e5aaef7fd671046074c3275da4bb13b580"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"001b51d76b4d422988f2c11f104a2c6c","answer":"C","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174202","instance_id":"123e4567-e89b-12d3-a456-426614174299","snapshot_seq":"2227","evidence_sha256":"fc60c3d902925d414493ce3621ff6cc3328f70c6a325226e04a6fae090f71358"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"aime2025-01","answer":"70","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174203","instance_id":"123e4567-e89b-12d3-a456-426614174299","snapshot_seq":"4293","evidence_sha256":"979020c5c9b48119bdbaf3b672d680addba766295f6065d549a214399a38b558"}\n'
+    b'{"schema":"ds4.eval.case/v1","case_id":"compsec-076","answer":"17-20","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174204","instance_id":"123e4567-e89b-12d3-a456-426614174299","snapshot_seq":"8391","evidence_sha256":"6b880ee632851f429995187e988173898b645d6ad197816fa2144ef10e643203"}\n'
+)
+SMOKE_EVAL_FAKE_SOURCE = r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+mode = "streamed" if "--ssd-streaming" in args else "resident"
+with Path(os.environ["SMOKE_EVAL_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"mode": mode, "argv": args}, separators=(",", ":")) + "\n")
+output = Path(os.environ[f"SMOKE_EVAL_{mode.upper()}_OUTPUT"]).read_bytes()
+sys.stdout.buffer.write(output)
+sys.stdout.buffer.flush()
+if os.environ.get("SMOKE_EVAL_EXIT_MODE") == mode:
+    sys.stderr.write("deliberate fake eval failure\n")
+    raise SystemExit(int(os.environ.get("SMOKE_EVAL_EXIT_CODE", "7")))
+'''
+
+_SMOKE_EVAL_UUID_RE = re.compile(
+    r"^(?!00000000-0000-0000-0000-000000000000$)"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_SMOKE_EVAL_SHA256_RE = re.compile(r"^(?!0{64}$)[0-9a-f]{64}$")
+_SMOKE_EVAL_UINT64_RE = re.compile(r"^[1-9][0-9]*$")
+
+
+def _smoke_eval_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    record: dict[str, object] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        record[key] = value
+    return record
+
+
+def _smoke_eval_digest(record: dict[str, object]) -> str:
+    preimage = bytearray(b"ds4.eval.case.evidence/v1\n")
+    for key in SMOKE_EVAL_KEYS[:-1]:
+        value = record[key]
+        if type(value) is not str:
+            raise ValueError(f"{key} must be a string")
+        encoded = value.encode("utf-8")
+        preimage.extend(key.encode("ascii"))
+        preimage.extend(b"=")
+        preimage.extend(str(len(encoded)).encode("ascii"))
+        preimage.extend(b":")
+        preimage.extend(encoded)
+        preimage.extend(b"\n")
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def _smoke_eval_records(raw: bytes) -> list[dict[str, object]]:
+    """Independent strict oracle for literal child bytes; never calls TOOL."""
+    lines = raw.splitlines(keepends=True)
+    if len(lines) != 4:
+        raise ValueError("expected exactly four records")
+    records: list[dict[str, object]] = []
+    for line in lines:
+        if not line.endswith(b"\n") or line.endswith(b"\r\n"):
+            raise ValueError("records must be LF terminated")
+        value = json.loads(
+            line[:-1].decode("utf-8"),
+            object_pairs_hook=_smoke_eval_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON value {token}")
+            ),
+        )
+        if type(value) is not dict or tuple(value) != SMOKE_EVAL_KEYS:
+            raise ValueError("record must be the closed nine-key shape")
+        if any(type(value[key]) is not str for key in SMOKE_EVAL_KEYS):
+            raise ValueError("record fields must be strings")
+        if value["schema"] != "ds4.eval.case/v1" or value["case_id"] not in SMOKE_EVAL_IDS:
+            raise ValueError("record has an invalid schema or case ID")
+        if not value["answer"] or value["grade"] not in ("passed", "failed", "not_graded"):
+            raise ValueError("record has an invalid answer or grade")
+        if value["terminal_status"] not in (
+            "completed", "cancelled", "rejected", "recoverable_error", "unsafe_error"
+        ) or value["terminal_status"] != "completed":
+            raise ValueError("record is not a completed terminal result")
+        for key in ("request_id", "instance_id"):
+            if _SMOKE_EVAL_UUID_RE.fullmatch(value[key]) is None:
+                raise ValueError(f"{key} is not a canonical nonzero UUID")
+        if value["request_id"] == value["instance_id"]:
+            raise ValueError("request and instance IDs must differ")
+        if _SMOKE_EVAL_UINT64_RE.fullmatch(value["snapshot_seq"]) is None:
+            raise ValueError("snapshot is not a canonical nonzero uint64")
+        if int(value["snapshot_seq"]) > (1 << 64) - 1:
+            raise ValueError("snapshot exceeds uint64")
+        if _SMOKE_EVAL_SHA256_RE.fullmatch(value["evidence_sha256"]) is None:
+            raise ValueError("evidence digest is not canonical")
+        if value["evidence_sha256"] != _smoke_eval_digest(value):
+            raise ValueError("evidence digest is stale")
+        expected = SMOKE_EVAL_EXPECTED_ANSWERS[SMOKE_EVAL_IDS.index(value["case_id"])]
+        if value["grade"] != ("passed" if value["answer"] == expected else "failed"):
+            raise ValueError("fixture answer/grade relation is invalid")
+        records.append(value)
+    if tuple(record["case_id"] for record in records) != SMOKE_EVAL_IDS:
+        raise ValueError("case IDs are not canonical")
+    if len({record["request_id"] for record in records}) != 4:
+        raise ValueError("request IDs are not unique")
+    if len({record["instance_id"] for record in records}) != 1:
+        raise ValueError("instance ID is not stable")
+    snapshots = [int(record["snapshot_seq"]) for record in records]
+    if any(previous >= current for previous, current in zip(snapshots, snapshots[1:])):
+        raise ValueError("snapshots are not strictly increasing")
+    return records
+
+
+def _smoke_eval_replace(raw: bytes, old: bytes, new: bytes) -> bytes:
+    if raw.count(old) != 1:
+        raise AssertionError(f"expected one occurrence of {old!r}")
+    return raw.replace(old, new, 1)
+
+
+def _smoke_eval_rewrite_record(raw: bytes, index: int, **changes: str) -> bytes:
+    lines = raw.splitlines(keepends=True)
+    record = json.loads(lines[index][:-1].decode("utf-8"))
+    record.update(changes)
+    record["evidence_sha256"] = _smoke_eval_digest(record)
+    lines[index] = json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+    return b"".join(lines)
+
+class CompactRuntimeSmokeEvalContractTest(unittest.TestCase):
+    """Task 19 Step 5 RED contract for the model-free smoke-eval CLI."""
+
+    @contextlib.contextmanager
+    def _fake_environment(
+        self,
+        *,
+        resident: bytes = SMOKE_EVAL_RESIDENT,
+        streamed: bytes = SMOKE_EVAL_STREAMED,
+        exit_mode: str = "",
+    ):
+        with tempfile.TemporaryDirectory(prefix="compact-runtime-smoke-") as name:
+            directory = Path(name)
+            fake = directory / "fake-ds4-eval"
+            fake.write_text(SMOKE_EVAL_FAKE_SOURCE, encoding="utf-8")
+            fake.chmod(0o755)
+            model = directory / "placeholder-model.gguf"
+            model.write_bytes(b"never opened by fake eval")
+            resident_path = directory / "resident.jsonl"
+            streamed_path = directory / "streamed.jsonl"
+            resident_path.write_bytes(resident)
+            streamed_path.write_bytes(streamed)
+            log = directory / "argv.jsonl"
+            env = os.environ.copy()
+            env.update({
+                "SMOKE_EVAL_LOG": str(log),
+                "SMOKE_EVAL_RESIDENT_OUTPUT": str(resident_path),
+                "SMOKE_EVAL_STREAMED_OUTPUT": str(streamed_path),
+            })
+            if exit_mode:
+                env.update({"SMOKE_EVAL_EXIT_MODE": exit_mode, "SMOKE_EVAL_EXIT_CODE": "7"})
+            else:
+                env.pop("SMOKE_EVAL_EXIT_MODE", None)
+                env.pop("SMOKE_EVAL_EXIT_CODE", None)
+            yield {"fake": fake, "model": model, "log": log, "env": env}
+
+    def _argv(self, fixture, case_ids=SMOKE_EVAL_IDS):
+        argv = ["smoke-eval", "--model", str(fixture["model"]), "--eval-bin", str(fixture["fake"])]
+        for case_id in case_ids:
+            argv.extend(("--case-id", case_id))
+        return argv
+
+    def _run(self, fixture, case_ids=SMOKE_EVAL_IDS):
+        return subprocess.run(
+            [sys.executable, str(TOOL_PATH), *self._argv(fixture, case_ids)],
+            cwd=ROOT, env=fixture["env"], capture_output=True, check=False, timeout=10,
+        )
+
+    def _logs(self, fixture):
+        log = fixture["log"]
+        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+
+    def _child_argv(self, fixture, streamed=False):
+        argv = [
+            "--model", str(fixture["model"]), "--backend", "cuda", "--ctx", "32768",
+            "--tokens", "512", "--temp", "0", "--top-p", "1", "--min-p", "0.05",
+            "--seed", "1", "--nothink",
+        ]
+        if streamed:
+            argv.extend(("--ssd-streaming", "--ssd-streaming-cache-bytes", "8589934592"))
+        for case_id in SMOKE_EVAL_IDS:
+            argv.extend(("--case-id", case_id))
+        return argv
+
+
+    def _assert_failure(self, fixture, expected: str, *, case_ids=SMOKE_EVAL_IDS):
+        result = self._run(fixture, case_ids)
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr.decode(), expected)
+        return result
+
+    def test_smoke_eval_literal_fixtures_and_fake_are_independent(self) -> None:
+        records = [_smoke_eval_records(raw) for raw in (SMOKE_EVAL_RESIDENT, SMOKE_EVAL_STREAMED, SMOKE_EVAL_MISMATCH)]
+        vector = lambda value: [(r["answer"], r["grade"], r["terminal_status"]) for r in value]
+        self.assertEqual(vector(records[0]), vector(records[1]))
+        self.assertTrue(any(r["grade"] == "failed" for r in records[0]))
+        self.assertNotEqual(vector(records[0]), vector(records[2]))
+        with self._fake_environment() as fixture:
+            for streamed, expected in ((False, SMOKE_EVAL_RESIDENT), (True, SMOKE_EVAL_STREAMED)):
+                args = ["--model", str(fixture["model"]), "--backend", "cuda"] + (["--ssd-streaming"] if streamed else [])
+                child = subprocess.run([str(fixture["fake"]), *args], env=fixture["env"], capture_output=True, check=False, timeout=10)
+                self.assertEqual(child.returncode, 0, child.stderr.decode())
+                self.assertEqual(child.stdout, expected)
+
+    def test_smoke_eval_runs_resident_then_streamed_with_exact_argv_and_summary(self) -> None:
+        with self._fake_environment() as fixture:
+            resident, streamed = _smoke_eval_records(SMOKE_EVAL_RESIDENT), _smoke_eval_records(SMOKE_EVAL_STREAMED)
+            result = self._run(fixture)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            expected = f"status=passed cases=4 resident_sha256={hashlib.sha256(SMOKE_EVAL_RESIDENT).hexdigest()} streamed_sha256={hashlib.sha256(SMOKE_EVAL_STREAMED).hexdigest()}\n".encode()
+            self.assertEqual(result.stdout, expected)
+            self.assertEqual(result.stderr, b"")
+            self.assertEqual(result.stdout.count(b"\n"), 1)
+            for forbidden in (b"ds4.eval.case/v1", b'"wrong"', str(fixture["model"]).encode()):
+                self.assertNotIn(forbidden, result.stdout)
+            entries = self._logs(fixture)
+            self.assertEqual([entry["mode"] for entry in entries], ["resident", "streamed"])
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0]["argv"], self._child_argv(fixture))
+            self.assertEqual(entries[1]["argv"], self._child_argv(fixture, True))
+            extra = ("--ssd-streaming", "--ssd-streaming-cache-bytes", "8589934592")
+            self.assertEqual([arg for arg in entries[1]["argv"] if arg not in extra], entries[0]["argv"])
+            self.assertFalse(any(flag in entry["argv"] for entry in entries for flag in ("--quality", "--index", "--case-sequence", "--questions")))
+            vector = lambda value: [(r["answer"], r["grade"], r["terminal_status"]) for r in value]
+            self.assertEqual(vector(resident), vector(streamed))
+            self.assertNotEqual([(r["instance_id"], r["snapshot_seq"], r["evidence_sha256"]) for r in resident], [(r["instance_id"], r["snapshot_seq"], r["evidence_sha256"]) for r in streamed])
+
+    def test_smoke_eval_rejects_exact_selection_and_evidence_mutations(self) -> None:
+        selections = {"incomplete": SMOKE_EVAL_IDS[:3], "duplicate": (SMOKE_EVAL_IDS[0],) * 2 + SMOKE_EVAL_IDS[2:], "reordered": (SMOKE_EVAL_IDS[1], SMOKE_EVAL_IDS[0], *SMOKE_EVAL_IDS[2:]), "unknown": (SMOKE_EVAL_IDS[0], "unknown-case", *SMOKE_EVAL_IDS[2:])}
+        for label, selected in selections.items():
+            with self.subTest(selection=label), self._fake_environment() as fixture:
+                self._assert_failure(fixture, f"compact-runtime-qualify: smoke-eval: invalid case selection: {label}\n", case_ids=selected)
+                self.assertFalse(fixture["log"].exists())
+        lines = SMOKE_EVAL_RESIDENT.splitlines(keepends=True)
+        mutations = (
+            ("missing LF", SMOKE_EVAL_RESIDENT[:-1]),
+            ("extra line", SMOKE_EVAL_RESIDENT + lines[0]),
+            ("noise line", b"noise\n" + SMOKE_EVAL_RESIDENT),
+            ("duplicate key", _smoke_eval_replace(lines[0], b'{"schema":"ds4.eval.case/v1"', b'{"schema":"ds4.eval.case/v1","schema":"ds4.eval.case/v1"') + b"".join(lines[1:])),
+            ("bad digest", _smoke_eval_replace(SMOKE_EVAL_RESIDENT, b'"evidence_sha256":"efc5cc823d2c62525f7f2dce7ed0e89ed2a4831096d2774b9356659ffd62bb7f"', b'"evidence_sha256":"0000000000000000000000000000000000000000000000000000000000000000"')),
+            ("non-completed", _smoke_eval_rewrite_record(SMOKE_EVAL_RESIDENT, 1, terminal_status="cancelled", grade="not_graded")),
+            ("duplicate request", _smoke_eval_rewrite_record(SMOKE_EVAL_RESIDENT, 1, request_id="123e4567-e89b-12d3-a456-426614174001")),
+            ("inconsistent instance", _smoke_eval_rewrite_record(SMOKE_EVAL_RESIDENT, 1, instance_id="123e4567-e89b-12d3-a456-426614174198")),
+            ("non-increasing snapshot", _smoke_eval_rewrite_record(SMOKE_EVAL_RESIDENT, 1, snapshot_seq="1000")),
+        )
+        for label, candidate in mutations:
+            with self.subTest(mutation=label), self._fake_environment(resident=candidate) as fixture:
+                self._assert_failure(fixture, f"compact-runtime-qualify: smoke-eval: resident evidence rejected: {label}\n")
+
+    def test_smoke_eval_compares_only_case_vectors_and_rejects_child_failures(self) -> None:
+        with self._fake_environment(streamed=SMOKE_EVAL_MISMATCH) as fixture:
+            _smoke_eval_records(SMOKE_EVAL_MISMATCH)
+            result = self._assert_failure(fixture, "compact-runtime-qualify: smoke-eval: resident/streamed vector mismatch at case_id=001b51d76b4d422988f2c11f104a2c6c resident=(wrong,failed,completed) streamed=(C,passed,completed)\n")
+            self.assertEqual([entry["mode"] for entry in self._logs(fixture)], ["resident", "streamed"])
+        with self._fake_environment(exit_mode="resident") as fixture:
+            result = self._assert_failure(fixture, "compact-runtime-qualify: smoke-eval: resident eval exited with status 7\n")
+            self.assertEqual([entry["mode"] for entry in self._logs(fixture)], ["resident"])
+
+    def test_smoke_eval_bounds_output_and_preserves_task20_run_rejection(self) -> None:
+        oversized = SMOKE_EVAL_RESIDENT + b"x" * (SMOKE_EVAL_MAX_STDOUT_BYTES - len(SMOKE_EVAL_RESIDENT) + 1)
+        self.assertGreater(len(oversized), SMOKE_EVAL_MAX_STDOUT_BYTES)
+        with self._fake_environment(resident=oversized) as fixture:
+            self._assert_failure(fixture, f"compact-runtime-qualify: smoke-eval: resident stdout exceeds {SMOKE_EVAL_MAX_STDOUT_BYTES}-byte limit\n")
+        with self.assertRaises(SystemExit):
+            TOOL.parse_args(["run"])
 
 if __name__ == "__main__":
     unittest.main()

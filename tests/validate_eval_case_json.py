@@ -57,6 +57,7 @@ UUID_RE = re.compile(
 NONZERO_DECIMAL_RE = re.compile(r"^[1-9][0-9]*$")
 SHA256_RE = re.compile(r"^(?!0{64}$)[0-9a-f]{64}$")
 UINT64_MAX = (1 << 64) - 1
+COMPSEC_TOKEN_RE = re.compile(r"[0-9]+(?:-[0-9]*)?")
 
 
 class StrictJSONError(ValueError):
@@ -99,6 +100,26 @@ def _contains_nonfinite(value: Any) -> bool:
     if isinstance(value, list):
         return any(_contains_nonfinite(item) for item in value)
     return False
+
+
+def _compsec_line_set(spec: str) -> set[int]:
+    """Parse the COMPSEC line-set syntax independently of production."""
+    lines: set[int] = set()
+    for token in COMPSEC_TOKEN_RE.findall(spec):
+        bounds = token.split("-")
+        lower = int(bounds[0])
+        upper = lower if len(bounds) == 1 else int(bounds[1] or 0)
+        lower, upper = sorted((lower, upper))
+        lower = max(lower, 0)
+        upper = min(upper, 255)
+        lines.update(range(lower, upper + 1))
+    return lines
+
+
+def _compsec_answer_matches(expected_spec: str, got_spec: str) -> bool:
+    expected = _compsec_line_set(expected_spec)
+    got = _compsec_line_set(got_spec)
+    return bool(got) and got <= expected
 
 
 def _load_schema() -> dict[str, Any]:
@@ -170,8 +191,12 @@ def validate_record(record: Any, *, expected_case_index: int | None = None) -> N
     if terminal not in TERMINAL_STATUSES:
         raise StrictJSONError("$.terminal_status: invalid enum")
     expected_answer = EXPECTED_ANSWERS[CASE_IDS.index(case_id)]
+    if case_id == "compsec-076":
+        answer_matches = _compsec_answer_matches(expected_answer, answer)
+    else:
+        answer_matches = answer == expected_answer
     expected_grade = (
-        ("passed" if answer == expected_answer else "failed")
+        ("passed" if answer_matches else "failed")
         if terminal == "completed" else "not_graded"
     )
     if grade != expected_grade:

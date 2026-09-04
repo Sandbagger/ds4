@@ -3723,6 +3723,29 @@ def _smoke_eval_reject(label: str) -> None:
     raise _SmokeEvalEvidenceError(label)
 
 
+_SMOKE_EVAL_COMPSEC_TOKEN_RE = re.compile(r"[0-9]+(?:-[0-9]*)?")
+
+
+def _smoke_eval_compsec_line_set(spec: str) -> set[int]:
+    """Parse the COMPSEC line-set syntax used by the C grader."""
+    lines: set[int] = set()
+    for token in _SMOKE_EVAL_COMPSEC_TOKEN_RE.findall(spec):
+        bounds = token.split("-")
+        lower = int(bounds[0])
+        upper = lower if len(bounds) == 1 else int(bounds[1] or 0)
+        lower, upper = sorted((lower, upper))
+        lower = max(lower, 0)
+        upper = min(upper, 255)
+        lines.update(range(lower, upper + 1))
+    return lines
+
+
+def _smoke_eval_compsec_answer_matches(expected_spec: str, got_spec: str) -> bool:
+    expected = _smoke_eval_compsec_line_set(expected_spec)
+    got = _smoke_eval_compsec_line_set(got_spec)
+    return bool(got) and got <= expected
+
+
 def validate_smoke_eval_evidence(raw: bytes) -> SmokeEvalEvidence:
     """Validate exactly one four-record ``ds4.eval.case/v1`` JSONL payload.
 
@@ -3794,7 +3817,13 @@ def validate_smoke_eval_evidence(raw: bytes) -> SmokeEvalEvidence:
         expected_answer = SMOKE_EVAL_EXPECTED_ANSWERS[
             EVAL_CASE_IDS.index(case_id)
         ]
-        expected_grade = "passed" if record["answer"] == expected_answer else "failed"
+        if case_id == "compsec-076":
+            answer_matches = _smoke_eval_compsec_answer_matches(
+                expected_answer, record["answer"]
+            )
+        else:
+            answer_matches = record["answer"] == expected_answer
+        expected_grade = "passed" if answer_matches else "failed"
         if grade != expected_grade:
             _smoke_eval_reject("answer/grade relation")
 

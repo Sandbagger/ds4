@@ -1156,6 +1156,84 @@ static int check_invalid_selectors(void) {
     return failures;
 }
 
+static int invoke_machine_mode_conflict(const char *label, char **argv, int argc) {
+    child_result result = run_cli_child(argc, argv, false, false);
+    const int rc = child_exit_code(&result);
+    int failures = 0;
+    if (rc != 2) {
+        fprintf(stderr, "case-contract: %s returned %d, expected selector rejection 2\n",
+                label, rc);
+        report_child_stderr(&result, label);
+        failures++;
+    }
+    /* Machine case records and legacy progress both use stdout.  A rejected
+     * mode combination must not let either output channel leak before the
+     * selector diagnostic, especially when --trace names /dev/stdout. */
+    if (result.stdout_len != 0) {
+        fprintf(stderr,
+                "case-contract: %s wrote %zu stdout bytes before selector rejection\n",
+                label, result.stdout_len);
+        failures++;
+    }
+    return failures;
+}
+
+static int check_machine_mode_conflicts(void) {
+    int failures = 0;
+    char *with_self_test[] = {
+        (char *)"ds4-eval",
+        (char *)"--model", (char *)"/literal/fake.gguf",
+        (char *)"--backend", (char *)"cpu",
+        (char *)"--ctx", (char *)"32768",
+        (char *)"--tokens", (char *)"8",
+        (char *)"--nothink",
+        (char *)"--case-id", (char *)"recNu3MXkvWUzHZr9",
+        (char *)"--case-id", (char *)"001b51d76b4d422988f2c11f104a2c6c",
+        (char *)"--case-id", (char *)"aime2025-01",
+        (char *)"--case-id", (char *)"compsec-076",
+        (char *)"--self-test-extractors", NULL,
+    };
+    char *with_regrade_trace[] = {
+        (char *)"ds4-eval",
+        (char *)"--model", (char *)"/literal/fake.gguf",
+        (char *)"--backend", (char *)"cpu",
+        (char *)"--ctx", (char *)"32768",
+        (char *)"--tokens", (char *)"8",
+        (char *)"--nothink",
+        (char *)"--case-id", (char *)"recNu3MXkvWUzHZr9",
+        (char *)"--case-id", (char *)"001b51d76b4d422988f2c11f104a2c6c",
+        (char *)"--case-id", (char *)"aime2025-01",
+        (char *)"--case-id", (char *)"compsec-076",
+        /* /dev/null is a valid empty input: the early regrade path emits its
+         * zero-case summary and returns 1, rather than failing to open a file
+         * with the same exit code this selector conflict must use. */
+        (char *)"--regrade-trace", (char *)"/dev/null", NULL,
+    };
+    char *with_trace_stdout[] = {
+        (char *)"ds4-eval",
+        (char *)"--model", (char *)"/literal/fake.gguf",
+        (char *)"--backend", (char *)"cpu",
+        (char *)"--ctx", (char *)"32768",
+        (char *)"--tokens", (char *)"8",
+        (char *)"--nothink",
+        (char *)"--case-id", (char *)"recNu3MXkvWUzHZr9",
+        (char *)"--case-id", (char *)"001b51d76b4d422988f2c11f104a2c6c",
+        (char *)"--case-id", (char *)"aime2025-01",
+        (char *)"--case-id", (char *)"compsec-076",
+        (char *)"--trace", (char *)"/dev/stdout", NULL,
+    };
+    failures += invoke_machine_mode_conflict(
+        "case IDs plus extractor self-test", with_self_test,
+        (int)ARRAY_LEN(with_self_test) - 1);
+    failures += invoke_machine_mode_conflict(
+        "case IDs plus trace regrade", with_regrade_trace,
+        (int)ARRAY_LEN(with_regrade_trace) - 1);
+    failures += invoke_machine_mode_conflict(
+        "case IDs plus stdout trace", with_trace_stdout,
+        (int)ARRAY_LEN(with_trace_stdout) - 1);
+    return failures;
+}
+
 static int check_legacy_smoke(void) {
     /* This invokes real argv parsing without a case selector.  The missing
      * model is an intentional post-parse boundary, proving legacy CLI reachability
@@ -1180,6 +1258,7 @@ int main(void) {
     failures += check_invalid_selectors();
     failures += check_legacy_smoke();
     failures += invoke_valid_machine();
+    failures += check_machine_mode_conflicts();
     if (failures != 0) {
         fprintf(stderr, "case selector contract RED assertions failed: %d\n", failures);
         return 1;

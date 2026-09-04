@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RED contract tests for the canonical Laguna qualification evidence index."""
+"""Contract tests for the canonical Laguna qualification evidence index."""
 
 from __future__ import annotations
 

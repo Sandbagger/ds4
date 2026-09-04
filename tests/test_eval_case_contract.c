@@ -797,6 +797,7 @@ static bool fake_request_finish(ds4_runtime_request_context *request,
 #define ds4_session_top_logprobs fake_session_top_logprobs
 #define ds4_session_sync fake_session_sync
 #define ds4_session_eval fake_session_eval
+#define ds4_session_request_barrier fake_session_request_barrier
 #define ds4_runtime_request_begin fake_request_begin
 #define ds4_runtime_request_set_prompt_tokens fake_request_set_prompt
 #define ds4_runtime_request_mark_prefill_started fake_request_mark_prefill_started
@@ -841,6 +842,7 @@ static bool fake_request_finish(ds4_runtime_request_context *request,
 #undef ds4_session_top_logprobs
 #undef ds4_session_sync
 #undef ds4_session_eval
+#undef ds4_session_request_barrier
 #undef ds4_runtime_request_begin
 #undef ds4_runtime_request_set_prompt_tokens
 #undef ds4_runtime_request_mark_prefill_started

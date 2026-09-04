@@ -1709,9 +1709,30 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Implementation progress (2026-09-04):** `4248699` adds the bounded
+`qualification_records.py` streaming parser and shared validator CLI shim.
+`b1d35bd` adds the pure `qualification_evidence.py` metadata index builder;
+`26abf29` wires its test target into `test-laguna-compact-python`. Each helper
+passes 12 host tests from a pinned worktree and has independent code review.
+
+The parser binds a streamed slice and validates its 12 records incrementally.
+The index builder checks the exact **declared** reference/observation union,
+path/SHA/uint64-string syntax and canonical bytes; it does not inspect files,
+check symlinks, authenticate observed bytes or collect references from a bundle.
+Neither helper launches children, enforces real deadlines, authenticates a
+running model/executable, evaluates gates, retries or publishes a bundle.
+The runner and publication steps below therefore remain unchecked. See
+[port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
+for diagnostic reuse, verification commands and the next implementation seam.
+
 **Files:**
 - Modify: `gguf-tools/quality-testing/compact_runtime_qualify.py`
 - Modify: `gguf-tools/quality-testing/test_compact_runtime_qualify.py`
+- Create: `gguf-tools/quality-testing/qualification_records.py`
+- Create: `gguf-tools/quality-testing/test_qualification_records.py`
+- Modify: `tests/validate_bench_qualification_json.py`
+- Create: `gguf-tools/quality-testing/qualification_evidence.py`
+- Create: `gguf-tools/quality-testing/test_qualification_evidence.py`
 - Modify: `schemas/ds4-laguna-compact-runtime-v1.schema.json`
 - Modify: `Makefile`
 

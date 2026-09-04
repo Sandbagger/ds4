@@ -888,6 +888,23 @@ static bool fake_emit_record(
     return true;
 }
 
+#ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
+/* Compose the existing structural observer with the linked production emitter.
+ * The runner's exact record, stream, and error arguments pass through without
+ * reconstruction.  Keeping the observer first preserves pointer/order/
+ * lifetime checks while the intentionally partial fake snapshots remain a
+ * deliberate RED at the real emitter boundary. */
+static bool lifecycle_real_emit_record(
+        FILE *stream,
+        const ds4_bench_qualification_record *record,
+        char *error,
+        size_t error_size) {
+    if (!fake_emit_record(stream, record, error, error_size)) return false;
+    return ds4_bench_qualification_emit_record(
+        stream, record, error, error_size);
+}
+#endif
+
 /* Macro substitution is deliberately limited to the lifecycle-facing APIs. */
 #define main ds4_bench_test_cli_main
 /* Keep the CUDA-only qualification branch testable in this host-only fake
@@ -936,7 +953,11 @@ static bool fake_emit_record(
 #define ds4_runtime_request_observe_page_advice fake_request_observe_page_advice
 #define ds4_runtime_request_record_page_advice_complete fake_request_record_page_advice_complete
 #define ds4_runtime_request_finish fake_request_finish
+#ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
+#define ds4_bench_qualification_emit_record lifecycle_real_emit_record
+#else
 #define ds4_bench_qualification_emit_record fake_emit_record
+#endif
 #include "../ds4_bench.c"
 #undef main
 
@@ -1182,6 +1203,30 @@ static void check_fail_closed_cleanup(void) {
     all_failures += state.contract_failures;
 }
 
+#ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
+int main(void) {
+    /* The composition target exercises only the successful four-repetition
+     * lifecycle.  The linked emitter owns stdout; this harness emits no PASS
+     * text and never runs the injected-failure case. */
+    reset_fake_state(false);
+    const int rc = invoke_bench();
+    if (state.contract_failures != 0) {
+        fprintf(stderr,
+                "qualification lifecycle real-emitter composition fake assertions failed: %d\n",
+                state.contract_failures);
+        return 1;
+    }
+    if (rc != 0) return rc;
+    check_lifecycle_shape();
+    if (state.contract_failures != 0) {
+        fprintf(stderr,
+                "qualification lifecycle real-emitter composition fake assertions failed: %d\n",
+                state.contract_failures);
+        return 1;
+    }
+    return 0;
+}
+#else
 int main(void) {
     check_happy_path();
     check_fail_closed_cleanup();
@@ -1193,3 +1238,4 @@ int main(void) {
     puts("qualification lifecycle fake backend: PASS");
     return 0;
 }
+#endif

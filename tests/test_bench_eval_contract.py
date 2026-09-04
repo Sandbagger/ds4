@@ -452,6 +452,48 @@ class BenchQualificationMakefileContractTest(unittest.TestCase):
             dependencies += " " + lines[start].strip()
         self.assertIn("test-bench-qualification-emitter", dependencies.split())
 
+    def test_composition_target_is_aggregate_linked_and_cleaned(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        lines = makefile.splitlines()
+        phony = next(line for line in lines if line.startswith(".PHONY:"))
+        self.assertIn("test-bench-qualification-composition", phony.split())
+
+        start = next(index for index, line in enumerate(lines) if line.startswith("test:"))
+        dependencies = lines[start]
+        while dependencies.rstrip().endswith("\\"):
+            start += 1
+            dependencies += " " + lines[start].strip()
+        self.assertIn("test-bench-qualification-composition", dependencies.split())
+
+        self.assertIn(
+            "tests/test_bench_qualification_composition.o: "
+            "tests/test_bench_qualification_lifecycle.c",
+            makefile,
+        )
+        self.assertIn(
+            "-DDS4_NO_GPU -DDS4_BENCH_LIFECYCLE_REAL_EMITTER",
+            makefile,
+        )
+        self.assertIn(
+            "tests/test_bench_qualification_composition: "
+            "tests/test_bench_qualification_composition.o ds4_help.o "
+            "ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ) "
+            "ds4_bench_qualification.o",
+            makefile,
+        )
+        target_start = makefile.index("test-bench-qualification-composition:")
+        target_end = makefile.index("\n\n", target_start)
+        target = makefile[target_start:target_end]
+        self.assertIn('>"$$tmp"', target)
+        self.assertIn(
+            'python3 tests/validate_bench_qualification_json.py <"$$tmp"',
+            target,
+        )
+
+        clean = next(line for line in lines if line.startswith("\trm -f "))
+        self.assertIn("tests/test_bench_qualification_composition", clean)
+        self.assertIn("tests/test_bench_qualification_composition.o", clean)
+
     def test_production_translation_unit_gate_is_direct_aggregate_and_cleaned(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         lines = makefile.splitlines()

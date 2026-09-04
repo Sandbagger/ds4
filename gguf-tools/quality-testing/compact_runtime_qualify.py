@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build and verify the immutable Laguna compact-runtime benchmark manifest.
 
-This task intentionally stops at manifest construction.  It neither launches a
-qualification server nor publishes a result bundle.
+This task also runs the resident/streamed model comparator, but it does not
+publish the full Task 20 result bundle.
 """
 
 from __future__ import annotations
@@ -73,6 +73,36 @@ EVAL_CASE_IDS = (
     "aime2025-01",
     "compsec-076",
 )
+SMOKE_EVAL_SCHEMA = "ds4.eval.case/v1"
+SMOKE_EVAL_KEYS = (
+    "schema",
+    "case_id",
+    "answer",
+    "grade",
+    "terminal_status",
+    "request_id",
+    "instance_id",
+    "snapshot_seq",
+    "evidence_sha256",
+)
+SMOKE_EVAL_EXPECTED_ANSWERS = ("B", "C", "70", "17-20")
+SMOKE_EVAL_GRADES = ("passed", "failed")
+SMOKE_EVAL_TERMINAL_STATUSES = (
+    "completed",
+    "cancelled",
+    "rejected",
+    "recoverable_error",
+    "unsafe_error",
+)
+SMOKE_EVAL_STREAMED_CACHE_BYTES = 8 << 30
+SMOKE_EVAL_TIMEOUT_SECONDS = 2700
+SMOKE_EVAL_MAX_STDOUT_BYTES = 4096
+SMOKE_EVAL_UUID_RE = re.compile(
+    r"^(?!00000000-0000-0000-0000-000000000000$)"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+SMOKE_EVAL_UINT64_RE = re.compile(r"^[1-9][0-9]*$")
+SMOKE_EVAL_EVIDENCE_DOMAIN = b"ds4.eval.case.evidence/v1\n"
 TOKEN_DUMP_ARGV = (
     "--dump-tokens",
     "--raw-prompt",
@@ -3593,6 +3623,394 @@ def write_manifest_atomic(path: Path | str, value: Mapping[str, Any]) -> None:
                 pass
 
 
+class _SmokeEvalEvidenceError(ValueError):
+    """A strict evidence failure with a stable operator-facing label."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        super().__init__(label)
+
+
+class SmokeEvalEvidence(NamedTuple):
+    """One validated, immutable-in-content eval output retained for Task 20."""
+
+    raw_jsonl: bytes
+    records: list[dict[str, str]]
+    vectors: list[tuple[str, str, str]]
+    sha256: str
+
+    @property
+    def raw(self) -> bytes:
+        return self.raw_jsonl
+
+    @property
+    def raw_sha256(self) -> str:
+        return self.sha256
+
+    @property
+    def vector(self) -> list[tuple[str, str, str]]:
+        return self.vectors
+
+
+class SmokeEvalComparison(NamedTuple):
+    """Validated resident and streamed evidence from one comparator run."""
+
+    resident: SmokeEvalEvidence
+    streamed: SmokeEvalEvidence
+
+    @property
+    def resident_raw_jsonl(self) -> bytes:
+        return self.resident.raw_jsonl
+
+    @property
+    def streamed_raw_jsonl(self) -> bytes:
+        return self.streamed.raw_jsonl
+
+    @property
+    def resident_records(self) -> list[dict[str, str]]:
+        return self.resident.records
+
+    @property
+    def streamed_records(self) -> list[dict[str, str]]:
+        return self.streamed.records
+
+    @property
+    def resident_vector(self) -> list[tuple[str, str, str]]:
+        return self.resident.vectors
+
+    @property
+    def streamed_vector(self) -> list[tuple[str, str, str]]:
+        return self.streamed.vectors
+
+    @property
+    def resident_sha256(self) -> str:
+        return self.resident.sha256
+
+    @property
+    def streamed_sha256(self) -> str:
+        return self.streamed.sha256
+
+
+def smoke_eval_evidence_digest(record: Mapping[str, Any]) -> str:
+    """Recompute the named-field digest used by ``ds4.eval.case/v1``."""
+    preimage = bytearray(SMOKE_EVAL_EVIDENCE_DOMAIN)
+    for key in SMOKE_EVAL_KEYS[:-1]:
+        try:
+            value = record[key]
+        except KeyError as exc:
+            raise ValueError(f"missing evidence field: {key}") from exc
+        if type(value) is not str:
+            raise ValueError(f"{key} must be a string")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"{key} is not valid UTF-8") from exc
+        preimage.extend(key.encode("ascii"))
+        preimage.extend(b"=")
+        preimage.extend(str(len(encoded)).encode("ascii"))
+        preimage.extend(b":")
+        preimage.extend(encoded)
+        preimage.extend(b"\n")
+    return _sha256_bytes(bytes(preimage))
+
+
+# A private spelling keeps the parser easy to find in traceback output while
+# the public function gives Task 20 a direct byte/hash seam.
+_smoke_eval_digest = smoke_eval_evidence_digest
+
+
+def _smoke_eval_reject(label: str) -> None:
+    raise _SmokeEvalEvidenceError(label)
+
+
+def validate_smoke_eval_evidence(raw: bytes) -> SmokeEvalEvidence:
+    """Validate exactly one four-record ``ds4.eval.case/v1`` JSONL payload.
+
+    Validation is independent of the child process and of any fixture bytes.
+    The original bytes are retained unchanged so a later publication step can
+    persist the exact content that was compared here.
+    """
+    if type(raw) is not bytes:
+        _smoke_eval_reject("output is not bytes")
+    if not raw:
+        _smoke_eval_reject("empty output")
+    if b"\r" in raw:
+        _smoke_eval_reject("LF-only")
+    if not raw.endswith(b"\n"):
+        _smoke_eval_reject("missing LF")
+
+    lines = raw.split(b"\n")[:-1]
+    for line in lines:
+        if not line or not line.strip():
+            _smoke_eval_reject("blank line")
+    if len(lines) != len(EVAL_CASE_IDS):
+        first = lines[0].lstrip() if lines else b""
+        if len(lines) > len(EVAL_CASE_IDS) and not first.startswith(b"{"):
+            _smoke_eval_reject("noise line")
+        if len(lines) > len(EVAL_CASE_IDS):
+            _smoke_eval_reject("extra line")
+        _smoke_eval_reject("incomplete")
+
+    records: list[dict[str, str]] = []
+    for line in lines:
+        if not line.lstrip().startswith(b"{"):
+            _smoke_eval_reject("noise line")
+        try:
+            text = line.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            _smoke_eval_reject("invalid UTF-8")
+        try:
+            value = loads_strict(text)
+        except ValueError as exc:
+            detail = str(exc).lower()
+            if "duplicate key" in detail:
+                _smoke_eval_reject("duplicate key")
+            if "non-finite" in detail:
+                _smoke_eval_reject("nonfinite")
+            _smoke_eval_reject("invalid JSON")
+        if type(value) is not dict or tuple(value) != SMOKE_EVAL_KEYS:
+            _smoke_eval_reject("record shape")
+        if any(type(value[key]) is not str for key in SMOKE_EVAL_KEYS):
+            _smoke_eval_reject("field type")
+        record: dict[str, str] = dict(value)
+
+        if record["schema"] != SMOKE_EVAL_SCHEMA:
+            _smoke_eval_reject("schema")
+        case_id = record["case_id"]
+        if case_id not in EVAL_CASE_IDS:
+            _smoke_eval_reject("unknown case ID")
+        if not record["answer"] or not record["answer"].strip():
+            _smoke_eval_reject("invalid answer")
+
+        terminal_status = record["terminal_status"]
+        if terminal_status not in SMOKE_EVAL_TERMINAL_STATUSES:
+            _smoke_eval_reject("invalid terminal status")
+        if terminal_status != "completed":
+            _smoke_eval_reject("non-completed")
+
+        grade = record["grade"]
+        if grade not in SMOKE_EVAL_GRADES:
+            _smoke_eval_reject("invalid grade")
+        expected_answer = SMOKE_EVAL_EXPECTED_ANSWERS[
+            EVAL_CASE_IDS.index(case_id)
+        ]
+        expected_grade = "passed" if record["answer"] == expected_answer else "failed"
+        if grade != expected_grade:
+            _smoke_eval_reject("answer/grade relation")
+
+        for key in ("request_id", "instance_id"):
+            if SMOKE_EVAL_UUID_RE.fullmatch(record[key]) is None:
+                _smoke_eval_reject("invalid UUID")
+        if record["request_id"] == record["instance_id"]:
+            _smoke_eval_reject("request/instance identity")
+
+        snapshot = record["snapshot_seq"]
+        if SMOKE_EVAL_UINT64_RE.fullmatch(snapshot) is None:
+            _smoke_eval_reject("invalid snapshot")
+        if int(snapshot) > UINT64_MAX:
+            _smoke_eval_reject("snapshot overflow")
+
+        evidence_digest = record["evidence_sha256"]
+        if (
+            SHA256_RE.fullmatch(evidence_digest) is None
+            or evidence_digest == "0" * 64
+        ):
+            _smoke_eval_reject("bad digest")
+        try:
+            expected_digest = smoke_eval_evidence_digest(record)
+        except ValueError:
+            _smoke_eval_reject("invalid UTF-8")
+        if evidence_digest != expected_digest:
+            _smoke_eval_reject("bad digest")
+        records.append(record)
+
+    case_ids = tuple(record["case_id"] for record in records)
+    if len(set(case_ids)) != len(case_ids):
+        _smoke_eval_reject("duplicate case ID")
+    if case_ids != EVAL_CASE_IDS:
+        _smoke_eval_reject("reordered")
+    if len({record["request_id"] for record in records}) != len(records):
+        _smoke_eval_reject("duplicate request")
+    if len({record["instance_id"] for record in records}) != 1:
+        _smoke_eval_reject("inconsistent instance")
+    snapshots = [int(record["snapshot_seq"]) for record in records]
+    if any(previous >= current for previous, current in zip(snapshots, snapshots[1:])):
+        _smoke_eval_reject("non-increasing snapshot")
+
+    vectors = [
+        (record["answer"], record["grade"], record["terminal_status"])
+        for record in records
+    ]
+    return SmokeEvalEvidence(raw, records, vectors, _sha256_bytes(raw))
+
+
+# Keep parser-oriented naming available to callers without duplicating logic.
+parse_smoke_eval_evidence = validate_smoke_eval_evidence
+
+
+def _validate_smoke_eval_case_ids(case_ids: Sequence[str]) -> tuple[str, ...]:
+    try:
+        selected = tuple(case_ids)
+    except TypeError:
+        _smoke_eval_reject("invalid case selection: incomplete")
+    if any(type(case_id) is not str or case_id not in EVAL_CASE_IDS for case_id in selected):
+        _smoke_eval_reject("invalid case selection: unknown")
+    if len(set(selected)) != len(selected):
+        _smoke_eval_reject("invalid case selection: duplicate")
+    if len(selected) != len(EVAL_CASE_IDS):
+        _smoke_eval_reject("invalid case selection: incomplete")
+    if selected != EVAL_CASE_IDS:
+        _smoke_eval_reject("invalid case selection: reordered")
+    return selected
+
+
+def _smoke_eval_case_argv(case_ids: Sequence[str]) -> list[str]:
+    arguments: list[str] = []
+    for case_id in case_ids:
+        arguments.extend(("--case-id", case_id))
+    return arguments
+
+
+def _smoke_eval_child_argv(
+    model: Path | str,
+    eval_bin: Path | str,
+    case_ids: Sequence[str],
+    *,
+    streamed: bool,
+) -> list[str]:
+    command = [
+        str(eval_bin),
+        "--model",
+        str(model),
+        "--backend",
+        "cuda",
+        "--ctx",
+        "32768",
+        "--tokens",
+        "512",
+        "--temp",
+        "0",
+        "--top-p",
+        "1",
+        "--min-p",
+        "0.05",
+        "--seed",
+        "1",
+        "--nothink",
+    ]
+    if streamed:
+        command.extend(
+            (
+                "--ssd-streaming",
+                "--ssd-streaming-cache-bytes",
+                str(SMOKE_EVAL_STREAMED_CACHE_BYTES),
+            )
+        )
+    command.extend(_smoke_eval_case_argv(case_ids))
+    return command
+
+
+def _run_smoke_eval_child(command: Sequence[str], mode: str) -> bytes:
+    """Run one child with bounded file-backed stdout and separately captured stderr."""
+    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
+        mode="w+b"
+    ) as stderr_file:
+        try:
+            child = subprocess.Popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                shell=False,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise ValueError(f"{mode} eval invocation failed: {exc}") from exc
+
+        try:
+            status = child.wait(timeout=SMOKE_EVAL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                child.kill()
+            except OSError:
+                pass
+            try:
+                child.wait()
+            except OSError:
+                pass
+            raise ValueError(
+                f"{mode} eval timed out after {SMOKE_EVAL_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        if status != 0:
+            raise ValueError(f"{mode} eval exited with status {status}")
+
+        try:
+            stdout_file.seek(0)
+            raw = stdout_file.read(SMOKE_EVAL_MAX_STDOUT_BYTES + 1)
+        except OSError as exc:
+            raise ValueError(f"{mode} stdout could not be read") from exc
+        if len(raw) > SMOKE_EVAL_MAX_STDOUT_BYTES:
+            raise ValueError(
+                f"{mode} stdout exceeds {SMOKE_EVAL_MAX_STDOUT_BYTES}-byte limit"
+            )
+        return raw
+
+
+def compare_smoke_eval_vectors(
+    resident: SmokeEvalEvidence,
+    streamed: SmokeEvalEvidence,
+) -> None:
+    """Require only answer/grade/terminal parity, naming the first mismatch."""
+    for index, (resident_vector, streamed_vector) in enumerate(
+        zip(resident.vectors, streamed.vectors)
+    ):
+        if resident_vector != streamed_vector:
+            case_id = EVAL_CASE_IDS[index]
+            resident_text = "(" + ",".join(resident_vector) + ")"
+            streamed_text = "(" + ",".join(streamed_vector) + ")"
+            raise ValueError(
+                "resident/streamed vector mismatch at "
+                f"case_id={case_id} resident={resident_text} streamed={streamed_text}"
+            )
+    if len(resident.vectors) != len(streamed.vectors):
+        raise ValueError("resident/streamed vector lengths differ")
+
+
+def run_smoke_eval(
+    model: Path | str,
+    eval_bin: Path | str,
+    case_ids: Sequence[str],
+) -> SmokeEvalComparison:
+    """Run and validate resident then streamed eval evidence exactly once each."""
+    selected = _validate_smoke_eval_case_ids(case_ids)
+
+    resident_raw = _run_smoke_eval_child(
+        _smoke_eval_child_argv(model, eval_bin, selected, streamed=False),
+        "resident",
+    )
+    try:
+        resident = validate_smoke_eval_evidence(resident_raw)
+    except _SmokeEvalEvidenceError as exc:
+        raise ValueError(f"resident evidence rejected: {exc.label}") from exc
+
+    streamed_raw = _run_smoke_eval_child(
+        _smoke_eval_child_argv(model, eval_bin, selected, streamed=True),
+        "streamed",
+    )
+    try:
+        streamed = validate_smoke_eval_evidence(streamed_raw)
+    except _SmokeEvalEvidenceError as exc:
+        raise ValueError(f"streamed evidence rejected: {exc.label}") from exc
+
+    compare_smoke_eval_vectors(resident, streamed)
+    return SmokeEvalComparison(resident, streamed)
+
+
+# A descriptive alias helps future callers discover the comparator without
+# adding another implementation or changing the Task 20 ``run`` boundary.
+run_smoke_eval_comparison = run_smoke_eval
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3613,6 +4031,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     verify = actions.add_parser("verify", help="verify an immutable reference manifest")
     verify.add_argument("--manifest", required=True, type=Path)
 
+    smoke_eval = commands.add_parser(
+        "smoke-eval", help="compare resident and streamed model-eval evidence"
+    )
+    smoke_eval.add_argument("--model", required=True, type=Path)
+    smoke_eval.add_argument("--eval-bin", required=True, type=Path)
+    smoke_eval.add_argument("--case-id", required=True, action="append")
+
     sequence = commands.add_parser(
         "sequence", help="build one immutable qualification input sequence"
     )
@@ -3630,6 +4055,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if args.command == "smoke-eval":
+            comparison = run_smoke_eval(args.model, args.eval_bin, args.case_id)
+            print(
+                "status=passed "
+                f"cases={len(comparison.resident.records)} "
+                f"resident_sha256={comparison.resident.sha256} "
+                f"streamed_sha256={comparison.streamed.sha256}"
+            )
+            return 0
         if args.command == "sequence":
             value = load_manifest(args.manifest)
             payload = build_qualification_sequence(
@@ -3672,7 +4106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     except ValueError as exc:
-        print(f"compact-runtime-qualify: {exc}", file=sys.stderr)
+        scope = "smoke-eval: " if args.command == "smoke-eval" else ""
+        print(f"compact-runtime-qualify: {scope}{exc}", file=sys.stderr)
         return 1
 
 

@@ -16,11 +16,13 @@ import math
 import os
 import re
 import socket
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -3790,6 +3792,53 @@ SMOKE_EVAL_IDS = (
 )
 SMOKE_EVAL_EXPECTED_ANSWERS = ("B", "C", "70", "17-20")
 SMOKE_EVAL_MAX_STDOUT_BYTES = 4096
+SMOKE_EVAL_MAX_STDERR_BYTES = 65536
+SMOKE_EVAL_OUTPUT_SAFETY_FAKE_SOURCE = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+if sys.argv[1:] == ["--validate"]:
+    print(json.dumps({"schema": "ds4.smoke-eval.output-fake/v1", "stdout_bytes": 4097, "stderr_bytes": 65537}, separators=(",", ":")))
+    raise SystemExit(0)
+mode = sys.argv[1] if len(sys.argv) == 2 else ""
+if mode not in ("stdout", "stderr"):
+    raise SystemExit("invalid output mode")
+fd = 1 if mode == "stdout" else 2
+payload = b"x" * (4097 if mode == "stdout" else 65537)
+written = 0
+while written < len(payload):
+    try:
+        written += os.write(fd, payload[written:])
+    except BrokenPipeError:
+        break
+time.sleep(5)
+'''
+SMOKE_EVAL_PROCESS_GROUP_FAKE_SOURCE = r'''#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+if sys.argv[1:] == ["--validate"]:
+    print(json.dumps({"schema": "ds4.smoke-eval.process-group-fake/v1", "fork": hasattr(os, "fork"), "ignores_term": True, "metadata_fields": ["parent_pid", "pgid", "child_pid"]}, separators=(",", ":")))
+    raise SystemExit(0)
+if sys.argv[1:] != ["--run"]:
+    raise SystemExit("invalid process-group mode")
+metadata_path = Path(os.environ["SMOKE_EVAL_PROCESS_GROUP_METADATA"])
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+parent_pid, pgid = os.getpid(), os.getpgrp()
+child_pid = os.fork()
+if child_pid == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(5)
+    raise SystemExit(0)
+metadata_path.write_text(json.dumps({"schema": "ds4.smoke-eval.process-group/v1", "parent_pid": parent_pid, "pgid": pgid, "child_pid": child_pid}, separators=(",", ":")) + "\n", encoding="ascii")
+time.sleep(5)
+'''
 SMOKE_EVAL_RESIDENT = (
     b'{"schema":"ds4.eval.case/v1","case_id":"recNu3MXkvWUzHZr9","answer":"B","grade":"passed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174001","instance_id":"123e4567-e89b-12d3-a456-426614174099","snapshot_seq":"1009","evidence_sha256":"efc5cc823d2c62525f7f2dce7ed0e89ed2a4831096d2774b9356659ffd62bb7f"}\n'
     b'{"schema":"ds4.eval.case/v1","case_id":"001b51d76b4d422988f2c11f104a2c6c","answer":"wrong","grade":"failed","terminal_status":"completed","request_id":"123e4567-e89b-12d3-a456-426614174002","instance_id":"123e4567-e89b-12d3-a456-426614174099","snapshot_seq":"2027","evidence_sha256":"5796c633738a636a7fe4d453f6a31056196b34e7200ee9bace1014a64059a7b8"}\n'
@@ -4015,6 +4064,39 @@ class CompactRuntimeSmokeEvalContractTest(unittest.TestCase):
             argv.extend(("--case-id", case_id))
         return argv
 
+    @contextlib.contextmanager
+    def _output_safety_fake(self):
+        with tempfile.TemporaryDirectory(prefix="compact-runtime-smoke-safety-") as name:
+            fake = Path(name) / "fake-output-safety"
+            fake.write_text(SMOKE_EVAL_OUTPUT_SAFETY_FAKE_SOURCE, encoding="utf-8")
+            fake.chmod(0o755)
+            validation = subprocess.run(
+                [str(fake), "--validate"], capture_output=True, check=False, timeout=5
+            )
+            self.assertEqual(validation.returncode, 0, validation.stderr.decode())
+            self.assertEqual(validation.stderr, b"")
+            self.assertEqual(
+                json.loads(validation.stdout),
+                {
+                    "schema": "ds4.smoke-eval.output-fake/v1",
+                    "stdout_bytes": SMOKE_EVAL_MAX_STDOUT_BYTES + 1,
+                    "stderr_bytes": SMOKE_EVAL_MAX_STDERR_BYTES + 1,
+                },
+            )
+            yield fake
+
+    def _assert_live_output_limit(self, stream: str, limit: int) -> None:
+        with self._output_safety_fake() as fake:
+            started = time.monotonic()
+            with mock.patch.object(TOOL, "SMOKE_EVAL_TIMEOUT_SECONDS", 2.0):
+                with self.assertRaises(ValueError) as raised:
+                    TOOL._run_smoke_eval_child([str(fake), stream], "resident")
+            elapsed = time.monotonic() - started
+            self.assertEqual(
+                str(raised.exception),
+                f"resident {stream} exceeds {limit}-byte limit",
+            )
+            self.assertLess(elapsed, 1.0, f"output ceiling was enforced after {elapsed:.3f}s")
 
     def _assert_failure(self, fixture, expected: str, *, case_ids=SMOKE_EVAL_IDS):
         result = self._run(fixture, case_ids)
@@ -4128,6 +4210,103 @@ class CompactRuntimeSmokeEvalContractTest(unittest.TestCase):
         with self._fake_environment(exit_mode="resident") as fixture:
             result = self._assert_failure(fixture, "compact-runtime-qualify: smoke-eval: resident eval exited with status 7\n")
             self.assertEqual([entry["mode"] for entry in self._logs(fixture)], ["resident"])
+
+    def test_smoke_eval_enforces_live_stdout_ceiling(self) -> None:
+        self._assert_live_output_limit("stdout", SMOKE_EVAL_MAX_STDOUT_BYTES)
+
+    def test_smoke_eval_enforces_live_stderr_ceiling(self) -> None:
+        self._assert_live_output_limit("stderr", SMOKE_EVAL_MAX_STDERR_BYTES)
+
+    def test_smoke_eval_timeout_kills_entire_process_group(self) -> None:
+        if os.name != "posix" or not hasattr(os, "fork") or not hasattr(os, "killpg"):
+            self.skipTest("POSIX fork/killpg are unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="compact-runtime-smoke-group-") as name:
+            directory = Path(name)
+            fake = directory / "fake-process-group"
+            fake.write_text(SMOKE_EVAL_PROCESS_GROUP_FAKE_SOURCE, encoding="utf-8")
+            fake.chmod(0o755)
+            metadata = directory / "process-group.json"
+            validation = subprocess.run(
+                [str(fake), "--validate"], capture_output=True, check=False, timeout=5
+            )
+            self.assertEqual(validation.returncode, 0, validation.stderr.decode())
+            self.assertEqual(validation.stderr, b"")
+            self.assertEqual(
+                json.loads(validation.stdout),
+                {
+                    "schema": "ds4.smoke-eval.process-group-fake/v1",
+                    "fork": True,
+                    "ignores_term": True,
+                    "metadata_fields": ["parent_pid", "pgid", "child_pid"],
+                },
+            )
+            pgid: int | None = None
+
+            def group_exists(group_id: int) -> bool:
+                try:
+                    os.killpg(group_id, 0)
+                except ProcessLookupError:
+                    return False
+                return True
+
+            try:
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"SMOKE_EVAL_PROCESS_GROUP_METADATA": str(metadata)},
+                        clear=False,
+                    ),
+                    mock.patch.object(TOOL, "SMOKE_EVAL_TIMEOUT_SECONDS", 0.3),
+                    mock.patch.object(
+                        TOOL,
+                        "SMOKE_EVAL_TERMINATION_GRACE_SECONDS",
+                        0.2,
+                        create=True,
+                    ),
+                ):
+                    started = time.monotonic()
+                    with self.assertRaises(ValueError) as raised:
+                        TOOL._run_smoke_eval_child([str(fake), "--run"], "resident")
+                    elapsed = time.monotonic() - started
+
+                self.assertEqual(
+                    str(raised.exception), "resident eval timed out after 0.3 seconds"
+                )
+                self.assertLess(elapsed, 1.0, f"timeout cleanup took {elapsed:.3f}s")
+                record = json.loads(metadata.read_text(encoding="ascii"))
+                self.assertEqual(
+                    set(record), {"schema", "parent_pid", "pgid", "child_pid"}
+                )
+                self.assertEqual(record["schema"], "ds4.smoke-eval.process-group/v1")
+                parent_pid = int(record["parent_pid"])
+                pgid = int(record["pgid"])
+                child_pid = int(record["child_pid"])
+                self.assertGreater(parent_pid, 0)
+                self.assertGreater(pgid, 0)
+                self.assertGreater(child_pid, 0)
+                self.assertNotEqual(pgid, os.getpgrp())
+
+                deadline = time.monotonic() + 1.0
+                while group_exists(pgid):
+                    if time.monotonic() >= deadline:
+                        self.fail(f"process group {pgid} survived timeout")
+                    time.sleep(0.02)
+            finally:
+                if pgid is None and metadata.exists():
+                    try:
+                        pgid = int(json.loads(metadata.read_text(encoding="ascii"))["pgid"])
+                    except (KeyError, OSError, TypeError, ValueError):
+                        pgid = None
+                if pgid and pgid != os.getpgrp():
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 1.0
+                    while group_exists(pgid) and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(group_exists(pgid), f"fake process group {pgid} leaked")
 
     def test_smoke_eval_bounds_output_and_preserves_task20_run_rejection(self) -> None:
         oversized = SMOKE_EVAL_RESIDENT + b"x" * (SMOKE_EVAL_MAX_STDOUT_BYTES - len(SMOKE_EVAL_RESIDENT) + 1)

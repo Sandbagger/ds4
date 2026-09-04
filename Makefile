@@ -805,16 +805,19 @@ test-cuda-build-contract:
 	python3 tests/test_main_session_recovery_hardening_contract.py -v
 	python3 tests/test_task18_cuda_failure_source_contract.py -v
 
-.PHONY: test-qualification-records test-laguna-layer-diagnostics
+.PHONY: test-qualification-records test-qualification-evidence test-laguna-layer-diagnostics
 
 test-qualification-records:
 	python3 gguf-tools/quality-testing/test_qualification_records.py -v
+
+test-qualification-evidence:
+	python3 gguf-tools/quality-testing/test_qualification_evidence.py -v
 
 test-laguna-layer-diagnostics:
 	python3 tests/test_laguna_layer_mismatch.py -v
 	python3 tests/test_poolside_layer_diagnostics.py -v
 
-test-laguna-compact-python: test-qualification-records test-laguna-layer-diagnostics
+test-laguna-compact-python: test-qualification-records test-qualification-evidence test-laguna-layer-diagnostics
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "error: test-laguna-compact-python requires uv" >&2; \
 		exit 127; \

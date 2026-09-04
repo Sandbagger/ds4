@@ -68,7 +68,14 @@ def metrics(
     expected_bytes: int | None,
     value_start: int = 0,
     value_count: int | None = None,
+    *,
+    row_width: int | None = None,
 ) -> dict[str, Any]:
+    if row_width is not None and (type(row_width) is not int or row_width <= 0):
+        raise DiagnosticError(
+            f"invalid row_width {row_width!r}: expected None or a positive integer"
+        )
+
     reference_bytes, reference = read_canonical_f32(reference_path, expected_bytes)
     candidate_bytes, candidate = read_canonical_f32(candidate_path, expected_bytes)
     if len(reference) != len(candidate):
@@ -93,6 +100,41 @@ def metrics(
     candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
     exact_hash = reference_sha256 == candidate_sha256
 
+    # Validate selected values before the exact-byte fast path.  The raw bytes
+    # are canonical little-endian F32, so bit identity is read directly rather
+    # than reconstructed through host floats or a repack operation.
+    first_mismatch: dict[str, Any] | None = None
+    for index, (expected, actual) in enumerate(zip(reference, candidate)):
+        if not math.isfinite(expected) or not math.isfinite(actual):
+            raise DiagnosticError(
+                f"{reference_path.name}/{candidate_path.name}: "
+                f"non-finite value at float index {value_start + index}"
+            )
+        if first_mismatch is not None:
+            continue
+        byte_offset = index * FLOAT_SIZE
+        reference_bits = int.from_bytes(
+            reference_bytes[byte_offset : byte_offset + FLOAT_SIZE], "little"
+        )
+        candidate_bits = int.from_bytes(
+            candidate_bytes[byte_offset : byte_offset + FLOAT_SIZE], "little"
+        )
+        if reference_bits != candidate_bits:
+            flat_index = value_start + index
+            first_mismatch = {
+                "flat_index": flat_index,
+                "token_index": (
+                    flat_index // row_width if row_width is not None else None
+                ),
+                "element_index": (
+                    flat_index % row_width if row_width is not None else None
+                ),
+                "reference_bits": f"0x{reference_bits:08x}",
+                "candidate_bits": f"0x{candidate_bits:08x}",
+                "reference_value": expected,
+                "candidate_value": actual,
+            }
+
     if reference_bytes == candidate_bytes:
         rms = 0.0
         relative_rms = 0.0
@@ -105,12 +147,7 @@ def metrics(
         dot_product = 0.0
         max_abs = 0.0
 
-        for index, (expected, actual) in enumerate(zip(reference, candidate)):
-            if not math.isfinite(expected) or not math.isfinite(actual):
-                raise DiagnosticError(
-                    f"{reference_path.name}/{candidate_path.name}: "
-                    f"non-finite value at float index {index}"
-                )
+        for expected, actual in zip(reference, candidate):
             delta = float(actual) - float(expected)
             absolute_delta = abs(delta)
             if absolute_delta > max_abs:
@@ -138,6 +175,7 @@ def metrics(
         "exact_hash": exact_hash,
         "reference_sha256": reference_sha256,
         "candidate_sha256": candidate_sha256,
+        "first_mismatch": first_mismatch,
     }
 
 
@@ -161,12 +199,13 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
     embedding_pair = optional_pair(reference, candidate, "embd.f32")
     embedding = None
     if embedding_pair is not None:
-        embedding = metrics(*embedding_pair, LAYER_BYTES)
+        embedding = metrics(*embedding_pair, LAYER_BYTES, row_width=WIDTH)
         embedding["last_token"] = metrics(
             *embedding_pair,
             LAYER_BYTES,
             value_start=(TOKENS - 1) * WIDTH,
             value_count=WIDTH,
+            row_width=WIDTH,
         )
 
     layer0_pairs = {
@@ -188,12 +227,13 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
             continue
         width = LAYER0_WIDTHS[stage]
         expected_bytes = width * TOKENS * FLOAT_SIZE
-        result = metrics(*pair, expected_bytes)
+        result = metrics(*pair, expected_bytes, row_width=width)
         result["last_token"] = metrics(
             *pair,
             expected_bytes,
             value_start=(TOKENS - 1) * width,
             value_count=width,
+            row_width=width,
         )
         result["width"] = width
         layer0_checkpoints[stage] = result
@@ -201,13 +241,19 @@ def compare(reference: Path, candidate: Path) -> dict[str, Any]:
     layers: list[dict[str, Any]] = []
     for layer in range(LAYER_COUNT):
         name = f"layer-{layer:02d}.f32"
-        result = metrics(reference / name, candidate / name, LAYER_BYTES)
+        result = metrics(
+            reference / name,
+            candidate / name,
+            LAYER_BYTES,
+            row_width=WIDTH,
+        )
         result["last_token"] = metrics(
             reference / name,
             candidate / name,
             LAYER_BYTES,
             value_start=(TOKENS - 1) * WIDTH,
             value_count=WIDTH,
+            row_width=WIDTH,
         )
         result["layer"] = layer
         layers.append(result)
@@ -274,6 +320,10 @@ def metric_rows(report: dict[str, Any]):
         yield "logits", report["logits"]
 
 
+def _first_mismatch_value(value: Any) -> str:
+    return "null" if value is None else str(value)
+
+
 def print_table(report: dict[str, Any]) -> None:
     print("stage\trms\trelative_rms\tmax_abs\tcosine\texact_hash")
     for stage, result in metric_rows(report):
@@ -282,6 +332,28 @@ def print_table(report: dict[str, Any]) -> None:
             f"{result['max_abs']:.9g}\t{result['cosine']:.12g}\t"
             f"{str(result['exact_hash']).lower()}"
         )
+
+    mismatch_rows = [
+        (stage, result.get("first_mismatch"))
+        for stage, result in metric_rows(report)
+        if result.get("first_mismatch") is not None
+    ]
+    if not mismatch_rows:
+        print("first_mismatch=none")
+    else:
+        for stage, mismatch in mismatch_rows:
+            assert mismatch is not None
+            print(
+                f"first_mismatch={stage} "
+                f"flat_index={mismatch['flat_index']} "
+                f"token_index={_first_mismatch_value(mismatch['token_index'])} "
+                f"element_index={_first_mismatch_value(mismatch['element_index'])} "
+                f"reference_bits={mismatch['reference_bits']} "
+                f"candidate_bits={mismatch['candidate_bits']} "
+                f"reference_value={_first_mismatch_value(mismatch['reference_value'])} "
+                f"candidate_value={_first_mismatch_value(mismatch['candidate_value'])}"
+            )
+
     divergence = report["first_divergence"]
     if divergence is None:
         print("first_divergence=none")

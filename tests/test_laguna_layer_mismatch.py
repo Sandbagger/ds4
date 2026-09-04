@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-only RED tests for Laguna layer mismatch localization.
+"""Host-only tests for Laguna layer mismatch localization.
 
 These tests use tiny synthetic float32 files.  They validate diagnostic
 localization only; they make no model-parity or acceptance claim and never
@@ -179,12 +179,16 @@ class LagunaLayerMismatchLocalizationTest(unittest.TestCase):
                     _metric([reference_bits], [candidate_bits], row_width=1)
 
     def test_invalid_row_width_is_rejected(self) -> None:
-        for row_width in (0, -1):
+        class DerivedInt(int):
+            pass
+
+        for row_width in (0, -1, True, False, 1.0, "1", DerivedInt(1)):
             with self.subTest(row_width=row_width):
                 with self.assertRaises(_COMPARATOR.DiagnosticError):
                     _metric([0x3F800000], [0x3F800000], row_width=row_width)
 
-    def test_cli_json_includes_logits_first_mismatch(self) -> None:
+    def test_cli_json_includes_layer_and_last_token_first_mismatch(self) -> None:
+        changed_flat_index = (21 * _COMPARATOR.WIDTH) + 9
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             reference = root / "reference"
@@ -198,23 +202,32 @@ class LagunaLayerMismatchLocalizationTest(unittest.TestCase):
                     layer_path = directory / f"layer-{layer:02d}.f32"
                     with layer_path.open("wb") as handle:
                         handle.truncate(_COMPARATOR.LAYER_BYTES)
+            changed_layer = candidate / "layer-07.f32"
+            with changed_layer.open("r+b") as handle:
+                handle.seek(changed_flat_index * 4)
+                handle.write(struct.pack("<I", 0x40000000))
             (reference / "logits.f32").write_bytes(
                 _payload([0x3F800000, 0x40000000])
             )
             (candidate / "logits.f32").write_bytes(
                 _payload([0x3F800000, 0x40400000])
             )
+            command = [
+                sys.executable,
+                str(COMPARATOR),
+                "--reference",
+                str(reference),
+                "--candidate",
+                str(candidate),
+            ]
             completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(COMPARATOR),
-                    "--reference",
-                    str(reference),
-                    "--candidate",
-                    str(candidate),
-                    "--format",
-                    "json",
-                ],
+                [*command, "--format", "json"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            table_completed = subprocess.run(
+                [*command, "--format", "table"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -234,6 +247,35 @@ class LagunaLayerMismatchLocalizationTest(unittest.TestCase):
                 "candidate_value": 3.0,
             },
         )
+        expected_mismatch = {
+            "flat_index": changed_flat_index,
+            "token_index": 21,
+            "element_index": 9,
+            "reference_bits": "0x00000000",
+            "candidate_bits": "0x40000000",
+            "reference_value": 0.0,
+            "candidate_value": 2.0,
+        }
+        self.assertEqual(report["layers"][7]["first_mismatch"], expected_mismatch)
+        self.assertEqual(
+            report["layers"][7]["last_token"]["first_mismatch"],
+            expected_mismatch,
+        )
+
+        self.assertEqual(table_completed.returncode, 0, table_completed.stderr)
+        table_lines = table_completed.stdout.splitlines()
+        self.assertEqual(
+            table_lines[0],
+            "stage\trms\trelative_rms\tmax_abs\tcosine\texact_hash",
+        )
+        self.assertIn(
+            "first_mismatch=l_out-7 "
+            "flat_index=64521 token_index=21 element_index=9 "
+            "reference_bits=0x00000000 candidate_bits=0x40000000 "
+            "reference_value=0.0 candidate_value=2.0",
+            table_lines,
+        )
+
 
 
 if __name__ == "__main__":

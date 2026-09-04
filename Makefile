@@ -238,7 +238,7 @@ ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 ds4_server.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_laguna_plan.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_plan_io.h ds4_runtime.h
@@ -280,7 +280,7 @@ ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 ds4_server_cpu.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
+ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_laguna_plan.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_plan_io.h ds4_runtime.h
@@ -436,7 +436,7 @@ test-bench-qualification-emitter: tests/test_bench_qualification_emitter
 # Model-free Task 19 lifecycle green target.  The harness includes ds4_bench.c
 # with main renamed and supplies only lifecycle-facing fake operations; all
 # ordinary benchmark symbols come from the host CPU objects.
-tests/test_bench_qualification_lifecycle.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4.h ds4_runtime.h
+tests/test_bench_qualification_lifecycle.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4_laguna_plan.h ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_bench_qualification_lifecycle: tests/test_bench_qualification_lifecycle.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ)
@@ -449,7 +449,7 @@ test-bench-qualification-lifecycle: tests/test_bench_qualification_lifecycle
 # backend with the structural observer chained to the linked production
 # qualification emitter.  Literal fake runtime snapshots satisfy the
 # emitter's validation boundary.
-tests/test_bench_qualification_composition.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4.h ds4_runtime.h
+tests/test_bench_qualification_composition.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4_laguna_plan.h ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_BENCH_LIFECYCLE_REAL_EMITTER -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_bench_qualification_composition: tests/test_bench_qualification_composition.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ) ds4_bench_qualification.o

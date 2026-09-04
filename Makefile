@@ -805,7 +805,12 @@ test-cuda-build-contract:
 	python3 tests/test_main_session_recovery_hardening_contract.py -v
 	python3 tests/test_task18_cuda_failure_source_contract.py -v
 
-test-laguna-compact-python:
+.PHONY: test-qualification-records
+
+test-qualification-records:
+	python3 gguf-tools/quality-testing/test_qualification_records.py -v
+
+test-laguna-compact-python: test-qualification-records
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "error: test-laguna-compact-python requires uv" >&2; \
 		exit 127; \

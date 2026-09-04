@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Host-only RED tests for the incremental qualification-record parser.
+"""Host-only tests for the incremental qualification-record parser.
 
 The records come from the checked-in C-emitter fixture and are independently
 assembled into the four-repetition lifecycle.  This file only exercises the
-future offline parser; it never launches DS4 or contacts a model, GPU, network,
+offline parser; it never launches DS4 or contacts a model, GPU, network,
 or service.
 """
 
@@ -22,8 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = ROOT / "tests/fixtures/ds4-bench-qualification-v1.jsonl"
 VALIDATOR_PATH = ROOT / "tests/validate_bench_qualification_json.py"
 
-# The production module is intentionally absent in this first RED slice.
-from qualification_records import (  # type: ignore[import-not-found]  # noqa: E402
+from qualification_records import (
     MAX_RECORD_BYTES,
     MAX_STREAM_BYTES,
     QualificationRecordStream,
@@ -285,7 +284,8 @@ class QualificationRecordStreamHostTest(unittest.TestCase):
         self.assertEqual(len(near_limit), MAX_STREAM_BYTES - 12)
         stream = QualificationRecordStream(expected)
         try:
-            stream.feed(near_limit)
+            for padded_line in padded_lines:
+                stream.feed(padded_line)
         except (TypeError, ValueError):
             self.fail("twelve valid padded records must fit below the stream cap")
         with self.assertRaises(ValueError):

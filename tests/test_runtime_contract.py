@@ -364,6 +364,11 @@ class MakeEnvironmentContractTests(unittest.TestCase):
                 "gguf-tools/quality-testing/test_qualification_authenticated.py",
                 "-v",
             ],
+            "test-qualification-resident-authenticated": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_resident_authenticated.py",
+                "-v",
+            ],
             "test-qualification-resident-sequence": [
                 "python",
                 "gguf-tools/quality-testing/test_qualification_resident_sequence.py",

@@ -262,7 +262,8 @@ class _Transport:
                 while True:
                     self.process.poll()  # reaping is safe only after last signal
                     self.read_ready(0)
-                    if self.process.returncode is not None and self.group_gone() and not self.pipes:
+                    if (self.process.returncode is not None and self.group_gone()
+                            and (not self.pipes or not self.io_open)):
                         break
                     remaining = until - time.monotonic_ns()
                     if remaining <= 0:
@@ -279,9 +280,11 @@ class _Transport:
                         pass
         # Darwin can report EPERM when a group contains only the unreaped
         # zombie.  Signal acknowledgement is not release proof: the reaped
-        # direct child, absent group, and both EOFs are the final authority.
+        # direct child, absent group, and closed parent pipes are authoritative.
+        # EOF is necessary for protocol completion, not for resource release
+        # after an I/O error has made further reads impossible.
         return (self.wait_owned and self.close_ok and self.process.returncode is not None
-                and self.group_gone() and all(self.eof.values()))
+                and self.group_gone() and not self.pipes)
 
 
 def run_qualification_child(
@@ -343,7 +346,7 @@ def run_qualification_child(
                 transport.fail("timeout", exc.phase)
             except (TypeError, ValueError):
                 transport.fail("protocol_error")
-    if transport.reason is None and not cleanup_complete:
+    if transport.reason is None and (not cleanup_complete or not all(transport.eof.values())):
         transport.fail("cleanup_error")
     return QualificationChildResult(
         reason=transport.reason or "complete",

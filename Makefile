@@ -817,7 +817,7 @@ test-qualification-supervisor:
 	python3 gguf-tools/quality-testing/test_qualification_supervisor.py -v
 
 test-qualification-process:
-	python3 gguf-tools/quality-testing/test_qualification_process.py -v
+	python3 -m unittest discover -s gguf-tools/quality-testing -p 'test_qualification_process*.py' -v
 
 test-laguna-layer-diagnostics:
 	python3 tests/test_laguna_layer_mismatch.py -v

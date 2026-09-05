@@ -1767,6 +1767,12 @@ seam is immutable input/schema/build admission and retained artifact identity.
 The shared regular-file opener now rejects FIFOs without blocking, and model
 hashing reads only the initial size with pre/post identity checks (94 qualifier
 tests, including two new RED-driven file-boundary regressions).
+`qualification_artifacts.py` now owns nofollow, read-only file descriptors,
+checks byte caps before hashing, and detects retained-inode/path/change-time
+drift. Six host tests include proc-exe identity simulation, real file growth,
+replacement, and same-size content changes with a restored mtime. Proc-exe
+matching does not establish PID ownership; the controlled transport must hold
+the PID, and live Linux process authentication remains unqualified here.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

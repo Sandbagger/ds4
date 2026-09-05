@@ -1721,8 +1721,17 @@ path/SHA/uint64-string syntax and canonical bytes; it does not inspect files,
 check symlinks, authenticate observed bytes or collect references from a bundle.
 Neither helper launches children, enforces real deadlines, authenticates a
 running model/executable, evaluates gates, retries or publishes a bundle.
-The runner and publication steps below therefore remain unchecked. See
-[port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
+The runner and publication steps below therefore remain unchecked.
+
+**Supervisor progress (2026-09-05):** `9b07a35` adds incremental, deep-copied
+validated-record draining (19 parser tests). `qualification_supervisor.py`
+adds pure lifecycle/parent-clock deadline monitoring (12 host tests), including
+coalesced late milestones, clock regression from launch onward, complete-stream
+closure and retained partial observations. These helpers do not launch or reap
+children. POSIX transport tests and implementation are the next active seam;
+full control-channel/orchestration/publication acceptance remains unfinished.
+
+See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 
 **Files:**

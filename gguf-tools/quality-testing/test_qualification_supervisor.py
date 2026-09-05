@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-only red tests for the qualification slice lifecycle supervisor.
+"""Host-only tests for the qualification slice lifecycle supervisor.
 
 These tests use the checked-in parser fixture and explicit nanosecond values.
 They do not launch a process, contact a model, use a GPU or service, or read
@@ -339,6 +339,19 @@ class QualificationSliceMonitorHostTest(unittest.TestCase):
             monitor.feed(_json_line(prestart[0]), now_ns=10)
         with self.assertRaises(ValueError):
             monitor.check_deadline(10)
+
+    def test_parent_clock_cannot_precede_start(self) -> None:
+        records = _timed_records([101, 102, 103, 106, 107, 108, 111, 112, 113, 116, 117, 118])
+        for operation in ("feed", "check_deadline"):
+            with self.subTest(operation=operation):
+                monitor = _monitor(records, start_ns=100)
+                with self.assertRaises(ValueError):
+                    if operation == "feed":
+                        monitor.feed(b"", now_ns=99)
+                    else:
+                        monitor.check_deadline(99)
+                with self.assertRaises(ValueError):
+                    monitor.check_deadline(100)
 
     def test_parent_clock_cannot_regress_after_a_valid_observation(self) -> None:
         records = _timed_records([1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15])

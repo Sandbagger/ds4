@@ -1778,10 +1778,29 @@ files, rejects nonlocal schema references and invalid/oversized inputs, matches
 the model inode/content, and validates three same-revision clean-CUDA version
 responses before yielding four artifact owners. Five host tests cover byte
 hashes, ordering, drift, rejection/cleanup and final context-exit verification.
-Its required `version_probe` is still a trusted callback: the next production
-seam is an owned descriptor-executed native probe, not a claim that injected
-version responses authenticate a running build. Full orchestration and bundle
-publication remain unfinished.
+At `4782539`, immutable host verification passed 130 focused tests, 214
+aggregate Python tests and the native host harnesses; independent review found
+no confirmed defect. Admission's required callback still treats injected version
+bytes as trusted claims, not native-origin proof.
+
+**Native version-probe progress (2026-09-05):**
+`QualificationVersionProbe` now provides that callback by executing the retained
+artifact descriptor with exactly `--version-json`. It borrows exactly one FD,
+caps both raw streams at 64 KiB, applies one fixed deadline, and checks the
+artifact again after owned cleanup. Its detached observations survive errors
+and interrupts, including interruption during context admission. The shared
+process owner records release proof even when cleanup is interrupted; merely
+reaching `finally` is not proof. Seven host tests pass, plus the 30 affected
+process/control/artifact/admission tests. Pinned verification and review of this
+increment remain pending at commit time.
+
+Descriptor execution is Linux-only. Measured Darwin `/dev/fd` attempts failed
+with `EACCES` for both a script and a native interpreter. The Darwin tests use
+an explicit Python-FD-content adapter for supervision only, plus an unadapted
+fail-closed/no-launch test. They do **not** prove native Linux origin or Linux
+`waitid` behavior. No mutable-path execution fallback exists. Full orchestration,
+runtime authentication, gates/retries and bundle publication remain unfinished;
+`run` still refuses incomplete execution.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

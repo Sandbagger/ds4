@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from qualification_records import MAX_STREAM_BYTES
 from qualification_supervisor import (
@@ -35,6 +35,22 @@ MAX_STDERR_BYTES = 65_536
 _READ_BYTES = 65_536
 _POLL_NS = 10_000_000
 _RELEASE_TIMEOUT_NS = 1_000_000_000
+
+
+class _OutputMonitor(Protocol):
+    """The shared owner needs clocks and optional stdout records, not a parser."""
+
+    @property
+    def deadline_ns(self) -> int | None: ...
+
+    @property
+    def records(self) -> tuple[dict[str, Any], ...]: ...
+
+    def feed(self, chunk: bytes, *, now_ns: int) -> None: ...
+
+    def check_deadline(self, now_ns: int) -> None: ...
+
+    def finish(self, exit_code: int, *, now_ns: int) -> tuple[dict[str, Any], ...]: ...
 
 
 @dataclass(frozen=True)
@@ -85,11 +101,19 @@ def _exit_probe() -> Callable[[int], bool]:
 
 
 class _Transport:
-    def __init__(self, monitor: QualificationSliceMonitor, grace_ns: int,
-                 exited: Callable[[int], bool]) -> None:
+    def __init__(self, monitor: _OutputMonitor, grace_ns: int, *,
+                 stdout_limit: int, stderr_limit: int) -> None:
+        for name, limit in (
+            ("termination_grace_ns", grace_ns),
+            ("stdout_limit", stdout_limit), ("stderr_limit", stderr_limit),
+        ):
+            if type(limit) is not int:
+                raise TypeError(f"{name} must be a built-in integer")
+            if limit <= 0:
+                raise ValueError(f"{name} must be positive")
         self.monitor = monitor
         self.grace_ns = grace_ns
-        self.exited = exited
+        self.exited = _exit_probe()
         self.process: subprocess.Popen[bytes] | None = None
         self.owned_group = False
         self.pid_reserved = False
@@ -103,7 +127,7 @@ class _Transport:
         self.close_ok = True
         self.cleanup_complete = True
         self.buffers = {"stdout": bytearray(), "stderr": bytearray()}
-        self.caps = {"stdout": MAX_STDOUT_BYTES, "stderr": MAX_STDERR_BYTES}
+        self.caps = {"stdout": stdout_limit, "stderr": stderr_limit}
         self.truncated = {"stdout": False, "stderr": False}
         self.pipes: dict[int, tuple[str, Any]] = {}
         self.eof = {"stdout": False, "stderr": False}
@@ -300,14 +324,18 @@ class _Transport:
                         self.process.wait(timeout=max(0, until - time.monotonic_ns()) / 1_000_000_000)
                     except subprocess.TimeoutExpired:
                         pass
-        # Darwin can report EPERM when a group contains only the unreaped
-        # zombie.  Signal acknowledgement is not release proof: the reaped
-        # direct child, absent group, and closed parent pipes are authoritative.
-        # EOF is necessary for protocol completion, not for resource release
-        # after an I/O error has made further reads impossible.
-        return (self.wait_owned and self.close_ok and self.process.returncode is not None
-                and self.group_gone() and not self.pipes)
+        return self.resources_released()
 
+    def resources_released(self) -> bool:
+        # Darwin can report EPERM for a zombie-only group.  Reaping, group
+        # absence and closed streams prove release, not signal acknowledgement
+        # or merely having reached a finally block.  This can also be checked
+        # after cleanup has propagated an interrupt instead of returning.
+        return (self.process is not None and self.wait_owned and self.close_ok
+                and self.process.returncode is not None and self.group_gone()
+                and not self.pipes
+                and all(pipe is not None and pipe.closed
+                        for pipe in (self.process.stdout, self.process.stderr)))
 
     def result(self) -> QualificationChildResult:
         """Finalize observations after the owning context has released resources."""
@@ -354,15 +382,11 @@ def _validated_command(command: list[str] | tuple[str, ...]) -> tuple[str, ...]:
 
 
 @contextmanager
-def _qualification_child_transport(
-    command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
-    first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
-    whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
-    idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
-    termination_grace_ns: int = 250_000_000,
+def _owned_child_transport(
+    command: list[str] | tuple[str, ...], transport: _Transport, *,
     pass_fds: tuple[int, ...] = (),
 ) -> Iterator[_Transport]:
-    """Own exactly one child, its pipes and its bounded release lifecycle."""
+    """Own exactly one child, its bounded streams, and its release lifecycle."""
     argv = _validated_command(command)
     if type(pass_fds) is not tuple or any(type(fd) is not int for fd in pass_fds):
         raise TypeError("inherited descriptors must be a tuple of built-in integers")
@@ -370,17 +394,6 @@ def _qualification_child_transport(
         raise ValueError("inherited descriptors must be unique and outside standard streams")
     for fd in pass_fds:
         os.fstat(fd)
-    if type(termination_grace_ns) is not int:
-        raise TypeError("termination_grace_ns must be a built-in integer")
-    if termination_grace_ns <= 0:
-        raise ValueError("termination_grace_ns must be positive")
-    monitor = QualificationSliceMonitor(
-        expected, start_ns=time.monotonic_ns(),
-        first_token_timeout_ns=first_token_timeout_ns,
-        whole_request_timeout_ns=whole_request_timeout_ns,
-        idle_timeout_ns=idle_timeout_ns,
-    )
-    transport = _Transport(monitor, termination_grace_ns, _exit_probe())
     try:
         process = subprocess.Popen(
             argv, shell=False, start_new_session=True, stdin=subprocess.DEVNULL,
@@ -406,7 +419,35 @@ def _qualification_child_transport(
     finally:
         if sys.exc_info()[0] is not None:
             transport.monitor_open = False
-        transport.cleanup_complete = transport.cleanup()
+        try:
+            transport.cleanup()
+        finally:
+            transport.cleanup_complete = transport.resources_released()
+
+
+@contextmanager
+def _qualification_child_transport(
+    command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
+    whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
+    idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
+    termination_grace_ns: int = 250_000_000,
+    pass_fds: tuple[int, ...] = (),
+) -> Iterator[_Transport]:
+    """Use the common owner with the twelve-record lifecycle monitor."""
+    argv = _validated_command(command)
+    monitor = QualificationSliceMonitor(
+        expected, start_ns=time.monotonic_ns(),
+        first_token_timeout_ns=first_token_timeout_ns,
+        whole_request_timeout_ns=whole_request_timeout_ns,
+        idle_timeout_ns=idle_timeout_ns,
+    )
+    transport = _Transport(
+        monitor, termination_grace_ns,
+        stdout_limit=MAX_STDOUT_BYTES, stderr_limit=MAX_STDERR_BYTES,
+    )
+    with _owned_child_transport(argv, transport, pass_fds=pass_fds):
+        yield transport
 
 
 def run_qualification_child(

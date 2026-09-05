@@ -548,6 +548,40 @@ class QualificationVersionProbeHostTest(unittest.TestCase):
             self.assertTrue(observation["stderr"].startswith(b"interrupt-stderr\n"))
             _assert_owned_cleanup(self, metadata_path, token, observation)
 
+    def test_interrupt_before_context_yield_keeps_started_observations(self) -> None:
+        import qualification_process as PROCESS
+
+        interrupted = KeyboardInterrupt("version admission interrupt")
+        original_attach = PROCESS._Transport.attach
+        admitted: list[int] = []
+
+        def interrupt_after_attach(transport: Any, process: Any) -> None:
+            original_attach(transport, process)
+            # Establish actual child bytes/ownership before the injected signal,
+            # but still interrupt __enter__, before the caller receives a yield.
+            transport.run()
+            admitted.append(process.pid)
+            raise interrupted
+
+        with _artifact_case("success", b"admitted-version", b"admitted-stderr") as (
+            _fake, metadata_path, token, artifact,
+        ):
+            probe = QualificationVersionProbe(
+                timeout_ns=1_000_000_000, termination_grace_ns=30_000_000,
+            )
+            with mock.patch.object(PROCESS._Transport, "attach", interrupt_after_attach):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    _call_probe_bounded(probe, "bench", artifact)
+            self.assertIs(caught.exception, interrupted)
+            self.assertEqual(len(admitted), 1)
+            self.assertEqual(len(probe.observations), 1)
+            observation = probe.observations[0]
+            _assert_observation(self, observation, role="bench", reason="interrupted")
+            self.assertEqual(observation["pid"], admitted[0])
+            self.assertEqual(observation["stdout"], b"admitted-version")
+            self.assertEqual(observation["stderr"], b"admitted-stderr")
+            _assert_owned_cleanup(self, metadata_path, token, observation)
+
     def test_path_replacement_around_popen_executes_pinned_bytes_then_artifact_error(self) -> None:
         original = b"ORIGINAL-PINNED-VERSION\n"
         replacement = b"REPLACEMENT-MUST-NOT-RUN\n"

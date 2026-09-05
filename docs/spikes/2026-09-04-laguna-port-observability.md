@@ -249,3 +249,25 @@ Negative-test rules from this increment:
 - Keep fixture patches active while the implementation runs, not just while
   constructing input. Mutate a test file through a separate writable handle;
   a failed write to the read-only owner is not a real growth race.
+
+## Descriptor-only version collection
+
+The admission callback now has a Linux-only owned implementation in
+`qualification_version_probe.py`. It returns raw bytes; admission still owns
+JSON, clean-CUDA and revision validation. The lifecycle and raw-version paths
+share one private child owner with separate monitors and byte caps.
+
+Two real interrupt regressions shaped the owner boundary: cleanup can release
+all resources yet propagate an interrupt before its return value is assigned,
+and an admitted child can produce evidence before a context yields its owner.
+Keep the owner before entering; then record actual reaping, group absence and
+closed-stream proof in the cleanup exit path. Never infer release just because
+a cleanup block ran. Preserve the original interrupt and capped raw prefixes.
+
+Darwin returned EACCES for `/dev/fd` execution of both a shebang program and the
+native project interpreter. Production therefore fails closed outside Linux.
+The host-test-only adapter reads the retained Python fake's FD; it validates
+supervision and FD handoff, not kernel-native executable origin. Adapters must
+assert the **entire requested command**, not synthesize a correct flag while
+silently ignoring a wrong production argument. Native Linux and real-model
+qualification remain separate evidence requirements.

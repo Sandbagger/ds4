@@ -16,7 +16,8 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -100,6 +101,7 @@ class _Transport:
         self.monitor_open = True
         self.io_open = True
         self.close_ok = True
+        self.cleanup_complete = True
         self.buffers = {"stdout": bytearray(), "stderr": bytearray()}
         self.caps = {"stdout": MAX_STDOUT_BYTES, "stderr": MAX_STDERR_BYTES}
         self.truncated = {"stdout": False, "stderr": False}
@@ -307,18 +309,38 @@ class _Transport:
                 and self.group_gone() and not self.pipes)
 
 
-def run_qualification_child(
-    command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
-    first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
-    whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
-    idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
-    termination_grace_ns: int = 250_000_000,
-) -> QualificationChildResult:
-    """Run one foreground producer, retain bounded observations, and clean up.
+    def result(self) -> QualificationChildResult:
+        """Finalize observations after the owning context has released resources."""
+        process = self.process
+        if process is None:
+            return QualificationChildResult("launch_error", b"", b"", (), None, True)
+        if self.reason is None:
+            self.check_clock()
+        if self.reason is None:
+            if process.returncode != 0:
+                self.fail("child_exit")
+            elif all(self.eof.values()):
+                try:
+                    self.monitor.finish(process.returncode, now_ns=self.clock_ns())
+                except QualificationTimeout as exc:
+                    self.fail("timeout", exc.phase)
+                except (TypeError, ValueError):
+                    self.fail("protocol_error")
+        if self.reason is None and (not self.cleanup_complete or not all(self.eof.values())):
+            self.fail("cleanup_error")
+        return QualificationChildResult(
+            reason=self.reason or "complete",
+            stdout=bytes(self.buffers["stdout"]),
+            stderr=bytes(self.buffers["stderr"]), records=self.monitor.records,
+            returncode=process.returncode if self.wait_owned else None,
+            cleanup_complete=self.cleanup_complete,
+            timeout_phase=self.timeout_phase,
+            stdout_truncated=self.truncated["stdout"],
+            stderr_truncated=self.truncated["stderr"],
+        )
 
-    Invalid arguments fail before launch.  The structured result describes
-    transport only.  Interrupts propagate after bounded owned-group cleanup.
-    """
+
+def _validated_command(command: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     if type(command) not in (list, tuple):
         raise TypeError("command must be a built-in list or tuple")
     if not command:
@@ -328,6 +350,19 @@ def run_qualification_child(
         raise TypeError("command arguments must be strings")
     if not argv[0] or any("\0" in arg for arg in argv):
         raise ValueError("command needs a program and NUL-free arguments")
+    return argv
+
+
+@contextmanager
+def _qualification_child_transport(
+    command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
+    whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
+    idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
+    termination_grace_ns: int = 250_000_000,
+) -> Iterator[_Transport]:
+    """Own exactly one child, its pipes and its bounded release lifecycle."""
+    argv = _validated_command(command)
     if type(termination_grace_ns) is not int:
         raise TypeError("termination_grace_ns must be a built-in integer")
     if termination_grace_ns <= 0:
@@ -345,38 +380,45 @@ def run_qualification_child(
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
         )
     except OSError:
-        return QualificationChildResult("launch_error", b"", b"", (), None, True)
+        process = None
+    if process is None:
+        transport.fail("launch_error")
+        yield transport
+        return
+    transport.cleanup_complete = False
     try:
         try:
             transport.attach(process)
-            transport.run()
+        except OSError:
+            transport.fail("io_error")
+        try:
+            yield transport
         except OSError:
             transport.fail("io_error")
     finally:
         if sys.exc_info()[0] is not None:
             transport.monitor_open = False
-        cleanup_complete = transport.cleanup()
-    if transport.reason is None:
-        transport.check_clock()
-    if transport.reason is None:
-        if process.returncode != 0:
-            transport.fail("child_exit")
-        elif all(transport.eof.values()):
-            try:
-                monitor.finish(process.returncode, now_ns=transport.clock_ns())
-            except QualificationTimeout as exc:
-                transport.fail("timeout", exc.phase)
-            except (TypeError, ValueError):
-                transport.fail("protocol_error")
-    if transport.reason is None and (not cleanup_complete or not all(transport.eof.values())):
-        transport.fail("cleanup_error")
-    return QualificationChildResult(
-        reason=transport.reason or "complete",
-        stdout=bytes(transport.buffers["stdout"]),
-        stderr=bytes(transport.buffers["stderr"]), records=monitor.records,
-        returncode=process.returncode if transport.wait_owned else None,
-        cleanup_complete=cleanup_complete,
-        timeout_phase=transport.timeout_phase,
-        stdout_truncated=transport.truncated["stdout"],
-        stderr_truncated=transport.truncated["stderr"],
-    )
+        transport.cleanup_complete = transport.cleanup()
+
+
+def run_qualification_child(
+    command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
+    whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
+    idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
+    termination_grace_ns: int = 250_000_000,
+) -> QualificationChildResult:
+    """Run one foreground producer, retain bounded observations, and clean up.
+
+    Invalid arguments fail before launch.  The structured result describes
+    transport only.  Interrupts propagate after bounded owned-group cleanup.
+    """
+    with _qualification_child_transport(
+        command, expected,
+        first_token_timeout_ns=first_token_timeout_ns,
+        whole_request_timeout_ns=whole_request_timeout_ns,
+        idle_timeout_ns=idle_timeout_ns,
+        termination_grace_ns=termination_grace_ns,
+    ) as transport:
+        transport.run()
+    return transport.result()

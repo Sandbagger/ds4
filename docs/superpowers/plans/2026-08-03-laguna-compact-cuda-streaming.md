@@ -1819,6 +1819,26 @@ Resident-first orchestration, runtime-schema binding, cold preparation and
 snapshot collection, gates/retry policy, filesystem evidence authentication and
 atomic bundle publication remain unfinished.
 
+
+**Resident producer dependency (2026-09-05):** At `83cb9b7`, pinned checks passed
+143 focused tests, 227 aggregate Python tests and the native host harnesses;
+independent review found no confirmed defect. Source inspection then confirmed
+that the current native plan writer and controlled benchmark are streamed-only.
+Resident engine open builds the tensor ledger, but does not initialize the
+qualification allocation tracker or publish `ds4.runtime/v1` snapshots. The
+human startup estimate and one-pass smoke eval are not substitutes for the
+resident plan, observed footprint and same-child cold/warm baseline required
+below. No native resident/model/GPU run was made during this inspection.
+
+Keep the existing streamed sequence/parser/emitter contracts unchanged. Add a
+separate, trusted resident sequence boundary before connecting native resident
+allocation/snapshot production: `ds4.resident-qualification-sequence/v1`,
+`profile_id=resident`, `cache_bytes=0`, `mode=resident`, canonical prompt order
+512/2048/8192/28672, and the same fixed one-cold/three-warm sampling contract.
+Host parser/builder tests must reject cross-mode substitutions in both
+directions. This boundary alone will not implement resident allocation
+accounting, execute a baseline, enable CLI `run`, or qualify CUDA behavior.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

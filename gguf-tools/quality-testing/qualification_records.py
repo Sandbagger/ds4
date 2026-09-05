@@ -273,7 +273,7 @@ def _require_equal(record: dict[str, Any], key: str, expected: Any, source: str)
         raise ValueError(f"$.{key}: does not match {source}")
 
 
-def _validate_flattened_bindings(record: dict[str, Any]) -> None:
+def _validate_flattened_bindings(record: dict[str, Any], *, resident: bool = False) -> None:
     runtime = record["runtime"]
     allocations = runtime["allocations"]
     categories = allocations["categories"]
@@ -326,8 +326,14 @@ def _validate_flattened_bindings(record: dict[str, Any]) -> None:
             f"runtime.allocations.reports.{key}.current_bytes",
         )
 
-    expected_cache = PROFILE_CACHE_BYTES.get(record["profile_id"])
-    expected_order = PROFILE_PROMPT_ORDER.get(record["profile_id"])
+    if resident:
+        expected_cache = "0" if record["profile_id"] == "resident" else None
+        expected_order = (
+            "native-512", "native-2048", "native-8192", "native-28672",
+        ) if record["profile_id"] == "resident" else None
+    else:
+        expected_cache = PROFILE_CACHE_BYTES.get(record["profile_id"])
+        expected_order = PROFILE_PROMPT_ORDER.get(record["profile_id"])
     if expected_cache is None or expected_order is None:
         raise ValueError("$.profile_id: unknown cache profile")
     if record["prompt_id"] != expected_order[record["prompt_order_index"]]:
@@ -347,7 +353,7 @@ def _validate_flattened_bindings(record: dict[str, Any]) -> None:
         "context_tokens": 32768,
         "prefill_chunk_tokens": 4096,
         "session_slots": 1,
-        "ssd_streaming": True,
+        "ssd_streaming": not resident,
         "ssd_streaming_cache_bytes": expected_cache,
     }
     expected_limits = {
@@ -373,9 +379,13 @@ def _validate_flattened_bindings(record: dict[str, Any]) -> None:
             raise ValueError("$.prompt_id: does not match request_metrics.prompt_tokens")
 
 
-def validate_record(record: Any, *, complete: bool | None = None) -> None:
-    schema = loads_strict(SCHEMA_PATH.read_bytes())
-    _validate(record, schema, "$", schema, SCHEMA_PATH)
+def _validate_record_with_contract(
+    record: Any, *, schema_path: Path, resident: bool,
+    complete: bool | None = None,
+) -> None:
+    """Validate one explicitly selected wire kind, never inferred from input."""
+    schema = loads_strict(schema_path.read_bytes())
+    _validate(record, schema, "$", schema, schema_path)
     if not isinstance(record, dict):
         raise ValueError("record root is not an object")
     _validate_wire_scalar_types(record)
@@ -387,9 +397,16 @@ def validate_record(record: Any, *, complete: bool | None = None) -> None:
         raise ValueError("external_attribution is not closed")
     if record["external_attribution"]["unrelated_process_inventory_stable"] is not True:
         raise ValueError("$.external_attribution.unrelated_process_inventory_stable must be true")
-    _validate_flattened_bindings(record)
+    _validate_flattened_bindings(record, resident=resident)
     if complete is True and record["event"] != "request_complete":
         raise ValueError("canned fixture must be a request_complete record")
+
+
+def validate_record(record: Any, *, complete: bool | None = None) -> None:
+    """Validate the existing streamed contract only."""
+    _validate_record_with_contract(
+        record, schema_path=SCHEMA_PATH, resident=False, complete=complete,
+    )
 
 
 def _validate_lifecycle(records: list[Any]) -> None:
@@ -451,7 +468,7 @@ def _copy_expected_bindings(expected: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
-class QualificationRecordStream:
+class _QualificationRecordStreamBase:
     """Incrementally validate one twelve-record qualification JSONL stream.
 
     This parser validates wire/schema/lifecycle structure only.  It does not
@@ -475,6 +492,15 @@ class QualificationRecordStream:
         self._failed = False
         self._finished = False
 
+    def _record_byte_limit(self) -> int:
+        return MAX_RECORD_BYTES
+
+    def _stream_byte_limit(self) -> int:
+        return MAX_STREAM_BYTES
+
+    def _validate_record(self, record: Any) -> None:
+        validate_record(record)
+
     def _fail(self, message: str) -> None:
         self._failed = True
         raise ValueError(message)
@@ -490,12 +516,13 @@ class QualificationRecordStream:
         if not isinstance(chunk, bytes):
             self._fail("qualification record chunks must be bytes")
         # Check the total before retaining any part of an unchecked chunk.
-        if self._total_bytes + len(chunk) > MAX_STREAM_BYTES:
+        if self._total_bytes + len(chunk) > self._stream_byte_limit():
             self._fail("qualification JSONL stream exceeds byte limit")
         self._total_bytes += len(chunk)
+        record_limit = self._record_byte_limit()
         try:
             for byte in chunk:
-                if len(self._line) + 1 > MAX_RECORD_BYTES:
+                if len(self._line) + 1 > record_limit:
                     self._fail("qualification JSONL record exceeds byte limit")
                 self._line.append(byte)
                 if byte == 0x0A:  # LF
@@ -508,13 +535,13 @@ class QualificationRecordStream:
     def _consume_line(self, line: bytes) -> None:
         if len(self._records) >= MAX_RECORD_COUNT:
             self._fail("qualification JSONL stream contains too many records")
-        if len(line) > MAX_RECORD_BYTES:
+        if len(line) > self._record_byte_limit():
             self._fail("qualification JSONL record exceeds byte limit")
         if len(line) >= 2 and line[-2] == 0x0D:
             self._fail("qualification JSONL uses CRLF")
         try:
             record = loads_strict(line[:-1])
-            validate_record(record)
+            self._validate_record(record)
         except (TypeError, ValueError, RecursionError) as exc:
             self._fail(str(exc))
         if type(record) is not dict:
@@ -606,6 +633,14 @@ class QualificationRecordStream:
         if len(self._records) != MAX_RECORD_COUNT:
             self._fail("qualification JSONL lifecycle is incomplete")
         return tuple(copy.deepcopy(record) for record in self._records)
+
+
+class QualificationRecordStream(_QualificationRecordStreamBase):
+    """The original streamed-only twelve-record boundary and owned observations.
+
+    Resident parsing has a separate class.  Its validation and byte limits do
+    not change this boundary's schema, profile maps, or module globals.
+    """
 
 
 def _iter_bounded_json_lines(handle: Any) -> Iterator[bytes]:

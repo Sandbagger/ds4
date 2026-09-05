@@ -1885,6 +1885,38 @@ Pinned verification and independent review of this increment remain pending
 at commit time. No CLI `run`, resident model/GPU execution, or CUDA qualification
 is claimed.
 
+**Resident raw consumer progress (2026-09-05):** The emitter at `dc5b643`
+subsequently passed 50 affected/focused and 231 aggregate Python tests plus
+native harnesses; independent review found no confirmed defect. RED `aa9d0cd`
+then required `QualificationResidentRecordStream` and `validate_resident_record`
+in `qualification_resident_records.py`, with the separate
+`ds4.bench.resident-qualification/v1` JSON schema. The public resident boundary
+selects its own schema/profile/order and cache-zero/4096-row restrictions. The
+existing streamed boundary and its schema remain strict and separate.
+
+Private parsing/lifecycle code is shared without temporarily changing shared
+schema paths, profile maps, or byte limits. Each slice binds all six expected
+values, accepts exactly twelve LF-terminated records, and enforces the existing
+1-MiB record, 12-MiB stream and 64-level JSON bounds. Copied drain/finish results
+preserve valid partial evidence without clearing sticky failure. Matching raw
+footprint and completion metrics are retained; they are not qualification gates.
+
+The model-free fixture now compiles the native emitter and feeds its actual
+bytes as four complete slices. Unlike the independent raw-emission fixture,
+each repetition uses accepted/first/completion snapshots at base+1/base+2/base+4
+with request metrics at base+3. Before pinning this increment, 11 resident, 19
+streamed and 14 deadline tests, plus native emitter/lifecycle/composition and
+production-compile harnesses, passed. Pinned aggregate verification and
+independent review remain pending at commit time.
+
+This consumer is not yet wired into a resident deadline/process/control runner.
+The admission schema registry remains the existing six bundle-required schemas;
+authenticated loading/binding of consumed record schemas still needs integration.
+Actual resident allocation tracking, plan/source-page accounting, engine runtime
+snapshots, controlled baseline execution, gates/retries and atomic publication
+remain unfinished. No model/GPU run, native CUDA qualification or CLI `run` is
+claimed.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 
@@ -1892,6 +1924,8 @@ for diagnostic reuse, verification commands and the next implementation seam.
 - Modify: `gguf-tools/quality-testing/compact_runtime_qualify.py`
 - Modify: `gguf-tools/quality-testing/test_compact_runtime_qualify.py`
 - Create: `gguf-tools/quality-testing/qualification_records.py`
+- Create: `gguf-tools/quality-testing/qualification_resident_records.py`
+- Create: `schemas/ds4-bench-resident-qualification-v1.schema.json`
 - Create: `gguf-tools/quality-testing/test_qualification_records.py`
 - Modify: `tests/validate_bench_qualification_json.py`
 - Create: `gguf-tools/quality-testing/qualification_evidence.py`

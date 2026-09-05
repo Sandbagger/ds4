@@ -316,6 +316,38 @@ class ResidentQualificationRecordTest(unittest.TestCase):
         with self.assertRaises((TypeError, ValueError)): validate_resident_record(streamed_record)
         _feed_reject(self, streamed_expected(streamed), _json_line(streamed_record))
 
+    def test_resident_pins_rows_hashes_and_keeps_streamed_state_independent(self) -> None:
+        records = _fresh_slice()
+        for key in ("manifest_sha256", "sequence_sha256", "input_sha256"):
+            _reject_field(self, key, records[0][key] + "\n")
+        for key in ("configured_prefill_rows", "allocated_prefill_rows"):
+            candidate = copy.deepcopy(records[0])
+            candidate[key] = 16384
+            candidate["runtime"]["allocations"][key] = 16384
+            with self.subTest(coupled_rows=key):
+                with self.assertRaises(ValueError):
+                    validate_resident_record(candidate)
+        old_schema = qualification_records_module.SCHEMA_PATH
+        old_cache = dict(qualification_records_module.PROFILE_CACHE_BYTES)
+        old_order = copy.deepcopy(qualification_records_module.PROFILE_PROMPT_ORDER)
+        original_validate = qualification_records_module._validate
+
+        def guard(*args: Any, **kwargs: Any) -> None:
+            self.assertEqual(qualification_records_module.SCHEMA_PATH, old_schema)
+            self.assertEqual(qualification_records_module.PROFILE_CACHE_BYTES, old_cache)
+            self.assertEqual(qualification_records_module.PROFILE_PROMPT_ORDER, old_order)
+            original_validate(*args, **kwargs)
+
+        with mock.patch.object(qualification_records_module, "_validate", side_effect=guard):
+            validate_resident_record(records[0])
+        line = _native_payload().splitlines(keepends=True)[0]
+        streamed = streamed_lifecycle()
+        old_stream = QualificationRecordStream(streamed_expected(streamed))
+        with mock.patch.object(resident_module, "MAX_RECORD_BYTES", len(line) - 1):
+            _feed_reject(self, _expected(records), line)
+            old_stream.feed(_payload(streamed))
+        self.assertEqual(old_stream.finish(), tuple(streamed))
+
     def test_strict_json_crlf_depth_and_wire_caps_are_bounded(self) -> None:
         records = _fresh_slice()
         expected, data = _expected(records), _payload(records)

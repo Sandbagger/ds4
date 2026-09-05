@@ -319,5 +319,29 @@ prove each discriminator.
 The resident emitter reuses runtime serialization and copies observed physical
 footprint even when the expert-cache limit is zero. A zero streaming cache does
 not mean zero resident CUDA allocations or zero registered model pages. Native
-allocation collection and parent-side lifecycle/schema validation remain
-separate required work.
+allocation collection and parent-side lifecycle/schema validation are not
+supplied by the emitter alone.
+
+## Resident record consumption and rejection boundaries
+
+The resident consumer shares private JSONL framing/lifecycle mechanics with the
+streamed consumer, not mutable public mode selection. Fixed public boundaries
+select their own schema and profile rules. Never temporarily swap the streamed
+module's schema paths, profile maps or limits to parse resident evidence.
+
+The host fixture feeds actual native-emitted bytes for four complete resident
+slices. Snapshot gaps matter: accepted, first token, request metrics and complete
+runtime snapshots occupy four successive sequence values, but only three are
+lifecycle records. Four sets of independent raw emissions do not prove that
+complete twelve-record slices are consumable.
+
+A malformed single-line input test must assert rejection during `feed()`, not
+merely accept any eventual error from `finish()`. An incomplete stream will fail
+finish even if the bad line or ignored byte cap was accepted. Establish valid
+baseline bytes first, isolate each mutant and each failed parser instance, and
+prove depth rejection precedes JSON decoding. Draining a valid prefix does not
+make a failed stream recoverable or a completed qualification run.
+
+This is raw host-side consumption, not native allocation/snapshot production,
+authenticated record-schema admission, resident process supervision, a baseline
+execution, or a qualification verdict. Those integration boundaries remain open.

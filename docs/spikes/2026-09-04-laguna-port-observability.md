@@ -271,3 +271,24 @@ supervision and FD handoff, not kernel-native executable origin. Adapters must
 assert the **entire requested command**, not synthesize a correct flag while
 silently ignoring a wrong production argument. Native Linux and real-model
 qualification remain separate evidence requirements.
+
+## Authenticated control-boundary composition
+
+`qualification_authenticated.py` checks retained input owners, the live owned
+PID's executable, and the received model FD around each preparation/snapshot
+callback. A rejection must happen before its ACK releases the child. The
+controller still owns socket/FD cleanup and raw observations; authentication
+does not replace its earliest transport failure with a qualification verdict.
+
+The host fixtures use a simulated proc tree whose allowed PIDs come only from
+actual Popen returns. They must not manufacture an acceptable proc leaf for any
+PID supplied by production. Capture the executable FD integer before a failing
+check invalidates its owner; assertions must not reopen a failed owner. Close
+an FD-directory iterator before counting inherited descriptors, or the fixture
+counts its own scan. To prove before-and-after callback checks, require both
+sides between successive callbacks, not merely one intervening authentication.
+
+The first native run also caught fixture-only errors: a 64-KiB stderr burst plus
+later milestone diagnostics correctly exceeded the existing 64-KiB cap, and
+an eight-byte read could not equal the nine-byte word `preflight`. The tests
+were corrected; production byte caps were not weakened.

@@ -44,6 +44,7 @@ def run_qualification_controlled_child(
     prepare_descriptor: Callable[[int, int, QualificationModelEvidence], Any],
     capture_before: Callable[[int, int], Any],
     capture_after: Callable[[int, int], Any],
+    _executable_fd: int | None = None,
     first_token_timeout_ns: int = 900_000_000_000,
     whole_request_timeout_ns: int = 2_700_000_000_000,
     idle_timeout_ns: int = 900_000_000_000,
@@ -55,6 +56,8 @@ def run_qualification_controlled_child(
     The setup idle default matches the child's 15-minute model-ACK budget.
     First-token and whole-request limits still originate at acceptance records.
     Parent snapshots are copied at capture, before a caller can reuse them.
+    The private executable FD is borrowed by the authenticated composition;
+    this controller inherits it but does not itself authenticate its origin.
     """
     argv = _validated_command(command)
     if any(arg == "--qualification-control-fd" or
@@ -132,7 +135,8 @@ def run_qualification_controlled_child(
             whole_request_timeout_ns=whole_request_timeout_ns,
             idle_timeout_ns=idle_timeout_ns,
             termination_grace_ns=termination_grace_ns,
-            pass_fds=(inherited,),
+            pass_fds=((inherited,) if _executable_fd is None
+                      else (inherited, _executable_fd)),
         ) as transport:
             control.close_child_endpoint()
             if transport.process is not None and transport.reason is None:

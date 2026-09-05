@@ -511,7 +511,7 @@ class QualificationAuthenticatedHostTest(unittest.TestCase):
             payload = b"authenticated model bytes\0" * 257
             model.write_bytes(payload)
             with CONTROLLED_TEST._controlled_fake_case(
-                "complete", self.records, model, stderr_burst=64 << 10
+                "complete", self.records, model, stderr_burst=32 << 10
             ) as (command, metadata_path, token):
                 fake = Path(command[1])
                 _adapt_controlled_fake(fake)
@@ -962,6 +962,68 @@ class QualificationAuthenticatedHostTest(unittest.TestCase):
                     executable.verify()
                     model_artifact.verify()
 
+    def test_exit_tail_model_drift_preserves_the_completed_raw_prefix(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qualification-authenticated-tail-") as tmp:
+            model = Path(tmp) / "tail-model.gguf"
+            payload = b"model before owned child exit"
+            model.write_bytes(payload)
+            with CONTROLLED_TEST._controlled_fake_case(
+                "complete", self.records, model,
+            ) as (command, metadata_path, token):
+                fake = Path(command[1])
+                _adapt_controlled_fake(fake)
+                with (
+                    open_qualification_artifact(fake, executable=True) as executable,
+                    open_qualification_artifact(model) as model_artifact,
+                    tempfile.TemporaryDirectory(prefix="SIMULATED-PROC-tail-") as proc,
+                ):
+                    probe = _AuthenticationProbe(
+                        executable, model_artifact, Path(proc), running_target=fake,
+                    )
+                    completed: list[Any] = []
+                    native_controlled = AUTH.run_qualification_controlled_child
+
+                    def mutate_after_owned_exit(*args: Any, **kwargs: Any) -> Any:
+                        observed = native_controlled(*args, **kwargs)
+                        self.assertEqual(observed.transport.reason, "complete")
+                        completed.append(observed)
+                        # Model a file change after the last live PID check.
+                        # The actual native child is already reaped here.
+                        with model.open("r+b") as handle:
+                            handle.write(b"M")
+                        return observed
+
+                    def prepare(pid: int, _fd: int, _evidence: Any) -> Any:
+                        return probe.callback("prepare", pid)
+
+                    def before(pid: int, _sequence: int) -> Any:
+                        return probe.callback("before", pid)
+
+                    def after(pid: int, _sequence: int) -> Any:
+                        return probe.callback("after", pid)
+
+                    with mock.patch.object(
+                        AUTH, "run_qualification_controlled_child", mutate_after_owned_exit,
+                    ):
+                        result, _requests = _call_bounded(
+                            ["--profile", "exit-tail"], self.expected,
+                            executable_artifact=executable, model_artifact=model_artifact,
+                            probe=probe, prepare_descriptor=prepare,
+                            capture_before=before, capture_after=after,
+                        )
+                    self.assertEqual(len(completed), 1)
+                    self.assertEqual(result.transport.reason, "protocol_error")
+                    self.assertIn("final artifact", result.control_error)
+                    self.assertEqual(result.transport.stdout, completed[0].transport.stdout)
+                    self.assertEqual(len(result.transport.records), 12)
+                    self.assertEqual(result.wire_records, completed[0].wire_records)
+                    self.assertEqual(len(result.wire_records), 50)
+                    self.assertEqual(result.model_evidence.sha256, hashlib.sha256(payload).hexdigest())
+                    _assert_cleanup(self, result, metadata_path, token)
+                    with self.assertRaises(ValueError):
+                        _ = model_artifact.fd
+                    executable.verify()
+
     def test_invalid_inputs_reject_before_popen_and_borrowed_owners_survive(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qualification-authenticated-preflight-") as tmp:
             directory = Path(tmp)
@@ -1002,7 +1064,7 @@ class QualificationAuthenticatedHostTest(unittest.TestCase):
                             )
                 popen.assert_not_called()
                 self.assertEqual(os.pread(executable.fd, 2, 0), b"#!")
-                self.assertEqual(os.pread(model_artifact.fd, 8, 0), b"preflight")
+                self.assertEqual(os.pread(model_artifact.fd, len(b"preflight"), 0), b"preflight")
                 executable.verify()
                 model_artifact.verify()
 

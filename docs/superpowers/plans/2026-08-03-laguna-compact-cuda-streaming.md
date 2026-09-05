@@ -1802,6 +1802,23 @@ fail-closed/no-launch test. They do **not** prove native Linux origin or Linux
 runtime authentication, gates/retries and bundle publication remain unfinished;
 `run` still refuses incomplete execution.
 
+At `81a8388`, pinned verification passed 137 focused tests, 221 aggregate Python
+tests and the native host harnesses; independent review found no confirmed
+defect. `qualification_authenticated.py` now composes controlled execution with
+retained model/executable owners. Only the executable FD and owned control
+socket are inherited. The running executable and received model descriptor
+must match the pinned inputs before preparation and before/after every sample
+callback, including the final callback before its RESULT_ACK. File drift in
+the exit tail rejects the result without discarding its completed raw prefix.
+Six host cases cover success, identity mismatches before model ACK, final-ACK
+refusal on drift, exit-tail drift, interruption and preflight rejection. The
+proc tree is simulated on every host; Darwin also uses the explicit FD-content
+adapter. These tests do not qualify Linux-native running-executable origin.
+Pinned verification/review of this increment remain pending at commit time.
+Resident-first orchestration, runtime-schema binding, cold preparation and
+snapshot collection, gates/retry policy, filesystem evidence authentication and
+atomic bundle publication remain unfinished.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

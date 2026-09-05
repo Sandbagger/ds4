@@ -1727,9 +1727,20 @@ The runner and publication steps below therefore remain unchecked.
 validated-record draining (19 parser tests). `qualification_supervisor.py`
 adds pure lifecycle/parent-clock deadline monitoring (14 host tests), including
 coalesced late milestones, clock regression from launch onward, complete-stream
-closure and retained partial observations. These helpers do not launch or reap
-children. POSIX transport tests and implementation are the next active seam;
-full control-channel/orchestration/publication acceptance remains unfinished.
+closure and retained partial observations. `192ed3e` closes a reviewed late
+parent-receipt bypass without discarding coalesced observations.
+
+**Process transport progress (2026-09-05):** `qualification_process.py` now
+launches one foreground child in a new session, drains both capped raw streams,
+enforces milestone deadlines, and preserves validated partial observations.
+Eight native fake-process tests cover success, protocol/exit/output errors,
+phase timeouts, descendant-held pipes and bounded group cleanup. The parent
+uses `waitid(WNOWAIT)` to reserve the direct-child PID until all group signaling
+ends, then reaps and proves group disappearance. Darwin needs a small libc
+`waitid` bridge because this Python build omits `os.waitid`; zombie-only groups
+can reject signals with `EPERM`, so actual release—not signal acknowledgement—is
+the cleanup authority. These are transport facts, not qualification verdicts.
+Full control-channel/orchestration/publication acceptance remains unfinished.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

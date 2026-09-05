@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-only RED contract tests for the Task-20 child transport.
+"""Host-only contract tests for the Task-20 child transport.
 
 The child programs in this module are generated in a private temporary
 folder.  They only emit qualification JSONL and metadata; they never launch

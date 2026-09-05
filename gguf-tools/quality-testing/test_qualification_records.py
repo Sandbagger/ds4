@@ -321,5 +321,128 @@ class QualificationRecordStreamHostTest(unittest.TestCase):
                     stream.feed(chunk)
 
 
+class QualificationRecordStreamDrainHostTest(unittest.TestCase):
+    def test_drain_empty_and_partial_line_is_nonblocking(self) -> None:
+        records = _lifecycle_records()
+        stream = QualificationRecordStream(_expected(records))
+
+        self.assertEqual(stream.drain_records(), ())
+        line = _json_line(records[0])
+        stream.feed(line[:-1])
+        self.assertEqual(stream.drain_records(), ())
+
+        stream.feed(line[-1:])
+        self.assertEqual(stream.drain_records(), (records[0],))
+        self.assertEqual(stream.drain_records(), ())
+
+        # Draining does not close the stream; another complete line is still
+        # accepted and becomes available to the next drain.
+        stream.feed(_json_line(records[1]))
+        self.assertEqual(stream.drain_records(), (records[1],))
+
+    def test_drain_returns_multiple_records_once_and_only_new_records(self) -> None:
+        records = _lifecycle_records()
+        stream = QualificationRecordStream(_expected(records))
+
+        stream.feed(_payload(records[:3]))
+        self.assertEqual(stream.drain_records(), tuple(records[:3]))
+        self.assertEqual(stream.drain_records(), ())
+
+        stream.feed(_payload(records[3:8]))
+        self.assertEqual(stream.drain_records(), tuple(records[3:8]))
+        self.assertEqual(stream.drain_records(), ())
+
+        stream.feed(_payload(records[8:]))
+        self.assertEqual(stream.drain_records(), tuple(records[8:]))
+        self.assertEqual(stream.drain_records(), ())
+
+    def test_drain_waits_for_lf_across_split_utf8_code_point(self) -> None:
+        records = _lifecycle_records()
+        stream = QualificationRecordStream(_expected(records))
+        line = _json_line(records[0], ensure_ascii=False)
+        marker = "界".encode("utf-8")
+        marker_start = line.index(marker)
+        self.assertEqual(line[marker_start : marker_start + len(marker)], marker)
+
+        chunks = (
+            line[: marker_start + 1],
+            line[marker_start + 1 : marker_start + 2],
+            line[marker_start + 2 : -1],
+            line[-1:],
+        )
+        for chunk in chunks[:-1]:
+            stream.feed(chunk)
+            self.assertEqual(stream.drain_records(), ())
+
+        stream.feed(chunks[-1])
+        self.assertEqual(stream.drain_records(), (records[0],))
+
+    def test_failed_feed_releases_valid_prefix_for_drain_without_recovery(self) -> None:
+        records = _lifecycle_records()
+        stream = QualificationRecordStream(_expected(records))
+
+        with self.assertRaises(ValueError):
+            stream.feed(_json_line(records[0]) + b"[]\n")
+
+        self.assertEqual(stream.drain_records(), (records[0],))
+        self.assertEqual(stream.drain_records(), ())
+        with self.assertRaises(ValueError):
+            stream.feed(_json_line(records[1]))
+        with self.assertRaises(ValueError):
+            stream.finish()
+
+    def test_drain_preserves_finished_and_failed_stream_stickiness(self) -> None:
+        records = _lifecycle_records()
+        expected = _expected(records)
+
+        finished = QualificationRecordStream(expected)
+        finished.feed(_payload(records))
+        self.assertEqual(finished.finish(), tuple(records))
+        with self.assertRaises(ValueError):
+            finished.feed(b"")
+        with self.assertRaises(ValueError):
+            finished.finish()
+
+        truncated = QualificationRecordStream(expected)
+        truncated.feed(_json_line(records[0]))
+        with self.assertRaises(ValueError):
+            truncated.finish()
+        self.assertEqual(truncated.drain_records(), (records[0],))
+        self.assertEqual(truncated.drain_records(), ())
+        with self.assertRaises(ValueError):
+            truncated.feed(_json_line(records[1]))
+        with self.assertRaises(ValueError):
+            truncated.finish()
+
+    def test_drain_and_finish_are_deep_copy_isolated(self) -> None:
+        records = _lifecycle_records()
+        stream = QualificationRecordStream(_expected(records))
+
+        stream.feed(_payload(records[:3]))
+        drained = stream.drain_records()
+        self.assertEqual(drained, tuple(records[:3]))
+        drained[0]["runtime"]["model"]["id"] = "mutated-by-drain"
+
+        stream.feed(_payload(records[3:]))
+        finished = stream.finish()
+        self.assertEqual(finished, tuple(records))
+        finished[3]["runtime"]["model"]["id"] = "mutated-by-finish"
+
+        # The finish result and the earlier drain result are independent from
+        # the stream's evidence, including nested dictionaries.
+        self.assertEqual(stream.drain_records(), tuple(records[3:]))
+
+    def test_full_lifecycle_finish_and_final_drain_preserve_order(self) -> None:
+        records = _lifecycle_records()
+        stream = QualificationRecordStream(_expected(records))
+
+        for start in range(0, len(records), 4):
+            stream.feed(_payload(records[start : start + 4]))
+
+        self.assertEqual(stream.finish(), tuple(records))
+        self.assertEqual(stream.drain_records(), tuple(records))
+        self.assertEqual(stream.drain_records(), ())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

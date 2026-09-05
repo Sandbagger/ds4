@@ -1745,7 +1745,13 @@ ends, then reaps and proves group disappearance. Darwin needs a small libc
 `waitid` bridge because this Python build omits `os.waitid`; zombie-only groups
 can reject signals with `EPERM`, so actual release—not signal acknowledgement—is
 the cleanup authority. These are transport facts, not qualification verdicts.
-Full control-channel/orchestration/publication acceptance remains unfinished.
+`QualificationControl.wire_records` now retains bounded raw message and
+failure-prefix observations (five new host tests). A full-frame flag is not a
+protocol verdict. The 64-KiB lifetime budget rejects an over-budget ACK before
+sending it, and received rights close on failure. The process owner is shared
+through one context so the control-FD path can reuse its tested cleanup rather
+than duplicate process supervision. Full control-channel/orchestration/
+publication acceptance remains unfinished.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

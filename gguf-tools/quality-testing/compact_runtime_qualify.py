@@ -165,6 +165,7 @@ _QUALIFICATION_CONTROL_SAMPLE_RESULT_ACK = 5
 _QUALIFICATION_CONTROL_MODEL_FD_ACK = 6
 _QUALIFICATION_CONTROL_MESSAGE = struct.Struct("@IIIIQQQQQ")
 _QUALIFICATION_CONTROL_RIGHTS_CAPACITY = 8
+MAX_QUALIFICATION_CONTROL_WIRE_BYTES = 65_536
 
 
 class QualificationFileIdentity(NamedTuple):
@@ -270,6 +271,8 @@ class QualificationControl:
         self._model_evidence: QualificationModelEvidence | None = None
         self._last_checkpoint_sequence = 0
         self._unsafe = False
+        self._wire_records: list[dict[str, Any]] = []
+        self._wire_bytes = 0
 
     @classmethod
     def create(
@@ -312,6 +315,29 @@ class QualificationControl:
         if self._parent is None:
             return -1
         return self._parent.fileno()
+
+    @property
+    def wire_records(self) -> tuple[dict[str, Any], ...]:
+        """Return independent raw observations, including failed wire prefixes.
+
+        ``complete`` describes frame transfer, not protocol acceptance.  Values
+        inside each copied mapping are immutable bytes/strings/integers/bools.
+        """
+        return tuple(dict(record) for record in self._wire_records)
+
+    def _require_wire_capacity(self, size: int) -> None:
+        if self._wire_bytes + size > MAX_QUALIFICATION_CONTROL_WIRE_BYTES:
+            self._fail("qualification control wire byte budget exceeded")
+
+    def _record_wire(self, direction: str, payload: bytes, descriptor_count: int) -> None:
+        self._require_wire_capacity(len(payload))
+        self._wire_records.append({
+            "direction": direction,
+            "payload": bytes(payload),
+            "complete": len(payload) == _QUALIFICATION_CONTROL_MESSAGE.size,
+            "descriptor_count": descriptor_count,
+        })
+        self._wire_bytes += len(payload)
 
     @property
     def child_fd(self) -> int:
@@ -427,6 +453,8 @@ class QualificationControl:
         deadline: float,
     ) -> tuple[QualificationFileIdentity, list[int]]:
         endpoint = self._require_usable()
+        # Reserve a whole fixed-size frame before accepting any new rights.
+        self._require_wire_capacity(_QUALIFICATION_CONTROL_MESSAGE.size)
         payload = bytearray()
         descriptors: list[int] = []
         integer_size = array.array("i").itemsize
@@ -435,67 +463,71 @@ class QualificationControl:
         )
         receive_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
         try:
-            while len(payload) < _QUALIFICATION_CONTROL_MESSAGE.size:
-                self._wait(
-                    write=False,
-                    deadline=deadline,
-                    operation="receive protocol message",
-                )
-                try:
-                    part, ancillary, flags, _ = endpoint.recvmsg(
-                        _QUALIFICATION_CONTROL_MESSAGE.size - len(payload),
-                        ancillary_size,
-                        receive_flags,
+            try:
+                while len(payload) < _QUALIFICATION_CONTROL_MESSAGE.size:
+                    self._wait(
+                        write=False,
+                        deadline=deadline,
+                        operation="receive protocol message",
                     )
-                except (BlockingIOError, InterruptedError):
-                    continue
-                except OSError as exc:
-                    self._fail(
-                        f"qualification control failed to receive protocol message: {exc}"
-                    )
-                if not part:
-                    self._fail(
-                        "qualification control peer disconnected while receiving protocol message"
-                    )
-                ancillary_error = ""
-                for level, kind, data in ancillary:
-                    if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
-                        ancillary_error = (
-                            "qualification control message carried unexpected ancillary data"
+                    try:
+                        part, ancillary, flags, _ = endpoint.recvmsg(
+                            _QUALIFICATION_CONTROL_MESSAGE.size - len(payload),
+                            ancillary_size,
+                            receive_flags,
                         )
+                    except (BlockingIOError, InterruptedError):
                         continue
-                    if not data:
-                        ancillary_error = (
-                            "qualification control SCM_RIGHTS data is malformed"
+                    except OSError as exc:
+                        self._fail(
+                            f"qualification control failed to receive protocol message: {exc}"
                         )
-                        continue
-                    aligned_size = len(data) - (len(data) % integer_size)
-                    rights = array.array("i")
-                    if aligned_size:
-                        rights.frombytes(data[:aligned_size])
-                    for descriptor in rights:
-                        try:
-                            os.set_inheritable(descriptor, False)
-                        except OSError as exc:
+                    payload.extend(part)
+                    ancillary_error = ""
+                    for level, kind, data in ancillary:
+                        if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
                             ancillary_error = (
-                                "qualification control could not make a received "
-                                f"descriptor close-on-exec: {exc}"
+                                "qualification control message carried unexpected ancillary data"
                             )
-                        descriptors.append(descriptor)
-                    if aligned_size != len(data):
-                        ancillary_error = (
-                            "qualification control SCM_RIGHTS data is malformed"
+                            continue
+                        if not data:
+                            ancillary_error = (
+                                "qualification control SCM_RIGHTS data is malformed"
+                            )
+                            continue
+                        aligned_size = len(data) - (len(data) % integer_size)
+                        rights = array.array("i")
+                        if aligned_size:
+                            rights.frombytes(data[:aligned_size])
+                        for descriptor in rights:
+                            try:
+                                os.set_inheritable(descriptor, False)
+                            except OSError as exc:
+                                ancillary_error = (
+                                    "qualification control could not make a received "
+                                    f"descriptor close-on-exec: {exc}"
+                                )
+                            descriptors.append(descriptor)
+                        if aligned_size != len(data):
+                            ancillary_error = (
+                                "qualification control SCM_RIGHTS data is malformed"
+                            )
+                    if flags & (
+                        getattr(socket, "MSG_CTRUNC", 0)
+                        | getattr(socket, "MSG_TRUNC", 0)
+                    ):
+                        self._fail(
+                            "qualification control message or ancillary data was truncated"
                         )
-                if flags & (
-                    getattr(socket, "MSG_CTRUNC", 0)
-                    | getattr(socket, "MSG_TRUNC", 0)
-                ):
-                    self._fail(
-                        "qualification control message or ancillary data was truncated"
-                    )
-                if ancillary_error:
-                    self._fail(ancillary_error)
-                payload.extend(part)
+                    if ancillary_error:
+                        self._fail(ancillary_error)
+                    if not part:
+                        self._fail(
+                            "qualification control peer disconnected while receiving protocol message"
+                        )
+
+            finally:
+                self._record_wire("receive", bytes(payload), len(descriptors))
 
             values = _QUALIFICATION_CONTROL_MESSAGE.unpack(payload)
             protocol, message_type, size, reserved, sequence = values[:5]
@@ -522,6 +554,7 @@ class QualificationControl:
             return identity, descriptors
         except BaseException:
             self._close_descriptors(descriptors)
+            self._mark_unsafe()
             raise
 
     def _send_message(
@@ -542,27 +575,36 @@ class QualificationControl:
             sequence,
             *identity_fields,
         )
+        # Refuse before an ACK can release the child beyond the audit budget.
+        self._require_wire_capacity(len(payload))
         offset = 0
         flags = getattr(socket, "MSG_NOSIGNAL", 0)
-        while offset != len(payload):
-            self._wait(
-                write=True,
-                deadline=deadline,
-                operation="send acknowledgement",
-            )
+        try:
             try:
-                written = endpoint.send(payload[offset:], flags)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError as exc:
-                self._fail(
-                    f"qualification control failed to send acknowledgement: {exc}"
-                )
-            if written <= 0:
-                self._fail(
-                    "qualification control peer disconnected while sending acknowledgement"
-                )
-            offset += written
+                while offset != len(payload):
+                    self._wait(
+                        write=True,
+                        deadline=deadline,
+                        operation="send acknowledgement",
+                    )
+                    try:
+                        written = endpoint.send(payload[offset:], flags)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError as exc:
+                        self._fail(
+                            f"qualification control failed to send acknowledgement: {exc}"
+                        )
+                    if written <= 0:
+                        self._fail(
+                            "qualification control peer disconnected while sending acknowledgement"
+                        )
+                    offset += written
+            finally:
+                self._record_wire("send", payload[:offset], 0)
+        except BaseException:
+            self._mark_unsafe()
+            raise
 
     def receive_model(
         self,

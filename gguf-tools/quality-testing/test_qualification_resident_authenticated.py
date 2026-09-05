@@ -385,6 +385,7 @@ def _assert_success(
     test.assertTrue(all(event[1] in ("executable", "model")
                         for event in probe.events
                         if event[0] == "verify"))
+    AUTH_TEST._assert_authentication_boundaries(test, probe)
 
     test.assertEqual(result.preparation, run["preparation_refs"][0])
     for sequence, checkpoint in enumerate(result.checkpoints, 1):

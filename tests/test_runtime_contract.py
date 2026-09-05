@@ -301,30 +301,100 @@ class DependencyTests(unittest.TestCase):
 
 
 class MakeEnvironmentContractTests(unittest.TestCase):
-    def test_qualification_evidence_uses_pinned_runtime_environment(self) -> None:
-        completed = subprocess.run(
-            ["make", "--no-print-directory", "--dry-run", "test-qualification-evidence"],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        dry_run = completed.stdout.replace("\\\n", " ")
-        commands = [shlex.split(line) for line in dry_run.splitlines() if line.strip()]
-        expected = [
-            "uv",
-            "run",
-            "--with-requirements",
-            "gguf-tools/quality-testing/requirements-compact-runtime.txt",
-            "python",
-            "gguf-tools/quality-testing/test_qualification_evidence.py",
-            "-v",
-        ]
-        self.assertIn(expected, commands)
-        self.assertNotIn(
-            ["python3", "gguf-tools/quality-testing/test_qualification_evidence.py", "-v"],
-            commands,
-        )
+    def test_qualification_targets_use_pinned_runtime_environment(self) -> None:
+        qualification_commands = {
+            "test-qualification-records": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_records.py",
+                "-v",
+            ],
+            "test-qualification-evidence": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_evidence.py",
+                "-v",
+            ],
+            "test-qualification-evidence-files": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_evidence_files.py",
+                "-v",
+            ],
+            "test-qualification-supervisor": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_supervisor.py",
+                "-v",
+            ],
+            "test-qualification-process": [
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "gguf-tools/quality-testing",
+                "-p",
+                "test_qualification_process*.py",
+                "-v",
+            ],
+            "test-qualification-control-records": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_control_records.py",
+                "-v",
+            ],
+            "test-qualification-controlled": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_controlled.py",
+                "-v",
+            ],
+            "test-qualification-artifacts": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_artifacts.py",
+                "-v",
+            ],
+            "test-qualification-admission": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_admission.py",
+                "-v",
+            ],
+            "test-qualification-version-probe": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_version_probe.py",
+                "-v",
+            ],
+            "test-qualification-authenticated": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_authenticated.py",
+                "-v",
+            ],
+            "test-qualification-resident-sequence": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_resident_sequence.py",
+                "-v",
+            ],
+            "test-qualification-resident-records": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_resident_records.py",
+                "-v",
+            ],
+        }
+        for target, test_command in qualification_commands.items():
+            with self.subTest(target=target):
+                completed = subprocess.run(
+                    ["make", "--no-print-directory", "--dry-run", target],
+                    cwd=ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                dry_run = completed.stdout.replace("\\\n", " ")
+                commands = [shlex.split(line) for line in dry_run.splitlines() if line.strip()]
+                expected = [
+                    "uv",
+                    "run",
+                    "--with-requirements",
+                    "gguf-tools/quality-testing/requirements-compact-runtime.txt",
+                    *test_command,
+                ]
+                self.assertIn(expected, commands)
+                self.assertNotIn(["python3", *test_command[1:]], commands)
 
 
 class ValidationProfileTests(unittest.TestCase):

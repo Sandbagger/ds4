@@ -390,3 +390,25 @@ payload scalar as arena reservation: the normal arena chunk is 1792 MiB, the
 copy path uses four 64-MiB staging buffers plus alignment, and optional Q8 caches
 consume additional memory. Those paths still need real inventory/bounds before
 native resident runtime evidence is available.
+
+## Bind explicit prefill geometry at the real call sites
+
+A sizing helper can pass while allocation and dispatch still ignore the user's
+rows. Test the actual mode-aware estimator against literal KV/scratch totals,
+then require the engine restriction, graph allocation and session loop to call
+the shared selectors. Check both estimator definitions: a GPU-enabled host C
+build does not exercise the `DS4_NO_GPU` definition, or vice versa. Compiling C
+host policy with unreachable GPU functions removed is not CUDA compilation.
+
+The existing resident 512-row dispatch and up-to-16384-row allocation remain the
+default only when the effective CUDA prefill override is zero. Nonzero overrides
+now select actual graph rows and bounded steps. Do not claim all tensor-parallel
+allocation defaults are unchanged: its effective 512-row override is also
+honored. Metal's explicit resident override restriction and compact plan-bound
+allocation remain separate boundaries.
+
+The shared CUDA attention entry stages current K/V, attends using prior and
+staged data, and commits afterward; no CUDA kernel was changed for this geometry
+increment. Source inspection and host selectors still do not prove GPU parity,
+performance, physical resident allocation ownership or authenticated snapshots.
+Those require separate evidence before Task 20 can run or publish qualification.

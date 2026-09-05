@@ -5254,8 +5254,11 @@ static uint32_t ds4_laguna_prefill_step(
         uint32_t configured_rows,
         bool compact) {
     uint32_t n = remaining_tokens < allocated_rows ? remaining_tokens : allocated_rows;
-    if (!compact && n > 512u) n = 512u;
-    if (compact && configured_rows != 0 && n > configured_rows) n = configured_rows;
+    if (configured_rows != 0) {
+        if (n > configured_rows) n = configured_rows;
+    } else if (!compact && n > 512u) {
+        n = 512u;
+    }
     return n;
 }
 
@@ -5263,8 +5266,8 @@ static bool ds4_laguna_prefill_override_supported(
         ds4_backend backend,
         bool compact_runtime,
         uint32_t configured_rows) {
-    (void)backend;
-    return configured_rows == 0 || compact_runtime;
+    return configured_rows == 0 || compact_runtime ||
+           backend == DS4_BACKEND_CUDA;
 }
 
 static bool ds4_laguna_prefill_memory_plan(
@@ -36046,8 +36049,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             return m;
         }
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-            const uint32_t rows = ssd_streaming && prefill_chunk != 0 ?
-                prefill_chunk : (ctx < 16384u ? ctx : 16384u);
+            const uint32_t rows = ds4_laguna_prefill_capacity(
+                ctx, (ssd_streaming || backend == DS4_BACKEND_CUDA) ?
+                    prefill_chunk : 0u);
             (void)ds4_laguna_prefill_memory_plan(ctx, rows, &m);
             return m;
         }
@@ -50284,8 +50288,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
 
     if (ds4_backend_uses_graph(backend) &&
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        const uint32_t rows = ssd_streaming && prefill_chunk != 0 ?
-            prefill_chunk : (ctx < 16384u ? ctx : 16384u);
+        const uint32_t rows = ds4_laguna_prefill_capacity(
+            ctx, (ssd_streaming || backend == DS4_BACKEND_CUDA) ?
+                prefill_chunk : 0u);
         (void)ds4_laguna_prefill_memory_plan(ctx, rows, &m);
         return m;
     }
@@ -61793,13 +61798,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->directional_steering_attn != 0.0f ||
             opt->directional_steering_ffn != 0.0f ||
             e->power_percent < 100 ||
-            (!e->laguna_compact_runtime && opt->prefill_chunk != 0) ||
+            !ds4_laguna_prefill_override_supported(
+                e->backend, e->laguna_compact_runtime, opt->prefill_chunk) ||
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
                     "ds4: Laguna S 2.1 currently supports the standard graph backend "
                     "generation path only (no steering, power cap, custom "
-                    "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
+                    "prefill outside CUDA, MTP/DSpark, or first-token diagnostic)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -63483,8 +63489,9 @@ static int ds4_session_create_unchecked(
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        uint32_t prefill_rows = (uint32_t)ctx_size < 16384u ?
-            (uint32_t)ctx_size : 16384u;
+        uint32_t prefill_rows = ds4_laguna_prefill_capacity(
+            (uint32_t)ctx_size,
+            e->backend == DS4_BACKEND_CUDA ? e->prefill_chunk : 0u);
         ds4_runtime_tracker *tracker = NULL;
         if (e->laguna_compact_runtime) {
             prefill_rows = e->laguna_allocation_plan.prefill_rows;
@@ -65307,17 +65314,9 @@ static int ds4_session_sync_internal(ds4_session *s,
                 s->mtp_draft_valid = false;
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            uint32_t n = (uint32_t)(prompt->len - i);
-            if (n > s->laguna_graph.prefill_cap) {
-                n = s->laguna_graph.prefill_cap;
-            }
-            if (!e->laguna_compact && n > 512u) {
-                n = 512u;
-            }
-            if (e->laguna_compact && e->prefill_chunk != 0u &&
-                n > e->prefill_chunk) {
-                n = e->prefill_chunk;
-            }
+            uint32_t n = ds4_laguna_prefill_step(
+                (uint32_t)(prompt->len - i), s->laguna_graph.prefill_cap,
+                e->prefill_chunk, e->laguna_compact != NULL);
             const bool last = i + (int)n == prompt->len;
             const bool checkpoint_logits = last || e->laguna_compact;
             const ds4_gpu_laguna_exec_result result = n == 1u ?

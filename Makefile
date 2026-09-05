@@ -553,6 +553,7 @@ test-laguna-stream: tests/test_laguna_stream tests/test_runtime_cpp_link
 	./tests/test_laguna_stream --case cache-policy
 	./tests/test_laguna_stream --case grouping
 	./tests/test_laguna_stream --case prefill-plan
+	./tests/test_laguna_stream --case prefill-geometry
 	./tests/test_laguna_stream --case page-ranges
 	./tests/test_runtime_cpp_link
 
@@ -945,6 +946,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract tes
 	./tests/test_laguna_stream --case cache-policy
 	./tests/test_laguna_stream --case grouping
 	./tests/test_laguna_stream --case prefill-plan
+	./tests/test_laguna_stream --case prefill-geometry
 	./tests/test_laguna_stream --case page-ranges
 	./tests/test_runtime --case external-attribution
 	./tests/test_runtime --case request-metrics

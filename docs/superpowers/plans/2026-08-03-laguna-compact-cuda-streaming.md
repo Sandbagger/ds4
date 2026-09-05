@@ -1977,6 +1977,39 @@ compile a CUDA translation unit or execute a GPU/model. Pinned regression
 verification and independent review remain pending at commit time. Task 20 and
 CLI `run` remain incomplete.
 
+**Explicit CUDA prefill geometry progress (2026-09-05):** At `d5b85e1`,
+pinned checks passed 137 focused and 251 aggregate Python tests plus native host
+checks; independent registration review found no confirmed defect. RED `730cf4d`
+then exposed the existing row policies through host test hooks. The native
+geometry case compiled and failed 14 of 28 assertions, with the legacy sizing
+controls intact. Four source-wiring tests also failed at the real admission,
+allocation, dispatch and both estimator definitions.
+
+Explicit Laguna CUDA prefill rows now select the graph capacity and session
+step size through shared tested helpers. Both GPU-enabled and `DS4_NO_GPU`
+estimator branches use the same capacity rule. The prefill restriction permits
+an explicit CUDA override, but does not grant new Metal/CPU backend support or
+weaken compact plan admission. Compact allocation retains its plan rows. With
+32K context and explicit 4096 rows, the graph sizing path reports KV 1686110208
+plus scratch 1537052680, totaling 3223162888 bytes. The host sequence selects
+seven 4096-row steps for the canonical 28672-token prompt.
+
+An effective CUDA prefill value of zero retains the legacy up-to-16384-row
+allocation and up-to-512-row resident dispatch. Nonzero effective values are
+honored, including an existing tensor-parallel default of 512; that path's
+allocation can shrink accordingly. Invalid configured rows above context yield
+zero capacity and fail before graph allocation. This is geometry selection,
+not a new resident allocation bound or full backend/profile admission policy.
+
+The geometry and prior prefill-plan cases pass 53 host assertions in both the
+GPU-enabled C host build and a separate `DS4_NO_GPU` build; neither launches GPU
+work. The four source-wiring tests pass. The geometry case is included by
+`test-laguna-stream` and the main `test` recipe. Pinned regression verification and independent
+review remain pending at commit time. CUDA kernels are unchanged. No model/GPU
+execution, numerical parity, throughput acceptance, complete resident inventory,
+tracker/snapshot producer, or full Task 20 runner is claimed; `run` still refuses
+incomplete execution.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

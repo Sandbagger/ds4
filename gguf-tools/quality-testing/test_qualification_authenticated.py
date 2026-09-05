@@ -348,6 +348,7 @@ def _call_bounded(
     capture_before: Any,
     capture_after: Any,
     watchdog_seconds: float = 8.0,
+    record_kind: str | None = None,
 ) -> tuple[Any, list[tuple[tuple[str, ...], tuple[int, ...]]]]:
     """Run one call under a main-thread SIGALRM/BaseException watchdog."""
 
@@ -355,19 +356,23 @@ def _call_bounded(
         raise unittest.SkipTest("authenticated qualification needs POSIX SIGALRM")
 
     def invoke() -> Any:
+        call_kwargs: dict[str, Any] = {
+            "executable_artifact": executable_artifact,
+            "model_artifact": model_artifact,
+            "prepare_descriptor": prepare_descriptor,
+            "capture_before": capture_before,
+            "capture_after": capture_after,
+            "first_token_timeout_ns": 2_000_000_000,
+            "whole_request_timeout_ns": 4_000_000_000,
+            "idle_timeout_ns": 2_000_000_000,
+            "termination_grace_ns": 100_000_000,
+            "control_timeout_seconds": 2.0,
+        }
+        # None means preserve the production function's streamed default.
+        if record_kind is not None:
+            call_kwargs["record_kind"] = record_kind
         return run_authenticated_qualification_child(
-            arguments,
-            expected,
-            executable_artifact=executable_artifact,
-            model_artifact=model_artifact,
-            prepare_descriptor=prepare_descriptor,
-            capture_before=capture_before,
-            capture_after=capture_after,
-            first_token_timeout_ns=2_000_000_000,
-            whole_request_timeout_ns=4_000_000_000,
-            idle_timeout_ns=2_000_000_000,
-            termination_grace_ns=100_000_000,
-            control_timeout_seconds=2.0,
+            arguments, expected, **call_kwargs
         )
 
     requests: list[tuple[tuple[str, ...], tuple[int, ...]]] = []

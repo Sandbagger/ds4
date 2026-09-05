@@ -228,3 +228,24 @@ Two fixture rules came from actual failures in this increment:
 transferred. It does not mean the frame was accepted, authenticated or useful
 as qualification evidence. The 64-KiB lifetime cap is checked before sending
 an ACK that could release the child beyond the retained evidence budget.
+
+## Immutable admission host increment
+
+Descriptor owners now enforce nofollow regular-file opens, initial-size hash
+bounds, pre-hash JSON byte caps, retained path/inode checks and change-time
+guards. A real regression showed that a same-size rewrite followed by restored
+mtime bypasses the four exported stat fields; change-time remains an internal
+owner guard, not a new bundle field. Input admission freezes exact schema,
+manifest and version-response bytes and rechecks held inputs before/after each
+trusted version callback and at normal context exit. Native version origin,
+full orchestration, gates/retries and publication still need integration.
+
+Negative-test rules from this increment:
+
+- Do not put `self.fail()` inside `assertRaises(Exception)`: it catches its own
+  AssertionError and can pass when the invalid operation succeeds.
+- Require evidence that an expected failure path actually ran. An empty list
+  of observed callback/descriptor events does not prove their cleanup.
+- Keep fixture patches active while the implementation runs, not just while
+  constructing input. Mutate a test file through a separate writable handle;
+  a failed write to the read-only owner is not a real growth race.

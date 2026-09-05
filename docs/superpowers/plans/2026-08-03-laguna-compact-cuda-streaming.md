@@ -1773,6 +1773,15 @@ drift. Six host tests include proc-exe identity simulation, real file growth,
 replacement, and same-size content changes with a restored mtime. Proc-exe
 matching does not establish PID ownership; the controlled transport must hold
 the PID, and live Linux process authentication remains unqualified here.
+`qualification_admission.py` now reads and pins the manifest and six schema
+files, rejects nonlocal schema references and invalid/oversized inputs, matches
+the model inode/content, and validates three same-revision clean-CUDA version
+responses before yielding four artifact owners. Five host tests cover byte
+hashes, ordering, drift, rejection/cleanup and final context-exit verification.
+Its required `version_probe` is still a trusted callback: the next production
+seam is an owned descriptor-executed native probe, not a claim that injected
+version responses authenticate a running build. Full orchestration and bundle
+publication remain unfinished.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

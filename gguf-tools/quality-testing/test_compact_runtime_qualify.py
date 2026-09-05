@@ -1583,6 +1583,62 @@ class WarmStabilityContractTest(unittest.TestCase):
 
 
 class ColdPreparationContractTest(unittest.TestCase):
+    def test_open_regular_nofollow_rejects_fifo_without_waiting(self) -> None:
+        if not hasattr(os, "mkfifo") or not hasattr(signal, "setitimer"):
+            self.skipTest("nonblocking FIFO guard requires POSIX")
+
+        class WatchdogExpired(BaseException):
+            pass
+
+        def interrupt(_signum, _frame):
+            raise WatchdogExpired("regular-file open blocked on a FIFO")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp).resolve() / "input.fifo"
+            os.mkfifo(fifo)
+            previous_handler = signal.getsignal(signal.SIGALRM)
+            previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, interrupt)
+            signal.setitimer(signal.ITIMER_REAL, 0.25)
+            try:
+                with self.assertRaises(ValueError):
+                    descriptor, _ = TOOL._open_regular_nofollow(fifo, "fixture")
+                    os.close(descriptor)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.signal(signal.SIGALRM, previous_handler)
+                if previous_timer != (0.0, 0.0):
+                    signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+    def test_descriptor_hash_reads_only_the_initial_size(self) -> None:
+        payload = b"bounded descriptor data" * 7
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.bin"
+            path.write_bytes(payload)
+            descriptor = os.open(path, os.O_RDONLY)
+            requests = []
+            original = TOOL.os.pread
+
+            def capture(fd, size, offset):
+                requests.append((size, offset))
+                return original(fd, size, offset)
+
+            try:
+                os.lseek(descriptor, 3, os.SEEK_SET)
+                with mock.patch.object(TOOL.os, "pread", side_effect=capture):
+                    self.assertEqual(
+                        TOOL._sha256_open_descriptor(descriptor),
+                        hashlib.sha256(payload).hexdigest(),
+                    )
+                self.assertTrue(requests)
+                self.assertTrue(all(
+                    0 <= offset < len(payload) and 0 < size <= len(payload) - offset
+                    for size, offset in requests
+                ), requests)
+                self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 3)
+            finally:
+                os.close(descriptor)
+
     def test_caller_owned_descriptor_survives_path_swap_and_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model, plan_path, _, plan_sha256 = _write_cold_preparation_fixture(

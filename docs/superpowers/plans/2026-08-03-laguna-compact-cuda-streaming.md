@@ -1764,6 +1764,9 @@ unfinished; the CLI `run` rejection is unchanged. At `0092010`, immutable
 verification passed 58 focused tests, 201 aggregate Python tests and the native
 host harnesses. Independent review found no confirmed defect. The next active
 seam is immutable input/schema/build admission and retained artifact identity.
+The shared regular-file opener now rejects FIFOs without blocking, and model
+hashing reads only the initial size with pre/post identity checks (94 qualifier
+tests, including two new RED-driven file-boundary regressions).
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

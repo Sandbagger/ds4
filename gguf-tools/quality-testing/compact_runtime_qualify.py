@@ -213,12 +213,17 @@ def _qualification_file_identity(
 
 
 def _sha256_open_descriptor(descriptor: int) -> str:
-    """Hash an opened descriptor without changing its shared file offset."""
+    """Hash the initial regular-file size without moving its shared offset.
+
+    Concurrent growth cannot extend the read loop.  Short reads and identity
+    drift fail closed instead of authenticating a changing file prefix.
+    """
+    before = _qualification_file_identity(descriptor)
     digest = hashlib.sha256()
     offset = 0
-    while True:
+    while offset < before.size_bytes:
         try:
-            chunk = os.pread(descriptor, 8 << 20, offset)
+            chunk = os.pread(descriptor, min(8 << 20, before.size_bytes - offset), offset)
         except InterruptedError:
             continue
         except OSError as exc:
@@ -226,9 +231,13 @@ def _sha256_open_descriptor(descriptor: int) -> str:
                 f"cannot hash qualification model descriptor: {exc}"
             ) from exc
         if not chunk:
-            return digest.hexdigest()
+            raise ValueError("qualification descriptor ended before its initial size")
         digest.update(chunk)
         offset += len(chunk)
+    if _qualification_file_identity(descriptor) != before:
+        raise ValueError("qualification descriptor identity changed while hashing")
+    return digest.hexdigest()
+
 
 
 def _qualification_wait_ready(
@@ -1642,7 +1651,8 @@ def _open_regular_nofollow(path: Path | str, label: str) -> tuple[int, os.stat_r
 
     cloexec = getattr(os, "O_CLOEXEC", 0)
     parent_flags = os.O_RDONLY | directory_flag | nofollow | cloexec
-    file_flags = os.O_RDONLY | nofollow | cloexec
+    # Reject FIFOs and other non-regular leaves without waiting for a writer.
+    file_flags = os.O_RDONLY | nofollow | cloexec | getattr(os, "O_NONBLOCK", 0)
     parts = source.parts[1:]
     if not parts:
         raise ValueError(f"{label} must name a regular file")

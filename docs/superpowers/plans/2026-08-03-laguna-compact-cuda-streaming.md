@@ -1747,6 +1747,27 @@ can reject signals with `EPERM`, so actual releaseâ€”not signal acknowledgementâ
 the cleanup authority. These are transport facts, not qualification verdicts.
 Full control-channel/orchestration/publication acceptance remains unfinished.
 
+**Evidence-file authentication progress (2026-09-05):**
+`qualification_evidence_files.py` verifies a supplied canonical index against
+bounded regular files using descriptor-relative no-follow traversal. It checks
+exact file union, sizes, streamed hashes, pre/post descriptor identity and a
+final metadata/tree pass. Missing/extra files, symlinks (including root spellings
+`link/` and `link/.`), special files, malformed/noncanonical indexes and observed
+mutation/replacement are rejected. The index builder stays declaration-only.
+`make test-qualification-evidence-files` runs the 26 host tests in the pinned
+Python environment and is part of `test-laguna-compact-python`; the existing
+index target now uses that environment too.
+
+This is file-byte authentication, not native acceptance or gate provenance.
+The caller still must derive references from the exact union of all gates,
+authenticate the supplied bundle/index, and reverify before durable publication.
+Reserved regular bundle/sidecar/index files are excluded, not authenticated by
+this helper. Its v0 limits are a 1-MiB index, 4096 evidence files, 64 MiB per
+file, 256 MiB total, 8192 directory entries and 32 path components. No `run`,
+`verify` or `publish` CLI has been admitted; model/executable control-channel
+composition, gate/retry evaluation and publication remain open. No GPU or model
+run is implied by the host tests.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 
@@ -1758,6 +1779,8 @@ for diagnostic reuse, verification commands and the next implementation seam.
 - Modify: `tests/validate_bench_qualification_json.py`
 - Create: `gguf-tools/quality-testing/qualification_evidence.py`
 - Create: `gguf-tools/quality-testing/test_qualification_evidence.py`
+- Create: `gguf-tools/quality-testing/qualification_evidence_files.py`
+- Create: `gguf-tools/quality-testing/test_qualification_evidence_files.py`
 - Modify: `schemas/ds4-laguna-compact-runtime-v1.schema.json`
 - Modify: `Makefile`
 

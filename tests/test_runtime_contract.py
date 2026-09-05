@@ -8,7 +8,9 @@ import importlib.util
 import importlib.metadata
 import json
 import math
+import shlex
 import struct
+import subprocess
 import unittest
 from pathlib import Path
 from typing import Any, Iterator
@@ -296,6 +298,33 @@ class DependencyTests(unittest.TestCase):
                 except importlib.metadata.PackageNotFoundError:
                     self.fail(f"missing qualification dependency: {name}=={expected}")
                 self.assertEqual(actual, expected)
+
+
+class MakeEnvironmentContractTests(unittest.TestCase):
+    def test_qualification_evidence_uses_pinned_runtime_environment(self) -> None:
+        completed = subprocess.run(
+            ["make", "--no-print-directory", "--dry-run", "test-qualification-evidence"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dry_run = completed.stdout.replace("\\\n", " ")
+        commands = [shlex.split(line) for line in dry_run.splitlines() if line.strip()]
+        expected = [
+            "uv",
+            "run",
+            "--with-requirements",
+            "gguf-tools/quality-testing/requirements-compact-runtime.txt",
+            "python",
+            "gguf-tools/quality-testing/test_qualification_evidence.py",
+            "-v",
+        ]
+        self.assertIn(expected, commands)
+        self.assertNotIn(
+            ["python3", "gguf-tools/quality-testing/test_qualification_evidence.py", "-v"],
+            commands,
+        )
 
 
 class ValidationProfileTests(unittest.TestCase):

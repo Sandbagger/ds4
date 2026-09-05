@@ -1733,8 +1733,13 @@ parent-receipt bypass without discarding coalesced observations.
 **Process transport progress (2026-09-05):** `qualification_process.py` now
 launches one foreground child in a new session, drains both capped raw streams,
 enforces milestone deadlines, and preserves validated partial observations.
-Eight native fake-process tests cover success, protocol/exit/output errors,
-phase timeouts, descendant-held pipes and bounded group cleanup. The parent
+Fifteen native fake-process tests cover success, protocol/exit/output errors,
+phase timeouts, descendant-held pipes, interrupts and bounded group cleanup.
+`8a551d3` separates released resources from EOF after I/O failure. The transport
+checks deadlines even when observing a nonzero exit, and freezes producer time
+only after both child exit and both pipe EOFs are observed; later cleanup grace
+cannot manufacture an exit timeout. EOF remains necessary for `complete`.
+The parent
 uses `waitid(WNOWAIT)` to reserve the direct-child PID until all group signaling
 ends, then reaps and proves group disappearance. Darwin needs a small libc
 `waitid` bridge because this Python build omits `os.waitid`; zombie-only groups

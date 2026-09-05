@@ -93,6 +93,8 @@ class _Transport:
         self.owned_group = False
         self.pid_reserved = False
         self.wait_owned = True
+        self.exit_observed = False
+        self.terminal_ns: int | None = None
         self.reason: str | None = None
         self.timeout_phase: str | None = None
         self.monitor_open = True
@@ -109,10 +111,19 @@ class _Transport:
             self.reason = reason
             self.timeout_phase = phase
 
+    def note_terminal(self, now_ns: int) -> None:
+        if self.terminal_ns is None and self.exit_observed and all(self.eof.values()):
+            # Producer timing ends only after BOTH exit and pipe EOF have been
+            # observed.  Subsequent group cleanup is not producer latency.
+            self.terminal_ns = now_ns
+
+    def clock_ns(self) -> int:
+        return self.terminal_ns if self.terminal_ns is not None else time.monotonic_ns()
+
     def check_clock(self) -> None:
         if self.monitor_open:
             try:
-                self.monitor.check_deadline(time.monotonic_ns())
+                self.monitor.check_deadline(self.clock_ns())
             except QualificationTimeout as exc:
                 self.monitor_open = False
                 self.fail("timeout", exc.phase)
@@ -174,6 +185,7 @@ class _Transport:
             if not chunk:
                 self.eof[name] = True
                 self.close_pipe(fd)
+                self.note_terminal(now_ns)
                 continue
             self.buffers[name].extend(chunk[:room])
             if self.truncated[name] or len(chunk) > room:
@@ -196,7 +208,7 @@ class _Transport:
     def observe_exit(self) -> bool:
         assert self.process is not None
         try:
-            return self.exited(self.process.pid)
+            exited = self.exited(self.process.pid)
         except OSError:
             # Another reaper or a broken wait primitive removes our ownership
             # proof.  Never send a group signal after this failure.
@@ -204,16 +216,24 @@ class _Transport:
             self.wait_owned = False
             self.fail("io_error")
             return True
+        if exited:
+            self.exit_observed = True
+            self.note_terminal(time.monotonic_ns())
+        return exited
 
     def run(self) -> None:
         while self.reason is None:
             if self.observe_exit():
+                self.read_ready(0)  # retain already-available observations first
+                if self.reason is None:
+                    self.check_clock()  # exit status cannot erase a late receipt
                 return  # proactively clean even if descendants hold the pipes
             deadline = self.monitor.deadline_ns
             assert deadline is not None
             wait_ns = max(0, min(_POLL_NS, deadline - time.monotonic_ns()))
             self.read_ready(wait_ns)
-            if self.reason is None and not self.observe_exit():
+            if self.reason is None:
+                self.observe_exit()
                 self.check_clock()
 
     def signal_group(self, signum: int) -> bool:
@@ -337,11 +357,13 @@ def run_qualification_child(
             transport.monitor_open = False
         cleanup_complete = transport.cleanup()
     if transport.reason is None:
+        transport.check_clock()
+    if transport.reason is None:
         if process.returncode != 0:
             transport.fail("child_exit")
         elif all(transport.eof.values()):
             try:
-                monitor.finish(process.returncode, now_ns=time.monotonic_ns())
+                monitor.finish(process.returncode, now_ns=transport.clock_ns())
             except QualificationTimeout as exc:
                 transport.fail("timeout", exc.phase)
             except (TypeError, ValueError):

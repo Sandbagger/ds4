@@ -80,6 +80,26 @@ class QualificationControlWireRecordsTest(unittest.TestCase):
         control.close()  # type: ignore[union-attr]
         child.close()
 
+    def test_clock_interrupts_propagate_in_deadline_and_receive_wait(self) -> None:
+        for fail_on_call in (1, 2):
+            with self.subTest(clock_call=fail_on_call):
+                calls = 0
+                interrupted = KeyboardInterrupt("stop control clock")
+
+                def clock() -> float:
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_on_call:
+                        raise interrupted
+                    return 0.0
+
+                with TOOL.QualificationControl.create(
+                    timeout_seconds=0.1, monotonic=clock,
+                ) as control:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        control.receive_model()
+                    self.assertIs(raised.exception, interrupted)
+
     def test_model_fd_and_ack_records_preserve_exact_wire_bytes_and_counts(
         self,
     ) -> None:

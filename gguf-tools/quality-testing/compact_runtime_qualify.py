@@ -399,7 +399,7 @@ class QualificationControl:
             )
         try:
             now = float(self._monotonic())
-        except BaseException as exc:
+        except Exception as exc:
             self._fail(f"cannot read qualification monotonic clock: {exc}")
         if not math.isfinite(now):
             self._fail("qualification monotonic clock is not finite")
@@ -413,7 +413,7 @@ class QualificationControl:
         while True:
             try:
                 now = float(self._monotonic())
-            except BaseException as exc:
+            except Exception as exc:
                 self._fail(f"cannot read qualification monotonic clock: {exc}")
             if not math.isfinite(now) or now >= deadline:
                 self._fail(

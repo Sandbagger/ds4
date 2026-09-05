@@ -1746,7 +1746,8 @@ ends, then reaps and proves group disappearance. Darwin needs a small libc
 can reject signals with `EPERM`, so actual release—not signal acknowledgement—is
 the cleanup authority. These are transport facts, not qualification verdicts.
 `QualificationControl.wire_records` now retains bounded raw message and
-failure-prefix observations (five new host tests). A full-frame flag is not a
+failure-prefix observations (six host tests, including interrupt propagation
+from deadline/readiness clocks). A full-frame flag is not a
 protocol verdict. The 64-KiB lifetime budget rejects an over-budget ACK before
 sending it, and received rights close on failure. The process owner is shared
 through one context so the control-FD path can reuse its tested cleanup rather

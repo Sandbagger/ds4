@@ -1917,6 +1917,39 @@ snapshots, controlled baseline execution, gates/retries and atomic publication
 remain unfinished. No model/GPU run, native CUDA qualification or CLI `run` is
 claimed.
 
+**Shared native model-page sampler progress (2026-09-05):** The consumer at
+`44861f6` passed pinned 71 focused and 242 aggregate Python tests plus native
+harnesses, with independent review clear. RED `2ab0285` then required the native
+`ds4_runtime_model_source_resident_bytes()` API. The existing compact CUDA
+sampler now calls this shared runtime helper instead of owning a separate
+`mincore` loop. This makes actual source-page measurement available to resident
+production without copying compact-only allocation bounds.
+
+The helper uses at most 65536 residency bytes on the stack per batch, requires
+the actual system page size, rejects alignment/rounding/full-address-interval
+overflow, and commits output only after every batch succeeds. Resident final
+partial file pages are charged as full physical pages. It neither touches
+model contents nor owns the mapping/FD; the caller must hold their lifetime.
+A multi-batch sample is an observation, not a globally atomic page snapshot.
+
+Before pinning, the new native harness passed 32 checks. It measures an
+immediately-unlinked, touched two-page host mapping against an independent
+`mincore` result, then separately interposes system calls for bounded large-span
+arithmetic, status-bit masking and transactional failure tests. Setup failures
+must fail the fixture; an oversized fake syscall must not overrun the vector.
+The C++ linkage/signature check reaches the new C symbol. Existing host checks
+passed 128 Python tests plus runtime/Laguna/emitter/lifecycle/composition harnesses.
+The CUDA build-contract suite uses host checks, not a CUDA compilation or GPU run.
+Pinned aggregate verification and independent review remain pending at commit time.
+
+The native audit also confirmed that resident startup rejects an explicit
+prefill chunk, allocates up to 16384 graph rows, and caps execution chunks at
+512 rows. Those paths are not a truthful configured/effective/allocated 4096-row
+qualification baseline. No resident geometry, CUDA cache policy or allocation
+bounds are changed by this sampler. Resident allocation-plan/tracker attachment,
+external attribution, engine snapshots and controlled execution remain required.
+No full CLI `run`, native Linux/CUDA execution or model qualification is claimed.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

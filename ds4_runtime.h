@@ -605,6 +605,18 @@ bool ds4_runtime_checked_affine_bytes(
     uint64_t fixed_bytes,
     uint64_t *bytes_out);
 
+/* Sample a caller-owned model mapping on Linux or Darwin without allocating
+ * or touching its contents. page_size must match sysconf(_SC_PAGESIZE). The
+ * caller must keep the entire page-rounded mapping valid for the call. Charge
+ * each resident page in full, including a partial final file page. Reject bad
+ * geometry, unsupported systems and mincore failure without changing output.
+ * This does not authenticate the mapping/FD or prove a globally atomic sample. */
+bool ds4_runtime_model_source_resident_bytes(
+    const void *model_map,
+    uint64_t model_size,
+    uint64_t page_size,
+    uint64_t *resident_bytes_out);
+
 ds4_runtime_status ds4_runtime_tracker_init(
     ds4_runtime_tracker *tracker,
     const ds4_runtime_tracker_config *config);

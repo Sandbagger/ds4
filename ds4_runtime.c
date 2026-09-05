@@ -1,3 +1,10 @@
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "ds4_runtime.h"
 
 #include <errno.h>
@@ -9,11 +16,74 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+
+bool ds4_runtime_model_source_resident_bytes(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t page_size,
+        uint64_t *resident_bytes_out) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (!model_map || !resident_bytes_out || model_size == 0 ||
+        page_size == 0 || (page_size & (page_size - 1u)) != 0 ||
+        page_size > SIZE_MAX || page_size > UINTPTR_MAX) {
+        return false;
+    }
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    if (system_page_size <= 0 ||
+        page_size != (uint64_t)system_page_size) return false;
+    const uintptr_t address = (uintptr_t)model_map;
+    if ((address & (uintptr_t)(page_size - 1u)) != 0 ||
+        model_size > UINT64_MAX - (page_size - 1u)) return false;
+    const uint64_t mapped_page_bytes =
+        (model_size + page_size - 1u) & ~(page_size - 1u);
+    if (mapped_page_bytes == 0 ||
+        mapped_page_bytes > (uint64_t)(UINTPTR_MAX - address)) return false;
+
+    /* Keep the compact sampler's allocation-free 65536-page batching. The
+     * final partial file page consumes a whole physical page, not a fraction. */
+    unsigned char residency[65536];
+    uint64_t resident = 0;
+    uint64_t offset = 0;
+    while (offset < mapped_page_bytes) {
+        uint64_t pages = (mapped_page_bytes - offset) / page_size;
+        if (pages > sizeof(residency)) pages = sizeof(residency);
+        if (pages == 0 || pages > UINT64_MAX / page_size) return false;
+        const uint64_t span = pages * page_size;
+        if (span == 0 || span > SIZE_MAX) return false;
+        memset(residency, 0, (size_t)pages);
+        void *sample_address = (void *)(address + (uintptr_t)offset);
+#if defined(__APPLE__)
+        const int result = mincore(sample_address, (size_t)span,
+                                   (char *)residency);
+#else
+        const int result = mincore(sample_address, (size_t)span, residency);
+#endif
+        if (result != 0) return false;
+        for (uint64_t page = 0; page < pages; page++) {
+            if ((residency[page] & 1u) == 0) continue;
+            if (resident > mapped_page_bytes - page_size) return false;
+            resident += page_size;
+        }
+        offset += span;
+    }
+    *resident_bytes_out = resident;
+    return true;
+#else
+    (void)model_map;
+    (void)model_size;
+    (void)page_size;
+    (void)resident_bytes_out;
+    return false;
+#endif
+}
 
 static bool runtime_file_identity_capture(
         int fd, ds4_runtime_file_identity *identity) {

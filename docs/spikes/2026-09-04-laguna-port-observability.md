@@ -345,3 +345,23 @@ make a failed stream recoverable or a completed qualification run.
 This is raw host-side consumption, not native allocation/snapshot production,
 authenticated record-schema admission, resident process supervision, a baseline
 execution, or a qualification verdict. Those integration boundaries remain open.
+
+## Reuse measured model-page accounting
+
+The source-page sampler is now shared by the native runtime and the compact
+CUDA caller. Keep its allocation-free bounded batches and full final-page
+charge. Require the actual system page size and validate the complete pointer
+interval before a syscall; power-of-two/alignment checks alone do not prevent
+undercounting with a wrong page size or wrapping the last span. Publish the
+caller output only after all batches succeed.
+
+Separate physical host evidence from simulated syscall evidence. A touched
+tiny mapping plus independent `mincore` proves actual host page accounting;
+interposed large spans prove batch geometry and error handling without a huge
+mapping. Neither proves a native resident CUDA allocation inventory. Fake
+syscalls must reject oversized vectors before writing them, and setup errors
+must fail rather than silently skip the meaningful test.
+
+Resident memory bounds still require the actual registration/cache/graph paths.
+Do not reuse the compact plan's hard-coded external envelopes or report the
+resident 512-row execution/16384-row allocation as a configured 4096-row run.

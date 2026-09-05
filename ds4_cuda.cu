@@ -2282,47 +2282,9 @@ static int cuda_laguna_compact_page_sample_exact_locked(
         const ds4_gpu_laguna_compact *ctx,
         uint64_t page_size,
         uint64_t *resident_bytes_out) {
-    if (!ctx || !ctx->model_map || ctx->model_size == 0 ||
-        !resident_bytes_out || page_size == 0 ||
-        (page_size & (page_size - 1u)) != 0 ||
-        ((uintptr_t)ctx->model_map & (uintptr_t)(page_size - 1u)) != 0) {
-        return 0;
-    }
-    if (ctx->model_size > UINT64_MAX - (page_size - 1u)) return 0;
-    const uint64_t mapped_page_bytes =
-        (ctx->model_size + page_size - 1u) & ~(page_size - 1u);
-    if (mapped_page_bytes == 0) return 0;
-    /* Keep sampling allocation-free, but amortize a 68 GiB mapping over
-     * roughly 255 mincore calls rather than roughly 4,068 calls.  mincore
-     * reports physical pages, so a resident final partial file page is
-     * charged as one full system page, never as only the remaining bytes. */
-    unsigned char residency[65536];
-    uint64_t resident = 0;
-    uint64_t offset = 0;
-    while (offset < mapped_page_bytes) {
-        const uint64_t remaining = mapped_page_bytes - offset;
-        uint64_t pages = remaining / page_size;
-        if (pages > sizeof(residency)) pages = sizeof(residency);
-        if (pages == 0 || pages > UINT64_MAX / page_size) return 0;
-        const uint64_t span = pages * page_size;
-        if (span == 0 || span > SIZE_MAX ||
-            offset > UINTPTR_MAX - (uintptr_t)ctx->model_map) {
-            return 0;
-        }
-        memset(residency, 0, (size_t)pages);
-        if (mincore((char *)ctx->model_map + offset,
-                    (size_t)span, residency) != 0) {
-            return 0;
-        }
-        for (uint64_t page = 0; page < pages; page++) {
-            if ((residency[page] & 1u) == 0) continue;
-            if (resident > mapped_page_bytes - page_size) return 0;
-            resident += page_size;
-        }
-        offset += span;
-    }
-    *resident_bytes_out = resident;
-    return 1;
+    if (!ctx) return 0;
+    return ds4_runtime_model_source_resident_bytes(
+        ctx->model_map, ctx->model_size, page_size, resident_bytes_out) ? 1 : 0;
 }
 
 static int cuda_laguna_compact_page_promote_locked(

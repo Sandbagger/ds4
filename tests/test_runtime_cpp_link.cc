@@ -7,6 +7,13 @@
 
 #include <type_traits>
 
+using model_source_sample_fn = bool (*)(
+    const void *, uint64_t, uint64_t, uint64_t *);
+static_assert(std::is_same<
+              decltype(&ds4_runtime_model_source_resident_bytes),
+              model_source_sample_fn>::value,
+              "model source sampler C ABI drifted");
+
 using laguna_compact_create_fn = int (*)(
     ds4_gpu_laguna_compact **,
     int,
@@ -204,6 +211,12 @@ static_assert(std::is_same<
               "engine close observation layout drifted");
 
 int main() {
+    uint64_t model_source_resident = 17u;
+    if (ds4_runtime_model_source_resident_bytes(
+            nullptr, 1u, 4096u, &model_source_resident) ||
+        model_source_resident != 17u) {
+        return 3;
+    }
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     uint64_t reduction = 0;
     if (!ds4_runtime_reduction_qualified(80ull * gib, 44ull * gib,

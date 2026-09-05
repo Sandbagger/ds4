@@ -292,3 +292,17 @@ The first native run also caught fixture-only errors: a 64-KiB stderr burst plus
 later milestone diagnostics correctly exceeded the existing 64-KiB cap, and
 an eight-byte read could not equal the nine-byte word `preflight`. The tests
 were corrected; production byte caps were not weakened.
+
+## Resident and streamed sequence separation
+
+The trusted entrypoint, not an authenticated file's contents, chooses the
+sequence kind. Matching hashes authenticate bytes; they do not authorize a
+resident file at a streamed boundary or the reverse. Tests must authenticate
+the mutated bytes again when checking schema/profile/cache/mode rejection,
+otherwise an early digest mismatch can hide missing semantic validation.
+
+The two C boundaries share file/size/hash/base64/cleanup code. The two Python
+builders share the fixed formatter, but retain separate public profile and
+prompt-order selection. A separate resident type and schema avoid adding an
+ambiguous mutable mode to existing streamed callers. This supplies no resident
+allocation or runtime evidence by itself.

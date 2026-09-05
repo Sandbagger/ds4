@@ -1407,6 +1407,24 @@ def build_qualification_sequence(
             "qualification sequence prompt_id does not match profile prompt order"
         )
 
+    return _qualification_sequence_bytes(
+        manifest, prompt_id, schema=QUALIFICATION_SEQUENCE_SCHEMA,
+        profile_id=profile_id, cache_bytes=cache_bytes,
+        prompt_order_index=prompt_order_index,
+        prompt_tokens=prompt_order[prompt_order_index], mode="streamed",
+    )
+
+
+def _qualification_sequence_bytes(
+    manifest: Mapping[str, Any], prompt_id: str, *, schema: str,
+    profile_id: str, cache_bytes: int, prompt_order_index: int,
+    prompt_tokens: int, mode: str,
+) -> bytes:
+    """Format bindings selected by a validated streamed or resident boundary.
+
+    Callers, not manifest/file fields, select the contract kind.  Keeping the
+    byte/hash and fixed sampling format shared prevents the two paths drifting.
+    """
     prompt = next(
         (item for item in manifest["prompts"] if item["id"] == prompt_id),
         None,
@@ -1430,14 +1448,14 @@ def build_qualification_sequence(
 
     manifest_digest = manifest_sha256(manifest)
     lines = [
-        f"schema={QUALIFICATION_SEQUENCE_SCHEMA}",
+        f"schema={schema}",
         f"manifest_sha256={manifest_digest}",
         f"profile_id={profile_id}",
         f"cache_bytes={cache_bytes}",
         f"prompt_order_index={prompt_order_index}",
         f"prompt_id={prompt_id}",
-        f"prompt_tokens={prompt_order[prompt_order_index]}",
-        "mode=streamed",
+        f"prompt_tokens={prompt_tokens}",
+        f"mode={mode}",
         f"input_size_bytes={len(rendered)}",
         f"input_sha256={_sha256_bytes(rendered)}",
         f"input_base64={base64.b64encode(rendered).decode('ascii')}",

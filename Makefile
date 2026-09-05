@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-eval-case-contract test-bench-eval-contract
+.PHONY: all help clean test test-cuda-build-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-eval-case-contract test-bench-eval-contract
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -417,6 +417,16 @@ tests/test_bench_sequence_trusted: tests/test_bench_sequence_trusted.o ds4_bench
 
 test-bench-sequence-trusted: tests/test_bench_sequence_trusted
 	./tests/test_bench_sequence_trusted
+
+# Resident has a separate trusted contract; do not auto-select mode from a file.
+tests/test_bench_resident_sequence.o: tests/test_bench_resident_sequence.c ds4_bench_sequence.h ds4_plan_io.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_bench_resident_sequence: tests/test_bench_resident_sequence.o ds4_bench_sequence.o ds4_plan_io.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-bench-resident-sequence: tests/test_bench_resident_sequence
+	./tests/test_bench_resident_sequence
 
 # Task 19 lifecycle JSONL emitter.
 ds4_bench_qualification.o: ds4_bench_qualification.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_runtime.h
@@ -805,7 +815,7 @@ test-cuda-build-contract:
 	python3 tests/test_main_session_recovery_hardening_contract.py -v
 	python3 tests/test_task18_cuda_failure_source_contract.py -v
 
-.PHONY: test-qualification-records test-qualification-evidence test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-laguna-layer-diagnostics
+.PHONY: test-qualification-records test-qualification-evidence test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-sequence test-laguna-layer-diagnostics
 
 test-qualification-records:
 	python3 gguf-tools/quality-testing/test_qualification_records.py -v
@@ -837,11 +847,14 @@ test-qualification-version-probe:
 test-qualification-authenticated:
 	python3 gguf-tools/quality-testing/test_qualification_authenticated.py -v
 
+test-qualification-resident-sequence:
+	python3 gguf-tools/quality-testing/test_qualification_resident_sequence.py -v
+
 test-laguna-layer-diagnostics:
 	python3 tests/test_laguna_layer_mismatch.py -v
 	python3 tests/test_poolside_layer_diagnostics.py -v
 
-test-laguna-compact-python: test-qualification-records test-qualification-evidence test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-laguna-layer-diagnostics
+test-laguna-compact-python: test-qualification-records test-qualification-evidence test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-sequence test-laguna-layer-diagnostics
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "error: test-laguna-compact-python requires uv" >&2; \
 		exit 127; \
@@ -894,7 +907,7 @@ test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_contro
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-server-contract \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_session_logits_only tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link \
-	tests/test_plan_io tests/test_laguna_plan test-bench-sequence test-bench-sequence-trusted test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-bench-eval-contract $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_plan_io tests/test_laguna_plan test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-bench-eval-contract $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -949,4 +962,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-server-test-hooks ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link tests/test_qualification_control tests/test_plan_io tests/test_bench_sequence tests/test_bench_sequence_trusted tests/test_laguna_plan tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_q4k_mmvq_microscope tests/test_cuda_f32_mmvf_microscope tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/test_bench_qualification_emitter tests/test_bench_qualification_lifecycle tests/test_bench_qualification_composition tests/test_eval_case_contract tests/test_eval_case_contract.o tests/test_bench_qualification_composition.o tests/test_bench_qualification_production_compile.o tests/probe_ds4_laguna_moe tests/probe_ds4_laguna_moe.o tests/probe_ds4_laguna_moe_release tests/probe_ds4_laguna_moe_release.o tests/probe_ds4_laguna_behavior tests/probe_ds4_laguna_behavior.o tests/test_cuda_laguna_stream tests/test_cuda_laguna_stream.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-server-test-hooks ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_session_logits_only tests/test_session_logits_only.o tests/test_laguna_stream tests/test_runtime tests/test_runtime_cpp_link tests/test_qualification_control tests/test_plan_io tests/test_bench_sequence tests/test_bench_sequence_trusted tests/test_bench_resident_sequence tests/test_laguna_plan tests/test_laguna_stream.o tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_cuda_laguna_kernels tests/test_cuda_q4k_mmvq_microscope tests/test_cuda_f32_mmvf_microscope tests/test_cuda_laguna_model tests/test_cuda_laguna_model.o tests/test_bench_qualification_emitter tests/test_bench_qualification_lifecycle tests/test_bench_qualification_composition tests/test_eval_case_contract tests/test_eval_case_contract.o tests/test_bench_qualification_composition.o tests/test_bench_qualification_production_compile.o tests/probe_ds4_laguna_moe tests/probe_ds4_laguna_moe.o tests/probe_ds4_laguna_moe_release tests/probe_ds4_laguna_moe_release.o tests/probe_ds4_laguna_behavior tests/probe_ds4_laguna_behavior.o tests/test_cuda_laguna_stream tests/test_cuda_laguna_stream.o tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

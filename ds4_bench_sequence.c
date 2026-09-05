@@ -628,6 +628,7 @@ static bool decode_base64(const unsigned char *value,
 static bool parse_payload(const unsigned char *bytes,
                           size_t size,
                           const char *expected_manifest_sha256,
+                          bool resident,
                           ds4_bench_sequence *result,
                           char *error,
                           size_t error_size) {
@@ -646,7 +647,8 @@ static bool parse_payload(const unsigned char *bytes,
 
     if (!next_line(&cursor, &line, &line_length, error, error_size) ||
         !line_literal(line, line_length,
-                      "schema=" DS4_BENCH_SEQUENCE_SCHEMA,
+                      resident ? "schema=" DS4_BENCH_RESIDENT_SEQUENCE_SCHEMA :
+                                 "schema=" DS4_BENCH_SEQUENCE_SCHEMA,
                       1u, error, error_size)) return false;
 
     if (!next_line(&cursor, &line, &line_length, error, error_size) ||
@@ -676,11 +678,12 @@ static bool parse_payload(const unsigned char *bytes,
         UINT64_C(8589934592), UINT64_C(12884901888), UINT64_C(17179869184)
     };
     size_t profile_index = 0;
-    while (profile_index < sizeof(profiles) / sizeof(profiles[0]) &&
+    while (!resident && profile_index < sizeof(profiles) / sizeof(profiles[0]) &&
            strcmp(result->profile_id, profiles[profile_index]) != 0) {
         profile_index++;
     }
-    if (profile_index == sizeof(profiles) / sizeof(profiles[0])) {
+    if ((resident && strcmp(result->profile_id, "resident") != 0) ||
+        (!resident && profile_index == sizeof(profiles) / sizeof(profiles[0]))) {
         set_error(error, error_size,
                   "qualification sequence has an unknown profile_id");
         return false;
@@ -689,9 +692,9 @@ static bool parse_payload(const unsigned char *bytes,
     if (!next_line(&cursor, &line, &line_length, error, error_size) ||
         !line_value(line, line_length, "cache_bytes=", &value,
                     &value_length, 4u, error, error_size) ||
-        !parse_uint64_decimal(value, value_length, true, &parsed, 4u,
+        !parse_uint64_decimal(value, value_length, !resident, &parsed, 4u,
                               error, error_size)) return false;
-    if (parsed != caches[profile_index]) {
+    if (parsed != (resident ? UINT64_C(0) : caches[profile_index])) {
         set_error(error, error_size,
                   "qualification sequence cache_bytes does not match profile");
         return false;
@@ -716,7 +719,10 @@ static bool parse_payload(const unsigned char *bytes,
         {2048, 8192, 512, 28672},
         {8192, 28672, 2048, 512},
     };
-    const uint32_t expected_tokens = orders[profile_index][result->prompt_order_index];
+    static const uint32_t resident_order[] = {512, 2048, 8192, 28672};
+    const uint32_t expected_tokens = resident ?
+        resident_order[result->prompt_order_index] :
+        orders[profile_index][result->prompt_order_index];
     char expected_prompt[32];
     (void)snprintf(expected_prompt, sizeof(expected_prompt),
                    "native-%u", expected_tokens);
@@ -745,7 +751,8 @@ static bool parse_payload(const unsigned char *bytes,
     result->prompt_tokens = (uint32_t)parsed;
 
     if (!next_line(&cursor, &line, &line_length, error, error_size) ||
-        !line_literal(line, line_length, "mode=streamed", 8u,
+        !line_literal(line, line_length,
+                      resident ? "mode=resident" : "mode=streamed", 8u,
                       error, error_size)) return false;
 
     if (!next_line(&cursor, &line, &line_length, error, error_size) ||
@@ -828,6 +835,7 @@ static bool parse_payload(const unsigned char *bytes,
 static bool parse_file_impl(const char *path,
                             const char *expected_manifest_sha256,
                             const char *expected_sequence_sha256,
+                            bool resident,
                             ds4_bench_sequence *sequence,
                             char *error,
                             size_t error_size) {
@@ -860,6 +868,7 @@ static bool parse_file_impl(const char *path,
     const bool ok = parse_payload(bytes,
                                   size,
                                   expected_manifest_sha256,
+                                  resident,
                                   &parsed,
                                   error,
                                   error_size);
@@ -889,6 +898,7 @@ bool ds4_bench_sequence_parse_file(const char *path,
     return parse_file_impl(path,
                            NULL,
                            NULL,
+                           false,
                            sequence,
                            error,
                            error_size);
@@ -921,7 +931,41 @@ bool ds4_bench_sequence_parse_file_trusted(
     return parse_file_impl(path,
                            expected_manifest_sha256,
                            expected_sequence_sha256,
+                           false,
                            sequence,
                            error,
                            error_size);
+}
+
+void ds4_bench_resident_sequence_init(ds4_bench_resident_sequence *sequence) {
+    if (sequence != NULL) ds4_bench_sequence_init(&sequence->sequence);
+}
+
+void ds4_bench_resident_sequence_free(ds4_bench_resident_sequence *sequence) {
+    if (sequence != NULL) ds4_bench_sequence_free(&sequence->sequence);
+}
+
+bool ds4_bench_resident_sequence_parse_file_trusted(
+        const char *path,
+        const char *expected_manifest_sha256,
+        const char *expected_sequence_sha256,
+        ds4_bench_resident_sequence *sequence,
+        char *error,
+        size_t error_size) {
+    clear_error(error, error_size);
+    if (sequence == NULL) {
+        set_error(error, error_size,
+                  "resident qualification sequence output is null");
+        return false;
+    }
+    ds4_bench_resident_sequence_free(sequence);
+    if (!validate_expected_sha256(expected_manifest_sha256,
+                                  "manifest", error, error_size) ||
+        !validate_expected_sha256(expected_sequence_sha256,
+                                  "sequence", error, error_size)) {
+        return false;
+    }
+    return parse_file_impl(path, expected_manifest_sha256,
+                           expected_sequence_sha256, true,
+                           &sequence->sequence, error, error_size);
 }

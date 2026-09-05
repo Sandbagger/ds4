@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 #define DS4_BENCH_SEQUENCE_SCHEMA "ds4.qualification-sequence/v1"
+#define DS4_BENCH_RESIDENT_SEQUENCE_SCHEMA "ds4.resident-qualification-sequence/v1"
 #define DS4_BENCH_SEQUENCE_LINE_COUNT 24u
 #define DS4_BENCH_SEQUENCE_SHA256_HEX_LENGTH 64u
 #define DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE \
@@ -34,6 +35,13 @@ typedef struct ds4_bench_sequence {
     char sequence_sha256[DS4_BENCH_SEQUENCE_SHA256_HEX_SIZE];
 } ds4_bench_sequence;
 
+/* Distinct owner for the resident contract.  The shared fields are not a
+ * streamed profile: profile_id is resident, cache_bytes is zero, and prompt
+ * order is canonical 512/2048/8192/28672.  Initialize before first parse. */
+typedef struct ds4_bench_resident_sequence {
+    ds4_bench_sequence sequence;
+} ds4_bench_resident_sequence;
+
 /* Initialize or release an owned result.  The caller must initialize a result
  * before its first parse (either with this function or with {0}); parsing
  * releases any prior result. */
@@ -56,6 +64,20 @@ bool ds4_bench_sequence_parse_file_trusted(
     const char *expected_manifest_sha256,
     const char *expected_sequence_sha256,
     ds4_bench_sequence *sequence,
+    char *error,
+    size_t error_size);
+
+/* Resident parsing is always authenticated.  These entrypoints never infer a
+ * mode from file contents and cannot accept the streamed schema.  File/input
+ * bounds, fixed sampling/repetitions, and failure cleanup match the shared
+ * sequence contract.  There is deliberately no untrusted resident parser. */
+void ds4_bench_resident_sequence_init(ds4_bench_resident_sequence *sequence);
+void ds4_bench_resident_sequence_free(ds4_bench_resident_sequence *sequence);
+bool ds4_bench_resident_sequence_parse_file_trusted(
+    const char *path,
+    const char *expected_manifest_sha256,
+    const char *expected_sequence_sha256,
+    ds4_bench_resident_sequence *sequence,
     char *error,
     size_t error_size);
 

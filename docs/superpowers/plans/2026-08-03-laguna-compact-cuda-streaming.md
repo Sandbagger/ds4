@@ -1839,6 +1839,29 @@ Host parser/builder tests must reject cross-mode substitutions in both
 directions. This boundary alone will not implement resident allocation
 accounting, execute a baseline, enable CLI `run`, or qualify CUDA behavior.
 
+
+**Resident sequence progress (2026-09-05):** RED `7c94a40` recorded the missing
+Python module and C resident type/API. The shared bounded C parser now has a
+separate, trusted-only resident entrypoint and owner type; it never selects the
+mode from file contents. Python uses a separate public resident builder and the
+shared fixed byte formatter. All four canonical prompt positions and the
+zero-cache resident profile are bound to the manifest/input/sequence digests.
+Root verification passed four Python tests and 193 native C checks, including
+mixed schema/profile/mode rejection in both directions, canonical-zero, input
+size and decoded-input limits. The existing streamed parser, trusted parser,
+and 27 benchmark/eval contract tests passed without changing their contracts.
+Pinned verification and independent review remain pending at commit time.
+
+The allocation review also confirmed that ordinary resident CUDA first tries
+registered host model pages and can fall back to a device range cache. Neither
+that fallback nor optional dequantized caches may be silently treated as zero
+allocation. Resident graph setup also currently chooses up to 16384 prefill
+rows rather than the compact plan's 4096 rows. The next native producer work
+must bind actual allocation paths and declared geometry before publishing a
+resident runtime snapshot. Startup estimates are not measured footprint.
+No resident baseline execution, native CUDA qualification, or full CLI `run`
+implementation follows from the sequence boundary.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

@@ -1725,7 +1725,7 @@ The runner and publication steps below therefore remain unchecked.
 
 **Supervisor progress (2026-09-05):** `9b07a35` adds incremental, deep-copied
 validated-record draining (19 parser tests). `qualification_supervisor.py`
-adds pure lifecycle/parent-clock deadline monitoring (12 host tests), including
+adds pure lifecycle/parent-clock deadline monitoring (14 host tests), including
 coalesced late milestones, clock regression from launch onward, complete-stream
 closure and retained partial observations. These helpers do not launch or reap
 children. POSIX transport tests and implementation are the next active seam;

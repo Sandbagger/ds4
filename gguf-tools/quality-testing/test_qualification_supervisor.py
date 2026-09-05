@@ -223,6 +223,42 @@ class QualificationSliceMonitorHostTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             monitor.feed(_json_line(records[2]), now_ns=26)
 
+    def test_late_parent_receipt_cannot_bypass_an_existing_phase_deadline(self) -> None:
+        records = _timed_records([1, 2, 3, 6, 7, 8, 11, 12, 13, 16, 17, 18])
+        for count, now_ns, phase, deadline in (
+            (0, 6, "startup", 5),
+            (3, 9, "between_requests", 8),
+        ):
+            with self.subTest(phase=phase):
+                monitor = _monitor(
+                    records, first_token_timeout_ns=10,
+                    whole_request_timeout_ns=20, idle_timeout_ns=5,
+                )
+                _feed_all(monitor, records[:count])
+                with self.assertRaises(QualificationTimeout) as raised:
+                    monitor.feed(_json_line(records[count]), now_ns=now_ns)
+                self.assertEqual(raised.exception.phase, phase)
+                self.assertEqual(raised.exception.deadline_ns, deadline)
+                self.assertEqual(raised.exception.now_ns, now_ns)
+                self.assertEqual(monitor.records, tuple(records[:count + 1]))
+                with self.assertRaises(ValueError):
+                    monitor.finish(0, now_ns=now_ns)
+
+    def test_parent_receipt_is_checked_for_each_new_coalesced_phase(self) -> None:
+        records = _timed_records([1, 2, 3, 6, 7, 8, 11, 12, 13, 16, 17, 18])
+        monitor = _monitor(
+            records, first_token_timeout_ns=1,
+            whole_request_timeout_ns=20, idle_timeout_ns=100,
+        )
+        with self.assertRaises(QualificationTimeout) as raised:
+            monitor.feed(_payload(records[:3]), now_ns=3)
+        self.assertEqual(raised.exception.phase, "first_token")
+        self.assertEqual(raised.exception.deadline_ns, 2)
+        self.assertEqual(raised.exception.now_ns, 3)
+        self.assertEqual(monitor.records, tuple(records[:3]))
+        with self.assertRaises(ValueError):
+            monitor.finish(0, now_ns=3)
+
     def test_inclusivebounds_allow_equal_clock_and_event_deadlines(self) -> None:
         cases = ("startup", "first_token", "request_complete", "between_requests", "exit")
         for phase in cases:

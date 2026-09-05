@@ -188,6 +188,9 @@ class QualificationSliceMonitor:
         for record in records:
             timestamp_ns = int(record["monotonic_ns"])
             self._check_event_timestamp(timestamp_ns, parent_now_ns)
+            # Timely child timestamps cannot excuse late parent receipt.
+            # Check every pre-transition phase, including within one chunk.
+            self._check_deadline_validated(parent_now_ns)
             self._advance(record, timestamp_ns)
 
     def _drain_and_evaluate(

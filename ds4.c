@@ -5239,6 +5239,34 @@ static bool ds4_laguna_graph_context_bound(
     return total != 0;
 }
 
+/* Row selection is separate from the exact KV/scratch sizing boundary. */
+static uint32_t ds4_laguna_prefill_capacity(
+        uint32_t context_tokens,
+        uint32_t configured_rows) {
+    if (context_tokens == 0 || configured_rows > context_tokens) return 0;
+    if (configured_rows != 0) return configured_rows;
+    return context_tokens < 16384u ? context_tokens : 16384u;
+}
+
+static uint32_t ds4_laguna_prefill_step(
+        uint32_t remaining_tokens,
+        uint32_t allocated_rows,
+        uint32_t configured_rows,
+        bool compact) {
+    uint32_t n = remaining_tokens < allocated_rows ? remaining_tokens : allocated_rows;
+    if (!compact && n > 512u) n = 512u;
+    if (compact && configured_rows != 0 && n > configured_rows) n = configured_rows;
+    return n;
+}
+
+static bool ds4_laguna_prefill_override_supported(
+        ds4_backend backend,
+        bool compact_runtime,
+        uint32_t configured_rows) {
+    (void)backend;
+    return configured_rows == 0 || compact_runtime;
+}
+
 static bool ds4_laguna_prefill_memory_plan(
         uint32_t context_tokens,
         uint32_t prefill_rows,
@@ -59893,10 +59921,34 @@ bool ds4_test_default_single_tier_working_set_bytes(
         default_device_bytes, visible_devices, out);
 }
 
-uint64_t ds4_test_graph_context_memory_bytes(
+uint32_t ds4_test_laguna_prefill_capacity(
+        uint32_t context_tokens,
+        uint32_t configured_rows) {
+    return ds4_laguna_prefill_capacity(context_tokens, configured_rows);
+}
+
+uint32_t ds4_test_laguna_prefill_step(
+        uint32_t remaining_tokens,
+        uint32_t allocated_rows,
+        uint32_t configured_rows,
+        bool compact) {
+    return ds4_laguna_prefill_step(
+        remaining_tokens, allocated_rows, configured_rows, compact);
+}
+
+bool ds4_test_laguna_prefill_override_supported(
+        ds4_backend backend,
+        bool compact_runtime,
+        uint32_t configured_rows) {
+    return ds4_laguna_prefill_override_supported(
+        backend, compact_runtime, configured_rows);
+}
+
+uint64_t ds4_test_graph_context_memory_bytes_with_prefill_mode(
         ds4_test_graph_family family,
         uint32_t context_tokens,
-        uint32_t prefill_chunk) {
+        uint32_t prefill_chunk,
+        bool ssd_streaming) {
     if (context_tokens == 0 || context_tokens > (uint32_t)INT_MAX) return 0;
 
     const ds4_shape saved_shape = g_ds4_shape;
@@ -59944,11 +59996,19 @@ uint64_t ds4_test_graph_context_memory_bytes(
             DS4_BACKEND_CUDA,
             (int)context_tokens,
             prefill_chunk,
-            true);
+            ssd_streaming);
     g_ds4_shape = saved_shape;
     memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
     memcpy(g_ds4_head_counts, saved_heads, sizeof(saved_heads));
     return memory.total_bytes;
+}
+
+uint64_t ds4_test_graph_context_memory_bytes(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk) {
+    return ds4_test_graph_context_memory_bytes_with_prefill_mode(
+        family, context_tokens, prefill_chunk, true);
 }
 
 bool ds4_test_laguna_prefill_plan(

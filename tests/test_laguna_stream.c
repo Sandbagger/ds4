@@ -2319,6 +2319,133 @@ static void test_prefill_plan(void) {
           "owner sequence exhaustion fails without mutating the output ID");
 }
 
+static void test_prefill_geometry(void) {
+    static const uint32_t context_tokens = 32768u;
+    static const uint64_t expected_kv_bytes = UINT64_C(1686110208);
+    static const uint64_t expected_scratch_bytes = UINT64_C(1537052680);
+    static const uint64_t expected_4k_bytes = UINT64_C(3223162888);
+    static const uint64_t expected_default_bytes = UINT64_C(7833079816);
+
+    /* Keep this independent plan seam ahead of the mode-aware estimator. */
+    ds4_context_memory plan;
+    memset(&plan, 0, sizeof(plan));
+    CHECK(ds4_test_laguna_prefill_plan(context_tokens, 4096u, &plan) &&
+              plan.raw_bytes == expected_kv_bytes &&
+              plan.scratch_bytes == expected_scratch_bytes &&
+              plan.total_bytes == expected_4k_bytes,
+          "independent 4K Laguna plan preserves literal KV/scratch/total sizing");
+
+    CHECK(ds4_test_graph_context_memory_bytes(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, context_tokens, 4096u) ==
+              expected_4k_bytes,
+          "legacy Laguna graph estimator positively controls exact 4K sizing");
+    CHECK(ds4_test_graph_context_memory_bytes_with_prefill_mode(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, context_tokens, 4096u, false) ==
+              expected_4k_bytes,
+          "resident explicit 4K Laguna geometry prices exact KV plus scratch");
+    CHECK(ds4_test_graph_context_memory_bytes_with_prefill_mode(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, context_tokens, 4096u, true) ==
+              expected_4k_bytes,
+          "streamed explicit 4K Laguna geometry equals resident sizing");
+    CHECK(ds4_test_graph_context_memory_bytes_with_prefill_mode(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, context_tokens, 0u, false) ==
+              expected_default_bytes,
+          "resident default Laguna geometry retains the 16K allocation");
+    CHECK(ds4_test_graph_context_memory_bytes_with_prefill_mode(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, context_tokens, 0u, true) ==
+              expected_default_bytes,
+          "streamed default Laguna geometry retains the 16K allocation");
+
+    CHECK(ds4_test_laguna_prefill_capacity(context_tokens, 0u) == 16384u &&
+              ds4_test_laguna_prefill_step(
+                  context_tokens, 16384u, 0u, false) == 512u,
+          "resident default selects 16K allocation and 512-token execution");
+    CHECK(ds4_test_laguna_prefill_step(
+              context_tokens, 4096u, 0u, true) == 4096u,
+          "compact default preserves the 4K execution capacity");
+    CHECK(ds4_test_laguna_prefill_capacity(context_tokens, 4096u) == 4096u &&
+              ds4_test_laguna_prefill_step(
+                  context_tokens, 4096u, 4096u, false) == 4096u,
+          "explicit resident 4K selects allocated rows, not stale 512");
+    CHECK(ds4_test_laguna_prefill_step(
+              123u, 4096u, 4096u, false) == 123u &&
+              ds4_test_laguna_prefill_step(
+                  4096u, 123u, 4096u, false) == 123u,
+          "explicit resident step clamps both tail and allocation");
+    CHECK(ds4_test_laguna_prefill_step(
+              8192u, 4096u, 8192u, false) == 4096u,
+          "configured rows above allocation clamp to allocation");
+    CHECK(ds4_test_laguna_prefill_step(
+              123u, 4096u, 0u, true) == 123u &&
+              ds4_test_laguna_prefill_step(
+                  0u, 4096u, 4096u, false) == 0u &&
+              ds4_test_laguna_prefill_step(
+                  4096u, 0u, 4096u, false) == 0u,
+          "compact tail and zero remaining/allocation fail closed");
+    CHECK(ds4_test_laguna_prefill_step(
+              UINT32_MAX, UINT32_MAX, 0u, true) == UINT32_MAX &&
+              ds4_test_laguna_prefill_step(
+                  UINT32_MAX, UINT32_MAX, 0u, false) == 512u &&
+              ds4_test_laguna_prefill_step(
+                  UINT32_MAX, UINT32_MAX, UINT32_MAX, false) == UINT32_MAX,
+          "step selector handles UINT32_MAX without overflow");
+
+    CHECK(ds4_test_laguna_prefill_capacity(0u, 0u) == 0u &&
+              ds4_test_laguna_prefill_capacity(0u, 1u) == 0u &&
+              ds4_test_laguna_prefill_capacity(1u, 0u) == 1u &&
+              ds4_test_laguna_prefill_capacity(1u, 1u) == 1u &&
+              ds4_test_laguna_prefill_capacity(1u, 2u) == 0u,
+          "capacity selector handles zero, one-row, and invalid small contexts");
+    CHECK(ds4_test_laguna_prefill_capacity(UINT32_MAX, 0u) == 16384u &&
+              ds4_test_laguna_prefill_capacity(
+                  UINT32_MAX, UINT32_MAX) == UINT32_MAX &&
+              ds4_test_laguna_prefill_capacity(
+                  UINT32_MAX, 1u) == 1u,
+          "capacity selector handles UINT32_MAX without comparison overflow");
+
+    CHECK(ds4_test_laguna_prefill_override_supported(
+              DS4_BACKEND_CUDA, false, 4096u),
+          "explicit CUDA prefill override is admitted");
+    CHECK(!ds4_test_laguna_prefill_override_supported(
+              DS4_BACKEND_METAL, false, 4096u) &&
+              !ds4_test_laguna_prefill_override_supported(
+                  DS4_BACKEND_CPU, false, 4096u),
+          "explicit resident Metal and CPU overrides remain rejected");
+    CHECK(ds4_test_laguna_prefill_override_supported(
+              DS4_BACKEND_METAL, true, 4096u) &&
+              ds4_test_laguna_prefill_override_supported(
+                  DS4_BACKEND_CPU, true, 4096u) &&
+              ds4_test_laguna_prefill_override_supported(
+                  DS4_BACKEND_METAL, false, 0u),
+          "compact or default mode keeps the restriction predicate permissive");
+
+    CHECK(ds4_test_graph_context_memory_bytes_with_prefill_mode(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, 1u, 1u, false) != 0u,
+          "one-row valid context has positive host geometry");
+    CHECK(ds4_test_graph_context_memory_bytes_with_prefill_mode(
+              DS4_TEST_GRAPH_FAMILY_LAGUNA, 0u, 0u, false) == 0u &&
+              ds4_test_graph_context_memory_bytes_with_prefill_mode(
+                  DS4_TEST_GRAPH_FAMILY_LAGUNA, 1u, 2u, false) == 0u &&
+              ds4_test_graph_context_memory_bytes_with_prefill_mode(
+                  DS4_TEST_GRAPH_FAMILY_LAGUNA, UINT32_MAX, 1u, false) == 0u,
+          "mode-aware estimator rejects zero, invalid rows, and max invalid context");
+
+    uint32_t remaining = 28672u;
+    uint32_t completed = 0u;
+    uint32_t iterations = 0u;
+    for (iterations = 0u; iterations < 7u && remaining != 0u; iterations++) {
+        const uint32_t step = ds4_test_laguna_prefill_step(
+            remaining, 4096u, 4096u, false);
+        CHECK(step != 0u && step == 4096u && step <= remaining,
+              "canonical 28K resident sequence makes bounded nonzero progress");
+        if (step == 0u || step > remaining) break;
+        remaining -= step;
+        completed += step;
+    }
+    CHECK(iterations == 7u && remaining == 0u && completed == 28672u,
+          "canonical 28672-token resident sequence completes in 7x4096 steps");
+}
+
 static void test_allocation_profiles(void) {
     const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
     const uint64_t tensor_range_count = UINT64_C(814);
@@ -3793,7 +3920,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s --case "
             "options|ledger|allocation|cache-policy|grouping|prefill-plan "
-            "|page-ranges [--case ...]\n",
+            "|prefill-geometry|page-ranges [--case ...]\n",
             argv0);
 }
 
@@ -3817,6 +3944,8 @@ int main(int argc, char **argv) {
             test_grouping();
         } else if (strcmp(argv[i + 1], "prefill-plan") == 0) {
             test_prefill_plan();
+        } else if (strcmp(argv[i + 1], "prefill-geometry") == 0) {
+            test_prefill_geometry();
         } else if (strcmp(argv[i + 1], "page-ranges") == 0) {
             test_page_ranges();
         } else {

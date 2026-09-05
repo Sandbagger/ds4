@@ -482,6 +482,57 @@ def function_body(signature: str) -> str:
 
 
 class CudaBuildContractTest(unittest.TestCase):
+    def test_laguna_prefill_geometry_wires_engine_override(self) -> None:
+        signature = "static int ds4_engine_open_internal("
+        body = " ".join(source_function_body(
+            DS4_SOURCE[DS4_SOURCE.rindex(signature):], signature, "DS4").split())
+        self.assertTrue(
+            "!ds4_laguna_prefill_override_supported( e->backend, "
+            "e->laguna_compact_runtime, opt->prefill_chunk)" in body,
+            "Laguna engine admission must use the tested CUDA override predicate")
+        self.assertFalse(
+            "!e->laguna_compact_runtime && opt->prefill_chunk != 0" in body,
+            "the old blanket resident override rejection must not remain")
+
+    def test_laguna_prefill_geometry_wires_session_allocation(self) -> None:
+        signature = "static int ds4_session_create_unchecked("
+        body = " ".join(source_function_body(
+            DS4_SOURCE[DS4_SOURCE.rindex(signature):], signature, "DS4").split())
+        self.assertTrue(
+            "ds4_laguna_prefill_capacity( (uint32_t)ctx_size, "
+            "e->backend == DS4_BACKEND_CUDA ? e->prefill_chunk : 0u)" in body,
+            "resident CUDA graph allocation must use the tested explicit row selector")
+        self.assertTrue(
+            "prefill_rows = e->laguna_allocation_plan.prefill_rows;" in body,
+            "compact graph allocation must retain its admitted plan rows")
+
+    def test_laguna_prefill_geometry_wires_session_dispatch(self) -> None:
+        signature = "static int ds4_session_sync_internal("
+        body = " ".join(source_function_body(
+            DS4_SOURCE[DS4_SOURCE.rindex(signature):], signature, "DS4").split())
+        self.assertTrue(
+            "ds4_laguna_prefill_step( (uint32_t)(prompt->len - i), "
+            "s->laguna_graph.prefill_cap, e->prefill_chunk, "
+            "e->laguna_compact != NULL)" in body,
+            "Laguna session dispatch must use the tested row selector")
+        self.assertFalse(
+            "if (!e->laguna_compact && n > 512u)" in body,
+            "an extra resident 512-row cap must not undo explicit selection")
+
+    def test_laguna_prefill_geometry_wires_both_memory_estimators(self) -> None:
+        signature = "ds4_context_memory ds4_context_memory_estimate_with_prefill_mode("
+        starts = [m.start() for m in re.finditer(re.escape(signature), DS4_SOURCE)]
+        self.assertEqual(len(starts), 2, "GPU and NO_GPU estimators must both be checked")
+        for index, start in enumerate(starts):
+            with self.subTest(estimator=index):
+                body = " ".join(source_function_body(
+                    DS4_SOURCE[start:], signature, "DS4").split())
+                self.assertTrue(
+                    "ds4_laguna_prefill_capacity( ctx, "
+                    "(ssd_streaming || backend == DS4_BACKEND_CUDA) ? "
+                    "prefill_chunk : 0u)" in body,
+                    "both estimators must use explicit CUDA rows without widening Metal")
+
     def test_compact_runtime_contract_has_pinned_standalone_target(self) -> None:
         requirements = [
             line

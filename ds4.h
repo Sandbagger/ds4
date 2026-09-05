@@ -676,6 +676,24 @@ uint64_t ds4_test_graph_context_memory_bytes(
         ds4_test_graph_family family,
         uint32_t context_tokens,
         uint32_t prefill_chunk);
+/* Host-only row-policy seams, not full backend/model/profile admission. */
+uint32_t ds4_test_laguna_prefill_capacity(
+        uint32_t context_tokens,
+        uint32_t configured_rows);
+uint32_t ds4_test_laguna_prefill_step(
+        uint32_t remaining_tokens,
+        uint32_t allocated_rows,
+        uint32_t configured_rows,
+        bool compact);
+bool ds4_test_laguna_prefill_override_supported(
+        ds4_backend backend,
+        bool compact_runtime,
+        uint32_t configured_rows);
+uint64_t ds4_test_graph_context_memory_bytes_with_prefill_mode(
+        ds4_test_graph_family family,
+        uint32_t context_tokens,
+        uint32_t prefill_chunk,
+        bool ssd_streaming);
 /* Exact Laguna graph sizing seam. Rows must be nonzero and within context;
  * callers resolve any legacy/default policy before entering this boundary.
  * Failure leaves `out` unchanged. */

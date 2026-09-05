@@ -360,9 +360,16 @@ def _qualification_child_transport(
     whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
     idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
     termination_grace_ns: int = 250_000_000,
+    pass_fds: tuple[int, ...] = (),
 ) -> Iterator[_Transport]:
     """Own exactly one child, its pipes and its bounded release lifecycle."""
     argv = _validated_command(command)
+    if type(pass_fds) is not tuple or any(type(fd) is not int for fd in pass_fds):
+        raise TypeError("inherited descriptors must be a tuple of built-in integers")
+    if len(set(pass_fds)) != len(pass_fds) or any(fd < 3 for fd in pass_fds):
+        raise ValueError("inherited descriptors must be unique and outside standard streams")
+    for fd in pass_fds:
+        os.fstat(fd)
     if type(termination_grace_ns) is not int:
         raise TypeError("termination_grace_ns must be a built-in integer")
     if termination_grace_ns <= 0:
@@ -378,6 +385,7 @@ def _qualification_child_transport(
         process = subprocess.Popen(
             argv, shell=False, start_new_session=True, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            close_fds=True, pass_fds=pass_fds,
         )
     except OSError:
         process = None

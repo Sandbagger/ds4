@@ -1751,8 +1751,16 @@ from deadline/readiness clocks). A full-frame flag is not a
 protocol verdict. The 64-KiB lifetime budget rejects an over-budget ACK before
 sending it, and received rights close on failure. The process owner is shared
 through one context so the control-FD path can reuse its tested cleanup rather
-than duplicate process supervision. Full control-channel/orchestration/
-publication acceptance remains unfinished.
+than duplicate process supervision. `qualification_controlled.py` now uses
+that owner for exactly one inherited control descriptor, descriptor-bound model
+preparation, twelve READY/RESULT brackets, and a strict trailing-control EOF
+check. Four generated-child host tests cover simultaneous pipe backpressure,
+snapshot/ACK ordering, retained preparation failures, milestone timeout while
+waiting for control, and unexpected-rights closure. Clock interrupts propagate
+rather than turning into protocol errors. These are tiny-file host tests, not
+model, CUDA, executable/runtime-authentication or qualification acceptance.
+Full orchestration, gates/retries, authentication and publication remain
+unfinished; the CLI `run` rejection is unchanged.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.

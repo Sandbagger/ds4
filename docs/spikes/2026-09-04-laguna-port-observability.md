@@ -205,3 +205,26 @@ The reusable pattern is **same boundary, exact provenance, first divergence,
 small replay, controlled intervention**. Typed metadata and content hashes are
 useful inputs to that workflow, not substitutes for observed and authenticated
 runtime evidence.
+
+## Control-FD host checkpoint (2026-09-05)
+
+The fixed control session now reuses the owned process transport. It pumps
+stdout/stderr and milestone deadlines during model-descriptor and checkpoint
+waits, freezes callback observations, preserves raw bounded wire messages and
+partial checkpoints, and rejects trailing bytes/rights before accepting EOF.
+Four native tests use tiny files and generated foreground children. This is
+not executable/runtime authentication, full runner acceptance or a GPU run.
+
+Two fixture rules came from actual failures in this increment:
+
+- An import-error RED proves the entry point is absent, not that unexecuted
+  test bodies are correct. Check callback forwarding and the real wire/record
+  order before implementing against a new scaffold.
+- Publish owned-child metadata by same-directory write/replace. TERM can land
+  during a metadata refresh. Assert wire transfer from captured wire bytes,
+  not from a later child metadata write that cleanup may prevent.
+
+`QualificationControl.wire_records[*].complete` means a complete frame was
+transferred. It does not mean the frame was accepted, authenticated or useful
+as qualification evidence. The 64-KiB lifetime cap is checked before sending
+an ACK that could release the child beyond the retained evidence budget.

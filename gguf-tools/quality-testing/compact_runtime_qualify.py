@@ -763,6 +763,44 @@ class QualificationControl:
         self._last_checkpoint_sequence = checkpoint_sequence
         return before, after
 
+    def finish(self) -> None:
+        """Require control EOF with no trailing message or ancillary rights."""
+        endpoint = self._require_usable()
+        if self._model_evidence is None:
+            raise ValueError("qualification model descriptor has not been received")
+        deadline = self._deadline()
+        descriptors: list[int] = []
+        integer_size = array.array("i").itemsize
+        try:
+            while True:
+                self._wait(write=False, deadline=deadline, operation="receive control EOF")
+                try:
+                    payload, ancillary, flags, _ = endpoint.recvmsg(
+                        1,
+                        socket.CMSG_SPACE(integer_size * _QUALIFICATION_CONTROL_RIGHTS_CAPACITY),
+                        getattr(socket, "MSG_CMSG_CLOEXEC", 0),
+                    )
+                except (BlockingIOError, InterruptedError):
+                    continue
+                for level, kind, data in ancillary:
+                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                        rights = array.array("i")
+                        rights.frombytes(data[:len(data) - len(data) % integer_size])
+                        descriptors.extend(rights)
+                if payload or ancillary or flags & (
+                    getattr(socket, "MSG_CTRUNC", 0) | getattr(socket, "MSG_TRUNC", 0)
+                ):
+                    self._record_wire("receive", payload, len(descriptors))
+                    self._fail("qualification control has trailing data or rights")
+                self.verify_model_unchanged()
+                self._close_parent_endpoint()
+                return
+        except BaseException:
+            self._mark_unsafe()
+            raise
+        finally:
+            self._close_descriptors(descriptors)
+
     def close(self) -> None:
         self._close_model_descriptor()
         self._close_parent_endpoint()

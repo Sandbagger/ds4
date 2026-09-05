@@ -751,10 +751,139 @@ class QualificationEvidenceFilesTests(unittest.TestCase):
                 return result
 
             with mock.patch.object(qef.os, "read", side_effect=racing_read):
-                self._assert_rejected(
-                    lambda: self._verify(root, refs, index)
-                )
+                with self.assertRaisesRegex(
+                    ValueError, r"^evidence identity changed: a\.bin$"
+                ):
+                    self._verify(root, refs, index)
             self.assertTrue(mutated)
+
+    def test_detects_in_place_identical_rewrite_during_final_rescan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = b"stable evidence"
+            path = _write(root, "a.bin", original)
+            refs = [_reference("a.bin", _sha256(original))]
+            index = _index_for(root, refs)
+            initial = os.stat(path)
+            real_scan = qef._scan
+            scan_modes: list[bool] = []
+
+            def scanning(
+                root_fd: int,
+                expected: dict[str, dict[str, str]],
+                directories: set[str],
+                reserved: set[str],
+                *,
+                authenticate: bool,
+            ) -> dict[str, tuple[int, ...]]:
+                scan_modes.append(authenticate)
+                snapshots = real_scan(
+                    root_fd,
+                    expected,
+                    directories,
+                    reserved,
+                    authenticate=authenticate,
+                )
+                if len(scan_modes) == 1:
+                    with path.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(original)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.utime(
+                        path,
+                        ns=(
+                            initial.st_atime_ns,
+                            initial.st_mtime_ns + 1_000_000_000,
+                        ),
+                    )
+                return snapshots
+
+            with mock.patch.object(qef, "_scan", side_effect=scanning) as scan_mock:
+                with self.assertRaisesRegex(
+                    ValueError, r"^evidence tree changed during verification$"
+                ):
+                    self._verify(root, refs, index)
+
+            self.assertEqual(scan_mock.call_count, 2)
+            self.assertEqual(scan_modes, [True, False])
+            after = os.stat(path)
+            self.assertEqual(after.st_dev, initial.st_dev)
+            self.assertEqual(after.st_ino, initial.st_ino)
+            self.assertNotEqual(after.st_mtime_ns, initial.st_mtime_ns)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_releases_nested_descriptors_when_nested_scan_or_read_raises(
+        self,
+    ) -> None:
+        for fault in ("read", "scandir"):
+            with self.subTest(fault=fault):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    data = b"nested evidence"
+                    _write(root, "nested/a.bin", data)
+                    refs = [_reference("nested/a.bin", _sha256(data))]
+                    index = _index_for(root, refs)
+                    opened: list[int] = []
+                    closed: list[int] = []
+                    read_fds: list[int] = []
+                    scandir_calls = 0
+                    real_open = qef.os.open
+                    real_close = qef.os.close
+                    real_scandir = qef.os.scandir
+
+                    def tracking_open(
+                        name: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        fd = real_open(name, flags, mode, dir_fd=dir_fd)
+                        opened.append(fd)
+                        return fd
+
+                    def tracking_close(fd: int) -> None:
+                        closed.append(fd)
+                        real_close(fd)
+
+                    def failing_read(fd: int, count: int) -> bytes:
+                        read_fds.append(fd)
+                        raise OSError("injected read failure")
+
+                    def failing_scandir(name: object):
+                        nonlocal scandir_calls
+                        scandir_calls += 1
+                        if fault == "scandir" and scandir_calls == 2:
+                            raise OSError("injected scandir failure")
+                        return real_scandir(name)
+
+                    if fault == "read":
+                        fault_patch = mock.patch.object(
+                            qef.os, "read", side_effect=failing_read
+                        )
+                    else:
+                        fault_patch = mock.patch.object(
+                            qef.os, "scandir", side_effect=failing_scandir
+                        )
+
+                    with mock.patch.object(
+                        qef.os, "open", side_effect=tracking_open
+                    ), mock.patch.object(
+                        qef.os, "close", side_effect=tracking_close
+                    ), fault_patch:
+                        with self.assertRaises(OSError) as raised:
+                            self._verify(root, refs, index)
+
+                    self.assertEqual(str(raised.exception), f"injected {fault} failure")
+                    self.assertGreaterEqual(len(opened), 2)
+                    self.assertEqual(len(closed), len(opened))
+                    self.assertEqual(set(closed), set(opened))
+                    if fault == "read":
+                        self.assertEqual(len(read_fds), 1)
+                        self.assertIn(read_fds[0], opened)
+                    else:
+                        self.assertEqual(scandir_calls, 2)
 
     def test_detects_replacement_of_earlier_evidence_while_another_is_hashed(
         self,

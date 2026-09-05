@@ -1754,9 +1754,11 @@ exact file union, sizes, streamed hashes, pre/post descriptor identity and a
 final metadata/tree pass. Missing/extra files, symlinks (including root spellings
 `link/` and `link/.`), special files, malformed/noncanonical indexes and observed
 mutation/replacement are rejected. The index builder stays declaration-only.
-`make test-qualification-evidence-files` runs the 26 host tests in the pinned
+`make test-qualification-evidence-files` runs the 28 host tests in the pinned
 Python environment and is part of `test-laguna-compact-python`; the existing
-index target now uses that environment too.
+index target now uses that environment too. Precision tests distinguish the
+post-read identity boundary from hash rejection, force an identical-byte
+rewrite between scans, and prove descriptor release on nested read/scan errors.
 
 This is file-byte authentication, not native acceptance or gate provenance.
 The caller still must derive references from the exact union of all gates,

@@ -1760,7 +1760,10 @@ waiting for control, and unexpected-rights closure. Clock interrupts propagate
 rather than turning into protocol errors. These are tiny-file host tests, not
 model, CUDA, executable/runtime-authentication or qualification acceptance.
 Full orchestration, gates/retries, authentication and publication remain
-unfinished; the CLI `run` rejection is unchanged.
+unfinished; the CLI `run` rejection is unchanged. At `0092010`, immutable
+verification passed 58 focused tests, 201 aggregate Python tests and the native
+host harnesses. Independent review found no confirmed defect. The next active
+seam is immutable input/schema/build admission and retained artifact identity.
 
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
@@ -1810,8 +1813,9 @@ Expected: runner/process-control and bundle build/verify/publish tests fail beca
 Add a `run` subcommand with explicit `--manifest`, `--model`, `--server-bin`,
 `--bench-bin`, `--eval-bin`, and `--evidence-dir` arguments. It must:
 
-1. validate and hash the manifest and all five schemas before creating the
-   evidence directory;
+1. validate and hash the manifest and all six schemas required by the bundle
+   schema (the five runtime/result schemas plus the benchmark-manifest schema)
+   before creating the evidence directory;
 2. verify each binary's clean CUDA version/build identity and hash/stat it;
 3. obtain and verify the pre-allocation plan/ledger for the resident baseline
    and every streamed profile;

@@ -811,7 +811,8 @@ test-qualification-records:
 	python3 gguf-tools/quality-testing/test_qualification_records.py -v
 
 test-qualification-evidence:
-	python3 gguf-tools/quality-testing/test_qualification_evidence.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_evidence.py -v
 
 test-qualification-supervisor:
 	python3 gguf-tools/quality-testing/test_qualification_supervisor.py -v

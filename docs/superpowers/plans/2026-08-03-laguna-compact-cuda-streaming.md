@@ -1862,6 +1862,29 @@ resident runtime snapshot. Startup estimates are not measured footprint.
 No resident baseline execution, native CUDA qualification, or full CLI `run`
 implementation follows from the sequence boundary.
 
+
+**Resident raw emitter progress (2026-09-05):** At `440d095`, pinned checks passed
+147 focused and 231 aggregate Python tests plus native harnesses; independent
+review found no confirmed defect. RED `e2b65b3` then required a distinct resident
+record type and emitter. `ds4_bench_resident_qualification_emit_record()` now
+uses the shared bounded formatter/validators through a resident-only entrypoint.
+It requires the resident profile/order, zero expert-cache config/bound/current/
+peak, 32K context, 4K configured/effective/allocated prefill geometry, one session,
+and stable external inventory. Request completion must bind matching metrics.
+Registered model pages, static/device allocations, and observed resident/source
+footprint are copied without replacement by zero or a startup estimate.
+
+The repaired native fixture passes 48 independent emissions and 1188 checks;
+the existing streamed emitter/lifecycle/composition/production compile and 27
+benchmark/eval Python contracts also pass. Each negative fixture starts from a
+valid record and independently reset nested objects. Both pipe ends are
+nonblocking and a 15-second alarm bounds the whole host fixture. The emitted
+objects are raw observations, not a complete resident twelve-record consumer,
+engine allocation tracker, native snapshot producer, or executed baseline.
+Pinned verification and independent review of this increment remain pending
+at commit time. No CLI `run`, resident model/GPU execution, or CUDA qualification
+is claimed.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

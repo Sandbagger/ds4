@@ -29,6 +29,7 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_bench_resident_sequence
+/tests/test_bench_resident_qualification_emitter
 *.o
 *.dSYM/
 __pycache__/

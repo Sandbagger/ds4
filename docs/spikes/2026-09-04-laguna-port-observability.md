@@ -306,3 +306,18 @@ builders share the fixed formatter, but retain separate public profile and
 prompt-order selection. A separate resident type and schema avoid adding an
 ambiguous mutable mode to existing streamed callers. This supplies no resident
 allocation or runtime evidence by itself.
+
+## Independent rejection fixtures and resident raw evidence
+
+Reset each rejection case from a known-valid record, including nested snapshot,
+sequence, metrics, and pointers. Reusing scratch state can leave an earlier
+invalid request ID or missing metrics in place, making later hash, geometry or
+cache tests pass without testing their intended rule. Mutate independent
+configuration fields separately. A multi-field cross-mode rejection does not
+prove each discriminator.
+
+The resident emitter reuses runtime serialization and copies observed physical
+footprint even when the expert-cache limit is zero. A zero streaming cache does
+not mean zero resident CUDA allocations or zero registered model pages. Native
+allocation collection and parent-side lifecycle/schema validation remain
+separate required work.

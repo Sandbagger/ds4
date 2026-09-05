@@ -40,6 +40,13 @@ static const ds4_bench_qualification_profile
         },
     };
 
+static const ds4_bench_qualification_profile
+    ds4_bench_resident_qualification_profile = {
+        "resident", UINT64_C(0),
+        {"native-512", "native-2048", "native-8192", "native-28672"},
+        {UINT32_C(512), UINT32_C(2048), UINT32_C(8192), UINT32_C(28672)},
+    };
+
 typedef struct {
     char *buffer;
     size_t capacity;
@@ -167,6 +174,7 @@ static const char *ds4_bench_qualification_terminal_status_name(
 
 static bool ds4_bench_qualification_validate_sequence(
         const ds4_bench_sequence *sequence,
+        bool resident,
         const ds4_bench_qualification_profile **profile_out,
         char *error,
         size_t error_size) {
@@ -190,9 +198,11 @@ static bool ds4_bench_qualification_validate_sequence(
             "qualification sequence input is not a parsed bounded payload");
     }
 
-    const ds4_bench_qualification_profile *profile =
+    const ds4_bench_qualification_profile *profile = resident ?
+        &ds4_bench_resident_qualification_profile :
         ds4_bench_qualification_profile_for_sequence(sequence);
-    if (!profile) {
+    if (!profile || !ds4_bench_qualification_bounded_equals(
+            sequence->profile_id, sizeof(sequence->profile_id), profile->id)) {
         return ds4_bench_qualification_fail(
             error, error_size,
             "qualification sequence has an unknown profile_id");
@@ -219,6 +229,7 @@ static bool ds4_bench_qualification_validate_sequence(
 static bool ds4_bench_qualification_validate_runtime(
         const ds4_runtime_wire_snapshot *snapshot,
         const ds4_bench_qualification_profile *profile,
+        bool resident,
         char *runtime_json,
         size_t runtime_json_capacity,
         size_t *runtime_json_length,
@@ -240,7 +251,7 @@ static bool ds4_bench_qualification_validate_runtime(
             DS4_BENCH_QUALIFICATION_PREFILL_CHUNK_TOKENS ||
         snapshot->configured_session_slots !=
             DS4_BENCH_QUALIFICATION_SESSION_SLOTS ||
-        !snapshot->configured_ssd_streaming ||
+        snapshot->configured_ssd_streaming != !resident ||
         snapshot->configured_ssd_streaming_cache_bytes != profile->cache_bytes ||
         snapshot->effective_context_tokens !=
             DS4_BENCH_QUALIFICATION_CONTEXT_TOKENS ||
@@ -255,6 +266,19 @@ static bool ds4_bench_qualification_validate_runtime(
         return ds4_bench_qualification_fail(
             error, error_size,
             "qualification runtime snapshot does not use the pinned configuration");
+    }
+    if (resident &&
+        (snapshot->configured_prefill_rows !=
+             DS4_BENCH_QUALIFICATION_PREFILL_CHUNK_TOKENS ||
+         snapshot->allocated_prefill_rows !=
+             DS4_BENCH_QUALIFICATION_PREFILL_CHUNK_TOKENS ||
+         snapshot->allocations.category_current[
+             DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] != 0u ||
+         snapshot->allocations.category_peak[
+             DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] != 0u)) {
+        return ds4_bench_qualification_fail(
+            error, error_size,
+            "resident qualification requires 4096 allocated rows and zero expert cache");
     }
     if (!ds4_runtime_wire_snapshot_json(
             snapshot, runtime_json, runtime_json_capacity,
@@ -317,9 +341,10 @@ static bool ds4_bench_qualification_json_appendf(
     return true;
 }
 
-bool ds4_bench_qualification_emit_record(
+static bool ds4_bench_qualification_emit_record_impl(
         FILE *stream,
         const ds4_bench_qualification_record *record,
+        bool resident,
         char *error,
         size_t error_size) {
     ds4_bench_qualification_clear_error(error, error_size);
@@ -353,14 +378,14 @@ bool ds4_bench_qualification_emit_record(
 
     const ds4_bench_qualification_profile *profile = NULL;
     if (!ds4_bench_qualification_validate_sequence(
-            record->sequence, &profile, error, error_size)) {
+            record->sequence, resident, &profile, error, error_size)) {
         return false;
     }
 
     char runtime_json[DS4_RUNTIME_JSON_CAPACITY];
     size_t runtime_json_length = 0u;
     if (!ds4_bench_qualification_validate_runtime(
-            record->runtime_snapshot, profile,
+            record->runtime_snapshot, profile, resident,
             runtime_json, sizeof(runtime_json), &runtime_json_length,
             error, error_size)) {
         return false;
@@ -423,7 +448,7 @@ bool ds4_bench_qualification_emit_record(
     output[0] = '\0';
     if (!ds4_bench_qualification_json_appendf(
             &writer,
-            "{\"schema\":\"ds4.bench.qualification/v1\","
+            "{\"schema\":\"%s\","
             "\"manifest_sha256\":\"%s\","
             "\"sequence_sha256\":\"%s\","
             "\"profile_id\":\"%s\","
@@ -436,7 +461,7 @@ bool ds4_bench_qualification_emit_record(
             "\"snapshot_seq\":\"%" PRIu64 "\","
             "\"repetition_index\":%" PRIu32 ","
             "\"monotonic_ns\":\"%" PRIu64 "\","
-            "\"mode\":\"streamed\","
+            "\"mode\":\"%s\","
             "\"session_payload_bytes\":\"%" PRIu64 "\","
             "\"kv_allocated_bytes\":\"%" PRIu64 "\","
             "\"configured_prefill_rows\":%" PRIu32 ","
@@ -453,6 +478,8 @@ bool ds4_bench_qualification_emit_record(
             "\",\"cuda_library_unattributed\":\"%" PRIu64
             "\",\"unrelated_process_inventory_stable\":%s},"
             "\"runtime\":",
+            resident ? DS4_BENCH_RESIDENT_QUALIFICATION_SCHEMA :
+                       "ds4.bench.qualification/v1",
             record->sequence->manifest_sha256,
             record->sequence->sequence_sha256,
             record->sequence->profile_id,
@@ -465,6 +492,7 @@ bool ds4_bench_qualification_emit_record(
             record->runtime_snapshot->snapshot_seq,
             record->repetition_index,
             record->monotonic_ns,
+            resident ? "resident" : "streamed",
             record->session_payload_bytes,
             record->runtime_snapshot->allocations.category_current[
                 DS4_RUNTIME_CATEGORY_KV_STATE],
@@ -520,4 +548,36 @@ bool ds4_bench_qualification_emit_record(
             error, error_size, "failed to flush qualification record");
     }
     return true;
+}
+
+bool ds4_bench_qualification_emit_record(
+        FILE *stream,
+        const ds4_bench_qualification_record *record,
+        char *error,
+        size_t error_size) {
+    return ds4_bench_qualification_emit_record_impl(
+        stream, record, false, error, error_size);
+}
+
+bool ds4_bench_resident_qualification_emit_record(
+        FILE *stream,
+        const ds4_bench_resident_qualification_record *record,
+        char *error,
+        size_t error_size) {
+    if (!record) {
+        return ds4_bench_qualification_emit_record_impl(
+            stream, NULL, true, error, error_size);
+    }
+    const ds4_bench_qualification_record shared = {
+        .sequence = record->sequence ? &record->sequence->sequence : NULL,
+        .event = record->event,
+        .request_id = record->request_id,
+        .repetition_index = record->repetition_index,
+        .monotonic_ns = record->monotonic_ns,
+        .session_payload_bytes = record->session_payload_bytes,
+        .runtime_snapshot = record->runtime_snapshot,
+        .request_metrics = record->request_metrics,
+    };
+    return ds4_bench_qualification_emit_record_impl(
+        stream, &shared, true, error, error_size);
 }

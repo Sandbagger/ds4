@@ -8348,7 +8348,23 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return 0;
     if (!model_map || model_size == 0) return 0;
-    if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (g_model_host_base == model_map && g_model_registered_size == model_size) {
+        /* A failed rollback still owns a registration, not a usable device map. */
+        return !g_model_registered || g_model_device_base != NULL;
+    }
+
+    /* Keep the old owner and its caches intact unless release is proved. */
+    if (g_model_registered && g_model_host_base) {
+        cudaError_t release_err = cudaHostUnregister((void *)g_model_host_base);
+        if (release_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA (no-copy) prior host registration release failed: %s\n",
+                    cudaGetErrorString(release_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_model_registered = 0;
+    }
 
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
@@ -8365,10 +8381,6 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
         (void)cudaFree((void *)g_model_device_base);
         g_model_device_owned = 0;
     }
-    if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
-        g_model_registered = 0;
-    }
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;
@@ -8384,19 +8396,31 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        cudaHostRegisterMapped | cudaHostRegisterReadOnly);
     if (err == cudaSuccess) {
+        /* Registration ownership starts before device-pointer acquisition. */
+        g_model_registered = 1;
+        g_model_device_base = NULL;
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
         if (err == cudaSuccess && dev) {
             g_model_device_base = (const char *)dev;
-            g_model_registered = 1;
             fprintf(stderr,
                     "ds4: CUDA (no-copy) registered %.2f GiB model mapping for multi-tier selective cache\n",
                     (double)model_size / 1073741824.0);
         } else {
             fprintf(stderr,
                     "ds4: CUDA (no-copy) host registration pointer lookup failed: %s\n",
-                    cudaGetErrorString(err));
+                    err == cudaSuccess ? "null device pointer" : cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cudaError_t rollback_err = cudaHostUnregister((void *)model_map);
+            if (rollback_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA (no-copy) host registration rollback failed: %s\n",
+                        cudaGetErrorString(rollback_err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+            g_model_registered = 0;
+            g_model_device_base = (const char *)model_map;
         }
     } else {
         fprintf(stderr,

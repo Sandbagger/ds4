@@ -1950,6 +1950,33 @@ bounds are changed by this sampler. Resident allocation-plan/tracker attachment,
 external attribution, engine snapshots and controlled execution remain required.
 No full CLI `run`, native Linux/CUDA execution or model qualification is claimed.
 
+**No-copy registration ownership progress (2026-09-05):** At `f873014`,
+pinned verification passed 128 focused and 242 aggregate Python tests plus the
+native host checks; independent review found no confirmed defect. RED `e9d8d46`
+then compiled the real no-copy registration function in a host-only fake CUDA
+fixture. Both positive controls passed, while seven fault/recovery cases exposed
+37 field failures. The fixture counts live registrations independently of the
+production ownership flags and allows more than one mapping to remain live.
+
+`ds4_gpu_register_model_map_no_copy()` now checks prior registration release
+before destroying caches or replacing its owner. A successful registration is
+owned before device-pointer lookup. Failed or null lookup requires rollback;
+a failed rollback returns failure while retaining the registered host base/size
+and a null device pointer. Same-map reuse cannot turn that unresolved state into
+success. A later different-map call can recover after releasing the old owner.
+The existing nonregistered fallback remains available after successful rollback.
+All nine host cases now pass, including failed-release preservation and recovery
+from a failed rollback. `test-cuda-model-registration-contract` is included by
+`test-cuda-build-contract` and the aggregate `test` target.
+
+This fixes only the no-copy registration transaction. Generic CUDA cleanup,
+range-cache releases, arena reservation, optional Q8 caches, tracker attachment,
+resident 4096-row geometry, external attribution and native snapshot production
+are not repaired or supplied by this increment. The host fixture does not
+compile a CUDA translation unit or execute a GPU/model. Pinned regression
+verification and independent review remain pending at commit time. Task 20 and
+CLI `run` remain incomplete.
+
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 

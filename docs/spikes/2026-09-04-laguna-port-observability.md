@@ -365,3 +365,28 @@ must fail rather than silently skip the meaningful test.
 Resident memory bounds still require the actual registration/cache/graph paths.
 Do not reuse the compact plan's hard-coded external envelopes or report the
 resident 512-row execution/16384-row allocation as a configured 4096-row run.
+
+## Preserve registration ownership through failed pointer lookup
+
+Acquiring a host registration and obtaining its device pointer are separate
+operations. Own the registration immediately after acquisition. If pointer
+lookup fails or returns null, prove rollback before reporting the unregistered
+fallback. Failed rollback retains the host base/size and ownership flag, with no
+usable device-pointer claim. An identical-map fast path must not convert that
+unresolved state to success. Before replacing an old registration, a failed
+release must preserve its metadata and prevent cache teardown/new registration.
+
+The no-copy function's host fixture extracts and compiles the real C++ function,
+not a reimplementation of its algorithm. Keep a separate fake registry that can
+hold multiple live mappings, validate CUDA-call arguments, and prove accepted
+controls before failure cases. Test both preservation and later recovery from
+pointer-lookup rollback failure. Register temporary-directory cleanup before
+compilation so a setup error cannot leak fixture files.
+
+This is a narrow transaction contract, not proof that every legacy CUDA free or
+unregister path preserves ownership. In particular, generic model/range cleanup
+still uses best-effort release. Resident bounds also cannot use the range-cache
+payload scalar as arena reservation: the normal arena chunk is 1792 MiB, the
+copy path uses four 64-MiB staging buffers plus alignment, and optional Q8 caches
+consume additional memory. Those paths still need real inventory/bounds before
+native resident runtime evidence is available.

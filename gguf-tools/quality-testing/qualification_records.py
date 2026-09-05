@@ -2,6 +2,7 @@
 """Strict qualification-record validation and bounded incremental JSONL parsing."""
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
@@ -463,6 +464,7 @@ class QualificationRecordStream:
         self._line = bytearray()
         self._total_bytes = 0
         self._records: list[dict[str, Any]] = []
+        self._drain_index = 0
         self._request_ids: set[str] = set()
         self._instance_id: str | None = None
         self._request_id: str | None = None
@@ -578,6 +580,19 @@ class QualificationRecordStream:
                 )
         self._records.append(record)
 
+    def drain_records(self) -> tuple[dict[str, Any], ...]:
+        """Copy new validated records, even after failure or finish.
+
+        A returned prefix is evidence, not proof of a complete valid stream.
+        Draining never changes the sticky feed/finish lifecycle.
+        """
+        end = len(self._records)
+        drained = tuple(
+            copy.deepcopy(record) for record in self._records[self._drain_index:end]
+        )
+        self._drain_index = end
+        return drained
+
     def finish(self) -> tuple[dict[str, Any], ...]:
         if self._finished:
             raise ValueError("qualification record stream is finished")
@@ -590,7 +605,7 @@ class QualificationRecordStream:
             self._fail("qualification JSONL stream has no records")
         if len(self._records) != MAX_RECORD_COUNT:
             self._fail("qualification JSONL lifecycle is incomplete")
-        return tuple(self._records)
+        return tuple(copy.deepcopy(record) for record in self._records)
 
 
 def _iter_bounded_json_lines(handle: Any) -> Iterator[bytes]:

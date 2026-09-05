@@ -836,7 +836,7 @@ test-cuda-build-contract: test-cuda-model-registration-contract
 	python3 tests/test_main_session_recovery_hardening_contract.py -v
 	python3 tests/test_task18_cuda_failure_source_contract.py -v
 
-.PHONY: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-sequence test-qualification-resident-records test-laguna-layer-diagnostics
+.PHONY: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-authenticated test-qualification-resident-sequence test-qualification-resident-records test-laguna-layer-diagnostics
 
 test-qualification-records:
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
@@ -882,6 +882,10 @@ test-qualification-authenticated:
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python gguf-tools/quality-testing/test_qualification_authenticated.py -v
 
+test-qualification-resident-authenticated:
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_resident_authenticated.py -v
+
 test-qualification-resident-sequence:
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python gguf-tools/quality-testing/test_qualification_resident_sequence.py -v
@@ -895,7 +899,7 @@ test-laguna-layer-diagnostics:
 	python3 tests/test_laguna_layer_mismatch.py -v
 	python3 tests/test_poolside_layer_diagnostics.py -v
 
-test-laguna-compact-python: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-sequence test-qualification-resident-records test-laguna-layer-diagnostics
+test-laguna-compact-python: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-authenticated test-qualification-resident-sequence test-qualification-resident-records test-laguna-layer-diagnostics
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "error: test-laguna-compact-python requires uv" >&2; \
 		exit 127; \

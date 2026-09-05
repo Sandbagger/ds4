@@ -15,11 +15,20 @@ from collections.abc import Mapping
 from typing import Any
 
 from qualification_records import QualificationRecordStream
+from qualification_resident_records import QualificationResidentRecordStream
 
 
 _DEFAULT_FIRST_TOKEN_TIMEOUT_NS = 900_000_000_000
 _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS = 2_700_000_000_000
 _DEFAULT_IDLE_TIMEOUT_NS = 30_000_000_000
+_RECORD_KINDS = ("streamed", "resident")
+
+
+def _validate_record_kind(record_kind: Any) -> None:
+    if type(record_kind) is not str:
+        raise TypeError("record_kind must be a built-in string")
+    if record_kind not in _RECORD_KINDS:
+        raise ValueError("record_kind must be 'streamed' or 'resident'")
 
 
 class QualificationTimeout(TimeoutError):
@@ -48,10 +57,12 @@ class QualificationSliceMonitor:
         expected: Mapping[str, Any],
         *,
         start_ns: int,
+        record_kind: str = "streamed",
         first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
         whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
         idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
     ) -> None:
+        _validate_record_kind(record_kind)
         self._require_nonnegative_int("start_ns", start_ns)
         self._require_positive_int(
             "first_token_timeout_ns", first_token_timeout_ns
@@ -66,8 +77,12 @@ class QualificationSliceMonitor:
                 "whole_request_timeout_ns"
             )
 
-        # QualificationRecordStream is the single owner of record validation.
-        self._stream = QualificationRecordStream(expected)
+        # One fixed stream class owns validation for the selected record kind.
+        self._stream = (
+            QualificationResidentRecordStream(expected)
+            if record_kind == "resident"
+            else QualificationRecordStream(expected)
+        )
         self._start_ns = start_ns
         self._first_token_timeout_ns = first_token_timeout_ns
         self._whole_request_timeout_ns = whole_request_timeout_ns

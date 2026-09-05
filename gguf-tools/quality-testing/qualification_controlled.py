@@ -23,6 +23,7 @@ from qualification_process import (
     _qualification_child_transport,
     _validated_command,
 )
+from qualification_supervisor import _validate_record_kind
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class _TransportStopped(BaseException):
 
 def run_qualification_controlled_child(
     command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    record_kind: str = "streamed",
     prepare_descriptor: Callable[[int, int, QualificationModelEvidence], Any],
     capture_before: Callable[[int, int], Any],
     capture_after: Callable[[int, int], Any],
@@ -59,6 +61,7 @@ def run_qualification_controlled_child(
     The private executable FD is borrowed by the authenticated composition;
     this controller inherits it but does not itself authenticate its origin.
     """
+    _validate_record_kind(record_kind)
     argv = _validated_command(command)
     if any(arg == "--qualification-control-fd" or
            arg.startswith("--qualification-control-fd=") for arg in argv):
@@ -130,7 +133,7 @@ def run_qualification_controlled_child(
         inherited = control.child_fd
         launched_argv = argv + ("--qualification-control-fd", str(inherited))
         with _qualification_child_transport(
-            launched_argv, expected,
+            launched_argv, expected, record_kind=record_kind,
             first_token_timeout_ns=first_token_timeout_ns,
             whole_request_timeout_ns=whole_request_timeout_ns,
             idle_timeout_ns=idle_timeout_ns,

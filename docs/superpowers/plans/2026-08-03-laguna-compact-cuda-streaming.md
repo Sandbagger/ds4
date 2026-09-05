@@ -2036,6 +2036,17 @@ run is implied by the host tests.
 See [port-observability notes](../../spikes/2026-09-04-laguna-port-observability.md)
 for diagnostic reuse, verification commands and the next implementation seam.
 
+**Authenticated record-kind wiring progress (2026-09-05):** The host-only
+qualification composition now accepts an explicit keyword-only `record_kind`
+with a fixed streamed default and selects only the trusted streamed or resident
+record stream. Resident and streamed slices can share the same retained model
+and executable owners; returned data remains observations, not a qualification
+verdict. Existing schema-path consumption is unchanged, and authenticated
+consumed-schema admission remains follow-on. The native resident plan/tracker/
+snapshot producer is still missing. Proc origin remains simulated, and the
+Darwin descriptor-content adapter remains test-only. Public `run` remains
+rejected.
+
 **Files:**
 - Modify: `gguf-tools/quality-testing/compact_runtime_qualify.py`
 - Modify: `gguf-tools/quality-testing/test_compact_runtime_qualify.py`

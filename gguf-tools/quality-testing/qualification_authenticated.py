@@ -20,11 +20,13 @@ from qualification_controlled import (
     run_qualification_controlled_child,
 )
 from qualification_process import _validated_command
+from qualification_supervisor import _validate_record_kind
 from qualification_version_probe import _descriptor_exec_path
 
 
 def run_authenticated_qualification_child(
     arguments: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    record_kind: str = "streamed",
     executable_artifact: QualificationArtifact,
     model_artifact: QualificationArtifact,
     prepare_descriptor: Callable[[int, int, QualificationModelEvidence], Any],
@@ -44,6 +46,7 @@ def run_authenticated_qualification_child(
     pathname.  Hashing happens on initial receipt; subsequent owner change-time
     and identity checks avoid rereading the model at every checkpoint.
     """
+    _validate_record_kind(record_kind)
     if type(arguments) not in (list, tuple):
         raise TypeError("authenticated child arguments must be a built-in list or tuple")
     if not arguments:
@@ -104,7 +107,7 @@ def run_authenticated_qualification_child(
         return value
 
     result = run_qualification_controlled_child(
-        command, expected, prepare_descriptor=prepare,
+        command, expected, record_kind=record_kind, prepare_descriptor=prepare,
         capture_before=before, capture_after=after, _executable_fd=executable_fd,
         first_token_timeout_ns=first_token_timeout_ns,
         whole_request_timeout_ns=whole_request_timeout_ns,

@@ -28,6 +28,7 @@ from qualification_supervisor import (
     _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
     _DEFAULT_IDLE_TIMEOUT_NS,
     _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
+    _validate_record_kind,
 )
 
 MAX_STDOUT_BYTES = MAX_STREAM_BYTES
@@ -428,6 +429,7 @@ def _owned_child_transport(
 @contextmanager
 def _qualification_child_transport(
     command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    record_kind: str = "streamed",
     first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
     whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
     idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
@@ -435,9 +437,10 @@ def _qualification_child_transport(
     pass_fds: tuple[int, ...] = (),
 ) -> Iterator[_Transport]:
     """Use the common owner with the twelve-record lifecycle monitor."""
+    _validate_record_kind(record_kind)
     argv = _validated_command(command)
     monitor = QualificationSliceMonitor(
-        expected, start_ns=time.monotonic_ns(),
+        expected, start_ns=time.monotonic_ns(), record_kind=record_kind,
         first_token_timeout_ns=first_token_timeout_ns,
         whole_request_timeout_ns=whole_request_timeout_ns,
         idle_timeout_ns=idle_timeout_ns,
@@ -452,6 +455,7 @@ def _qualification_child_transport(
 
 def run_qualification_child(
     command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
+    record_kind: str = "streamed",
     first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
     whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
     idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
@@ -462,8 +466,9 @@ def run_qualification_child(
     Invalid arguments fail before launch.  The structured result describes
     transport only.  Interrupts propagate after bounded owned-group cleanup.
     """
+    _validate_record_kind(record_kind)
     with _qualification_child_transport(
-        command, expected,
+        command, expected, record_kind=record_kind,
         first_token_timeout_ns=first_token_timeout_ns,
         whole_request_timeout_ns=whole_request_timeout_ns,
         idle_timeout_ns=idle_timeout_ns,

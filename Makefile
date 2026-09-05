@@ -839,7 +839,8 @@ test-cuda-build-contract: test-cuda-model-registration-contract
 .PHONY: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-version-probe test-qualification-authenticated test-qualification-resident-sequence test-qualification-resident-records test-laguna-layer-diagnostics
 
 test-qualification-records:
-	python3 gguf-tools/quality-testing/test_qualification_records.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_records.py -v
 
 test-qualification-evidence:
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
@@ -850,35 +851,45 @@ test-qualification-evidence-files:
 		python gguf-tools/quality-testing/test_qualification_evidence_files.py -v
 
 test-qualification-supervisor:
-	python3 gguf-tools/quality-testing/test_qualification_supervisor.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_supervisor.py -v
 
 test-qualification-process:
-	python3 -m unittest discover -s gguf-tools/quality-testing -p 'test_qualification_process*.py' -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python -m unittest discover -s gguf-tools/quality-testing -p 'test_qualification_process*.py' -v
 
 test-qualification-control-records:
-	python3 gguf-tools/quality-testing/test_qualification_control_records.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_control_records.py -v
 
 test-qualification-controlled:
-	python3 gguf-tools/quality-testing/test_qualification_controlled.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_controlled.py -v
 
 test-qualification-artifacts:
-	python3 gguf-tools/quality-testing/test_qualification_artifacts.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_artifacts.py -v
 
 test-qualification-admission:
-	python3 gguf-tools/quality-testing/test_qualification_admission.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_admission.py -v
 
 test-qualification-version-probe:
-	python3 gguf-tools/quality-testing/test_qualification_version_probe.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_version_probe.py -v
 
 test-qualification-authenticated:
-	python3 gguf-tools/quality-testing/test_qualification_authenticated.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_authenticated.py -v
 
 test-qualification-resident-sequence:
-	python3 gguf-tools/quality-testing/test_qualification_resident_sequence.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_resident_sequence.py -v
 
 # Model-free native emitter bytes feed the separate resident lifecycle consumer.
 test-qualification-resident-records:
-	python3 gguf-tools/quality-testing/test_qualification_resident_records.py -v
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_resident_records.py -v
 
 test-laguna-layer-diagnostics:
 	python3 tests/test_laguna_layer_mismatch.py -v

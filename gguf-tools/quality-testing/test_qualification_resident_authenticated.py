@@ -320,7 +320,7 @@ def _assert_full_ack_sequence(test: unittest.TestCase, run: dict[str, Any]) -> N
     test.assertEqual(len(result.wire_records), len(expected_wire))
     model_identity = tuple(run["model_artifact"].identity)
     for index, (wire, expected) in enumerate(zip(result.wire_records, expected_wire)):
-        AUTH_TEST._assert_wire_shape(test, wire)
+        AUTH_TEST.CONTROLLED_TEST._assert_wire_shape(test, wire)
         test.assertTrue(wire["complete"], index)
         values = WIRE.unpack(wire["payload"])
         test.assertEqual((wire["direction"], values[1], values[4]), expected)
@@ -659,7 +659,37 @@ class QualificationResidentAuthenticatedHostTest(unittest.TestCase):
             self.assertEqual(result.transport.records[0]["event"], "request_accepted")
             self.assertEqual(len(result.checkpoints), 1)
             self.assertTrue(result.checkpoints[0]["complete"])
-            self.assertEqual(len(result.wire_records), 6)
+            self.assertEqual(len(result.wire_records), 7)
+            for index, wire in enumerate(result.wire_records):
+                AUTH_TEST.CONTROLLED_TEST._assert_wire_shape(self, wire)
+                if index < 6:
+                    self.assertTrue(wire["complete"], index)
+                    self.assertEqual(len(wire["payload"]), WIRE.size, index)
+            self.assertEqual(
+                result.wire_records[6],
+                {
+                    "direction": "receive",
+                    "payload": b"",
+                    "complete": False,
+                    "descriptor_count": 0,
+                },
+            )
+            self.assertEqual(
+                [
+                    (
+                        index,
+                        WIRE.unpack(wire["payload"])[1],
+                        WIRE.unpack(wire["payload"])[4],
+                    )
+                    for index, wire in enumerate(result.wire_records)
+                    if wire["direction"] == "send"
+                ],
+                [
+                    (1, MODEL_ACK, 0),
+                    (3, READY_ACK, 1),
+                    (5, RESULT_ACK, 1),
+                ],
+            )
             self.assertEqual(run["probe"].callback_calls[0][0], "prepare")
             self.assertEqual(
                 [name for name, _pid in run["probe"].callback_calls[1:]],

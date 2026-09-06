@@ -72,6 +72,7 @@ def _invoke_authenticated(
     payload: bytes,
     arguments: list[str],
     after_hook: Callable[[int, Path, Path], None] | None = None,
+    input_admission: Any | None = None,
 ) -> dict[str, Any]:
     """Invoke one child while borrowing caller-owned artifacts."""
     received_fds: list[int] = []
@@ -116,6 +117,8 @@ def _invoke_authenticated(
     }
     if record_kind is not None:
         call_kwargs["record_kind"] = record_kind
+    if input_admission is not None:
+        call_kwargs["input_admission"] = input_admission
     result, requests = AUTH_TEST._call_bounded(
         arguments, expected, **call_kwargs
     )
@@ -226,8 +229,17 @@ def _enable_parent_payload(fake: Path) -> None:
 @contextlib.contextmanager
 def _shared_authenticated_session(
     cases: tuple[tuple[str, list[dict[str, Any]]], ...],
+    *,
+    admission_context_factory: Callable[[Path, Path], Any] | None = None,
 ) -> Iterator[Callable[[str, list[dict[str, Any]], dict[str, Any]], dict[str, Any]]]:
-    """Yield a runner that reuses one fake/model owner pair for two payloads."""
+    """Yield a runner that reuses one fake/model owner pair for two payloads.
+
+    ``admission_context_factory`` is test scaffolding only.  When supplied, it
+    receives the generated fake and model paths and must yield a real live
+    ``QualificationAdmission``.  The helper borrows that admission's retained
+    ``bench`` and ``model`` owners for every run; the default still opens the
+    historical two-owner pair.
+    """
     if not cases:
         raise AssertionError("shared authenticated session needs payload cases")
     payload = b"one retained model owner for two payloads\0" * 29
@@ -250,50 +262,91 @@ def _shared_authenticated_session(
                 )
                 payload_paths[record_kind] = path
             _enable_parent_payload(fake)
-            with (
-                open_qualification_artifact(fake, executable=True) as executable,
-                open_qualification_artifact(model) as model_artifact,
-                tempfile.TemporaryDirectory(prefix="SIMULATED-PROC-resident-shared-") as proc,
-            ):
-                def run_once(
-                    record_kind: str,
-                    records: list[dict[str, Any]],
-                    expected: dict[str, Any],
-                ) -> dict[str, Any]:
-                    try:
-                        payload_path = payload_paths[record_kind]
-                    except KeyError as exc:
-                        raise AssertionError(f"unknown shared payload {record_kind!r}") from exc
-                    probe = AUTH_TEST._AuthenticationProbe(
-                        executable,
-                        model_artifact,
-                        Path(proc),
-                        running_target=fake,
+            with contextlib.ExitStack() as owners:
+                input_admission = None
+                if admission_context_factory is not None:
+                    input_admission = owners.enter_context(
+                        admission_context_factory(fake, model)
                     )
-                    arguments = [
-                        "--profile",
-                        f"selected-{record_kind}",
-                        "--model",
-                        "ignored.gguf",
-                        "--record-payload",
-                        str(payload_path),
-                    ]
-                    return _invoke_authenticated(
-                        records,
-                        expected,
-                        record_kind,
-                        executable=executable,
-                        model_artifact=model_artifact,
-                        probe=probe,
-                        metadata_path=metadata_path,
-                        token=token,
-                        model=model,
-                        fake=fake,
-                        payload=payload,
-                        arguments=arguments,
+                    if input_admission is None:
+                        raise AssertionError(
+                            "admission context factory yielded no live admission"
+                        )
+                    admitted_artifacts = input_admission.artifacts
+                    executable = admitted_artifacts["bench"]
+                    model_artifact = admitted_artifacts["model"]
+                    if Path(str(executable.path)).resolve() != fake.resolve():
+                        raise AssertionError("admitted bench owner did not bind fake path")
+                    if Path(str(model_artifact.path)).resolve() != model.resolve():
+                        raise AssertionError("admitted model owner did not bind model path")
+                else:
+                    executable = owners.enter_context(
+                        open_qualification_artifact(fake, executable=True)
                     )
+                    model_artifact = owners.enter_context(
+                        open_qualification_artifact(model)
+                    )
+                with tempfile.TemporaryDirectory(
+                    prefix="SIMULATED-PROC-resident-shared-"
+                ) as proc:
+                    def run_once(
+                        record_kind: str,
+                        records: list[dict[str, Any]],
+                        expected: dict[str, Any],
+                    ) -> dict[str, Any]:
+                        try:
+                            payload_path = payload_paths[record_kind]
+                        except KeyError as exc:
+                            raise AssertionError(
+                                f"unknown shared payload {record_kind!r}"
+                            ) from exc
+                        # Qualification records carry the digest of the live
+                        # admission.  Refresh caller-owned fixture records only
+                        # after the real context has produced that digest.
+                        if input_admission is not None:
+                            _manifest = input_admission.manifest_sha256
+                            for record in records:
+                                record["manifest_sha256"] = _manifest
+                            payload_path.write_text(
+                                json.dumps(
+                                    records,
+                                    separators=(",", ":"),
+                                    ensure_ascii=False,
+                                ),
+                                encoding="utf-8",
+                            )
+                            expected["manifest_sha256"] = _manifest
+                        probe = AUTH_TEST._AuthenticationProbe(
+                            executable,
+                            model_artifact,
+                            Path(proc),
+                            running_target=fake,
+                        )
+                        arguments = [
+                            "--profile",
+                            f"selected-{record_kind}",
+                            "--model",
+                            "ignored.gguf",
+                            "--record-payload",
+                            str(payload_path),
+                        ]
+                        return _invoke_authenticated(
+                            records,
+                            expected,
+                            record_kind,
+                            executable=executable,
+                            model_artifact=model_artifact,
+                            probe=probe,
+                            metadata_path=metadata_path,
+                            token=token,
+                            model=model,
+                            fake=fake,
+                            payload=payload,
+                            arguments=arguments,
+                            input_admission=input_admission,
+                        )
 
-                yield run_once
+                    yield run_once
 
 def _selected_stream(
     record_kind: str, expected: dict[str, Any]

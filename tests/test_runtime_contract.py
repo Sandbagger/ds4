@@ -354,6 +354,16 @@ class MakeEnvironmentContractTests(unittest.TestCase):
                 "gguf-tools/quality-testing/test_qualification_admission.py",
                 "-v",
             ],
+            "test-qualification-schema-binding": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_schema_binding.py",
+                "-v",
+            ],
+            "test-qualification-admitted-authenticated": [
+                "python",
+                "gguf-tools/quality-testing/test_qualification_admitted_authenticated.py",
+                "-v",
+            ],
             "test-qualification-version-probe": [
                 "python",
                 "gguf-tools/quality-testing/test_qualification_version_probe.py",

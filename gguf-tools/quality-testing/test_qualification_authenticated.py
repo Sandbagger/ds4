@@ -349,6 +349,7 @@ def _call_bounded(
     capture_after: Any,
     watchdog_seconds: float = 8.0,
     record_kind: str | None = None,
+    input_admission: Any | None = None,
 ) -> tuple[Any, list[tuple[tuple[str, ...], tuple[int, ...]]]]:
     """Run one call under a main-thread SIGALRM/BaseException watchdog."""
 
@@ -371,6 +372,10 @@ def _call_bounded(
         # None means preserve the production function's streamed default.
         if record_kind is not None:
             call_kwargs["record_kind"] = record_kind
+        # The test-only helper forwards a live admission only when a caller
+        # explicitly supplies one; legacy cases keep the old host-only path.
+        if input_admission is not None:
+            call_kwargs["input_admission"] = input_admission
         return run_authenticated_qualification_child(
             arguments, expected, **call_kwargs
         )

@@ -32,6 +32,8 @@ SCHEMA_NAMES = (
     "ds4-token-admission-v1.schema.json",
     "ds4-laguna-compact-runtime-v1.schema.json",
     "compact-runtime-benchmark-v1.schema.json",
+    "ds4-bench-qualification-v1.schema.json",
+    "ds4-bench-resident-qualification-v1.schema.json",
 )
 SCHEMA_IDS = (
     "ds4.version/v1",
@@ -40,6 +42,18 @@ SCHEMA_IDS = (
     "ds4.token-admission/v1",
     "ds4.laguna.compact-runtime/v1",
     "ds4.compact-runtime-benchmark/v1",
+    "ds4.bench.qualification/v1",
+    "ds4.bench.resident-qualification/v1",
+)
+CORE_SCHEMA_NAMES = SCHEMA_NAMES[:-2]
+RECORD_SCHEMA_NAMES = SCHEMA_NAMES[-2:]
+CORE_SCHEMA_IDS = SCHEMA_IDS[:-2]
+RECORD_SCHEMA_IDS = SCHEMA_IDS[-2:]
+RECORD_SCHEMA_DEPENDENCIES = frozenset(
+    {
+        "ds4-runtime-v1.schema.json",
+        "ds4-runtime-request-v1.schema.json",
+    }
 )
 ROLES = ("server", "bench", "eval")
 
@@ -112,7 +126,7 @@ def _compact_modules() -> tuple[types.ModuleType, ...]:
 
 @contextmanager
 def _tiny_inputs():
-    """Build a real, regular tiny model and a valid six-schema bundle."""
+    """Build a real, regular tiny model and a valid eight-schema bundle."""
     with tempfile.TemporaryDirectory(prefix="task20-admission-") as name:
         directory = Path(name)
         model = directory / "laguna-s-2.1-Q4_K_M.gguf"
@@ -216,7 +230,7 @@ def _write_schema_bundle(
     model_sha256: str,
     mutate: dict[str, object] | None = None,
 ) -> dict[str, bytes]:
-    """Clone the six real schemas, changing only tiny-model consts."""
+    """Clone the eight real schemas, changing only tiny-model consts."""
     root.mkdir(parents=True, exist_ok=True)
     result: dict[str, bytes] = {}
     for name in SCHEMA_NAMES:
@@ -239,6 +253,83 @@ def _write_schema_bundle(
 
 def _payload_hash(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _schema_references(value: object) -> tuple[tuple[str, str], ...]:
+    found: list[tuple[str, str]] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in ("$ref", "$dynamicRef", "$recursiveRef") and type(item) is str:
+                    found.append((key, item))
+                visit(item)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(value)
+    return tuple(found)
+
+
+def _replace_first_schema_reference(
+    value: object,
+    replacement: str,
+    *,
+    predicate,
+    keyword: str = "$ref",
+) -> None:
+    def visit(node: object) -> bool:
+        if isinstance(node, dict):
+            for key, item in list(node.items()):
+                if key == "$ref" and type(item) is str and predicate(item):
+                    if keyword == "$ref":
+                        node[key] = replacement
+                    else:
+                        del node[key]
+                        node[keyword] = replacement
+                    return True
+                if visit(item):
+                    return True
+        elif isinstance(node, list):
+            for item in node:
+                if visit(item):
+                    return True
+        return False
+
+    if not visit(value):
+        raise AssertionError("schema fixture did not contain the expected reference")
+
+
+def _schema_variant_root(
+    inputs: Inputs,
+    label: str,
+    schema_name: str,
+    action,
+) -> Path:
+    root = inputs.directory / f"schemas-{label}"
+    _write_schema_bundle(
+        root,
+        model_size=inputs.model.stat().st_size,
+        model_sha256=_sha256_file(inputs.model),
+        mutate={"name": schema_name, "action": action},
+    )
+    return root
+
+
+@contextmanager
+def _spy_opened_descriptors(descriptors: list[int], paths: list[Path]):
+    original_open = ADMISSION.open_qualification_artifact
+
+    @contextmanager
+    def spy(path, *args, **kwargs):
+        paths.append(Path(path))
+        with original_open(path, *args, **kwargs) as artifact:
+            descriptors.append(artifact.fd)
+            yield artifact
+
+    with mock.patch.object(ADMISSION, "open_qualification_artifact", spy):
+        yield
 
 
 def _proc_targets(paths: list[Path]) -> set[str]:
@@ -288,6 +379,7 @@ class QualificationAdmissionTest(unittest.TestCase):
         model_path: Path | str | None = None,
         binaries: dict[str, Path] | None = None,
         probe=None,
+        expected_exceptions=(ValueError,),
     ) -> None:
         calls: list[str] = []
 
@@ -303,7 +395,7 @@ class QualificationAdmissionTest(unittest.TestCase):
         selected_binaries = dict(inputs.binaries) if binaries is None else binaries
         selected_probe = no_probe if probe is None else probe
         with mock.patch.object(ADMISSION, "_SCHEMA_ROOT", selected_schema_root):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(expected_exceptions):
                 with ADMISSION.admit_qualification_inputs(
                     selected_manifest_path,
                     model_path=model_path if model_path is not None else inputs.model,
@@ -314,6 +406,103 @@ class QualificationAdmissionTest(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(before, sorted(path.name for path in inputs.directory.iterdir()))
         self._assert_no_fixture_fds(inputs)
+
+    def _assert_schema_owner_rejected_before_hash(
+        self,
+        inputs: Inputs,
+        schema_root: Path,
+        schema_name: str,
+        *,
+        max_schema_bytes: int | None = None,
+    ) -> None:
+        target = schema_root / schema_name
+        opened: list[Path] = []
+        descriptors: list[int] = []
+        calls: list[str] = []
+        target_stat = target.stat()
+        target_identity = (target_stat.st_dev, target_stat.st_ino)
+        target_descriptors: set[int] = set()
+        original_open = ADMISSION.open_qualification_artifact
+        original_os_open = ADMISSION.os.open
+        original_pread = ADMISSION.os.pread
+        original_read = ADMISSION.os.read
+
+        @contextmanager
+        def spy(path, *args, **kwargs):
+            observed_path = Path(path)
+            opened.append(observed_path)
+            with original_open(path, *args, **kwargs) as artifact:
+                descriptors.append(artifact.fd)
+                yield artifact
+
+        def recording_open(*args, **kwargs):
+            descriptor = original_os_open(*args, **kwargs)
+            try:
+                observed = os.fstat(descriptor)
+            except OSError:
+                pass
+            else:
+                if (observed.st_dev, observed.st_ino) == target_identity:
+                    target_descriptors.add(descriptor)
+            return descriptor
+
+        def no_target_pread(descriptor, size, offset):
+            if descriptor in target_descriptors:
+                raise AssertionError("bounded owner read a rejected schema")
+            return original_pread(descriptor, size, offset)
+
+        def no_target_read(descriptor, size):
+            if descriptor in target_descriptors:
+                raise AssertionError("bounded owner read a rejected schema")
+            return original_read(descriptor, size)
+
+        def no_probe(role, artifact):
+            calls.append(role)
+            return inputs.version_bytes[role]
+
+        patches = [
+            mock.patch.object(ADMISSION, "_SCHEMA_ROOT", schema_root),
+            mock.patch.object(ADMISSION, "open_qualification_artifact", spy),
+            mock.patch.object(ADMISSION.os, "open", side_effect=recording_open),
+            mock.patch.object(ADMISSION.os, "pread", side_effect=no_target_pread),
+            mock.patch.object(ADMISSION.os, "read", side_effect=no_target_read),
+        ]
+        if max_schema_bytes is not None:
+            patches.append(
+                mock.patch.object(ADMISSION, "MAX_SCHEMA_BYTES", max_schema_bytes)
+            )
+        with _patches(patches):
+            with self.assertRaises((ValueError, OSError)):
+                with ADMISSION.admit_qualification_inputs(
+                    inputs.manifest_path,
+                    model_path=inputs.model,
+                    binaries=dict(inputs.binaries),
+                    version_probe=no_probe,
+                ):
+                    self.fail("rejected schema unexpectedly yielded")
+        self.assertIn(target, opened)
+        self.assertEqual(calls, [])
+        self._assert_fds_closed(descriptors)
+        self._assert_fds_closed(list(target_descriptors))
+        self._assert_no_fixture_fds(inputs)
+
+    def _assert_rejected_without_external_owner(
+        self,
+        inputs: Inputs,
+        schema_root: Path,
+    ) -> None:
+        descriptors: list[int] = []
+        opened: list[Path] = []
+        with _spy_opened_descriptors(descriptors, opened):
+            self._assert_rejected_before_probe(inputs, schema_root=schema_root)
+        allowed = {
+            inputs.manifest_path,
+            inputs.model,
+            *inputs.binaries.values(),
+            *(schema_root / name for name in SCHEMA_NAMES),
+        }
+        self.assertTrue(set(opened).issubset(allowed), opened)
+        self._assert_fds_closed(descriptors)
 
     def test_normal_context_exit_rechecks_the_retained_manifest(self) -> None:
         with _tiny_inputs() as inputs:
@@ -384,6 +573,42 @@ class QualificationAdmissionTest(unittest.TestCase):
                     self.assertNotEqual(
                         admitted.manifest_sha256, admitted.manifest_file_sha256
                     )
+
+                    retained_schema_owners = {
+                        owner.path.resolve(): owner
+                        for owner in admitted._owners
+                        if owner.path.parent == inputs.schema_root
+                    }
+                    self.assertEqual(
+                        set(retained_schema_owners),
+                        {(inputs.schema_root / name).resolve() for name in SCHEMA_NAMES},
+                    )
+                    for name in SCHEMA_NAMES:
+                        self.assertEqual(
+                            retained_schema_owners[(inputs.schema_root / name).resolve()].sha256,
+                            _payload_hash(inputs.schema_bytes[name]),
+                        )
+                    for name in RECORD_SCHEMA_NAMES:
+                        references = _schema_references(
+                            json.loads(inputs.schema_bytes[name].decode("utf-8"))
+                        )
+                        self.assertEqual(
+                            {
+                                (key, value)
+                                for key, value in references
+                                if not value.startswith("#")
+                            },
+                            {
+                                ("$ref", dependency)
+                                for dependency in RECORD_SCHEMA_DEPENDENCIES
+                            },
+                        )
+                        self.assertFalse(
+                            any(
+                                key in ("$dynamicRef", "$recursiveRef")
+                                for key, _ in references
+                            )
+                        )
 
                     self.assertIs(type(admitted.schema_records), tuple)
                     self.assertEqual(
@@ -509,9 +734,9 @@ class QualificationAdmissionTest(unittest.TestCase):
                 model_size=inputs.model.stat().st_size,
                 model_sha256=_sha256_file(inputs.model),
             )
-            malformed_path = malformed_root / SCHEMA_NAMES[-1]
+            malformed_path = malformed_root / CORE_SCHEMA_NAMES[-1]
             malformed_path.write_bytes(
-                malformed_bytes[SCHEMA_NAMES[-1]][:-1] + b'\n"'
+                malformed_bytes[CORE_SCHEMA_NAMES[-1]][:-1] + b'\n"'
             )
             self._assert_rejected_before_probe(inputs, schema_root=malformed_root)
 
@@ -541,6 +766,214 @@ class QualificationAdmissionTest(unittest.TestCase):
                 inputs,
                 binaries={**inputs.binaries, "server": Path("relative-server")},
             )
+
+    def test_record_schema_files_are_required_and_identity_checked_before_version_probe(self) -> None:
+        for schema_name, schema_id in zip(RECORD_SCHEMA_NAMES, RECORD_SCHEMA_IDS, strict=True):
+            for kind in ("missing", "malformed", "wrong-id", "wrong-schema-const"):
+                with self.subTest(schema=schema_name, failure=kind), _tiny_inputs() as inputs:
+                    if kind == "wrong-id":
+                        action = lambda value: value.__setitem__("$id", "wrong/v1")
+                    elif kind == "wrong-schema-const":
+                        action = lambda value, schema_id=schema_id: value["properties"][
+                            "schema"
+                        ].__setitem__("const", "wrong/v1")
+                    else:
+                        action = lambda value: None
+                    root = _schema_variant_root(
+                        inputs,
+                        f"record-{schema_name.replace('.schema.json', '')}-{kind}",
+                        schema_name,
+                        action,
+                    )
+                    target = root / schema_name
+                    if kind == "missing":
+                        target.unlink()
+                    elif kind == "malformed":
+                        target.write_bytes(b'{"schema":"unterminated')
+                    self._assert_rejected_before_probe(
+                        inputs,
+                        schema_root=root,
+                        expected_exceptions=(ValueError, OSError)
+                        if kind == "missing"
+                        else (ValueError,),
+                    )
+
+    def test_new_schema_owner_rejects_symlinks_and_over_bound_files_before_hash_read_probe(self) -> None:
+        for schema_name in RECORD_SCHEMA_NAMES:
+            with self.subTest(schema=schema_name, owner_failure="symlink"), _tiny_inputs() as inputs:
+                root = _schema_variant_root(
+                    inputs,
+                    f"symlink-{schema_name.replace('.schema.json', '')}",
+                    schema_name,
+                    lambda value: None,
+                )
+                target = root / schema_name
+                outside = inputs.directory / f"outside-{schema_name}"
+                outside.write_bytes(target.read_bytes())
+                target.unlink()
+                target.symlink_to(outside)
+                self._assert_schema_owner_rejected_before_hash(
+                    inputs, root, schema_name,
+                )
+
+            with self.subTest(schema=schema_name, owner_failure="size-cap"), _tiny_inputs() as inputs:
+                root = _schema_variant_root(
+                    inputs,
+                    f"oversized-{schema_name.replace('.schema.json', '')}",
+                    schema_name,
+                    lambda value: None,
+                )
+                target = root / schema_name
+                other_sizes = [
+                    (root / name).stat().st_size
+                    for name in SCHEMA_NAMES
+                    if name != schema_name
+                ]
+                cap = max(other_sizes) + 1
+                padding = max(0, cap - target.stat().st_size + 1)
+                target.write_bytes(target.read_bytes() + b" " * padding)
+                self._assert_schema_owner_rejected_before_hash(
+                    inputs, root, schema_name, max_schema_bytes=cap,
+                )
+
+    def test_schema_reference_policy_allows_only_canonical_record_dependencies(self) -> None:
+        invalid_targets = (
+            ("url", "https://example.invalid/ds4-runtime-v1.schema.json"),
+            ("file-url", "file:///tmp/ds4-runtime-v1.schema.json"),
+            ("traversal", "../ds4-runtime-v1.schema.json"),
+            ("relative-alias", "./ds4-runtime-v1.schema.json"),
+            ("unknown", "ds4-unknown-v1.schema.json"),
+        )
+        with _tiny_inputs() as inputs:
+            for schema_name in RECORD_SCHEMA_NAMES:
+                for label, target in invalid_targets:
+                    with self.subTest(schema=schema_name, reference=label):
+                        root = _schema_variant_root(
+                            inputs,
+                            f"ref-{schema_name.replace('.schema.json', '')}-{label}",
+                            schema_name,
+                            lambda value, target=target: _replace_first_schema_reference(
+                                value,
+                                target,
+                                predicate=lambda ref: ref in RECORD_SCHEMA_DEPENDENCIES,
+                            ),
+                        )
+                        self._assert_rejected_without_external_owner(inputs, root)
+
+                for keyword in ("$dynamicRef", "$recursiveRef"):
+                    with self.subTest(schema=schema_name, reference=keyword):
+                        root = _schema_variant_root(
+                            inputs,
+                            f"ref-{schema_name.replace('.schema.json', '')}-{keyword[1:]}",
+                            schema_name,
+                            lambda value, keyword=keyword: _replace_first_schema_reference(
+                                value,
+                                "ds4-runtime-v1.schema.json",
+                                predicate=lambda ref: ref in RECORD_SCHEMA_DEPENDENCIES,
+                                keyword=keyword,
+                            ),
+                        )
+                        self._assert_rejected_without_external_owner(inputs, root)
+
+            for schema_name in CORE_SCHEMA_NAMES:
+                with self.subTest(schema=schema_name, reference="core-nonlocal"):
+                    root = _schema_variant_root(
+                        inputs,
+                        f"core-ref-{schema_name.replace('.schema.json', '')}",
+                        schema_name,
+                        lambda value: _replace_first_schema_reference(
+                            value,
+                            "ds4-runtime-v1.schema.json",
+                            predicate=lambda ref: ref.startswith("#"),
+                        ),
+                    )
+                    self._assert_rejected_without_external_owner(inputs, root)
+
+    def test_record_schema_mutations_fail_verify_and_probe_guards(self) -> None:
+        for schema_name in RECORD_SCHEMA_NAMES:
+            with self.subTest(schema=schema_name, check="admission.verify"), _tiny_inputs() as inputs:
+                target = inputs.schema_root / schema_name
+                descriptors: list[int] = []
+                with mock.patch.object(ADMISSION, "_SCHEMA_ROOT", inputs.schema_root):
+                    with self.assertRaises(ValueError):
+                        with self._admit(inputs, lambda role, artifact: inputs.version_bytes[role]) as admitted:
+                            owners = {
+                                owner.path.name: owner for owner in admitted._owners
+                            }
+                            self.assertIn(schema_name, owners)
+                            descriptors.extend(owner.fd for owner in admitted._owners)
+                            target.write_bytes(target.read_bytes() + b"\n")
+                            with self.assertRaises(ValueError):
+                                admitted.verify()
+                self.assertTrue(
+                    descriptors,
+                    "admission.verify mutation did not reach the yielded admission",
+                )
+                self._assert_fds_closed(descriptors)
+                self._assert_no_fixture_fds(inputs)
+
+            with self.subTest(schema=schema_name, check="probe-guards"), _tiny_inputs() as inputs:
+                target = inputs.schema_root / schema_name
+                descriptors: list[int] = []
+                opened: list[Path] = []
+                seen_roles: list[str] = []
+
+                def mutating_probe(role, artifact):
+                    seen_roles.append(role)
+                    if role == "server":
+                        target.write_bytes(target.read_bytes() + b"\n")
+                    return inputs.version_bytes[role]
+
+                with mock.patch.object(ADMISSION, "_SCHEMA_ROOT", inputs.schema_root):
+                    with _spy_opened_descriptors(descriptors, opened):
+                        with self.assertRaises(ValueError):
+                            with ADMISSION.admit_qualification_inputs(
+                                inputs.manifest_path,
+                                model_path=inputs.model,
+                                binaries=dict(inputs.binaries),
+                                version_probe=mutating_probe,
+                            ):
+                                self.fail("schema mutation unexpectedly reached yield")
+                self.assertEqual(seen_roles, ["server"])
+                self.assertIn(target, opened)
+                self._assert_fds_closed(descriptors)
+                self._assert_no_fixture_fds(inputs)
+
+    def test_schema_owner_descriptors_close_on_normal_error_and_interrupt_exit(self) -> None:
+        exits = (
+            ("normal", None),
+            ("error", RuntimeError),
+            ("interrupt", KeyboardInterrupt),
+        )
+        for label, exception_type in exits:
+            with self.subTest(exit=label), _tiny_inputs() as inputs:
+                descriptors: list[int] = []
+                opened: list[Path] = []
+                with _spy_opened_descriptors(descriptors, opened):
+                    with mock.patch.object(ADMISSION, "_SCHEMA_ROOT", inputs.schema_root):
+                        if exception_type is None:
+                            with self._admit(
+                                inputs,
+                                lambda role, artifact: inputs.version_bytes[role],
+                            ):
+                                pass
+                        else:
+                            with self.assertRaises(exception_type):
+                                with self._admit(
+                                    inputs,
+                                    lambda role, artifact: inputs.version_bytes[role],
+                                ):
+                                    raise exception_type(f"forced {label} exit")
+                self.assertEqual(
+                    {
+                        path.resolve()
+                        for path in opened
+                        if path.parent == inputs.schema_root
+                    },
+                    {(inputs.schema_root / name).resolve() for name in SCHEMA_NAMES},
+                )
+                self._assert_fds_closed(descriptors)
+                self._assert_no_fixture_fds(inputs)
 
     def test_dirty_version_digest_stat_drift_and_callback_failure_close_descriptors(self) -> None:
         revision = str(

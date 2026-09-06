@@ -2047,6 +2047,16 @@ snapshot producer is still missing. Proc origin remains simulated, and the
 Darwin descriptor-content adapter remains test-only. Public `run` remains
 rejected.
 
+**Record-schema admission progress (2026-09-06):** Admission now requires,
+retains, and hashes both benchmark record schemas alongside the six core
+schemas. Only the two record schemas may use the exact runtime and request
+schema filenames as cross-document `$ref` targets; core schemas remain
+local-only, and resource retrieval remains disabled. The existing bounded
+owners and lifetime checks cover all eight files before and after version
+probes and through context exit. This does not yet bind the record parsers'
+path-based reads to admitted snapshots. That consumption binding remains the
+next integration step; native qualification and public `run` remain absent.
+
 **Files:**
 - Modify: `gguf-tools/quality-testing/compact_runtime_qualify.py`
 - Modify: `gguf-tools/quality-testing/test_compact_runtime_qualify.py`

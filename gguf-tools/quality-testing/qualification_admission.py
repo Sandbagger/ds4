@@ -35,6 +35,10 @@ MAX_VERSION_BYTES = 65_536
 _JSON_DEPTH = 64
 _SCHEMA_ROOT = COMPACT.ROOT / "schemas"
 _DRAFT = "https://json-schema.org/draft/2020-12/schema"
+_RECORD_SCHEMA_SPECS = (
+    ("ds4.bench.qualification/v1", "ds4-bench-qualification-v1.schema.json"),
+    ("ds4.bench.resident-qualification/v1", "ds4-bench-resident-qualification-v1.schema.json"),
+)
 _SCHEMA_SPECS = (
     ("ds4.version/v1", "ds4-version-v1.schema.json"),
     ("ds4.runtime/v1", "ds4-runtime-v1.schema.json"),
@@ -42,7 +46,14 @@ _SCHEMA_SPECS = (
     ("ds4.token-admission/v1", "ds4-token-admission-v1.schema.json"),
     ("ds4.laguna.compact-runtime/v1", "ds4-laguna-compact-runtime-v1.schema.json"),
     ("ds4.compact-runtime-benchmark/v1", "compact-runtime-benchmark-v1.schema.json"),
+    *_RECORD_SCHEMA_SPECS,
 )
+_RECORD_SCHEMA_IDS = frozenset(schema_id for schema_id, _ in _RECORD_SCHEMA_SPECS)
+# These literal dependencies already have required owners in _SCHEMA_SPECS.
+# Admitting their names does not enable filesystem or network retrieval.
+_RECORD_SCHEMA_DEPENDENCIES = frozenset({
+    "ds4-runtime-v1.schema.json", "ds4-runtime-request-v1.schema.json",
+})
 _ROLES = ("server", "bench", "eval")
 
 
@@ -118,9 +129,14 @@ def _schema_validator(value: dict[str, Any], schema_id: str) -> Draft202012Valid
         if isinstance(node, dict):
             for key, item in node.items():
                 if key in ("$ref", "$dynamicRef", "$recursiveRef") and (
-                    type(item) is not str or not item.startswith("#")
+                    type(item) is not str or (
+                        not item.startswith("#") and not (
+                            key == "$ref" and schema_id in _RECORD_SCHEMA_IDS and
+                            item in _RECORD_SCHEMA_DEPENDENCIES
+                        )
+                    )
                 ):
-                    raise ValueError("qualification schema has a nonlocal reference")
+                    raise ValueError("qualification schema has an unadmitted reference")
                 pending.append(item)
         elif isinstance(node, list):
             pending.extend(node)

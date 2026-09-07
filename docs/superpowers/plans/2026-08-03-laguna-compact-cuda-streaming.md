@@ -1743,6 +1743,33 @@ Python aggregate. This is deterministic runner input, not admission, process
 execution, retry/gate policy, native residency accounting, or a qualification
 verdict. No public `run` or publication behavior changes in this increment.
 
+**Native platform proof (2026-09-07):** Clean commit
+`c57b062a90c9729f231fa7dc49fb7618eab5420d` compiled all four production
+programs (`ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`) with NVCC 13.0.88
+and `CUDA_ARCH=sm_121` on DGX GB10. The authenticated source archive, clean
+Git tree, complete compiler/link log and output binary digests were retained
+outside the worktree. This was compile-only; none of those programs ran.
+All 54 snapshot/staging/ownership/arena host regressions also pass on Linux
+(7/19/20/8), including real glibc memory streams. CUDA calls in those host
+fixtures remain fake; the same 54 tests pass on macOS.
+
+A separate root-reviewed, tiny-file Linux fixture now passes three tests:
+real retained-descriptor ELF version transport (success, raw malformed bytes,
+nonzero exit and timeout), authenticated twelve-checkpoint control with real
+`/proc/<owned-pid>/exe`, and independent wrong-inode executable refusal.
+`test-qualification-linux-native-origin` uses the pinned requirements and
+explicitly skips on non-Linux; no fake proc tree or Darwin adapter is used.
+The fixture uses legacy `input_admission=None`, so this proves Linux host
+transport/origin, not admitted-schema provenance or native DS4 runtime identity.
+No GPU/model, resident allocation/snapshot, numerical, throughput, gate or
+publication acceptance is claimed. Those remain Task 20's completion boundary.
+
+Reusable native-test rule: compile and execute a small real ELF for Linux
+`/proc`/descriptor semantics; retain failing controls and raw observations.
+Keep model-FD evidence separate from executable identity. Verify actual resource
+and access boundaries rather than treating sandbox configuration admission as
+proof. A native compile and host transport pass cannot replace a GPU/model run.
+
 **Implementation progress (2026-09-04):** `4248699` adds the bounded
 `qualification_records.py` streaming parser and shared validator CLI shim.
 `b1d35bd` adds the pure `qualification_evidence.py` metadata index builder;

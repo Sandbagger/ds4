@@ -422,10 +422,13 @@ static uint64_t g_cuda_tmp_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
+/* Raw reservations remain owned even when the complete pool is not ready. */
+static uint64_t g_model_stage_reserved_bytes[4];
 static uint64_t g_model_stage_bytes;
 static void *g_stream_selected_stage_raw[4];
 static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
+static uint64_t g_stream_selected_stage_reserved_bytes[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
 
@@ -6596,20 +6599,77 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
     return (void *)(((p + a - 1u) / a) * a);
 }
 
-static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+/* Alignment can advance stage within its backing reservation.  Capacity is
+ * the remaining actual span, not the original allocation size. */
+static uint64_t cuda_stage_usable_bytes(const void *raw, const void *stage,
+                                         uint64_t reserved_bytes) {
+    if (!raw || !stage || reserved_bytes == 0 ||
+        reserved_bytes > SIZE_MAX || reserved_bytes > UINTPTR_MAX) return 0;
+    const uintptr_t raw_address = (uintptr_t)raw;
+    const uintptr_t stage_address = (uintptr_t)stage;
+    if (reserved_bytes - 1u > UINTPTR_MAX - raw_address ||
+        stage_address < raw_address) return 0;
+    const uint64_t consumed = (uint64_t)(stage_address - raw_address);
+    return consumed < reserved_bytes ? reserved_bytes - consumed : 0;
+}
+
+/* Stop at the first failure so failed and unvisited owners remain retryable. */
+static int cuda_stage_slots_release(void **raw, void **stage,
+                                    cudaEvent_t *events,
+                                    uint64_t *reserved_bytes) {
     for (size_t i = 0; i < 4; i++) {
-        if (g_model_stage_event[i]) {
-            (void)cudaEventDestroy(g_model_stage_event[i]);
-            g_model_stage_event[i] = NULL;
+        if (events[i]) {
+            cudaError_t err = cudaEventDestroy(events[i]);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA staging event release failed at slot %zu: %s\n",
+                        i, cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+            events[i] = NULL;
         }
-        if (g_model_stage_raw[i]) {
-            (void)cudaFreeHost(g_model_stage_raw[i]);
-            g_model_stage_raw[i] = NULL;
-            g_model_stage[i] = NULL;
+        if (raw[i]) {
+            cudaError_t err = cudaFreeHost(raw[i]);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA pinned staging release failed at slot %zu: %s\n",
+                        i, cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+            raw[i] = NULL;
+            stage[i] = NULL;
+            reserved_bytes[i] = 0;
         }
     }
+    return 1;
+}
+
+static int cuda_model_stage_release(void) {
     g_model_stage_bytes = 0;
+    if (!cuda_stage_slots_release(g_model_stage_raw, g_model_stage,
+                                  g_model_stage_event,
+                                  g_model_stage_reserved_bytes)) return 0;
+    if (g_model_upload_stream) {
+        cudaError_t err = cudaStreamDestroy(g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model upload stream release failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_model_upload_stream = NULL;
+    }
+    return 1;
+}
+
+static int cuda_model_stage_pool_alloc(uint64_t bytes) {
+    if (bytes == 0 || bytes > SIZE_MAX) return 0;
+    if (g_model_stage_bytes >= bytes) return 1;
+    g_model_stage_bytes = 0;
+    /* Resize releases slots, not the reusable model upload stream. */
+    if (!cuda_stage_slots_release(g_model_stage_raw, g_model_stage,
+                                  g_model_stage_event,
+                                  g_model_stage_reserved_bytes)) return 0;
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
@@ -6619,12 +6679,16 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     for (size_t i = 0; i < 4; i++) {
-        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
+        void *raw = NULL;
+        cudaError_t err = cudaMallocHost(&raw, (size_t)bytes);
+        if (err != cudaSuccess || !raw) {
+            fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n",
+                    err == cudaSuccess ? "null host pointer" : cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
+        g_model_stage_raw[i] = raw;
+        g_model_stage_reserved_bytes[i] = bytes;
         g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
@@ -6655,13 +6719,29 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload) {
-    *payload = (const char *)stage;
+    if (!stage || !payload || stage_bytes > SIZE_MAX ||
+        stage_bytes > UINTPTR_MAX || bytes > stage_bytes ||
+        bytes > UINT64_MAX - offset ||
+        (stage_bytes != 0 &&
+         stage_bytes - 1u > UINTPTR_MAX - (uintptr_t)stage)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (bytes == 0) {
+        *payload = (const char *)stage;
+        return 1;
+    }
 #if defined(__linux__) && defined(O_DIRECT)
     if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
         const uint64_t delta = offset - aligned_off;
-        uint64_t read_size = cuda_round_up(delta + bytes, g_model_direct_align);
-        if (aligned_off <= g_model_file_size &&
+        /* delta <= offset, so the checked file interval also bounds needed. */
+        const uint64_t needed = delta + bytes;
+        const uint64_t remainder = needed % g_model_direct_align;
+        const uint64_t padding = remainder ? g_model_direct_align - remainder : 0;
+        const uint64_t read_size = padding <= UINT64_MAX - needed
+            ? needed + padding : 0;
+        if (read_size != 0 && aligned_off <= g_model_file_size &&
             read_size <= stage_bytes &&
             read_size <= g_model_file_size - aligned_off) {
             const int saved_errno = errno;
@@ -6683,34 +6763,35 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             errno = direct_errno;
         }
     }
-#else
-    (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    if (!cuda_pread_full(g_model_fd, stage, bytes, offset)) return 0;
+    *payload = (const char *)stage;
+    return 1;
 }
 
-static void cuda_stream_selected_stage_release(void) {
-    for (size_t i = 0; i < 4; i++) {
-        if (g_stream_selected_stage_event[i]) {
-            (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
-            g_stream_selected_stage_event[i] = NULL;
-        }
-        if (g_stream_selected_stage_raw[i]) {
-            (void)cudaFreeHost(g_stream_selected_stage_raw[i]);
-            g_stream_selected_stage_raw[i] = NULL;
-            g_stream_selected_stage[i] = NULL;
-        }
-    }
+static int cuda_stream_selected_stage_release(void) {
     g_stream_selected_stage_bytes = 0;
+    if (!cuda_stage_slots_release(g_stream_selected_stage_raw,
+                                  g_stream_selected_stage,
+                                  g_stream_selected_stage_event,
+                                  g_stream_selected_stage_reserved_bytes)) return 0;
     if (g_stream_selected_upload_stream) {
-        (void)cudaStreamDestroy(g_stream_selected_upload_stream);
+        cudaError_t err = cudaStreamDestroy(g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA streaming selected upload stream release failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
         g_stream_selected_upload_stream = NULL;
     }
+    return 1;
 }
 
 static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
+    if (bytes == 0 || bytes > SIZE_MAX) return 0;
     if (g_stream_selected_stage_bytes >= bytes) return 1;
-    cuda_stream_selected_stage_release();
+    if (!cuda_stream_selected_stage_release()) return 0;
     cudaError_t err = cudaStreamCreateWithFlags(
             &g_stream_selected_upload_stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
@@ -6721,15 +6802,18 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         return 0;
     }
     for (size_t i = 0; i < 4; i++) {
-        err = cudaMallocHost(&g_stream_selected_stage_raw[i], (size_t)bytes);
-        if (err != cudaSuccess) {
+        void *raw = NULL;
+        err = cudaMallocHost(&raw, (size_t)bytes);
+        if (err != cudaSuccess || !raw) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected staging allocation failed: %s\n",
-                    cudaGetErrorString(err));
+                    err == cudaSuccess ? "null host pointer" : cudaGetErrorString(err));
             (void)cudaGetLastError();
-            cuda_stream_selected_stage_release();
+            (void)cuda_stream_selected_stage_release();
             return 0;
         }
+        g_stream_selected_stage_raw[i] = raw;
+        g_stream_selected_stage_reserved_bytes[i] = bytes;
         g_stream_selected_stage[i] = cuda_align_ptr(
                 g_stream_selected_stage_raw[i], g_model_direct_align);
         err = cudaEventCreateWithFlags(&g_stream_selected_stage_event[i],
@@ -6739,7 +6823,7 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
                     "ds4: CUDA streaming selected staging event creation failed: %s\n",
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
-            cuda_stream_selected_stage_release();
+            (void)cuda_stream_selected_stage_release();
             return 0;
         }
     }
@@ -6793,7 +6877,10 @@ static int cuda_model_copy_to_device_streamed(
         }
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_stream_selected_stage[bi],
-                                   g_stream_selected_stage_bytes,
+                                   cuda_stage_usable_bytes(
+                                       g_stream_selected_stage_raw[bi],
+                                       g_stream_selected_stage[bi],
+                                       g_stream_selected_stage_bytes),
                                    offset + copied, n, &payload)) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected read failed for %s at %.2f MiB: %s\n",
@@ -6853,6 +6940,7 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
+    if (need == 0 || need > SIZE_MAX) return 0;
     uint64_t mb = 1792;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
     if (env && env[0]) {
@@ -6865,21 +6953,27 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t bytes = mb * 1048576ull;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
+        if (need > UINT64_MAX - (align - 1u)) return 0;
         bytes = (need + align - 1u) & ~(align - 1u);
     }
-    return bytes;
+    return bytes <= SIZE_MAX ? bytes : 0;
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return NULL;
-    if (bytes == 0) return NULL;
+    if (bytes == 0 || bytes > SIZE_MAX) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
+    if (bytes > UINT64_MAX - (align - 1u)) return NULL;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
+    if (aligned > SIZE_MAX) return NULL;
 
     for (cuda_model_arena &a : g_model_arenas) {
+        if (!a.device_ptr || a.bytes == 0 || a.bytes > SIZE_MAX ||
+            a.used > a.bytes || a.used > UINT64_MAX - (align - 1u)) return NULL;
         const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
+        if (used > SIZE_MAX) return NULL;
         if (used <= a.bytes && aligned <= a.bytes - used) {
             char *ptr = a.device_ptr + used;
             a.used = used + aligned;
@@ -6891,13 +6985,14 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    if (chunk == 0 || chunk < aligned || chunk > SIZE_MAX) return NULL;
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
-    if (err != cudaSuccess) {
+    if (err != cudaSuccess || !dev) {
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
                 (double)chunk / 1048576.0,
-                cudaGetErrorString(err));
+                err == cudaSuccess ? "null device pointer" : cudaGetErrorString(err));
         (void)cudaGetLastError();
         g_model_cache_full = 1;
         return NULL;
@@ -6959,7 +7054,10 @@ static const char *cuda_model_range_ptr_from_fd(
             }
         }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+        if (!cuda_model_stage_read(g_model_stage[bi],
+                                   cuda_stage_usable_bytes(
+                                       g_model_stage_raw[bi], g_model_stage[bi],
+                                       g_model_stage_bytes),
                                    offset + copied, n, &payload)) {
             fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
@@ -7415,22 +7513,8 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
-    for (size_t i = 0; i < 4; i++) {
-        if (g_model_stage_event[i]) {
-            (void)cudaEventDestroy(g_model_stage_event[i]);
-            g_model_stage_event[i] = NULL;
-        }
-        if (g_model_stage_raw[i]) {
-            (void)cudaFreeHost(g_model_stage_raw[i]);
-            g_model_stage_raw[i] = NULL;
-            g_model_stage[i] = NULL;
-        }
-    }
-    g_model_stage_bytes = 0;
-    if (g_model_upload_stream) {
-        (void)cudaStreamDestroy(g_model_upload_stream);
-        g_model_upload_stream = NULL;
-    }
+    /* Preserve unresolved staging owners and byte records for a retry. */
+    (void)cuda_model_stage_release();
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
     }

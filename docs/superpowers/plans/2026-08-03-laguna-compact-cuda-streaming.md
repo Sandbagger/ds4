@@ -1719,6 +1719,18 @@ the existing terminal/distributed-session guards. All seven focused tests pass
 on macOS. This verifies the host allocation/stream boundary, not a Linux,
 whole-engine, model, Metal, or CUDA qualification result.
 
+**CUDA allocation-safety integration (2026-09-07):** The runner's native safety
+changes were selected independently of its competing wrapper/schema changes.
+Staging reads now use the span remaining after pointer alignment and reject
+capacity/address/file-interval overflow before I/O. Checked staging release
+retains failed and unvisited owners for retry, and arena allocation rejects
+unrepresentable alignment or invalid existing geometry before allocation.
+The three recovered host contract targets ran RED with passing existing-body
+controls, then passed 19/20/8 tests after the patch. These use extracted C++
+bodies and fake CUDA calls, not NVCC, GPU execution, async-quiescence proof, or
+model qualification. Admitted schema binding and descriptor-relative evidence
+verification are retained. Task 20 and public `run` remain incomplete.
+
 **Implementation progress (2026-09-04):** `4248699` adds the bounded
 `qualification_records.py` streaming parser and shared validator CLI shim.
 `b1d35bd` adds the pure `qualification_evidence.py` metadata index builder;

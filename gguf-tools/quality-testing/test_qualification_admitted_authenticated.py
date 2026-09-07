@@ -297,7 +297,7 @@ def _single_admitted_session(
 ) -> Iterator[dict[str, Any]]:
     """Run one generated child with a real admission and optional after hook."""
 
-    payload = f"one admitted {record_kind} model\0".encode("utf-8") * 29
+    payload = f"one admitted {record_kind} model\0".encode("utf-8") * 256
     with tempfile.TemporaryDirectory(prefix="qualification-admitted-single-") as tmp:
         directory = Path(tmp)
         model = directory / "admitted-model.gguf"
@@ -552,7 +552,7 @@ class QualificationAdmittedAuthenticatedHostTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory(prefix="qualification-schema-copy-") as tmp:
             model = Path(tmp) / "model.gguf"
-            model.write_bytes(b"schema-copy model\0" * 29)
+            model.write_bytes(b"schema-copy model\0" * 256)
             fake = Path(tmp) / "fake-runner"
             fake.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
             fake.chmod(0o700)
@@ -598,7 +598,7 @@ class QualificationAdmittedAuthenticatedHostTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="qualification-admitted-preflight-") as tmp:
             directory = Path(tmp)
             model = directory / "model.gguf"
-            model.write_bytes(b"preflight model\0" * 29)
+            model.write_bytes(b"preflight model\0" * 256)
             with AUTH_TEST.CONTROLLED_TEST._controlled_fake_case(
                 "complete", expected_records, model
             ) as (command, _metadata, _token):

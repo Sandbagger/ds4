@@ -242,7 +242,8 @@ def _shared_authenticated_session(
     """
     if not cases:
         raise AssertionError("shared authenticated session needs payload cases")
-    payload = b"one retained model owner for two payloads\0" * 29
+    payload_repetitions = 256 if admission_context_factory is not None else 29
+    payload = b"one retained model owner for two payloads\0" * payload_repetitions
     baseline_records = cases[0][1]
     with tempfile.TemporaryDirectory(prefix="qualification-resident-shared-") as tmp:
         directory = Path(tmp)

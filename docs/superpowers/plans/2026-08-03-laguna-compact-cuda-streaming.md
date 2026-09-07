@@ -2298,3 +2298,28 @@ git commit -m "docs: record compact Laguna qualification"
 ## Completion boundary
 
 This plan is complete only when checkpoint F produces a schema-valid canonical bundle whose external sidecar verifies, all global gates pass, and at least one of the mandatory 8/12/16-GiB profiles is `passed`. The deliverable is a truthful DS4 compact-runtime qualification artifact and stable runtime interface. It does not deploy Laguna, choose a port, evict or retain Flash, manage ensemble co-residency, or modify Dotfiles; those actions begin only under the approved downstream Dotfiles plan after it consumes a passed bundle.
+
+**Admitted-schema consumption progress (2026-09-07):** Both fixed record
+streams and the existing monitor/process/controlled/authenticated chain now
+accept keyword-only `input_admission=None`. A supplied handle must be the exact
+live admission type with a matching manifest binding; authenticated execution
+also requires its exact retained bench and model owner objects. Admission
+retains four parsed record/runtime/request documents from the already-read,
+hash-checked bytes and exposes detached copies. The consumers use a private
+in-memory map, with local references resolved in their owning document and
+only the two fixed runtime/request dependencies allowed across documents.
+They do not reopen schema paths or use an ambient cache in admitted mode.
+Live owner checks bracket record validation, finish, and authenticated
+callbacks; final exit-tail drift retains the bounded observation prefix as a
+protocol error. Existing strict numeric, scalar, flattened, lifecycle, ACK,
+deadline, descriptor-inheritance and cleanup boundaries remain in place.
+The two new host suites are wired into `test-laguna-compact-python` with the
+pinned runtime requirements. GREEN and independent review are pending at
+commit time. `None` remains the legacy path, not schema-bound qualification.
+
+Reusable rule: admitting a schema hash is not consumption binding. Pass its
+retained admission explicitly, validate only detached authenticated bytes,
+and recheck the owners at the existing evidence/ACK boundaries. Do not infer
+native origin, gate provenance, or safe publication from schema binding.
+Native resident plan/tracker/snapshots, qualification and public `run` remain
+unfinished; this increment does not run a model/GPU or publish a verdict.

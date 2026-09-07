@@ -4,7 +4,8 @@
 The caller owns this direct child exclusively (including reaping).  Keep its
 PID reserved with WNOWAIT until group signaling has ended.  Cleanup covers the
 created process group, not descendants that escape into another session.
-No model, executable, descriptor, or evidence-file authentication happens here.
+Its record stream can recheck admitted input owners.  Running-executable and
+received-model authentication remain responsibilities of the enclosing caller.
 """
 
 from __future__ import annotations
@@ -430,6 +431,7 @@ def _owned_child_transport(
 def _qualification_child_transport(
     command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
     record_kind: str = "streamed",
+    input_admission: Any = None,
     first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
     whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
     idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
@@ -441,6 +443,7 @@ def _qualification_child_transport(
     argv = _validated_command(command)
     monitor = QualificationSliceMonitor(
         expected, start_ns=time.monotonic_ns(), record_kind=record_kind,
+        input_admission=input_admission,
         first_token_timeout_ns=first_token_timeout_ns,
         whole_request_timeout_ns=whole_request_timeout_ns,
         idle_timeout_ns=idle_timeout_ns,
@@ -456,6 +459,7 @@ def _qualification_child_transport(
 def run_qualification_child(
     command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
     record_kind: str = "streamed",
+    input_admission: Any = None,
     first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
     whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
     idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
@@ -468,7 +472,7 @@ def run_qualification_child(
     """
     _validate_record_kind(record_kind)
     with _qualification_child_transport(
-        command, expected, record_kind=record_kind,
+        command, expected, record_kind=record_kind, input_admission=input_admission,
         first_token_timeout_ns=first_token_timeout_ns,
         whole_request_timeout_ns=whole_request_timeout_ns,
         idle_timeout_ns=idle_timeout_ns,

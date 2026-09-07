@@ -2,8 +2,9 @@
 """Bind one controlled slice to retained model and native executable identities.
 
 The existing owner reserves the PID; live authentication runs while the child
-is waiting for an ACK.  This composition returns observations, not runtime
-schema validation, a qualification verdict, a retry decision or publication.
+is waiting for an ACK.  Optional input admission binds record validation to
+retained schema snapshots.  This composition returns observations, not native
+qualification, a retry decision or publication.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from qualification_controlled import (
     run_qualification_controlled_child,
 )
 from qualification_process import _validated_command
+from qualification_records import _validate_input_admission
 from qualification_supervisor import _validate_record_kind
 from qualification_version_probe import _descriptor_exec_path
 
@@ -27,6 +29,7 @@ from qualification_version_probe import _descriptor_exec_path
 def run_authenticated_qualification_child(
     arguments: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
     record_kind: str = "streamed",
+    input_admission: Any = None,
     executable_artifact: QualificationArtifact,
     model_artifact: QualificationArtifact,
     prepare_descriptor: Callable[[int, int, QualificationModelEvidence], Any],
@@ -47,6 +50,12 @@ def run_authenticated_qualification_child(
     and identity checks avoid rereading the model at every checkpoint.
     """
     _validate_record_kind(record_kind)
+    input_admission = _validate_input_admission(input_admission, expected)
+    if input_admission is not None:
+        admitted = input_admission.artifacts
+        if (executable_artifact is not admitted["bench"]
+                or model_artifact is not admitted["model"]):
+            raise ValueError("authenticated slice requires the exact retained bench/model owners")
     if type(arguments) not in (list, tuple):
         raise TypeError("authenticated child arguments must be a built-in list or tuple")
     if not arguments:
@@ -78,6 +87,8 @@ def run_authenticated_qualification_child(
         # allocation or the next sample continue.  Auth verifies its owner too.
         authenticate_running_executable(pid, executable_artifact)
         model_artifact.verify()
+        if input_admission is not None:
+            input_admission.verify()
         if received_fd is None or received_evidence is None:
             raise ValueError("authenticated model descriptor was not received")
         if (received_evidence.identity != model_artifact.identity
@@ -107,7 +118,8 @@ def run_authenticated_qualification_child(
         return value
 
     result = run_qualification_controlled_child(
-        command, expected, record_kind=record_kind, prepare_descriptor=prepare,
+        command, expected, record_kind=record_kind, input_admission=input_admission,
+        prepare_descriptor=prepare,
         capture_before=before, capture_after=after, _executable_fd=executable_fd,
         first_token_timeout_ns=first_token_timeout_ns,
         whole_request_timeout_ns=whole_request_timeout_ns,
@@ -121,6 +133,8 @@ def run_authenticated_qualification_child(
         try:
             executable_artifact.verify()
             model_artifact.verify()
+            if input_admission is not None:
+                input_admission.verify()
         except (OSError, ValueError) as exc:
             result = replace(
                 result,

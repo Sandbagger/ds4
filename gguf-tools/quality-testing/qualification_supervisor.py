@@ -4,7 +4,8 @@
 Parent and record timestamps must share one host monotonic-clock epoch, as
 Linux CLOCK_MONOTONIC producers and time.monotonic_ns() do.  The idle guard
 bounds startup, between-request, and exit waits; it is not a performance gate.
-This module launches no processes and authenticates no files or live identities.
+This module launches no processes.  Its record stream can recheck admitted
+input owners; running-executable authentication remains a caller responsibility.
 Even a complete observed lifecycle is not a qualification verdict.
 """
 
@@ -58,6 +59,7 @@ class QualificationSliceMonitor:
         *,
         start_ns: int,
         record_kind: str = "streamed",
+        input_admission: Any = None,
         first_token_timeout_ns: int = _DEFAULT_FIRST_TOKEN_TIMEOUT_NS,
         whole_request_timeout_ns: int = _DEFAULT_WHOLE_REQUEST_TIMEOUT_NS,
         idle_timeout_ns: int = _DEFAULT_IDLE_TIMEOUT_NS,
@@ -79,9 +81,9 @@ class QualificationSliceMonitor:
 
         # One fixed stream class owns validation for the selected record kind.
         self._stream = (
-            QualificationResidentRecordStream(expected)
+            QualificationResidentRecordStream(expected, input_admission=input_admission)
             if record_kind == "resident"
-            else QualificationRecordStream(expected)
+            else QualificationRecordStream(expected, input_admission=input_admission)
         )
         self._start_ns = start_ns
         self._first_token_timeout_ns = first_token_timeout_ns

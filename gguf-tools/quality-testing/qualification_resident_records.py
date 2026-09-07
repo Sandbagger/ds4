@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Strict resident lifecycle validation, separate from the streamed boundary.
 
-This consumes raw observations.  It does not launch a producer, authenticate
-files/processes, sample native allocation state, or decide qualification gates.
+This consumes raw observations and can recheck admitted input owners.  It
+does not launch or authenticate a process, sample native allocation state,
+or decide qualification gates.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import qualification_records as _records
@@ -40,4 +42,10 @@ class QualificationResidentRecordStream(_records._QualificationRecordStreamBase)
         return MAX_STREAM_BYTES
 
     def _validate_record(self, record: Any) -> None:
-        validate_resident_record(record)
+        if self._record_schema_documents is None:
+            validate_resident_record(record)
+        else:
+            _records._validate_record_with_contract(
+                record, schema_path=Path("ds4-bench-resident-qualification-v1.schema.json"),
+                resident=True, schema_documents=self._record_schema_documents,
+            )

@@ -43,6 +43,7 @@ class _TransportStopped(BaseException):
 def run_qualification_controlled_child(
     command: list[str] | tuple[str, ...], expected: Mapping[str, Any], *,
     record_kind: str = "streamed",
+    input_admission: Any = None,
     prepare_descriptor: Callable[[int, int, QualificationModelEvidence], Any],
     capture_before: Callable[[int, int], Any],
     capture_after: Callable[[int, int], Any],
@@ -134,6 +135,7 @@ def run_qualification_controlled_child(
         launched_argv = argv + ("--qualification-control-fd", str(inherited))
         with _qualification_child_transport(
             launched_argv, expected, record_kind=record_kind,
+            input_admission=input_admission,
             first_token_timeout_ns=first_token_timeout_ns,
             whole_request_timeout_ns=whole_request_timeout_ns,
             idle_timeout_ns=idle_timeout_ns,

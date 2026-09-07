@@ -167,6 +167,7 @@ class QualificationAdmission:
     _versions: tuple[dict[str, Any], ...] = field(repr=False)
     _artifacts: dict[str, QualificationArtifact] = field(repr=False)
     _owners: tuple[QualificationArtifact, ...] = field(repr=False)
+    _record_schema_documents: dict[str, dict[str, Any]] = field(repr=False)
 
     @property
     def manifest(self) -> dict[str, Any]:
@@ -175,6 +176,11 @@ class QualificationAdmission:
     @property
     def schema_records(self) -> tuple[dict[str, Any], ...]:
         return copy.deepcopy(self._schemas)
+
+    @property
+    def record_schema_documents(self) -> dict[str, dict[str, Any]]:
+        """Copy the four record documents retained from authenticated bytes."""
+        return copy.deepcopy(self._record_schema_documents)
 
     @property
     def versions(self) -> tuple[dict[str, Any], ...]:
@@ -220,6 +226,7 @@ def admit_qualification_inputs(
         )
         validators = {}
         schema_records = []
+        record_schema_documents = {}
         owners = [manifest_owner]
         for schema_id, filename in _SCHEMA_SPECS:
             owner, _, document = _read_json_owner(
@@ -227,6 +234,8 @@ def admit_qualification_inputs(
             )
             owners.append(owner)
             validators[schema_id] = _schema_validator(document, schema_id)
+            if schema_id in _RECORD_SCHEMA_IDS or filename in _RECORD_SCHEMA_DEPENDENCIES:
+                record_schema_documents[filename] = document
             schema_records.append({"schema_id": schema_id, "sha256": owner.sha256})
         _validate(validators[COMPACT.SCHEMA_ID], manifest, "qualification manifest")
         COMPACT.validate_manifest(manifest)
@@ -267,7 +276,7 @@ def admit_qualification_inputs(
         admission = QualificationAdmission(
             canonical_digest, hashlib.sha256(manifest_raw).hexdigest(),
             copy.deepcopy(manifest), tuple(schema_records), tuple(versions),
-            artifacts, tuple(owners),
+            artifacts, tuple(owners), copy.deepcopy(record_schema_documents),
         )
         admission.verify()
         yield admission

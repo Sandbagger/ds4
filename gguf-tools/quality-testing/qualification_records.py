@@ -111,8 +111,28 @@ def loads_strict(raw: bytes) -> Any:
 
 
 def _resolve_ref(
-    ref: str, document: Any, document_path: Path
+    ref: str, document: Any, document_path: Path,
+    schema_documents: Mapping[str, Any] | None = None,
 ) -> tuple[Any, Any, Path]:
+    if schema_documents is not None:
+        if type(ref) is not str:
+            raise ValueError("admitted schema reference must be a string")
+        if ref == "#":
+            return document, document, document_path
+        if ref.startswith("#/"):
+            value = document
+            try:
+                for part in ref[2:].split("/"):
+                    value = value[part.replace("~1", "/").replace("~0", "~")]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise ValueError("admitted schema has an unresolved local reference") from exc
+            return value, document, document_path
+        if ref not in ("ds4-runtime-v1.schema.json", "ds4-runtime-request-v1.schema.json"):
+            raise ValueError("admitted record schema has an unadmitted reference")
+        if ref not in schema_documents:
+            raise ValueError("admitted record schema dependency is missing")
+        target = schema_documents[ref]
+        return target, target, Path(ref)
     if ref.startswith("#/"):
         value = document
         for part in ref[2:].split("/"):
@@ -141,9 +161,12 @@ def _type_matches(value: Any, expected: str) -> bool:
     }.get(expected, True)
 
 
-def _matches(value: Any, schema: Any, document: Any, document_path: Path) -> bool:
+def _matches(
+    value: Any, schema: Any, document: Any, document_path: Path,
+    schema_documents: Mapping[str, Any] | None = None,
+) -> bool:
     try:
-        _validate(value, schema, "$", document, document_path)
+        _validate(value, schema, "$", document, document_path, schema_documents)
         return True
     except ValueError:
         return False
@@ -155,6 +178,7 @@ def _validate(
     path: str,
     document: Any,
     document_path: Path,
+    schema_documents: Mapping[str, Any] | None = None,
 ) -> None:
     if schema is True:
         return
@@ -164,9 +188,9 @@ def _validate(
         raise ValueError(f"{path}: malformed schema")
     if "$ref" in schema:
         target, target_document, target_path = _resolve_ref(
-            schema["$ref"], document, document_path
+            schema["$ref"], document, document_path, schema_documents
         )
-        _validate(value, target, path, target_document, target_path)
+        _validate(value, target, path, target_document, target_path, schema_documents)
         return
     if "const" in schema and value != schema["const"]:
         raise ValueError(f"{path}: expected {schema['const']!r}")
@@ -181,19 +205,19 @@ def _validate(
             raise ValueError(f"{path}: expected {expected}")
     if "allOf" in schema:
         for child in schema["allOf"]:
-            _validate(value, child, path, document, document_path)
+            _validate(value, child, path, document, document_path, schema_documents)
     if "anyOf" in schema:
-        if not any(_matches(value, child, document, document_path) for child in schema["anyOf"]):
+        if not any(_matches(value, child, document, document_path, schema_documents) for child in schema["anyOf"]):
             raise ValueError(f"{path}: no anyOf branch matched")
     if "oneOf" in schema:
-        if sum(_matches(value, child, document, document_path) for child in schema["oneOf"]) != 1:
+        if sum(_matches(value, child, document, document_path, schema_documents) for child in schema["oneOf"]) != 1:
             raise ValueError(f"{path}: expected exactly one oneOf branch")
-    if "not" in schema and _matches(value, schema["not"], document, document_path):
+    if "not" in schema and _matches(value, schema["not"], document, document_path, schema_documents):
         raise ValueError(f"{path}: forbidden value")
     if "if" in schema:
-        branch = schema.get("then") if _matches(value, schema["if"], document, document_path) else schema.get("else")
+        branch = schema.get("then") if _matches(value, schema["if"], document, document_path, schema_documents) else schema.get("else")
         if branch is not None:
-            _validate(value, branch, path, document, document_path)
+            _validate(value, branch, path, document, document_path, schema_documents)
     if type(value) is float and not math.isfinite(value):
         raise ValueError(f"{path}: non-finite number")
     if type(value) is str:
@@ -223,7 +247,7 @@ def _validate(
                 raise ValueError(f"{path}: unexpected key {extras[0]!r}")
         for key, child in properties.items():
             if key in value:
-                _validate(value[key], child, f"{path}.{key}", document, document_path)
+                _validate(value[key], child, f"{path}.{key}", document, document_path, schema_documents)
     if type(value) is list:
         if schema.get("uniqueItems"):
             encoded = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value]
@@ -236,12 +260,12 @@ def _validate(
         prefix = schema.get("prefixItems", [])
         for index, child in enumerate(prefix):
             if index < len(value):
-                _validate(value[index], child, f"{path}[{index}]", document, document_path)
+                _validate(value[index], child, f"{path}[{index}]", document, document_path, schema_documents)
         if schema.get("items") is False and len(value) > len(prefix):
             raise ValueError(f"{path}: unexpected array item")
         if isinstance(schema.get("items"), dict):
             for index in range(len(prefix), len(value)):
-                _validate(value[index], schema["items"], f"{path}[{index}]", document, document_path)
+                _validate(value[index], schema["items"], f"{path}[{index}]", document, document_path, schema_documents)
 
 
 def _validate_wire_scalar_types(record: dict[str, Any]) -> None:
@@ -382,10 +406,14 @@ def _validate_flattened_bindings(record: dict[str, Any], *, resident: bool = Fal
 def _validate_record_with_contract(
     record: Any, *, schema_path: Path, resident: bool,
     complete: bool | None = None,
+    schema_documents: Mapping[str, Any] | None = None,
 ) -> None:
     """Validate one explicitly selected wire kind, never inferred from input."""
-    schema = loads_strict(schema_path.read_bytes())
-    _validate(record, schema, "$", schema, schema_path)
+    schema = (
+        loads_strict(schema_path.read_bytes()) if schema_documents is None
+        else schema_documents[schema_path.name]
+    )
+    _validate(record, schema, "$", schema, schema_path, schema_documents)
     if not isinstance(record, dict):
         raise ValueError("record root is not an object")
     _validate_wire_scalar_types(record)
@@ -468,16 +496,40 @@ def _copy_expected_bindings(expected: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _validate_input_admission(input_admission: Any, expected: Mapping[str, Any]) -> Any:
+    """Check an explicit borrowed admission without affecting legacy imports."""
+    if input_admission is None:
+        return None
+    # Record-only legacy callers need no jsonschema dependency or ambient owner.
+    from qualification_admission import QualificationAdmission
+
+    if type(input_admission) is not QualificationAdmission:
+        raise TypeError("input_admission must be a live QualificationAdmission")
+    bindings = _copy_expected_bindings(expected)
+    if bindings["manifest_sha256"] != input_admission.manifest_sha256:
+        raise ValueError("expected manifest differs from input_admission")
+    input_admission.verify()
+    return input_admission
+
+
 class _QualificationRecordStreamBase:
     """Incrementally validate one twelve-record qualification JSONL stream.
 
     This parser validates wire/schema/lifecycle structure only.  It does not
     launch a process, measure deadlines, compare numerical output, or declare
-    qualification status.
+    qualification status.  An explicit live input_admission binds validation
+    to copied admitted documents; None preserves legacy schema-path loading.
     """
 
-    def __init__(self, expected: Mapping[str, Any]) -> None:
+    def __init__(
+        self, expected: Mapping[str, Any], *, input_admission: Any = None,
+    ) -> None:
         self._expected = _copy_expected_bindings(expected)
+        self._input_admission = _validate_input_admission(input_admission, self._expected)
+        self._record_schema_documents = None
+        if self._input_admission is not None:
+            self._record_schema_documents = self._input_admission.record_schema_documents
+            self._input_admission.verify()
         self._line = bytearray()
         self._total_bytes = 0
         self._records: list[dict[str, Any]] = []
@@ -499,7 +551,20 @@ class _QualificationRecordStreamBase:
         return MAX_STREAM_BYTES
 
     def _validate_record(self, record: Any) -> None:
-        validate_record(record)
+        if self._record_schema_documents is None:
+            validate_record(record)
+        else:
+            _validate_record_with_contract(
+                record, schema_path=Path("ds4-bench-qualification-v1.schema.json"),
+                resident=False, schema_documents=self._record_schema_documents,
+            )
+
+    def _verify_admission(self) -> None:
+        if self._input_admission is not None:
+            try:
+                self._input_admission.verify()
+            except (OSError, ValueError) as exc:
+                self._fail(str(exc))
 
     def _fail(self, message: str) -> None:
         self._failed = True
@@ -540,8 +605,10 @@ class _QualificationRecordStreamBase:
         if len(line) >= 2 and line[-2] == 0x0D:
             self._fail("qualification JSONL uses CRLF")
         try:
+            self._verify_admission()
             record = loads_strict(line[:-1])
             self._validate_record(record)
+            self._verify_admission()
         except (TypeError, ValueError, RecursionError) as exc:
             self._fail(str(exc))
         if type(record) is not dict:
@@ -626,13 +693,16 @@ class _QualificationRecordStreamBase:
         self._finished = True
         if self._failed:
             raise ValueError("qualification record stream is failed")
+        self._verify_admission()
         if self._line:
             self._fail("qualification JSONL stream is not LF terminated")
         if not self._records:
             self._fail("qualification JSONL stream has no records")
         if len(self._records) != MAX_RECORD_COUNT:
             self._fail("qualification JSONL lifecycle is incomplete")
-        return tuple(copy.deepcopy(record) for record in self._records)
+        records = tuple(copy.deepcopy(record) for record in self._records)
+        self._verify_admission()
+        return records
 
 
 class QualificationRecordStream(_QualificationRecordStreamBase):

@@ -973,6 +973,11 @@ test-qualification-resident-sequence:
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python gguf-tools/quality-testing/test_qualification_resident_sequence.py -v
 
+.PHONY: test-qualification-schedule
+test-qualification-schedule:
+	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
+		python gguf-tools/quality-testing/test_qualification_schedule.py -v
+
 # Model-free native emitter bytes feed the separate resident lifecycle consumer.
 test-qualification-resident-records:
 	uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
@@ -982,7 +987,7 @@ test-laguna-layer-diagnostics:
 	python3 tests/test_laguna_layer_mismatch.py -v
 	python3 tests/test_poolside_layer_diagnostics.py -v
 
-test-laguna-compact-python: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-schema-binding test-qualification-admitted-authenticated test-qualification-version-probe test-qualification-authenticated test-qualification-resident-authenticated test-qualification-resident-sequence test-qualification-resident-records test-laguna-layer-diagnostics
+test-laguna-compact-python: test-qualification-records test-qualification-evidence test-qualification-evidence-files test-qualification-supervisor test-qualification-process test-qualification-control-records test-qualification-controlled test-qualification-artifacts test-qualification-admission test-qualification-schema-binding test-qualification-admitted-authenticated test-qualification-version-probe test-qualification-authenticated test-qualification-resident-authenticated test-qualification-resident-sequence test-qualification-resident-records test-qualification-schedule test-laguna-layer-diagnostics
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "error: test-laguna-compact-python requires uv" >&2; \
 		exit 127; \

@@ -1731,6 +1731,18 @@ bodies and fake CUDA calls, not NVCC, GPU execution, async-quiescence proof, or
 model qualification. Admitted schema binding and descriptor-relative evidence
 verification are retained. Task 20 and public `run` remain incomplete.
 
+**Frozen execution schedule (2026-09-07):** `qualification_schedule.py` now
+materializes exactly sixteen immutable slice inputs: the four canonical
+resident prompts, then the 8/12/16-GiB streamed profiles in their frozen prompt
+orders. Each slice carries its trusted record kind, profile/prompt/index,
+manifest digest, exact sequence bytes and sequence digest. The helper validates
+and detaches the manifest and reuses the existing mode-specific builders.
+Six new tests passed after the missing-module RED; the four existing resident
+sequence controls also pass. `test-qualification-schedule` is part of the pinned
+Python aggregate. This is deterministic runner input, not admission, process
+execution, retry/gate policy, native residency accounting, or a qualification
+verdict. No public `run` or publication behavior changes in this increment.
+
 **Implementation progress (2026-09-04):** `4248699` adds the bounded
 `qualification_records.py` streaming parser and shared validator CLI shim.
 `b1d35bd` adds the pure `qualification_evidence.py` metadata index builder;

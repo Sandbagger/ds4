@@ -247,7 +247,11 @@ def _shared_authenticated_session(
     baseline_records = cases[0][1]
     with tempfile.TemporaryDirectory(prefix="qualification-resident-shared-") as tmp:
         directory = Path(tmp)
-        model = directory / "admitted-model.gguf"
+        model = directory / (
+            COMPACT.MODEL_FILENAME
+            if admission_context_factory is not None
+            else "admitted-model.gguf"
+        )
         model.write_bytes(payload)
         with AUTH_TEST.CONTROLLED_TEST._controlled_fake_case(
             "complete", baseline_records, model

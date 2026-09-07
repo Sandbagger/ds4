@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import compact_runtime_qualify as COMPACT
 import qualification_admission as ADMISSION
 import qualification_authenticated as AUTH
 import qualification_process as PROCESS
@@ -300,7 +301,7 @@ def _single_admitted_session(
     payload = f"one admitted {record_kind} model\0".encode("utf-8") * 256
     with tempfile.TemporaryDirectory(prefix="qualification-admitted-single-") as tmp:
         directory = Path(tmp)
-        model = directory / "admitted-model.gguf"
+        model = directory / COMPACT.MODEL_FILENAME
         model.write_bytes(payload)
         with AUTH_TEST.CONTROLLED_TEST._controlled_fake_case(
             "complete", records, model
@@ -551,7 +552,7 @@ class QualificationAdmittedAuthenticatedHostTest(unittest.TestCase):
             "streamed": streamed_lifecycle(),
         }
         with tempfile.TemporaryDirectory(prefix="qualification-schema-copy-") as tmp:
-            model = Path(tmp) / "model.gguf"
+            model = Path(tmp) / COMPACT.MODEL_FILENAME
             model.write_bytes(b"schema-copy model\0" * 256)
             fake = Path(tmp) / "fake-runner"
             fake.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
@@ -597,7 +598,7 @@ class QualificationAdmittedAuthenticatedHostTest(unittest.TestCase):
         expected_records = copy.deepcopy(records)
         with tempfile.TemporaryDirectory(prefix="qualification-admitted-preflight-") as tmp:
             directory = Path(tmp)
-            model = directory / "model.gguf"
+            model = directory / COMPACT.MODEL_FILENAME
             model.write_bytes(b"preflight model\0" * 256)
             with AUTH_TEST.CONTROLLED_TEST._controlled_fake_case(
                 "complete", expected_records, model

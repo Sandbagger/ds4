@@ -1709,6 +1709,16 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Snapshot-buffer repair (2026-09-07):** The recovered
+`test-session-snapshot-buffers` target exercises the production
+`ds4_session_save_snapshot` body with the host libc memory stream and a small
+stub payload. Before the fix, its controls passed and five of seven cases
+failed. The writer now reserves one byte outside the serialized payload for a
+possible `fmemopen` terminator, rejects `SIZE_MAX` before allocation, and keeps
+the existing terminal/distributed-session guards. All seven focused tests pass
+on macOS. This verifies the host allocation/stream boundary, not a Linux,
+whole-engine, model, Metal, or CUDA qualification result.
+
 **Implementation progress (2026-09-04):** `4248699` adds the bounded
 `qualification_records.py` streaming parser and shared validator CLI shim.
 `b1d35bd` adds the pure `qualification_evidence.py` metadata index builder;

@@ -48078,6 +48078,17 @@ static int generate_glm_metal_argmax(
  * full-attention and sliding-window layers with different query geometry.
  * Keep this graph separate from DeepSeek's compressed-attention graph and
  * GLM's DSA graph so their mature scheduling paths remain untouched. */
+/* Laguna graph ownership and allocation. */
+typedef enum {
+    DS4_LAGUNA_GRAPH_OWNER_LEGACY = 0,
+    DS4_LAGUNA_GRAPH_OWNER_RESIDENT = 1,
+} ds4_laguna_graph_owner_mode;
+
+typedef struct {
+    ds4_gpu_laguna_resident_tensor_owner owner;
+    ds4_gpu_tensor **slot;
+} ds4_laguna_graph_resident_owner;
+
 enum {
     DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT = 28,
     DS4_LAGUNA_GRAPH_OWNER_CAPACITY =
@@ -48093,6 +48104,9 @@ typedef struct {
     uint64_t runtime_record_ids[DS4_LAGUNA_GRAPH_OWNER_CAPACITY];
     bool runtime_records_live[DS4_LAGUNA_GRAPH_OWNER_CAPACITY];
     uint32_t runtime_record_count;
+    ds4_laguna_graph_owner_mode runtime_owner_mode;
+    ds4_laguna_graph_resident_owner resident_owners[DS4_LAGUNA_GRAPH_OWNER_CAPACITY];
+    uint32_t resident_owner_count;
 
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *cur;
@@ -48127,6 +48141,37 @@ typedef struct {
     uint32_t cache_cap[DS4_MAX_LAYER];
 } ds4_laguna_gpu_graph;
 
+/* Slot bindings are local to this stable caller-owned graph. Do not move/copy
+ * a live native graph. The pointer span excludes owner metadata and scalars. */
+_Static_assert(offsetof(ds4_laguna_gpu_graph, value_cache) +
+                   sizeof(((ds4_laguna_gpu_graph *)0)->value_cache) -
+                   offsetof(ds4_laguna_gpu_graph, tokens) ==
+                   DS4_LAGUNA_GRAPH_OWNER_CAPACITY * sizeof(ds4_gpu_tensor *),
+               "Laguna graph tensor slots must remain contiguous");
+
+static bool laguna_graph_empty(const ds4_laguna_gpu_graph *g) {
+    if (!g) return true;
+    const unsigned char *bytes = (const unsigned char *)g;
+    for (size_t i = 0; i < sizeof(*g); i++)
+        if (bytes[i] != 0) return false;
+    return true;
+}
+
+static bool laguna_graph_resident_failure(ds4_laguna_gpu_graph *g) {
+    (void)ds4_runtime_tracker_latch_failure(
+        g->runtime_tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    return false;
+}
+
+static bool laguna_graph_slot_is_local(
+        const ds4_laguna_gpu_graph *g, ds4_gpu_tensor **slot) {
+    const uintptr_t first = (uintptr_t)&g->tokens;
+    const uintptr_t last = (uintptr_t)&g->value_cache[DS4_MAX_LAYER - 1u];
+    const uintptr_t address = (uintptr_t)slot;
+    return address >= first && address <= last &&
+        (address - first) % sizeof(ds4_gpu_tensor *) == 0;
+}
+
 static bool laguna_graph_tracker_record_live(
         const ds4_runtime_tracker *tracker,
         uint64_t record_id) {
@@ -48141,9 +48186,19 @@ static bool laguna_graph_tracker_record_live(
 
 static bool laguna_graph_tracker_preflight(
         ds4_runtime_tracker *tracker,
-        const ds4_context_memory *plan) {
-    if (!tracker) return true;
-    if (!plan || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        const ds4_context_memory *plan,
+        ds4_laguna_graph_owner_mode owner_mode) {
+    const bool resident = owner_mode == DS4_LAGUNA_GRAPH_OWNER_RESIDENT;
+    if (resident) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (!ds4_gpu_laguna_resident_observer_attached(tracker)) return false;
+#else
+        return false;
+#endif
+    }
+    if (!tracker) return !resident;
+    if (!tracker->records || tracker->record_count > tracker->record_capacity ||
+        !tracker->callsites || !plan || tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
         plan->scratch_bytes == 0 || plan->raw_bytes == 0 ||
         tracker->category_bounds[DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] <
             plan->scratch_bytes ||
@@ -48162,8 +48217,12 @@ static bool laguna_graph_tracker_preflight(
     for (size_t i = 0; i < tracker->record_count; i++) {
         if (tracker->records[i].live) live_records++;
     }
-    const size_t required = DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT +
-        2u * DS4_N_LAYER;
+    const size_t tensors = DS4_LAGUNA_GRAPH_SCRATCH_OWNER_COUNT +
+        2u * (size_t)DS4_N_LAYER;
+    const size_t required = tensors * (resident ? 2u : 1u);
+    if (tensors > DS4_LAGUNA_GRAPH_OWNER_CAPACITY ||
+        (resident && tracker->issued_sequence_high_water[0x52u] >
+             UINT64_C(0x00ffffffffffffff) - required)) return false;
     if (live_records > tracker->record_capacity ||
         required > tracker->record_capacity - live_records) {
         return false;
@@ -48171,8 +48230,13 @@ static bool laguna_graph_tracker_preflight(
 
     bool graph_site = false;
     bool kv_site = false;
+    bool host_site = false;
     for (size_t i = 0; i < tracker->callsite_count; i++) {
         const ds4_runtime_callsite *site = &tracker->callsites[i];
+        if (site->id == DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE + 4u) {
+            host_site = site->category == DS4_RUNTIME_CATEGORY_OTHER_HOST &&
+                site->domain == DS4_RUNTIME_DOMAIN_HOST;
+        }
         if (site->id == DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH) {
             graph_site = site->category ==
                     DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH &&
@@ -48186,7 +48250,7 @@ static bool laguna_graph_tracker_preflight(
                     DS4_RUNTIME_CATEGORY_KV_STATE];
         }
     }
-    return graph_site && kv_site;
+    return graph_site && kv_site && (!resident || host_site);
 }
 
 static bool laguna_graph_track_tensor(
@@ -48219,6 +48283,31 @@ static bool laguna_graph_track_tensor(
     return status == DS4_RUNTIME_STATUS_OK;
 }
 
+static bool laguna_graph_alloc_tensor(
+        ds4_laguna_gpu_graph *g, ds4_gpu_tensor **slot,
+        uint64_t bytes, uint32_t callsite_id) {
+    if (g->runtime_owner_mode == DS4_LAGUNA_GRAPH_OWNER_RESIDENT) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (!laguna_graph_slot_is_local(g, slot) || *slot ||
+            g->resident_owner_count >= DS4_LAGUNA_GRAPH_OWNER_CAPACITY)
+            return laguna_graph_resident_failure(g);
+        ds4_laguna_graph_resident_owner *entry =
+            &g->resident_owners[g->resident_owner_count];
+        if (!ds4_gpu_laguna_resident_tensor_alloc(
+                g->runtime_tracker, callsite_id, bytes, &entry->owner))
+            return false;
+        entry->slot = slot;
+        *slot = entry->owner.tensor;
+        g->resident_owner_count++;
+        return true;
+#else
+        return false;
+#endif
+    }
+    *slot = ds4_gpu_tensor_alloc(bytes);
+    return *slot && laguna_graph_track_tensor(g, *slot, bytes, callsite_id);
+}
+
 static bool laguna_graph_release_tracker(ds4_laguna_gpu_graph *g) {
     if (!g || !g->runtime_tracker) return true;
     bool released = true;
@@ -48243,8 +48332,46 @@ static bool laguna_graph_release_tracker(ds4_laguna_gpu_graph *g) {
     return released;
 }
 
-static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
-    if (!g) return;
+static bool laguna_graph_free(ds4_laguna_gpu_graph *g) {
+    if (laguna_graph_empty(g)) return true;
+    if (g->runtime_owner_mode == DS4_LAGUNA_GRAPH_OWNER_RESIDENT) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Identity, not safety: a failed owner must remain retryable. */
+        if (!ds4_gpu_laguna_resident_observer_attached(g->runtime_tracker))
+            return false;
+        if (g->resident_owner_count > DS4_LAGUNA_GRAPH_OWNER_CAPACITY ||
+            g->runtime_record_count != 0) return laguna_graph_resident_failure(g);
+        for (uint32_t i = 0; i < DS4_LAGUNA_GRAPH_OWNER_CAPACITY; i++) {
+            ds4_laguna_graph_resident_owner *entry = &g->resident_owners[i];
+            if (!entry->owner.tensor && !entry->owner.descriptor_record_id &&
+                !entry->owner.device_record_id && !entry->slot) continue;
+            if (i >= g->resident_owner_count ||
+                !laguna_graph_slot_is_local(g, entry->slot))
+                return laguna_graph_resident_failure(g);
+            /* Only after the own-graph bounds check may this slot be read. */
+            if (!entry->owner.tensor || *entry->slot != entry->owner.tensor)
+                return laguna_graph_resident_failure(g);
+            if (!ds4_gpu_laguna_resident_tensor_free(
+                    g->runtime_tracker, &entry->owner)) return false;
+            *entry->slot = NULL;
+            entry->slot = NULL;
+        }
+        /* Never erase an unbound alias. Use byte copies across struct members,
+         * not pointer arithmetic pretending those members form a C array. */
+        for (size_t i = 0; i < DS4_LAGUNA_GRAPH_OWNER_CAPACITY; i++) {
+            ds4_gpu_tensor *alias = NULL;
+            memcpy(&alias, (const unsigned char *)g +
+                       offsetof(ds4_laguna_gpu_graph, tokens) + i * sizeof(alias),
+                   sizeof(alias));
+            if (alias) return laguna_graph_resident_failure(g);
+        }
+        memset(g, 0, sizeof(*g));
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (g->runtime_owner_mode != DS4_LAGUNA_GRAPH_OWNER_LEGACY) return false;
     /* Physical ownership is dropped before its tracker record. The legacy
      * tensor-free ABI is void, so this proves temporal ordering and normal
      * CUDA teardown, but not a driver-level cudaFree failure; extending that
@@ -48293,20 +48420,27 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
         fprintf(stderr,
                 "ds4: Laguna graph ownership remains tracker-live after "
                 "physical free; engine teardown will fail closed\n");
+        return false;
     }
     memset(g, 0, sizeof(*g));
+    return true;
 }
 
 static bool laguna_graph_alloc(
         ds4_laguna_gpu_graph *g,
         uint32_t ctx_size,
         uint32_t prefill_rows,
-        ds4_runtime_tracker *tracker) {
+        ds4_runtime_tracker *tracker,
+        ds4_laguna_graph_owner_mode owner_mode) {
     ds4_context_memory memory_plan;
-    if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
+    if (!g || (owner_mode != DS4_LAGUNA_GRAPH_OWNER_LEGACY &&
+               owner_mode != DS4_LAGUNA_GRAPH_OWNER_RESIDENT) ||
+        (owner_mode == DS4_LAGUNA_GRAPH_OWNER_RESIDENT && !laguna_graph_empty(g)) ||
+        DS4_N_LAYER <= 0 || DS4_N_LAYER > DS4_MAX_LAYER ||
+        ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         !ds4_laguna_prefill_memory_plan(
             ctx_size, prefill_rows, &memory_plan) ||
-        !laguna_graph_tracker_preflight(tracker, &memory_plan) ||
+        !laguna_graph_tracker_preflight(tracker, &memory_plan, owner_mode) ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
     }
@@ -48314,6 +48448,7 @@ static bool laguna_graph_alloc(
     g->ctx_size = ctx_size;
     g->prefill_cap = prefill_rows;
     g->runtime_tracker = tracker;
+    g->runtime_owner_mode = owner_mode;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -48326,9 +48461,8 @@ static bool laguna_graph_alloc(
 
 #define DS4_LAGUNA_ALLOC(name, bytes) do { \
         const uint64_t ds4_laguna_bytes_ = (uint64_t)(bytes); \
-        g->name = ds4_gpu_tensor_alloc(ds4_laguna_bytes_); \
-        if (!g->name || !laguna_graph_track_tensor( \
-                g, g->name, ds4_laguna_bytes_, \
+        if (!laguna_graph_alloc_tensor( \
+                g, &g->name, ds4_laguna_bytes_, \
                 DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH)) goto fail; \
         g->scratch_bytes += ds4_laguna_bytes_; \
     } while (0)
@@ -48383,17 +48517,23 @@ static bool laguna_graph_alloc(
         if (cap == 0) cap = 1;
         const uint64_t bytes =
             (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
-        g->key_cache[il] = ds4_gpu_tensor_alloc(bytes);
-        g->value_cache[il] = ds4_gpu_tensor_alloc(bytes);
-        if (!g->key_cache[il] ||
-            !laguna_graph_track_tensor(
-                g, g->key_cache[il], bytes,
-                DS4_LAGUNA_CALLSITE_KV_STATE) ||
-            !g->value_cache[il] ||
-            !laguna_graph_track_tensor(
-                g, g->value_cache[il], bytes,
-                DS4_LAGUNA_CALLSITE_KV_STATE)) {
-            goto fail;
+        if (owner_mode == DS4_LAGUNA_GRAPH_OWNER_RESIDENT) {
+            if (!laguna_graph_alloc_tensor(g, &g->key_cache[il], bytes,
+                                           DS4_LAGUNA_CALLSITE_KV_STATE) ||
+                !laguna_graph_alloc_tensor(g, &g->value_cache[il], bytes,
+                                           DS4_LAGUNA_CALLSITE_KV_STATE))
+                goto fail;
+        } else {
+            /* Preserve legacy's two physical allocations before tracking. */
+            g->key_cache[il] = ds4_gpu_tensor_alloc(bytes);
+            g->value_cache[il] = ds4_gpu_tensor_alloc(bytes);
+            if (!g->key_cache[il] ||
+                !laguna_graph_track_tensor(
+                    g, g->key_cache[il], bytes, DS4_LAGUNA_CALLSITE_KV_STATE) ||
+                !g->value_cache[il] ||
+                !laguna_graph_track_tensor(
+                    g, g->value_cache[il], bytes, DS4_LAGUNA_CALLSITE_KV_STATE))
+                goto fail;
         }
         g->cache_cap[il] = cap;
         g->kv_bytes += 2u * bytes;
@@ -48414,9 +48554,14 @@ static bool laguna_graph_alloc(
 
 fail:
     fprintf(stderr, "ds4: failed to allocate Laguna Metal graph\n");
-    laguna_graph_free(g);
+    if (owner_mode == DS4_LAGUNA_GRAPH_OWNER_RESIDENT)
+        (void)ds4_runtime_tracker_latch_failure(
+            tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+    /* Caller retains g even on allocation failure until checked free succeeds. */
+    if (!laguna_graph_free(g)) return false;
     return false;
 }
+/* End Laguna graph ownership and allocation. */
 
 static bool laguna_graph_matmul(
         ds4_gpu_tensor       *out,
@@ -50005,7 +50150,8 @@ static int generate_laguna_metal_argmax(
     const uint32_t legacy_prefill_rows = (uint32_t)ctx_size < 16384u ?
         (uint32_t)ctx_size : 16384u;
     if (!laguna_graph_alloc(
-            &g, (uint32_t)ctx_size, legacy_prefill_rows, NULL)) {
+            &g, (uint32_t)ctx_size, legacy_prefill_rows, NULL,
+            DS4_LAGUNA_GRAPH_OWNER_LEGACY)) {
         return 1;
     }
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -50065,7 +50211,7 @@ static int generate_laguna_metal_argmax(
             decode_t1 > decode_t0 ?
                 (double)generated / (decode_t1 - decode_t0) : 0.0);
     free(logits);
-    laguna_graph_free(&g);
+    if (!laguna_graph_free(&g)) return 1;
     return ok ? 0 : 1;
 }
 
@@ -63504,7 +63650,7 @@ static int ds4_session_create_unchecked(
                 &s->laguna_graph,
                 (uint32_t)ctx_size,
                 prefill_rows,
-                tracker)) {
+                tracker, DS4_LAGUNA_GRAPH_OWNER_LEGACY)) {
             free(s);
             return 1;
         }
@@ -63859,10 +64005,15 @@ void ds4_session_free(ds4_session *s) {
                         "ds4: compact tracker lock failed during session free; retaining session\n");
                 return;
             }
-            laguna_graph_free(&s->laguna_graph);
+            const bool graph_freed = laguna_graph_free(&s->laguna_graph);
             if (!ds4_engine_compact_tracker_unlock(s->engine)) {
                 fprintf(stderr,
                         "ds4: compact tracker unlock failed during session free; retaining session\n");
+                return;
+            }
+            if (!graph_freed) {
+                fprintf(stderr,
+                        "ds4: Laguna graph cleanup failed; retaining session\n");
                 return;
             }
         } else if (ds4_session_is_glm(s)) {

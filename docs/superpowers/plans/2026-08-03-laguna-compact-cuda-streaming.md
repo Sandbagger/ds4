@@ -1709,6 +1709,55 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Explicit graph owner composition, host-tested increment:**
+The graph now selects `LEGACY` or `RESIDENT` explicitly. Both existing production
+allocation callers remain `LEGACY`; neither tracker presence nor a noncompact
+profile opens resident execution. Native mode uses embedded typed owners and
+own-graph slot bindings, not a second heap allocation or legacy `0x4f` charges.
+The canonical 28 scratch plus 96 K/V tensors require 124 owner entries and 248
+native records. The preflight budgets reusable records and monotonic producer IDs
+separately, checks attached identity before tracker access, and rejects unsupported
+Metal/ROCm branches without linking CUDA native-owner implementations.
+
+Native cleanup releases in allocation order, clears only successful aliases, and
+retains failed/unvisited owners, tracker and graph storage for a checked retry.
+Copied/foreign slot bindings refuse before dereference. Observer attachment is a
+read-only identity query even while unsafe; cleanup may detach successfully while
+preserving the violation and peaks. Legacy physical-free order and reverse record
+retirement remain separate. Callers check local graph cleanup; session failure
+returns before common storage is freed. The public void session/engine teardown
+chain and failed-session custody are still unfinished, not a publication gate.
+
+Root-reviewed feature RED preceded production edits: 20 methods/38 failures at
+missing graph/bridge/build seams. First GREEN: all 20 methods using the actual C
+graph block, actual C++ native observer/tensor functions and separate real runtime
+C TU. Oracles cover exact currents/peaks, four owner cycles, partial rollback,
+private unrecorded rollback, cleanup retry, identity and slot refusals. Planner
+and data I/O are labeled host-fixture stubs. Backend controls select preprocessor
+branches after real platform headers; they are not Metal/ROCm device tests.
+Wrong-site cases mutate metadata after valid attachment and prove changed-config
+refusal, not admission of alternate tracker configurations. Prior owner, resident,
+legacy CUDA, runtime, snapshot and bench/eval host regressions and five selected
+source checks pass. Independent review found no in-scope native graph blocker.
+A further actual-runtime legacy-retirement-refusal control brings the graph suite
+to 21 methods: aliases are already null before failed record retirement, retry
+does not repeat physical frees, and the first violation persists. The control's
+initial report-bound confound was retained and corrected before acceptance.
+Exact-commit verification is pending.
+
+The prior tensor revision `f47d094c45754ef393716e741226815db1de1242` has separate
+immutable host and full NVCC `sm_121` compile/four-link seals; those seals do not
+cover these uncommitted graph changes. No produced CUDA product, GPU or model was
+executed. Production resident qualification remains blocked on the remaining
+reachable owners, engine authority, authenticated snapshots and checked late
+failure through child exit/publication. This is not allocation fit, numerical
+correctness, throughput or published qualification evidence.
+
+Reusable rule: **compose physical owners with stable caller-local bindings; do
+not copy a live owner container or replace failed cleanup with metadata reset.**
+A syntactically repaired scaffold is not feature RED. First validate its language,
+forwarding sensors and cleanup oracles; preserve rejected revisions separately.
+
 **Explicit resident tensor owners, host-tested increment:**
 `ds4_gpu_resident.h` exposes a CUDA-only allocation/checked-free handle without
 changing the ordinary tensor layout. Each tensor has two actual namespace `0x52`

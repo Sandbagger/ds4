@@ -3442,6 +3442,13 @@ static cudaError_t cuda_laguna_resident_free_host(void *base) {
     return cuda_laguna_resident_release(base, 1);
 }
 
+extern "C" int ds4_gpu_laguna_resident_observer_attached(
+        const ds4_runtime_tracker *tracker) {
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    return tracker && tracker ==
+        g_laguna_resident_tracker.load(std::memory_order_relaxed);
+}
+
 extern "C" int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker) {
     std::lock_guard<std::recursive_mutex> compact_guard(g_laguna_compact_mutex);
     std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);

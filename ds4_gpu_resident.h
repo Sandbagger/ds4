@@ -13,6 +13,11 @@ extern "C" {
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 #endif
 
+/* Read-only attachment identity, including sticky-unsafe cleanup state.
+ * No readiness/admission promise. Foreign/null pointers are never dereferenced.
+ * Caller remains quiescent and retains the borrowed tracker through cleanup. */
+int ds4_gpu_laguna_resident_observer_attached(const ds4_runtime_tracker *tracker);
+
 /* CUDA resident observation only, not admission or snapshot readiness.
  * The descriptor and device storage each have an observed physical owner.
  * Keep this caller-owned handle and the attached tracker alive through cleanup;

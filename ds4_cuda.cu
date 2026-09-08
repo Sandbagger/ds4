@@ -3169,14 +3169,18 @@ static void cuda_laguna_compact_counter_add(
 /* Resident native allocation observer.
  * Observe native reservations at allocation/free time, including transient
  * peaks and failed rollback owners. This is not admission or a snapshot
- * producer. Current callers cover scratch, model staging and device arenas;
- * graph, registrations and remaining owners still need explicit wiring.
+ * producer. Scratch, model staging, device arenas and explicit tensor owners
+ * are observed. Graph/engine callers, registrations and remaining owners still
+ * need wiring; generic tensors are refused while attached.
  * Begin/end require a quiescent caller. The tracker must outlive attachment;
  * native operations are serialized with each other, not with arbitrary direct
  * tracker mutations. Absent an observer, preserve the legacy CUDA calls.
  */
 static std::atomic<ds4_runtime_tracker *> g_laguna_resident_tracker{NULL};
 static std::mutex g_laguna_resident_mutex;
+/* A fresh-process boundary: legacy tensors have no trustworthy live inventory.
+ * Even their attempted teardown cannot authorize a later observer attachment. */
+static bool g_laguna_resident_legacy_tensor_seen;
 static const uint8_t cuda_laguna_resident_namespace = 0x52u;
 typedef struct {
     void *base;
@@ -3191,6 +3195,19 @@ static cudaError_t cuda_laguna_resident_fail(
         ds4_runtime_tracker *tracker, ds4_runtime_violation violation) {
     (void)ds4_runtime_tracker_latch_failure(tracker, violation);
     return cudaErrorInvalidValue;
+}
+
+static int cuda_laguna_resident_legacy_tensor_permit(void) {
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    ds4_runtime_tracker *tracker =
+        g_laguna_resident_tracker.load(std::memory_order_relaxed);
+    if (tracker) {
+        (void)cuda_laguna_resident_fail(
+            tracker, DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE);
+        return 0;
+    }
+    g_laguna_resident_legacy_tensor_seen = true;
+    return 1;
 }
 
 static const ds4_runtime_callsite *cuda_laguna_resident_site(
@@ -3213,7 +3230,11 @@ static int cuda_laguna_resident_site_matches(
         ((site->id == DS4_LAGUNA_CALLSITE_STATIC_SLAB &&
           site->category == DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS) ||
          (site->id == DS4_LAGUNA_CALLSITE_OTHER_CUDA_KERNEL_TMP &&
-          site->category == DS4_RUNTIME_CATEGORY_OTHER_CUDA));
+          site->category == DS4_RUNTIME_CATEGORY_OTHER_CUDA) ||
+         (site->id == DS4_LAGUNA_CALLSITE_KV_STATE &&
+          site->category == DS4_RUNTIME_CATEGORY_KV_STATE) ||
+         (site->id == DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH &&
+          site->category == DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH));
 }
 
 static ds4_runtime_allocation_record *cuda_laguna_resident_record(
@@ -3251,6 +3272,7 @@ extern "C" int ds4_gpu_laguna_resident_observer_begin(
         tracker->issued_sequence_high_water[cuda_laguna_resident_namespace] != 0 ||
         g_laguna_resident_tracker.load(std::memory_order_relaxed) ||
         g_laguna_resident_retained.base ||
+        g_laguna_resident_legacy_tensor_seen ||
         g_laguna_compact_state.load(std::memory_order_acquire) != DS4_LAGUNA_COMPACT_IDLE ||
         g_n_gpus > 1 || g_cuda_tmp || g_cuda_tmp_bytes ||
         g_model_host_base || g_model_device_base || g_model_registered ||
@@ -3296,14 +3318,10 @@ static int cuda_laguna_resident_observer_safe(void) {
     return !tracker || tracker->violation == DS4_RUNTIME_VIOLATION_NONE;
 }
 
-static cudaError_t cuda_laguna_resident_allocate(
-        void **out, size_t bytes, uint32_t callsite_id, int pinned) {
-    if (!g_laguna_resident_tracker.load(std::memory_order_acquire))
-        return pinned ? cudaMallocHost(out, bytes) : cudaMalloc(out, bytes);
-    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
-    ds4_runtime_tracker *tracker =
-        g_laguna_resident_tracker.load(std::memory_order_relaxed);
-    if (!tracker) return pinned ? cudaMallocHost(out, bytes) : cudaMalloc(out, bytes);
+static cudaError_t cuda_laguna_resident_allocate_locked(
+        ds4_runtime_tracker *tracker, void **out, size_t bytes,
+        uint32_t callsite_id, int pinned, uint64_t *record_id_out) {
+    if (record_id_out) *record_id_out = 0;
     if (!out || bytes == 0) return cuda_laguna_resident_fail(
         tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
     *out = NULL;
@@ -3347,6 +3365,7 @@ static cudaError_t cuda_laguna_resident_allocate(
             tracker, cuda_laguna_resident_namespace, callsite_id,
             (uint64_t)(uintptr_t)base, bytes, bytes, &id) == DS4_RUNTIME_STATUS_OK) {
         *out = base;
+        if (record_id_out) *record_id_out = id;
         return cudaSuccess;
     }
     /* A bound failure may already have inserted an owner. Keep its peak, and
@@ -3360,6 +3379,18 @@ static cudaError_t cuda_laguna_resident_allocate(
         g_laguna_resident_retained = {base, id, pinned};
     }
     return released != cudaSuccess ? released : cudaErrorInvalidValue;
+}
+
+static cudaError_t cuda_laguna_resident_allocate(
+        void **out, size_t bytes, uint32_t callsite_id, int pinned) {
+    if (!g_laguna_resident_tracker.load(std::memory_order_acquire))
+        return pinned ? cudaMallocHost(out, bytes) : cudaMalloc(out, bytes);
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    ds4_runtime_tracker *tracker =
+        g_laguna_resident_tracker.load(std::memory_order_relaxed);
+    if (!tracker) return pinned ? cudaMallocHost(out, bytes) : cudaMalloc(out, bytes);
+    return cuda_laguna_resident_allocate_locked(
+        tracker, out, bytes, callsite_id, pinned, NULL);
 }
 
 static cudaError_t cuda_laguna_resident_malloc(
@@ -3436,6 +3467,179 @@ extern "C" int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker
     return 1;
 }
 /* End resident native allocation observer. */
+
+/* Resident native tensor ownership. */
+static int cuda_laguna_resident_tensor_fail(
+        ds4_runtime_tracker *tracker, ds4_runtime_violation violation) {
+    (void)cuda_laguna_resident_fail(tracker, violation);
+    return 0;
+}
+
+static int cuda_laguna_resident_tensor_device_site(
+        const ds4_runtime_callsite *site) {
+    return site && site->domain == DS4_RUNTIME_DOMAIN_CUDA_DEVICE &&
+        ((site->id == DS4_LAGUNA_CALLSITE_KV_STATE &&
+          site->category == DS4_RUNTIME_CATEGORY_KV_STATE) ||
+         (site->id == DS4_LAGUNA_CALLSITE_GRAPH_SCRATCH &&
+          site->category == DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH));
+}
+
+static int cuda_laguna_resident_tensor_descriptor_site(
+        const ds4_runtime_callsite *site) {
+    return site && site->id == DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE + 4u &&
+        site->domain == DS4_RUNTIME_DOMAIN_HOST &&
+        site->category == DS4_RUNTIME_CATEGORY_OTHER_HOST;
+}
+
+/* No implicit device switch: the quiescent caller owns the one bound device.
+ * A query failure is unsafe, not permission to allocate/free on another GPU. */
+static int cuda_laguna_resident_tensor_device_ready(ds4_runtime_tracker *tracker) {
+    if (g_n_gpus != 1 || g_gpu[0].device_id < 0)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    int current = -1;
+    if (cudaGetDevice(&current) != cudaSuccess)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+    if (current != g_gpu[0].device_id)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_resident_tensor_alloc(
+        ds4_runtime_tracker *tracker, uint32_t callsite_id, uint64_t bytes,
+        ds4_gpu_laguna_resident_tensor_owner *out) {
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    /* A wrong tracker is not ours to mutate; never dereference it. */
+    if (!tracker || tracker !=
+            g_laguna_resident_tracker.load(std::memory_order_relaxed)) return 0;
+    if (!out || out->tensor || out->descriptor_record_id || out->device_record_id ||
+        bytes == 0 || !tracker->records ||
+        tracker->record_count > tracker->record_capacity)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    if (bytes > (uint64_t)SIZE_MAX)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+    if (tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        g_laguna_resident_retained.base) return 0;
+    const ds4_runtime_callsite *device_site =
+        cuda_laguna_resident_site(tracker, callsite_id);
+    const ds4_runtime_callsite *descriptor_site = cuda_laguna_resident_site(
+        tracker, DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE + 4u);
+    if (!device_site || !descriptor_site)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE);
+    if (!cuda_laguna_resident_tensor_device_site(device_site) ||
+        !cuda_laguna_resident_tensor_descriptor_site(descriptor_site))
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE);
+    size_t available = tracker->record_capacity - tracker->record_count;
+    for (size_t i = 0; i < tracker->record_count; i++)
+        if (!tracker->records[i].live) available++;
+    if (available < 2u)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_CAPACITY);
+    if (tracker->issued_sequence_high_water[cuda_laguna_resident_namespace] >
+            UINT64_C(0x00fffffffffffffd))
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+    if (!cuda_laguna_resident_tensor_device_ready(tracker)) return 0;
+
+    ds4_gpu_tensor *tensor = (ds4_gpu_tensor *)calloc(1, sizeof(*tensor));
+    if (!tensor) return 0;
+    uint64_t descriptor_id = 0;
+    if (ds4_runtime_tracker_allocate_next(
+            tracker, cuda_laguna_resident_namespace, descriptor_site->id,
+            (uint64_t)(uintptr_t)tensor, sizeof(*tensor), sizeof(*tensor),
+            &descriptor_id) != DS4_RUNTIME_STATUS_OK) {
+        free(tensor);
+        if (descriptor_id) (void)ds4_runtime_tracker_release(tracker, descriptor_id);
+        return 0;
+    }
+
+    void *storage = NULL;
+    uint64_t device_id = 0;
+    if (cuda_laguna_resident_allocate_locked(
+            tracker, &storage, (size_t)bytes, callsite_id, 0, &device_id) != cudaSuccess) {
+        /* Device rollback is already complete or privately retained. The host
+         * descriptor never escaped; retire it only after the ordinary C free. */
+        free(tensor);
+        (void)ds4_runtime_tracker_release(tracker, descriptor_id);
+        return 0;
+    }
+    tensor->ptr = storage;
+    tensor->bytes = bytes;
+    tensor->owner = 1;
+    tensor->device_id = 0;
+    const ds4_gpu_laguna_resident_tensor_owner owner = {
+        tensor, descriptor_id, device_id
+    };
+    *out = owner;
+    return 1;
+}
+
+extern "C" int ds4_gpu_laguna_resident_tensor_free(
+        ds4_runtime_tracker *tracker,
+        ds4_gpu_laguna_resident_tensor_owner *owner) {
+    if (!owner || (!owner->tensor && !owner->descriptor_record_id &&
+                   !owner->device_record_id)) return 1;
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    if (!tracker || tracker !=
+            g_laguna_resident_tracker.load(std::memory_order_relaxed)) return 0;
+    if (!owner->tensor || !owner->descriptor_record_id || !owner->device_record_id ||
+        !tracker->records || tracker->record_count > tracker->record_capacity)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    ds4_runtime_allocation_record *descriptor_record =
+        cuda_laguna_resident_record(tracker, owner->descriptor_record_id, NULL);
+    ds4_runtime_allocation_record *device_record =
+        cuda_laguna_resident_record(tracker, owner->device_record_id, NULL);
+    /* Validate both identities before dereferencing a possibly stale descriptor.
+     * Record IDs, not a recycled pointer alone, bind this caller's owner. */
+    if (!descriptor_record || !device_record ||
+        descriptor_record->base != (uint64_t)(uintptr_t)owner->tensor ||
+        descriptor_record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+        descriptor_record->category != DS4_RUNTIME_CATEGORY_OTHER_HOST ||
+        descriptor_record->requested_bytes != sizeof(*owner->tensor) ||
+        descriptor_record->charged_bytes != sizeof(*owner->tensor) ||
+        !cuda_laguna_resident_tensor_descriptor_site(cuda_laguna_resident_site(
+            tracker, descriptor_record->callsite_id)) ||
+        device_record->domain != DS4_RUNTIME_DOMAIN_CUDA_DEVICE ||
+        !cuda_laguna_resident_tensor_device_site(cuda_laguna_resident_site(
+            tracker, device_record->callsite_id)) ||
+        device_record->category != cuda_laguna_resident_site(
+            tracker, device_record->callsite_id)->category ||
+        !device_record->base || !device_record->requested_bytes ||
+        device_record->charged_bytes != device_record->requested_bytes)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_NOT_LIVE);
+    ds4_gpu_tensor *tensor = owner->tensor;
+    if (tensor->owner != 1 || tensor->device_id != 0 ||
+        tensor->ptr != (void *)(uintptr_t)device_record->base ||
+        tensor->bytes != device_record->requested_bytes)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    if (cuda_laguna_resident_has_relation(tracker, descriptor_record->id) ||
+        cuda_laguna_resident_has_relation(tracker, device_record->id))
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_LIVE_RELATION);
+    if (!cuda_laguna_resident_tensor_device_ready(tracker)) return 0;
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaFree(tensor->ptr) != cudaSuccess)
+        return cuda_laguna_resident_tensor_fail(
+            tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+
+    /* The same lock protects validation through retirement. With no live child
+     * relations, release retires even when its returned status remains sticky.
+     * A failed physical free above leaves BOTH owners and the handle untouched. */
+    (void)ds4_runtime_tracker_release(tracker, owner->device_record_id);
+    free(tensor);
+    (void)ds4_runtime_tracker_release(tracker, owner->descriptor_record_id);
+    memset(owner, 0, sizeof(*owner));
+    return 1;
+}
+/* End resident native tensor ownership. */
 
 extern "C" int ds4_gpu_laguna_compact_create(
         ds4_gpu_laguna_compact **out,
@@ -7876,6 +8080,7 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
                                        uint64_t bytes) {
     if (!t) return 1;
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return 3;
     if (device_id < 0 || device_id >= g_n_gpus) return 2;
     if (bytes == 0) bytes = 1;
     int ok = 0;
@@ -7905,6 +8110,7 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
 
 extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     if (!t) return;
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return;
     int d = ds4_tensor_device_idx(t);
     if (t->owner && t->ptr) {
         WITH_DEVICE(g_gpu[d].device_id) {
@@ -7917,6 +8123,7 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (ds4_gpu_tensor_alloc_on(t, 0, bytes) != 0) {
@@ -7927,6 +8134,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return NULL;
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -7955,6 +8163,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
  * bytes) is byte-equivalent. Single-tier callers MAY remain on the
  * legacy 1-arg helper; new multi-tier callers in ds4.c use _ptr_on. */
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return NULL;
     if (tier < 0 || tier >= g_n_gpus) {
         fprintf(stderr,
             "ds4: ds4_gpu_tensor_alloc_ptr_on: bad tier %d (n_gpus=%d)\n",
@@ -7981,6 +8190,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes)
  * unless another device touches it. Stamping tier matches the home
  * device for free-time accounting. */
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return NULL;
     if (tier < 0 || tier >= g_n_gpus) {
         fprintf(stderr,
             "ds4: ds4_gpu_tensor_alloc_managed_on: bad tier %d (n_gpus=%d)\n",
@@ -8046,6 +8256,7 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return NULL;
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -8058,6 +8269,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
+    if (!cuda_laguna_resident_legacy_tensor_permit()) return;
     int d = ds4_tensor_device_idx(tensor);
     if (tensor->owner && tensor->ptr) {
         WITH_DEVICE(g_gpu[d].device_id) {

@@ -507,7 +507,7 @@ class BenchQualificationMakefileContractTest(unittest.TestCase):
         )
         self.assertIsNotNone(target)
         assert target is not None
-        self.assertEqual(target.group("deps").split(), ["ds4_bench.c", "ds4_gpu.h"])
+        self.assertEqual(target.group("deps").split(), ["ds4_bench.c", "ds4_gpu.h", "ds4_gpu_resident.h"])
         recipe = target.group("recipe")
         for flag in (
             "$(CC) $(CFLAGS)",

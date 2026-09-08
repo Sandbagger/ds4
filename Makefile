@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-cuda-model-registration-contract test-cuda-model-stage-contract test-cuda-stage-pool-ownership-contract test-cuda-model-arena-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-model-source test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-resident-qualification-emitter test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-eval-case-contract test-bench-eval-contract test-session-snapshot-buffers test-bench-resident-args test-bench-resident-qualification-composition test-laguna-resident-plan test-laguna-resident-path test-cuda-resident-ownership-contract
+.PHONY: all help clean test test-cuda-build-contract test-cuda-model-registration-contract test-cuda-model-stage-contract test-cuda-stage-pool-ownership-contract test-cuda-model-arena-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-model-source test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-resident-qualification-emitter test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-eval-case-contract test-bench-eval-contract test-session-snapshot-buffers test-bench-resident-args test-bench-resident-qualification-composition test-laguna-resident-plan test-laguna-resident-path test-cuda-resident-ownership-contract test-cuda-resident-tensor-contract
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -217,7 +217,7 @@ ds4_build_info_rocm.o: ds4_build_info.c ds4_build_info.h ds4_runtime.h FORCE_BUI
 
 FORCE_BUILD_INFO:
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
@@ -235,13 +235,13 @@ ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h
 ds4_help.o: ds4_help.c ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
 
-ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
+ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_gpu_args.c
 
 ds4_server.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_laguna_plan.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_laguna_plan.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_plan_io.h ds4_runtime.h
@@ -256,13 +256,13 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h ds4_gpu.h ds4_laguna_plan.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h ds4_gpu.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
 
-tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h ds4_laguna_plan.h
+tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
 rax.o: rax.c rax.h rax_malloc.h
@@ -271,19 +271,19 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
-ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
+ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_gpu_args.c
 
 ds4_server_cpu.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_laguna_plan.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h
+ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_laguna_plan.h ds4_help.h ds4_bench_sequence.h ds4_bench_qualification.h ds4_plan_io.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_plan_io.h ds4_runtime.h
@@ -292,16 +292,16 @@ ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_laguna_plan.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_laguna_plan.h $(METAL_SRCS) ds4_gpu_resident.h
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc ds4_gpu_resident.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_laguna_plan.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
+ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_laguna_plan.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) ds4_gpu_resident.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
-ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h ds4_gpu_args.h
+ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h ds4_gpu_args.h ds4_gpu_resident.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
@@ -310,10 +310,10 @@ ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_cuda_laguna_kernels.o: tests/test_cuda_laguna_kernels.c ds4_gpu.h ds4_laguna_plan.h
+tests/test_cuda_laguna_kernels.o: tests/test_cuda_laguna_kernels.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/ds4_cuda_laguna_kernels_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
+tests/ds4_cuda_laguna_kernels_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc ds4_gpu_resident.h
 	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_cuda.cu
 
 tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_laguna_stream.o ds4_runtime.o
@@ -322,7 +322,7 @@ tests/test_cuda_laguna_kernels: tests/test_cuda_laguna_kernels.o tests/ds4_cuda_
 test-cuda-laguna-kernels: tests/test_cuda_laguna_kernels
 	env -u DS4_CUDA_MOE_DECODE_GRAPH ./tests/test_cuda_laguna_kernels --case all
 
-tests/test_cuda_q4k_mmvq_microscope.o: tests/test_cuda_q4k_mmvq_microscope.c ds4_gpu.h ds4_laguna_plan.h
+tests/test_cuda_q4k_mmvq_microscope.o: tests/test_cuda_q4k_mmvq_microscope.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_cuda_q4k_mmvq_microscope: tests/test_cuda_q4k_mmvq_microscope.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_laguna_stream.o ds4_runtime.o
@@ -331,7 +331,7 @@ tests/test_cuda_q4k_mmvq_microscope: tests/test_cuda_q4k_mmvq_microscope.o tests
 test-cuda-q4k-mmvq-microscope: tests/test_cuda_q4k_mmvq_microscope
 	./tests/test_cuda_q4k_mmvq_microscope
 
-tests/test_cuda_f32_mmvf_microscope.o: tests/test_cuda_f32_mmvf_microscope.c ds4_gpu.h ds4_laguna_plan.h
+tests/test_cuda_f32_mmvf_microscope.o: tests/test_cuda_f32_mmvf_microscope.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_cuda_f32_mmvf_microscope: tests/test_cuda_f32_mmvf_microscope.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_laguna_stream.o ds4_runtime.o
@@ -346,7 +346,7 @@ tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
+tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<
 
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
@@ -466,7 +466,7 @@ test-bench-resident-qualification-emitter: tests/test_bench_resident_qualificati
 # Model-free Task 19 lifecycle green target.  The harness includes ds4_bench.c
 # with main renamed and supplies only lifecycle-facing fake operations; all
 # ordinary benchmark symbols come from the host CPU objects.
-tests/test_bench_qualification_lifecycle.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4_laguna_plan.h ds4.h ds4_runtime.h
+tests/test_bench_qualification_lifecycle.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4_laguna_plan.h ds4.h ds4_runtime.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_bench_qualification_lifecycle: tests/test_bench_qualification_lifecycle.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ)
@@ -479,7 +479,7 @@ test-bench-qualification-lifecycle: tests/test_bench_qualification_lifecycle
 # backend with the structural observer chained to the linked production
 # qualification emitter.  Literal fake runtime snapshots satisfy the
 # emitter's validation boundary.
-tests/test_bench_qualification_composition.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4_laguna_plan.h ds4.h ds4_runtime.h
+tests/test_bench_qualification_composition.o: tests/test_bench_qualification_lifecycle.c ds4_bench.c ds4_bench_qualification.h ds4_bench_sequence.h ds4_gpu.h ds4_laguna_plan.h ds4.h ds4_runtime.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_BENCH_LIFECYCLE_REAL_EMITTER -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_bench_qualification_composition: tests/test_bench_qualification_composition.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(CPU_BUILD_INFO_OBJ) ds4_bench_qualification.o
@@ -519,11 +519,11 @@ tests/test_laguna_resident_plan: tests/test_laguna_resident_plan.o ds4_laguna_re
 test-laguna-resident-plan: tests/test_laguna_resident_plan
 	./tests/test_laguna_resident_plan
 
-test-laguna-resident-path: test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-resident-args test-bench-resident-qualification-composition test-bench-qualification-production-compile test-laguna-resident-plan test-cuda-resident-ownership-contract
+test-laguna-resident-path: test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-resident-args test-bench-resident-qualification-composition test-bench-qualification-production-compile test-laguna-resident-plan test-cuda-resident-ownership-contract test-cuda-resident-tensor-contract
 
 # Model-free production translation-unit gate.  Compile ds4_bench.c directly,
 # without the lifecycle fake harness's preincluded production headers.
-test-bench-qualification-production-compile: ds4_bench.c ds4_gpu.h
+test-bench-qualification-production-compile: ds4_bench.c ds4_gpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_BENCH_QUALIFICATION_TEST_BACKEND -Werror=implicit-function-declaration -I. -c -o tests/test_bench_qualification_production_compile.o ds4_bench.c
 
 # Model-free Task 19 stable case-ID RED target.  Includes real ds4_eval.c with
@@ -550,7 +550,7 @@ ds4_plan_io_test_hooks.o: ds4_plan_io.c ds4_plan_io.h
 ds4_laguna_plan.o: ds4_laguna_plan.c ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_plan_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_laguna_plan.c
 
-ds4_bound_test_hooks.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h
+ds4_bound_test_hooks.o: ds4.c ds4.h ds4_ssd.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_distributed.h ds4_gpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS \
 		-DDS4_TEST_FORCE_GRAPH_CACHE_F32 -ffunction-sections \
 		-fdata-sections -c -o $@ ds4.c
@@ -574,7 +574,7 @@ test-laguna-plan: tests/test_plan_io tests/test_laguna_plan
 	./tests/test_plan_io
 	./tests/test_laguna_plan
 
-tests/test_runtime_cpp_link.o: tests/test_runtime_cpp_link.cc ds4.h ds4_gpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h
+tests/test_runtime_cpp_link.o: tests/test_runtime_cpp_link.cc ds4.h ds4_gpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_gpu_resident.h
 	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
 
 tests/test_runtime_cpp_link: tests/test_runtime_cpp_link.o ds4_laguna_stream.o ds4_runtime.o
@@ -591,10 +591,10 @@ test-laguna-stream: tests/test_laguna_stream tests/test_runtime_cpp_link
 	./tests/test_laguna_stream --case page-ranges
 	./tests/test_runtime_cpp_link
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
-tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
+tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o ds4_layer_pack.o
@@ -610,28 +610,28 @@ test-session-logits-only-policy: tests/test_session_logits_only
 	./tests/test_session_logits_only
 
 ifneq ($(UNAME_S),Darwin)
-tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h
+tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h ds4_laguna_plan.h
+tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h
+tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_gpu.h ds4_laguna_plan.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o ds4_laguna_stream.o ds4_runtime.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_laguna_stream.h ds4_laguna_plan.h ds4_plan_io.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
-tests/ds4_server_test_hooks.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_args.h ds4_help.h ds4_kvstore.h ds4_laguna_plan.h rax.h
+tests/ds4_server_test_hooks.o: ds4_server.c ds4.h ds4_build_info.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_args.h ds4_help.h ds4_kvstore.h ds4_laguna_plan.h rax.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ ds4_server.c
 
 ds4-server-test-hooks: tests/ds4_server_test_hooks.o ds4_cuda_test_hooks.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_stream_test_hooks.o ds4_layer_pack.o $(DS4_BUILD_INFO_OBJ)
@@ -654,19 +654,19 @@ test-cuda-task18-server-failures: ds4-server-test-hooks
 		tests/test_task18_cuda_failure_contract.py \
 		--server ./ds4-server-test-hooks -v
 
-tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
+tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_gpu_args.o ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h
+tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h
+tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_engine_correctness: tests/test_engine_correctness.o ds4_gpu_args.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -678,7 +678,7 @@ tests/test_sampling.o: tests/test_sampling.c ds4.h
 tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_cuda_session_batch.o: tests/test_cuda_session_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
+tests/test_cuda_session_batch.o: tests/test_cuda_session_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_cuda_session_batch: tests/test_cuda_session_batch.o ds4_gpu_args.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -687,7 +687,7 @@ tests/test_cuda_session_batch: tests/test_cuda_session_batch.o ds4_gpu_args.o ds
 test-cuda-session-batch: tests/test_cuda_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_session_batch
 
-tests/test_cuda_mixed_batch.o: tests/test_cuda_mixed_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
+tests/test_cuda_mixed_batch.o: tests/test_cuda_mixed_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
@@ -696,7 +696,7 @@ tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o
 test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 
-tests/test_cuda_laguna_model.o: tests/test_cuda_laguna_model.c ds4.h ds4_gpu.h ds4_gpu_args.h ds4_laguna_plan.h
+tests/test_cuda_laguna_model.o: tests/test_cuda_laguna_model.c ds4.h ds4_gpu.h ds4_gpu_args.h ds4_laguna_plan.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_cuda_laguna_model: tests/test_cuda_laguna_model.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_kernels_test_hooks.o ds4_layer_pack.o
@@ -725,10 +725,10 @@ test-cuda-laguna-model: tests/test_cuda_laguna_model
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode streamed --case prefill-8192
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_laguna_model --mode resident --case all
 
-tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_plan_io.h ds4_runtime.h
+tests/test_cuda_laguna_stream.o: tests/test_cuda_laguna_stream.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_plan_io.h ds4_runtime.h ds4_gpu_resident.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/ds4_cuda_laguna_stream_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc
+tests/ds4_cuda_laguna_stream_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_laguna_plan.h ds4_laguna_stream.h ds4_runtime.h ds4_iq2_tables_cuda.inc ds4_gpu_resident.h
 	$(NVCC) $(NVCCFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_cuda.cu
 
 tests/test_cuda_laguna_stream: tests/test_cuda_laguna_stream.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_laguna_stream.o ds4_runtime.o ds4_qualification_control.o ds4_plan_io.o ds4_laguna_plan.o tests/ds4_cuda_laguna_stream_test_hooks.o ds4_layer_pack.o
@@ -870,6 +870,9 @@ test-cuda-model-stage-contract:
 
 test-cuda-stage-pool-ownership-contract:
 	python3 tests/test_cuda_stage_pool_ownership_contract.py -v
+
+test-cuda-resident-tensor-contract:
+	python3 tests/test_cuda_resident_tensor_contract.py -v
 
 test-cuda-resident-ownership-contract:
 	python3 tests/test_cuda_resident_ownership_contract.py -v

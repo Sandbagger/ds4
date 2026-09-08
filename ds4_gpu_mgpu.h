@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "ds4_gpu_resident.h"
 
 #ifdef __cplusplus
 extern "C" {

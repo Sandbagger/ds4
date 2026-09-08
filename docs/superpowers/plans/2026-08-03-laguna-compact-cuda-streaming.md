@@ -1709,6 +1709,47 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Explicit resident tensor owners, host-tested increment:**
+`ds4_gpu_resident.h` exposes a CUDA-only allocation/checked-free handle without
+changing the ordinary tensor layout. Each tensor has two actual namespace `0x52`
+owners: its CPU descriptor at `OTHER_HOST_SESSION`, and CUDA storage at
+`KV_STATE` or `GRAPH_SCRATCH`. Both record slots and producer IDs are checked
+before allocation. The descriptor event precedes the CUDA allocation. Failed
+allocation preserves transient peaks and either rolls back or retains the only
+private retry handle; no failed driver result is relabeled as a successful event.
+
+Checked free authenticates IDs before dereferencing a descriptor, checks live
+relations/current device/synchronization, and preserves both owners on failure.
+Physical release precedes each record's retirement. Successful cleanup zeros the
+handle but does not clear a sticky violation. A wrong attached-tracker identity
+refuses without mutating either tracker. Caller quiescence and retained tracker
+storage remain required; this is not an arbitrary-memory-corruption boundary.
+
+Generic CUDA tensor allocation/view/free paths refuse while attached. Generic
+use before attachment sets a one-way fresh-process fence, even after cleanup.
+Tensor data I/O and compute remain usable; their reachable lazy allocations are
+separate coverage work. Metal/ROCm implementations and tensor layouts are unchanged.
+All 37 explicit GPU-header Make rules now depend on the shared header, including
+CPU and test-hook objects. The benchmark dependency oracle retains exact equality
+with the new prerequisite rather than weakening the check.
+
+RED preceded implementation: 22 methods failed at missing ABI/body/build wiring.
+The root reviewed and repaired fixture semantics before execution. GREEN: 22 new
+tensor methods plus 24 prior-owner methods use extracted native functions and the
+real tracker against fake CUDA. C99/C++17 include-order probes and the broader
+resident/legacy CUDA/runtime/source/snapshot/bench-eval host controls pass.
+Independent review preserves the limits: no full CUDA translation-unit build or
+GPU/model execution is established for this tensor increment by these host tests.
+
+Production remains blocked. Graph/KV caller composition, remaining host/managed/
+registration owners, selected-expert cache and other raw allocation paths,
+explicit engine attachment, authenticated external snapshots and late-cleanup
+exit/publication refusal are unfinished. Earlier owner notes below predate these
+tensor primitives, not these outstanding caller and admission requirements.
+Reusable rules: **an allocation descriptor is a physical owner, not free metadata;
+shared-header changes require dependency-oracle updates outside backend-named
+tests as well as build-rule changes.**
+
 **Native resident owner events, bounded first slice (2026-09-08):**
 CUDA scratch, raw pinned model-stage reservations and device weight arenas now
 use event-time observation helpers. Sites 1/11/22 issue namespace `0x52` owners

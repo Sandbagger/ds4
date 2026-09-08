@@ -372,6 +372,13 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--chat-prompt-file FILE", "Render FILE as one no-thinking chat user message.");
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
     fputc('\n', fp);
+    title(fp, c, "Benchmark Qualification");
+    opt(fp, c, "--qualification-sequence FILE", "Trusted streamed cold/three-warm sequence; separate from ordinary sweeps.");
+    opt(fp, c, "--qualification-resident-sequence FILE", "Trusted resident cold/three-warm sequence; fixed CUDA 32K/4K/one-slot configuration.");
+    opt(fp, c, "--qualification-manifest-sha256 SHA256", "Required trusted manifest digest for either sequence kind.");
+    opt(fp, c, "--qualification-sequence-sha256 SHA256", "Required trusted serialized-sequence digest.");
+    opt(fp, c, "--qualification-control-fd FD", "Inherited authenticated checkpoint channel; missing runtime accounting fails closed.");
+    fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
     opt(fp, c, "--ctx-max N", "Last measured frontier. Default: 32768");

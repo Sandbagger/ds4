@@ -42,6 +42,14 @@ static const unsigned char literal_input[] = LITERAL_RENDERED_SEQUENCE;
 static unsigned char literal_sequence_input[] =
     LITERAL_RENDERED_SEQUENCE "\x7f";
 
+#define RESIDENT_LITERAL_RENDERED_SEQUENCE "task19 resident qualification prompt"
+static const unsigned char resident_literal_input[] =
+    RESIDENT_LITERAL_RENDERED_SEQUENCE;
+/* Resident uses a separate sentinel so a mode mix-up cannot accidentally
+ * compare the streamed fixture's storage. */
+static unsigned char resident_sequence_input[] =
+    RESIDENT_LITERAL_RENDERED_SEQUENCE "\x7f";
+
 static const uint32_t literal_prompt_tokens = 512u;
 /* Deliberately nonzero: a hard-coded common EOS value must not pass the fake. */
 static const int literal_eos_token = 17;
@@ -54,6 +62,12 @@ static const char literal_input_sha256[] =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static const char literal_instance_id[] =
     "123e4567-e89b-12d3-a456-426614174099";
+static const char resident_manifest_sha256[] =
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+static const char resident_sequence_sha256[] =
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+static const char resident_input_sha256[] =
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 static ds4_engine *const fake_engine =
     (ds4_engine *)(void *)&fake_engine_storage;
@@ -61,6 +75,8 @@ static ds4_engine *const fake_engine =
 enum call_kind {
     CALL_SEQUENCE_PARSE,
     CALL_SEQUENCE_FREE,
+    CALL_RESIDENT_SEQUENCE_PARSE,
+    CALL_RESIDENT_SEQUENCE_FREE,
     CALL_ENGINE_OPEN,
     CALL_ENGINE_CLOSE,
     CALL_NVML_CAPTURE,
@@ -82,6 +98,7 @@ enum call_kind {
     CALL_EXTERNAL_CHECKPOINT,
     CALL_RUNTIME_SNAPSHOT,
     CALL_EMIT,
+    CALL_RESIDENT_EMIT,
     CALL_UNEXPECTED,
 };
 
@@ -91,6 +108,7 @@ typedef struct {
     ds4_session *session;
     ds4_runtime_request_context *request;
     const ds4_bench_sequence *sequence;
+    const ds4_bench_resident_sequence *resident_sequence;
     ds4_bench_qualification_event event;
     const ds4_runtime_request_metrics *metrics;
     uint64_t value;
@@ -122,10 +140,21 @@ typedef struct {
     int checkpoint_count;
     int snapshot_count;
     int emit_count;
+    int resident_emit_count;
     int sequence_free_count;
+    int resident_sequence_free_count;
+    bool resident_mode;
     bool inject_emitter_failure;
+    bool inject_resident_parser_failure;
+    bool reject_resident_cross_mode;
+    bool reject_streamed_cross_mode;
+    bool inject_snapshot_failure;
+    bool inject_checkpoint_failure;
     bool emitter_failed;
+    bool snapshot_failed;
+    bool checkpoint_failed;
     const ds4_bench_sequence *trusted_sequence;
+    const ds4_bench_resident_sequence *trusted_resident_sequence;
     const ds4_gpu_nvml_inventory_snapshot *captured_pre_child;
     uint64_t last_emitted_monotonic_ns;
     ds4_runtime_request_context *requests[4];
@@ -158,6 +187,7 @@ static void record_call(enum call_kind kind, int repetition) {
         .session = NULL,
         .request = NULL,
         .sequence = NULL,
+        .resident_sequence = NULL,
         .event = DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED,
         .metrics = NULL,
         .value = 0u,
@@ -223,14 +253,26 @@ static bool fake_sequence_parse_file_trusted(
     (void)error;
     (void)error_size;
     record_call(CALL_SEQUENCE_PARSE, -1);
-    if (!path || strcmp(path, "/literal/sequence.txt") != 0) {
-        fail_contract("trusted parser did not receive the literal sequence path");
+    const bool reject_cross_mode = state.reject_streamed_cross_mode;
+    const char *expected_path = reject_cross_mode
+        ? "/literal/resident-sequence.txt" : "/literal/sequence.txt";
+    const char *expected_manifest = reject_cross_mode
+        ? resident_manifest_sha256 : literal_manifest_sha256;
+    const char *expected_sequence = reject_cross_mode
+        ? resident_sequence_sha256 : literal_sequence_sha256;
+    if (!path || strcmp(path, expected_path) != 0) {
+        fail_contract("trusted parser did not receive the expected sequence path");
         return false;
     }
     if (!out || !expected_manifest_sha256 || !expected_sequence_sha256 ||
-        strcmp(expected_manifest_sha256, literal_manifest_sha256) != 0 ||
-        strcmp(expected_sequence_sha256, literal_sequence_sha256) != 0) {
-        fail_contract("trusted parser did not receive the literal authenticated digests");
+        strcmp(expected_manifest_sha256, expected_manifest) != 0 ||
+        strcmp(expected_sequence_sha256, expected_sequence) != 0) {
+        fail_contract("trusted parser did not receive the expected authenticated digests");
+        return false;
+    }
+    state.trusted_sequence = out;
+    if (reject_cross_mode) {
+        snprintf(error, error_size, "streamed parser rejected resident fixture");
         return false;
     }
     ds4_bench_sequence literal = {0};
@@ -258,6 +300,72 @@ static void fake_sequence_free(ds4_bench_sequence *sequence) {
     state.sequence_free_count++;
     if (sequence != state.trusted_sequence) {
         fail_contract("sequence free did not receive the exact trusted sequence pointer");
+    }
+    /* The input is static in this fake.  Do not free or scrub it. */
+}
+
+static bool fake_resident_sequence_parse_file_trusted(
+        const char *path,
+        const char *expected_manifest_sha256,
+        const char *expected_sequence_sha256,
+        ds4_bench_resident_sequence *out,
+        char *error,
+        size_t error_size) {
+    record_call(CALL_RESIDENT_SEQUENCE_PARSE, -1);
+    state.resident_mode = true;
+    if (!out || !expected_manifest_sha256 || !expected_sequence_sha256 ||
+        strcmp(path ? path : "", state.reject_resident_cross_mode
+                                      ? "/literal/sequence.txt"
+                                      : "/literal/resident-sequence.txt") != 0 ||
+        strcmp(expected_manifest_sha256,
+               state.reject_resident_cross_mode ? literal_manifest_sha256
+                                                 : resident_manifest_sha256) != 0 ||
+        strcmp(expected_sequence_sha256,
+               state.reject_resident_cross_mode ? literal_sequence_sha256
+                                                 : resident_sequence_sha256) != 0) {
+        fail_contract("resident trusted parser did not receive its literal authenticated fixture");
+        return false;
+    }
+    state.trusted_resident_sequence = out;
+    if (state.reject_resident_cross_mode) {
+        if (error && error_size != 0u) {
+            snprintf(error, error_size,
+                     "resident parser rejected streamed fixture");
+        }
+        return false;
+    }
+    if (state.inject_resident_parser_failure) {
+        if (error && error_size != 0u) {
+            snprintf(error, error_size, "injected resident parser failure");
+        }
+        return false;
+    }
+    if (!out) return false;
+    ds4_bench_resident_sequence resident = {0};
+    memcpy(resident.sequence.manifest_sha256, resident_manifest_sha256,
+           sizeof(resident.sequence.manifest_sha256));
+    memcpy(resident.sequence.profile_id, "resident", sizeof("resident"));
+    resident.sequence.cache_bytes = 0u;
+    resident.sequence.prompt_order_index = 0u;
+    memcpy(resident.sequence.prompt_id, "native-512", sizeof("native-512"));
+    resident.sequence.prompt_tokens = literal_prompt_tokens;
+    resident.sequence.input_size_bytes = sizeof(resident_literal_input) - 1u;
+    resident.sequence.input_size = sizeof(resident_literal_input) - 1u;
+    resident.sequence.input_bytes = resident_sequence_input;
+    memcpy(resident.sequence.input_sha256, resident_input_sha256,
+           sizeof(resident.sequence.input_sha256));
+    memcpy(resident.sequence.sequence_sha256, resident_sequence_sha256,
+           sizeof(resident.sequence.sequence_sha256));
+    *out = resident;
+    return true;
+}
+
+static void fake_resident_sequence_free(
+        ds4_bench_resident_sequence *sequence) {
+    record_call(CALL_RESIDENT_SEQUENCE_FREE, -1);
+    state.resident_sequence_free_count++;
+    if (sequence != state.trusted_resident_sequence) {
+        fail_contract("resident sequence free did not receive the exact trusted sequence pointer");
     }
     /* The input is static in this fake.  Do not free or scrub it. */
 }
@@ -323,13 +431,39 @@ static bool pinned_engine_options(const ds4_engine_options *options) {
            options->qualification_control_fd == 9;
 }
 
+static bool pinned_resident_engine_options(const ds4_engine_options *options) {
+    if (!options) return false;
+    return options->model_path &&
+           strcmp(options->model_path, "/literal/fake.gguf") == 0 &&
+           options->backend == DS4_BACKEND_CUDA &&
+           options->context_size == 32768 &&
+           options->prefill_chunk == 4096u &&
+           options->session_slots == 1u &&
+           !options->ssd_streaming &&
+           options->ssd_streaming_cache_bytes == 0u &&
+           !options->ssd_streaming_cache_bytes_set &&
+           options->placement_ctx_hint == 32768 &&
+           !options->quality &&
+           !options->warm_weights &&
+           !options->ssd_streaming_cold &&
+           !options->ssd_streaming_cache_experts_set &&
+           !options->ssd_streaming_full_layers_set &&
+           !options->ssd_streaming_preload_experts &&
+           !options->qualification_plan_path_set &&
+           options->qualification_control_fd_set &&
+           options->qualification_control_fd == 9;
+}
+
 static int fake_engine_open(ds4_engine **out, const ds4_engine_options *options) {
     record_call(CALL_ENGINE_OPEN, -1);
     state.engine_open_count++;
     if (state.nvml_capture_count != 1 || state.captured_pre_child == NULL) {
         fail_contract("engine open was not preceded by exactly one pre-child NVML capture");
     }
-    if (!out || !pinned_engine_options(options)) {
+    const bool options_valid = state.resident_mode
+        ? pinned_resident_engine_options(options)
+        : pinned_engine_options(options);
+    if (!out || !options_valid) {
         fail_contract("engine open did not receive the pinned qualification configuration");
         return 1;
     }
@@ -386,6 +520,10 @@ static bool fake_engine_runtime_snapshot(
         fail_contract("runtime snapshot received an invalid engine/output");
         return false;
     }
+    if (state.inject_snapshot_failure && state.snapshot_count == 2) {
+        state.snapshot_failed = true;
+        return false;
+    }
     memset(out, 0, sizeof(*out));
     snprintf(out->instance_id, sizeof(out->instance_id), "%s",
              literal_instance_id);
@@ -402,6 +540,7 @@ static bool fake_engine_runtime_snapshot(
     out->build.dirty = false;
     memcpy(out->build.backend, "cuda", sizeof("cuda"));
     memcpy(out->build.features[0], "laguna", sizeof("laguna"));
+    /* Build features describe capabilities, not this run's selected mode. */
     memcpy(out->build.features[1], "ssd_streaming", sizeof("ssd_streaming"));
     out->build.feature_count = 2u;
     out->executable = (ds4_runtime_file_identity){
@@ -416,12 +555,14 @@ static bool fake_engine_runtime_snapshot(
     out->configured_context_tokens = 32768u;
     out->configured_prefill_chunk_tokens = 4096u;
     out->configured_session_slots = 1u;
-    out->configured_ssd_streaming = true;
-    out->configured_ssd_streaming_cache_bytes = literal_cache_bytes;
+    out->configured_ssd_streaming = !state.resident_mode;
+    out->configured_ssd_streaming_cache_bytes = state.resident_mode
+        ? 0u : literal_cache_bytes;
     out->effective_context_tokens = 32768u;
     out->effective_prefill_chunk_tokens = 4096u;
     out->effective_session_slots = 1u;
-    out->expert_cache_limit_bytes = literal_cache_bytes;
+    out->expert_cache_limit_bytes = state.resident_mode
+        ? 0u : literal_cache_bytes;
     out->configured_prefill_rows = 4096u;
     out->allocated_prefill_rows = 4096u;
 
@@ -429,9 +570,12 @@ static bool fake_engine_runtime_snapshot(
     out->allocations.category_current[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 256u;
     out->allocations.category_peak[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 512u;
     out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] = 4096u;
-    out->allocations.category_current[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = 1000u;
-    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = 2000u;
-    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] = literal_cache_bytes;
+    out->allocations.category_current[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] =
+        state.resident_mode ? 0u : 1000u;
+    out->allocations.category_peak[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] =
+        state.resident_mode ? 0u : 2000u;
+    out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] =
+        state.resident_mode ? 0u : literal_cache_bytes;
     out->allocations.category_current[DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 128u;
     out->allocations.category_peak[DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 256u;
     out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES] = 4096u;
@@ -450,9 +594,10 @@ static bool fake_engine_runtime_snapshot(
     out->allocations.category_current[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 32u;
     out->allocations.category_peak[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 64u;
     out->allocations.category_bounds[DS4_RUNTIME_CATEGORY_OTHER_CUDA] = 4096u;
-    out->allocations.owned_total_current = 2152u;
-    out->allocations.owned_total_peak = 4304u;
-    out->allocations.owned_total_bound_bytes = UINT64_C(8589963264);
+    out->allocations.owned_total_current = state.resident_mode ? 1152u : 2152u;
+    out->allocations.owned_total_peak = state.resident_mode ? 2304u : 4304u;
+    out->allocations.owned_total_bound_bytes = state.resident_mode
+        ? UINT64_C(28672) : UINT64_C(8589963264);
 
     out->allocations.report_current[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] = 4096u;
     out->allocations.report_peak[DS4_RUNTIME_REPORT_MODEL_MAPPED_VIRTUAL] = 8192u;
@@ -469,9 +614,13 @@ static bool fake_engine_runtime_snapshot(
     out->allocations.report_current[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 200u;
     out->allocations.report_peak[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 400u;
     out->allocations.report_bounds[DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] = 4096u;
-    out->allocations.qualification_total_current = 7452u;
-    out->allocations.qualification_total_peak = 10904u;
-    out->allocations.qualification_total_bound_bytes = UINT64_C(8589979648);
+    /* Mapping and registration are report-only: do not charge them again. */
+    out->allocations.qualification_total_current = state.resident_mode
+        ? 6452u : 7452u;
+    out->allocations.qualification_total_peak = state.resident_mode
+        ? 8904u : 10904u;
+    out->allocations.qualification_total_bound_bytes = state.resident_mode
+        ? UINT64_C(45056) : UINT64_C(8589979648);
     out->allocations.external_sample.host_library_unattributed_bytes = 100u;
     out->allocations.external_sample.cuda_library_unattributed_bytes = 200u;
     out->allocations.external_sample.unrelated_process_inventory_stable = true;
@@ -512,6 +661,10 @@ static ds4_runtime_status fake_engine_laguna_external_checkpoint(
         fail_contract("external checkpoint did not use the captured pre-child inventory and trusted build identity");
     }
     if (!out) {
+        return DS4_RUNTIME_STATUS_UNSAFE;
+    }
+    if (state.inject_checkpoint_failure && state.checkpoint_count == 2) {
+        state.checkpoint_failed = true;
         return DS4_RUNTIME_STATUS_UNSAFE;
     }
     memset(out, 0, sizeof(*out));
@@ -579,8 +732,13 @@ static bool is_exact_rendered_sequence_input(const char *text) {
     /* The tokenizer API takes a C string. strcmp checks both the complete
      * already-rendered payload and its terminating NUL without reading a fixed
      * length from an arbitrary caller buffer. */
-    return text != NULL &&
-           literal_sequence_input[sizeof(literal_input) - 1u] == 0x7fu &&
+    if (!text) return false;
+    if (state.resident_mode) {
+        return resident_sequence_input[sizeof(resident_literal_input) - 1u] == 0x7fu &&
+               text != (const char *)resident_sequence_input &&
+               strcmp(text, (const char *)resident_literal_input) == 0;
+    }
+    return literal_sequence_input[sizeof(literal_input) - 1u] == 0x7fu &&
            text != (const char *)literal_sequence_input &&
            strcmp(text, (const char *)literal_input) == 0;
 }
@@ -903,6 +1061,110 @@ static bool fake_request_finish(
     return true;
 }
 
+static bool fake_validate_emission(
+        bool resident,
+        const ds4_bench_sequence *sequence,
+        const ds4_bench_resident_sequence *resident_sequence,
+        ds4_bench_qualification_event event,
+        const char *request_id,
+        uint32_t repetition_index,
+        uint64_t monotonic_ns,
+        uint64_t session_payload_bytes,
+        const ds4_runtime_wire_snapshot *runtime_snapshot,
+        const ds4_runtime_request_metrics *metrics,
+        char *error,
+        size_t error_size) {
+    const int emission_count = resident ? state.resident_emit_count : state.emit_count;
+    const int event_index = emission_count - 1;
+    const ds4_bench_qualification_event expected_event =
+        (ds4_bench_qualification_event)(event_index % 3);
+    const int expected_repetition = event_index / 3;
+    char expected_request[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
+    expected_request_id(expected_repetition, expected_request,
+                        sizeof(expected_request));
+    ds4_session *current_session =
+        expected_repetition >= 0 && expected_repetition < state.session_create_count
+            ? state.sessions[expected_repetition] : NULL;
+    const bool sequence_pointer_valid = resident
+        ? resident_sequence != NULL &&
+          resident_sequence == state.trusted_resident_sequence &&
+          sequence == &resident_sequence->sequence
+        : resident_sequence == NULL && sequence == state.trusted_sequence;
+    if (emission_count > 12 || monotonic_ns == 0u ||
+        monotonic_ns <= state.last_emitted_monotonic_ns ||
+        (current_session != NULL &&
+         session_payload_bytes != fake_session_payload_bytes(current_session)) ||
+        current_session == NULL || !sequence_pointer_valid ||
+        event != expected_event ||
+        !check_repetition((int)repetition_index, expected_repetition,
+                          resident ? "resident emitter" : "emitter") ||
+        !request_id || strcmp(request_id, expected_request) != 0 ||
+        !runtime_snapshot ||
+        strcmp(runtime_snapshot->instance_id, literal_instance_id) != 0 ||
+        runtime_snapshot->snapshot_seq !=
+            UINT64_C(99) + (uint64_t)emission_count +
+                (uint64_t)(emission_count / 3)) {
+        fail_contract(resident
+            ? "resident emitter did not receive the exact ordered typed lifecycle record"
+            : "emitter did not receive the exact ordered lifecycle record");
+    }
+    if (resident && (!runtime_snapshot ||
+        runtime_snapshot->configured_ssd_streaming ||
+        runtime_snapshot->configured_ssd_streaming_cache_bytes != 0u ||
+        runtime_snapshot->expert_cache_limit_bytes != 0u ||
+        runtime_snapshot->configured_prefill_rows != 4096u ||
+        runtime_snapshot->allocated_prefill_rows != 4096u ||
+        runtime_snapshot->allocations.category_current[
+            DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] != 0u ||
+        runtime_snapshot->allocations.category_peak[
+            DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] != 0u ||
+        runtime_snapshot->allocations.category_bounds[
+            DS4_RUNTIME_CATEGORY_EXPERT_CACHE_PAYLOAD] != 0u ||
+        runtime_snapshot->allocations.category_current[
+            DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS] == 0u ||
+        runtime_snapshot->allocations.category_current[
+            DS4_RUNTIME_CATEGORY_KV_STATE] == 0u ||
+        runtime_snapshot->allocations.category_current[
+            DS4_RUNTIME_CATEGORY_GRAPH_SCRATCH] == 0u ||
+        runtime_snapshot->allocations.report_current[
+            DS4_RUNTIME_REPORT_MODEL_SOURCE_RESIDENT] == 0u ||
+        runtime_snapshot->allocations.report_current[
+            DS4_RUNTIME_REPORT_HOST_LIBRARY_UNATTRIBUTED] == 0u ||
+        runtime_snapshot->allocations.report_current[
+            DS4_RUNTIME_REPORT_CUDA_LIBRARY_UNATTRIBUTED] == 0u ||
+        !runtime_snapshot->allocations.external_sample
+             .unrelated_process_inventory_stable)) {
+        fail_contract("resident snapshot did not preserve truthful physical evidence");
+    }
+    if (monotonic_ns > state.last_emitted_monotonic_ns) {
+        state.last_emitted_monotonic_ns = monotonic_ns;
+    }
+    if (event != DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE &&
+        metrics != NULL) {
+        fail_contract("accepted/first-token record unexpectedly carried metrics");
+    }
+    if (event == DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE) {
+        if (!metrics || !runtime_snapshot ||
+            metrics->terminal_status != DS4_RUNTIME_REQUEST_COMPLETED ||
+            strcmp(metrics->request_id, expected_request) != 0 ||
+            strcmp(metrics->instance_id, literal_instance_id) != 0 ||
+            metrics->snapshot_seq == UINT64_MAX ||
+            metrics->snapshot_seq + 1u != runtime_snapshot->snapshot_seq ||
+            metrics->prompt_tokens != literal_prompt_tokens ||
+            metrics->generated_tokens != 1u) {
+            fail_contract("completion metrics did not match the enclosing runtime snapshot");
+        }
+    }
+    if (state.inject_emitter_failure && !state.emitter_failed) {
+        state.emitter_failed = true;
+        if (error && error_size != 0u) {
+            snprintf(error, error_size, "injected fake emitter failure");
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool fake_emit_record(
         FILE *stream,
         const ds4_bench_qualification_record *record,
@@ -920,69 +1182,59 @@ static bool fake_emit_record(
         call->value = record && record->runtime_snapshot ?
             record->runtime_snapshot->snapshot_seq : 0u;
     }
-    const int event_index = state.emit_count - 1;
-    const ds4_bench_qualification_event expected_event =
-        (ds4_bench_qualification_event)(event_index % 3);
-    const int expected_repetition = event_index / 3;
-    char expected_request[DS4_RUNTIME_INSTANCE_ID_CAPACITY];
-    expected_request_id(expected_repetition, expected_request,
-                        sizeof(expected_request));
-    ds4_session *current_session =
-        expected_repetition >= 0 && expected_repetition < state.session_create_count ?
-        state.sessions[expected_repetition] : NULL;
-    if (!record || state.emit_count > 12 ||
-        record->monotonic_ns == 0u ||
-        record->monotonic_ns <= state.last_emitted_monotonic_ns ||
-        (current_session != NULL &&
-         record->session_payload_bytes != fake_session_payload_bytes(current_session)) ||
-        current_session == NULL ||
-        record->sequence != state.trusted_sequence ||
-        record->event != expected_event ||
-        !check_repetition((int)record->repetition_index, expected_repetition,
-                          "emitter") ||
-        !record->request_id || strcmp(record->request_id, expected_request) != 0 ||
-        !record->runtime_snapshot ||
-        strcmp(record->runtime_snapshot->instance_id, literal_instance_id) != 0 ||
-        record->runtime_snapshot->snapshot_seq !=
-            UINT64_C(99) + (uint64_t)state.emit_count +
-                (uint64_t)(state.emit_count / 3)) {
-        fail_contract("emitter did not receive the exact ordered lifecycle record");
+    return fake_validate_emission(
+        false,
+        record ? record->sequence : NULL,
+        NULL,
+        record ? record->event : DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED,
+        record ? record->request_id : NULL,
+        record ? record->repetition_index : 0u,
+        record ? record->monotonic_ns : 0u,
+        record ? record->session_payload_bytes : 0u,
+        record ? record->runtime_snapshot : NULL,
+        record ? record->request_metrics : NULL,
+        error,
+        error_size);
+}
+
+static bool fake_emit_resident_record(
+        FILE *stream,
+        const ds4_bench_resident_qualification_record *record,
+        char *error,
+        size_t error_size) {
+    (void)stream;
+    const int repetition = record ? (int)record->repetition_index : -1;
+    record_call(CALL_RESIDENT_EMIT, repetition);
+    state.resident_emit_count++;
+    if (state.call_count != 0u) {
+        call_record *call = &state.calls[state.call_count - 1u];
+        call->sequence = record && record->sequence
+            ? &record->sequence->sequence : NULL;
+        call->resident_sequence = record ? record->sequence : NULL;
+        call->event = record ? record->event : DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED;
+        call->metrics = record ? record->request_metrics : NULL;
+        call->value = record && record->runtime_snapshot ?
+            record->runtime_snapshot->snapshot_seq : 0u;
     }
-    if (record && record->monotonic_ns > state.last_emitted_monotonic_ns) {
-        state.last_emitted_monotonic_ns = record->monotonic_ns;
-    }
-    if (record && record->event != DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE &&
-        record->request_metrics != NULL) {
-        fail_contract("accepted/first-token record unexpectedly carried metrics");
-    }
-    if (record && record->event == DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE) {
-        const ds4_runtime_request_metrics *metrics = record->request_metrics;
-        if (!metrics || metrics->terminal_status != DS4_RUNTIME_REQUEST_COMPLETED ||
-            strcmp(metrics->request_id, expected_request) != 0 ||
-            strcmp(metrics->instance_id, literal_instance_id) != 0 ||
-            metrics->snapshot_seq == UINT64_MAX ||
-            metrics->snapshot_seq + 1u != record->runtime_snapshot->snapshot_seq ||
-            metrics->prompt_tokens != literal_prompt_tokens ||
-            metrics->generated_tokens != 1u) {
-            fail_contract("completion metrics did not match the enclosing runtime snapshot");
-        }
-    }
-    if (state.inject_emitter_failure && !state.emitter_failed) {
-        state.emitter_failed = true;
-        if (error && error_size != 0u) {
-            snprintf(error, error_size, "injected fake emitter failure");
-        }
-        return false;
-    }
-    return true;
+    return fake_validate_emission(
+        true,
+        record && record->sequence ? &record->sequence->sequence : NULL,
+        record ? record->sequence : NULL,
+        record ? record->event : DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED,
+        record ? record->request_id : NULL,
+        record ? record->repetition_index : 0u,
+        record ? record->monotonic_ns : 0u,
+        record ? record->session_payload_bytes : 0u,
+        record ? record->runtime_snapshot : NULL,
+        record ? record->request_metrics : NULL,
+        error,
+        error_size);
 }
 
 #ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
-/* Compose the existing structural observer with the linked production emitter.
+/* Compose each structural observer with its linked typed production emitter.
  * The runner's exact record, stream, and error arguments pass through without
- * reconstruction.  Keeping the observer first preserves pointer/order/
- * lifetime checks while the literal fake snapshots satisfy the production
- * emitter ABI at the real emitter boundary. */
+ * reconstruction.  The literal fake snapshots satisfy the production ABI. */
 static bool lifecycle_real_emit_record(
         FILE *stream,
         const ds4_bench_qualification_record *record,
@@ -990,6 +1242,16 @@ static bool lifecycle_real_emit_record(
         size_t error_size) {
     if (!fake_emit_record(stream, record, error, error_size)) return false;
     return ds4_bench_qualification_emit_record(
+        stream, record, error, error_size);
+}
+
+static bool lifecycle_real_resident_emit_record(
+        FILE *stream,
+        const ds4_bench_resident_qualification_record *record,
+        char *error,
+        size_t error_size) {
+    if (!fake_emit_resident_record(stream, record, error, error_size)) return false;
+    return ds4_bench_resident_qualification_emit_record(
         stream, record, error, error_size);
 }
 #endif
@@ -1001,6 +1263,8 @@ static bool lifecycle_real_emit_record(
 #define DS4_BENCH_QUALIFICATION_TEST_BACKEND 1
 #define ds4_bench_sequence_parse_file_trusted fake_sequence_parse_file_trusted
 #define ds4_bench_sequence_free fake_sequence_free
+#define ds4_bench_resident_sequence_parse_file_trusted fake_resident_sequence_parse_file_trusted
+#define ds4_bench_resident_sequence_free fake_resident_sequence_free
 #define ds4_engine_open fake_engine_open
 #define ds4_engine_create_with_gpu_config fake_engine_create_with_gpu_config
 #define ds4_engine_close fake_engine_close
@@ -1044,8 +1308,10 @@ static bool lifecycle_real_emit_record(
 #define ds4_runtime_request_finish fake_request_finish
 #ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
 #define ds4_bench_qualification_emit_record lifecycle_real_emit_record
+#define ds4_bench_resident_qualification_emit_record lifecycle_real_resident_emit_record
 #else
 #define ds4_bench_qualification_emit_record fake_emit_record
+#define ds4_bench_resident_qualification_emit_record fake_emit_resident_record
 #endif
 #include "../ds4_bench.c"
 #undef main
@@ -1076,37 +1342,72 @@ static void require_call_order(int before, int after, const char *message) {
     }
 }
 
-static void check_lifecycle_shape(void) {
+static void check_lifecycle_shape(bool resident) {
+    const enum call_kind emit_kind = resident ? CALL_RESIDENT_EMIT : CALL_EMIT;
+    const enum call_kind parse_kind = resident
+        ? CALL_RESIDENT_SEQUENCE_PARSE : CALL_SEQUENCE_PARSE;
+    const enum call_kind sequence_free_kind = resident
+        ? CALL_RESIDENT_SEQUENCE_FREE : CALL_SEQUENCE_FREE;
+    const enum call_kind other_parse_kind = resident
+        ? CALL_SEQUENCE_PARSE : CALL_RESIDENT_SEQUENCE_PARSE;
+    const int emission_count = resident ? state.resident_emit_count : state.emit_count;
     int event_count = 0;
     for (size_t i = 0; i < state.call_count; i++) {
-        if (state.calls[i].kind != CALL_EMIT) continue;
+        if (state.calls[i].kind != emit_kind) continue;
         if (event_count >= 12) {
-            fail_contract("more than twelve lifecycle emissions occurred");
+            fail_contract(resident
+                ? "more than twelve resident lifecycle emissions occurred"
+                : "more than twelve lifecycle emissions occurred");
             break;
         }
         if (state.calls[i].event !=
                 (ds4_bench_qualification_event)(event_count % 3) ||
             state.calls[i].repetition != event_count / 3) {
-            fail_contract("milestones were not emitted as accepted, first-token, complete per repetition");
+            fail_contract(resident
+                ? "resident milestones were not emitted as accepted, first-token, complete per repetition"
+                : "milestones were not emitted as accepted, first-token, complete per repetition");
+        }
+        if (resident && (state.calls[i].resident_sequence == NULL ||
+                         state.calls[i].resident_sequence !=
+                             state.trusted_resident_sequence)) {
+            fail_contract("resident milestones did not retain the typed sequence owner");
+        }
+        if (!resident && state.calls[i].resident_sequence != NULL) {
+            fail_contract("streamed milestone unexpectedly carried resident sequence metadata");
         }
         event_count++;
     }
-    if (event_count != 12) fail_contract("expected exactly twelve lifecycle emissions");
+    if (event_count != 12 || emission_count != 12) {
+        fail_contract(resident
+            ? "expected exactly twelve resident lifecycle emissions"
+            : "expected exactly twelve lifecycle emissions");
+    }
+    if (state.resident_mode != resident) {
+        fail_contract("fake lifecycle mode did not match the requested typed path");
+    }
     if (state.engine_open_count != 1 || state.engine_close_count != 1) {
         fail_contract("expected exactly one engine open and close");
     }
-    if (state.sequence_free_count != 1) {
-        fail_contract("expected exactly one trusted sequence cleanup");
+    if (state.sequence_free_count != (resident ? 0 : 1) ||
+        state.resident_sequence_free_count != (resident ? 1 : 0)) {
+        fail_contract("expected exactly one cleanup of the selected typed sequence owner");
+    }
+    if (first_call(parse_kind, -1) < 0 || first_call(other_parse_kind, -1) >= 0) {
+        fail_contract("lifecycle did not use only the parser for its explicit mode");
     }
     if (state.nvml_capture_count != 1 || state.tokenize_rendered_count != 1) {
         fail_contract("expected one pre-engine NVML capture and one rendered-input tokenization");
     }
+    const int parse = first_call(parse_kind, -1);
     const int engine_open = first_call(CALL_ENGINE_OPEN, -1);
     const int nvml_capture = first_call(CALL_NVML_CAPTURE, -1);
     const int rendered_tokenize = first_call(CALL_TOKENIZE_RENDERED, -1);
     const int first_session = first_call(CALL_SESSION_CREATE, -1);
     const int engine_close = first_call(CALL_ENGINE_CLOSE, -1);
     const int last_free = nth_call(CALL_SESSION_FREE, -1, 3);
+    const int sequence_free = first_call(sequence_free_kind, -1);
+    require_call_order(parse, nvml_capture,
+                       "typed sequence parse must precede pre-child NVML capture");
     require_call_order(nvml_capture, engine_open,
                        "pre-child NVML capture must precede engine open");
     require_call_order(engine_open, rendered_tokenize,
@@ -1117,6 +1418,8 @@ static void check_lifecycle_shape(void) {
                        "engine must open before the first qualification session");
     require_call_order(last_free, engine_close,
                        "engine must remain open until the last qualification session is freed");
+    require_call_order(engine_close, sequence_free,
+                       "typed sequence cleanup must occur after engine close");
     if (state.session_create_count != 4 || state.session_free_count != 4) {
         fail_contract("expected four fresh sessions and four frees");
     }
@@ -1137,7 +1440,7 @@ static void check_lifecycle_shape(void) {
         const int prompt = nth_call(CALL_REQUEST_PROMPT, repetition, 0);
         const int accepted_checkpoint = nth_call(CALL_EXTERNAL_CHECKPOINT, -1, repetition * 3);
         const int accepted_snapshot = nth_call(CALL_RUNTIME_SNAPSHOT, -1, repetition * 3);
-        const int accepted = nth_call(CALL_EMIT, repetition, 0);
+        const int accepted = nth_call(emit_kind, repetition, 0);
         const int prefill_start = nth_call(CALL_PREFILL_START, repetition, 0);
         const int sync = nth_call(CALL_SESSION_SYNC_ATTRIBUTED, repetition, 0);
         const int prefill_complete = nth_call(CALL_PREFILL_COMPLETE, repetition, 0);
@@ -1148,14 +1451,13 @@ static void check_lifecycle_shape(void) {
         const int first_visible = nth_call(CALL_FIRST_VISIBLE, repetition, 0);
         const int first_checkpoint = nth_call(CALL_EXTERNAL_CHECKPOINT, -1, repetition * 3 + 1);
         const int first_snapshot = nth_call(CALL_RUNTIME_SNAPSHOT, -1, repetition * 3 + 1);
-        const int first = nth_call(CALL_EMIT, repetition, 1);
+        const int first = nth_call(emit_kind, repetition, 1);
         const int barrier = nth_call(CALL_REQUEST_BARRIER, repetition, 0);
         const int finish = nth_call(CALL_REQUEST_FINISH, repetition, 0);
         const int complete_checkpoint = nth_call(CALL_EXTERNAL_CHECKPOINT, -1, repetition * 3 + 2);
         const int complete_snapshot = nth_call(CALL_RUNTIME_SNAPSHOT, -1, repetition * 3 + 2);
-        const int complete = nth_call(CALL_EMIT, repetition, 2);
+        const int complete = nth_call(emit_kind, repetition, 2);
         const int free = nth_call(CALL_SESSION_FREE, repetition, 0);
-        const int sequence_free = nth_call(CALL_SEQUENCE_FREE, -1, 0);
         require_call_order(request, prompt, "request prompt binding must follow request begin");
         require_call_order(prompt, accepted_checkpoint, "accepted checkpoint must follow request binding");
         require_call_order(accepted_checkpoint, accepted_snapshot, "accepted checkpoint must precede its runtime snapshot");
@@ -1191,7 +1493,7 @@ static void check_lifecycle_shape(void) {
         require_call_order(complete, free, "session free must follow completion emission");
         if (repetition == 3) {
             require_call_order(complete, sequence_free,
-                               "final completion event must precede trusted sequence cleanup");
+                               "final completion event must precede typed sequence cleanup");
         }
         if (repetition > 0) {
             const int previous_free = nth_call(CALL_SESSION_FREE, repetition - 1, 0);
@@ -1215,6 +1517,7 @@ static void check_lifecycle_shape(void) {
 static void reset_fake_state(bool inject_emitter_failure) {
     memset(&state, 0, sizeof(state));
     literal_sequence_input[sizeof(literal_input) - 1u] = 0x7fu;
+    resident_sequence_input[sizeof(resident_literal_input) - 1u] = 0x7fu;
     state.inject_emitter_failure = inject_emitter_failure;
 }
 
@@ -1224,6 +1527,50 @@ static int invoke_bench(void) {
         (char *)"--qualification-sequence", (char *)"/literal/sequence.txt",
         (char *)"--qualification-manifest-sha256", (char *)literal_manifest_sha256,
         (char *)"--qualification-sequence-sha256", (char *)literal_sequence_sha256,
+        (char *)"--model", (char *)"/literal/fake.gguf",
+        (char *)"--backend", (char *)"cuda",
+        (char *)"--qualification-control-fd", (char *)"9",
+        NULL,
+    };
+    return ds4_bench_test_cli_main((int)(ARRAY_LEN(argv) - 1u), argv);
+}
+
+static int invoke_bench_resident(void) {
+    char *argv[] = {
+        (char *)"ds4-bench",
+        (char *)"--qualification-resident-sequence",
+        (char *)"/literal/resident-sequence.txt",
+        (char *)"--qualification-manifest-sha256", (char *)resident_manifest_sha256,
+        (char *)"--qualification-sequence-sha256", (char *)resident_sequence_sha256,
+        (char *)"--model", (char *)"/literal/fake.gguf",
+        (char *)"--backend", (char *)"cuda",
+        (char *)"--qualification-control-fd", (char *)"9",
+        NULL,
+    };
+    return ds4_bench_test_cli_main((int)(ARRAY_LEN(argv) - 1u), argv);
+}
+
+static int invoke_bench_resident_streamed_fixture(void) {
+    char *argv[] = {
+        (char *)"ds4-bench",
+        (char *)"--qualification-resident-sequence",
+        (char *)"/literal/sequence.txt",
+        (char *)"--qualification-manifest-sha256", (char *)literal_manifest_sha256,
+        (char *)"--qualification-sequence-sha256", (char *)literal_sequence_sha256,
+        (char *)"--model", (char *)"/literal/fake.gguf",
+        (char *)"--backend", (char *)"cuda",
+        (char *)"--qualification-control-fd", (char *)"9",
+        NULL,
+    };
+    return ds4_bench_test_cli_main((int)(ARRAY_LEN(argv) - 1u), argv);
+}
+
+static int invoke_bench_streamed_resident_fixture(void) {
+    char *argv[] = {
+        (char *)"ds4-bench",
+        (char *)"--qualification-sequence", (char *)"/literal/resident-sequence.txt",
+        (char *)"--qualification-manifest-sha256", (char *)resident_manifest_sha256,
+        (char *)"--qualification-sequence-sha256", (char *)resident_sequence_sha256,
         (char *)"--model", (char *)"/literal/fake.gguf",
         (char *)"--backend", (char *)"cuda",
         (char *)"--qualification-control-fd", (char *)"9",
@@ -1245,7 +1592,7 @@ static void check_happy_path(void) {
          * run all strict assertions once the runner exists. */
         fail_contract("happy-path fake lifecycle emitted no milestones");
     }
-    check_lifecycle_shape();
+    check_lifecycle_shape(false);
     all_failures += state.contract_failures;
 }
 
@@ -1292,35 +1639,178 @@ static void check_fail_closed_cleanup(void) {
     all_failures += state.contract_failures;
 }
 
-#ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
-int main(void) {
-    /* The composition target exercises only the successful four-repetition
-     * lifecycle.  The linked emitter owns stdout; this harness emits no PASS
-     * text and never runs the injected-failure case. */
+static void check_resident_cross_mode(void) {
     reset_fake_state(false);
-    const int rc = invoke_bench();
-    if (state.contract_failures != 0) {
-        fprintf(stderr,
-                "qualification lifecycle real-emitter composition fake assertions failed: %d\n",
-                state.contract_failures);
-        return 1;
+    state.reject_resident_cross_mode = true;
+    const int resident_rc = invoke_bench_resident_streamed_fixture();
+    if (resident_rc == 0) fail_contract("resident flag accepted a streamed fixture");
+    if (first_call(CALL_RESIDENT_SEQUENCE_PARSE, -1) < 0 ||
+        state.resident_sequence_free_count != 1 ||
+        state.nvml_capture_count != 0 || state.engine_open_count != 0 ||
+        state.session_create_count != 0 || state.resident_emit_count != 0) {
+        fail_contract("resident cross-mode rejection did not stop before backend work");
     }
-    if (rc != 0) return rc;
-    check_lifecycle_shape();
-    if (state.contract_failures != 0) {
+    all_failures += state.contract_failures;
+
+    reset_fake_state(false);
+    state.reject_streamed_cross_mode = true;
+    const int streamed_rc = invoke_bench_streamed_resident_fixture();
+    if (streamed_rc == 0) fail_contract("streamed flag accepted a resident fixture");
+    if (first_call(CALL_SEQUENCE_PARSE, -1) < 0 ||
+        state.sequence_free_count != 1 || state.nvml_capture_count != 0 ||
+        state.engine_open_count != 0 || state.session_create_count != 0 ||
+        state.emit_count != 0) {
+        fail_contract("streamed cross-mode rejection did not stop before backend work");
+    }
+    all_failures += state.contract_failures;
+}
+
+static void check_resident_parser_failure(void) {
+    reset_fake_state(false);
+    state.inject_resident_parser_failure = true;
+    const int rc = invoke_bench_resident();
+    if (rc == 0) fail_contract("resident parser failure unexpectedly returned success");
+    if (first_call(CALL_RESIDENT_SEQUENCE_PARSE, -1) < 0 ||
+        state.resident_sequence_free_count != 1 ||
+        state.sequence_free_count != 0 || state.nvml_capture_count != 0 ||
+        state.engine_open_count != 0 || state.session_create_count != 0 ||
+        state.resident_emit_count != 0) {
+        fail_contract("resident parser failure performed backend work or missed typed cleanup");
+    }
+    const int parse = first_call(CALL_RESIDENT_SEQUENCE_PARSE, -1);
+    const int sequence_free = first_call(CALL_RESIDENT_SEQUENCE_FREE, -1);
+    require_call_order(parse, sequence_free,
+                       "resident parser failure must precede resident sequence cleanup");
+    for (size_t i = sequence_free >= 0 ? (size_t)sequence_free + 1u : 0u;
+         i < state.call_count; i++) {
+        fail_contract("resident parser failure allowed work after typed cleanup");
+    }
+    all_failures += state.contract_failures;
+}
+
+static void check_resident_emitter_failure(void) {
+    reset_fake_state(true);
+    const int rc = invoke_bench_resident();
+    if (rc == 0) fail_contract("resident emitter failure unexpectedly returned success");
+    if (!state.emitter_failed || state.resident_emit_count != 1 ||
+        state.emit_count != 0 || state.session_create_count != 1 ||
+        state.session_free_count != 1 || state.engine_open_count != 1 ||
+        state.engine_close_count != 1 || state.resident_sequence_free_count != 1 ||
+        state.sequence_free_count != 0) {
+        fail_contract("resident emitter failure did not stop and clean the current typed run");
+    }
+    const int failed_emit = first_call(CALL_RESIDENT_EMIT, -1);
+    const int sequence_free = first_call(CALL_RESIDENT_SEQUENCE_FREE, -1);
+    require_call_order(failed_emit, sequence_free,
+                       "resident emitter failure must precede resident sequence cleanup");
+    for (size_t i = failed_emit >= 0 ? (size_t)failed_emit + 1u : 0u;
+         i < state.call_count; i++) {
+        const enum call_kind kind = state.calls[i].kind;
+        if (kind != CALL_SESSION_FREE && kind != CALL_ENGINE_CLOSE &&
+            kind != CALL_RESIDENT_SEQUENCE_FREE) {
+            fail_contract("resident emitter failure allowed lifecycle work after abort");
+        }
+    }
+    all_failures += state.contract_failures;
+}
+
+static void check_resident_midrun_failure(bool snapshot_failure) {
+    reset_fake_state(false);
+    state.inject_snapshot_failure = snapshot_failure;
+    state.inject_checkpoint_failure = !snapshot_failure;
+    const int rc = invoke_bench_resident();
+    if (rc == 0) fail_contract("resident mid-run failure unexpectedly returned success");
+    if (snapshot_failure && !state.snapshot_failed) {
+        fail_contract("resident snapshot failure was not injected");
+    }
+    if (!snapshot_failure && !state.checkpoint_failed) {
+        fail_contract("resident checkpoint failure was not injected");
+    }
+    if (state.resident_emit_count != 1 || state.emit_count != 0 ||
+        state.session_create_count != 1 || state.session_free_count != 1 ||
+        state.engine_open_count != 1 || state.engine_close_count != 1 ||
+        state.resident_sequence_free_count != 1 || state.sequence_free_count != 0 ||
+        state.barrier_count != 0 || state.finish_count != 0) {
+        fail_contract("resident mid-run failure did not clean the current typed run");
+    }
+    if (snapshot_failure) {
+        if (state.checkpoint_count != 2 || state.snapshot_count != 2) {
+            fail_contract("resident snapshot failure did not stop at the second snapshot");
+        }
+    } else if (state.checkpoint_count != 2 || state.snapshot_count != 1) {
+        fail_contract("resident checkpoint failure did not stop before the second snapshot");
+    }
+    const enum call_kind failed_kind = snapshot_failure
+        ? CALL_RUNTIME_SNAPSHOT : CALL_EXTERNAL_CHECKPOINT;
+    const int failed_call = nth_call(failed_kind, -1, 1);
+    const int sequence_free = first_call(CALL_RESIDENT_SEQUENCE_FREE, -1);
+    require_call_order(failed_call, sequence_free,
+                       "resident mid-run failure must precede resident sequence cleanup");
+    for (size_t i = failed_call >= 0 ? (size_t)failed_call + 1u : 0u;
+         i < state.call_count; i++) {
+        const enum call_kind kind = state.calls[i].kind;
+        if (kind != CALL_SESSION_FREE && kind != CALL_ENGINE_CLOSE &&
+            kind != CALL_RESIDENT_SEQUENCE_FREE) {
+            fail_contract("resident mid-run failure allowed subsequent lifecycle work");
+        }
+    }
+    all_failures += state.contract_failures;
+}
+
+static void check_resident_happy_path(void) {
+    reset_fake_state(false);
+    const int rc = invoke_bench_resident();
+    if (rc != 0) {
         fprintf(stderr,
-                "qualification lifecycle real-emitter composition fake assertions failed: %d\n",
+                "RED: resident qualification sequence has no typed lifecycle runner "
+                "(valid fake resident sequence returned %d before engine/lifecycle calls)\n", rc);
+    }
+    if (state.resident_emit_count == 0 && rc != 0) {
+        fail_contract("resident happy-path fake lifecycle emitted no milestones");
+    }
+    check_lifecycle_shape(true);
+    all_failures += state.contract_failures;
+}
+
+#ifdef DS4_BENCH_LIFECYCLE_REAL_EMITTER
+int main(int argc, char **argv) {
+    /* Keep the established streamed stdout contract. The separate resident
+     * target selects its typed contract explicitly, never from wire data. */
+    const bool resident = argc == 2 && strcmp(argv[1], "--resident") == 0;
+    if (argc != 1 && !resident) return 2;
+    reset_fake_state(false);
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    if (state.contract_failures != 0 || rc != 0) return rc != 0 ? rc : 1;
+    check_lifecycle_shape(resident);
+    if (state.contract_failures != 0) {
+        fprintf(stderr, "qualification real-emitter composition: %d failures\n",
                 state.contract_failures);
         return 1;
     }
     return 0;
 }
 #else
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        if (strcmp(argv[1], "--probe-argv-rejection") != 0) return 2;
+        reset_fake_state(false);
+        const int rc = ds4_bench_test_cli_main(argc - 1, argv + 1);
+        if (state.call_count != 0u) {
+            fprintf(stderr, "argument rejection reached parser/backend\n");
+            return 91;
+        }
+        return rc;
+    }
     check_happy_path();
     check_fail_closed_cleanup();
+    check_resident_cross_mode();
+    check_resident_parser_failure();
+    check_resident_emitter_failure();
+    check_resident_midrun_failure(true);
+    check_resident_midrun_failure(false);
+    check_resident_happy_path();
     if (all_failures != 0) {
-        fprintf(stderr, "qualification lifecycle fake RED assertions failed: %d\n",
+        fprintf(stderr, "qualification lifecycle fake backend: %d failures\n",
                 all_failures);
         return 1;
     }

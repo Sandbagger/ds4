@@ -80,6 +80,7 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool qualification_plan_path_set;
     bool qualification_sequence_path_set;
+    bool qualification_resident_sequence;
     bool qualification_manifest_sha256_set;
     bool qualification_sequence_sha256_set;
     bool qualification_control_fd_set;
@@ -224,6 +225,38 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+/* Resident qualification has no benchmark override surface. Check the raw
+ * grammar as well as values: an ignored or matching override must not look
+ * like a distinct benchmark configuration. The streamed CLI is unchanged. */
+static bool resident_qualification_args_fixed(int argc, char **argv) {
+    unsigned model_selectors = 0u;
+    unsigned backend_selectors = 0u;
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!arg) return false;
+        if (!strcmp(arg, "--cuda")) {
+            if (++backend_selectors > 1u) return false;
+            continue;
+        }
+        const bool takes_value =
+            !strcmp(arg, "-m") || !strcmp(arg, "--model") ||
+            !strcmp(arg, "--qualification-resident-sequence") ||
+            !strcmp(arg, "--qualification-manifest-sha256") ||
+            !strcmp(arg, "--qualification-sequence-sha256") ||
+            !strcmp(arg, "--qualification-control-fd") ||
+            !strcmp(arg, "--backend");
+        if (!takes_value || i + 1 >= argc || !argv[i + 1]) return false;
+        if ((!strcmp(arg, "-m") || !strcmp(arg, "--model")) &&
+            ++model_selectors > 1u) return false;
+        if (!strcmp(arg, "--backend") &&
+            (++backend_selectors > 1u || strcmp(argv[i + 1], "cuda"))) {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
         .model_path = "ds4flash.gguf",
@@ -263,20 +296,24 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--qualification-sequence")) {
+        } else if (!strcmp(arg, "--qualification-sequence") ||
+                   !strcmp(arg, "--qualification-resident-sequence")) {
             if (c.qualification_sequence_path_set) {
                 fprintf(stderr,
-                        "ds4-bench: --qualification-sequence may only be specified once\n");
+                        "ds4-bench: %s may only be specified once; streamed and "
+                        "resident sequence flags are mutually exclusive\n", arg);
                 exit(2);
             }
             const char *path = need_arg(&i, argc, argv, arg);
             if (path[0] == '\0') {
                 fprintf(stderr,
-                        "ds4-bench: --qualification-sequence requires a non-empty path\n");
+                        "ds4-bench: %s requires a non-empty path\n", arg);
                 exit(2);
             }
             c.qualification_sequence_path = path;
             c.qualification_sequence_path_set = true;
+            c.qualification_resident_sequence =
+                !strcmp(arg, "--qualification-resident-sequence");
         } else if (!strcmp(arg, "--qualification-manifest-sha256")) {
             if (c.qualification_manifest_sha256_set) {
                 fprintf(stderr,
@@ -465,7 +502,8 @@ static bench_config parse_options(int argc, char **argv) {
             fprintf(stderr,
                     "ds4-bench: qualification sequence requires exactly one complete "
                     "triplet; missing one or more required options (each must occur "
-                    "once): --qualification-sequence, "
+                    "once): --qualification-sequence or "
+                    "--qualification-resident-sequence, "
                     "--qualification-manifest-sha256, and "
                     "--qualification-sequence-sha256\n");
             exit(2);
@@ -480,6 +518,14 @@ static bench_config parse_options(int argc, char **argv) {
             fprintf(stderr,
                     "ds4-bench: qualification sequence cannot be combined with "
                     "--prompt-file or --chat-prompt-file\n");
+            exit(2);
+        }
+        if (c.qualification_resident_sequence &&
+            (c.backend != DS4_BACKEND_CUDA ||
+             !resident_qualification_args_fixed(argc, argv))) {
+            fprintf(stderr,
+                    "ds4-bench: resident qualification requires the fixed CUDA "
+                    "argument set; benchmark and streaming overrides are forbidden\n");
             exit(2);
         }
         /* The sequence is authenticated before backend availability is
@@ -910,14 +956,76 @@ static bool qualification_copy_rendered_prompt(
 /* Execute one authenticated, fixed-shape benchmark sequence.  The caller
  * owns engine, prompt, rendered, and sequence; this runner owns each session
  * only until its repetition reaches a terminal milestone or aborts. */
+/* Mode is selected by the explicit CLI flag and retained as a typed owner.
+ * Neither the schema/profile strings nor a borrowed nested sequence can choose
+ * the emitter. Exactly one source pointer must be present. */
+typedef struct {
+    const ds4_bench_sequence *streamed;
+    const ds4_bench_resident_sequence *resident;
+} qualification_lifecycle_source;
+
+typedef struct {
+    ds4_bench_qualification_event event;
+    const char *request_id;
+    uint32_t repetition_index;
+    uint64_t monotonic_ns;
+    uint64_t session_payload_bytes;
+    const ds4_runtime_wire_snapshot *runtime_snapshot;
+    const ds4_runtime_request_metrics *request_metrics;
+} qualification_lifecycle_record;
+
+static bool qualification_lifecycle_emit(
+        FILE *stream,
+        const qualification_lifecycle_source *source,
+        const qualification_lifecycle_record *progress,
+        char *error, size_t error_size) {
+    if (!source || !progress ||
+        (!!source->streamed == !!source->resident)) {
+        if (error && error_size != 0u) {
+            snprintf(error, error_size, "invalid typed qualification source");
+        }
+        return false;
+    }
+    if (source->resident) {
+        const ds4_bench_resident_qualification_record record = {
+            .sequence = source->resident,
+            .event = progress->event,
+            .request_id = progress->request_id,
+            .repetition_index = progress->repetition_index,
+            .monotonic_ns = progress->monotonic_ns,
+            .session_payload_bytes = progress->session_payload_bytes,
+            .runtime_snapshot = progress->runtime_snapshot,
+            .request_metrics = progress->request_metrics,
+        };
+        return ds4_bench_resident_qualification_emit_record(
+            stream, &record, error, error_size);
+    }
+    const ds4_bench_qualification_record record = {
+        .sequence = source->streamed,
+        .event = progress->event,
+        .request_id = progress->request_id,
+        .repetition_index = progress->repetition_index,
+        .monotonic_ns = progress->monotonic_ns,
+        .session_payload_bytes = progress->session_payload_bytes,
+        .runtime_snapshot = progress->runtime_snapshot,
+        .request_metrics = progress->request_metrics,
+    };
+    return ds4_bench_qualification_emit_record(
+        stream, &record, error, error_size);
+}
+
 static int run_qualification_lifecycle(
         ds4_engine *engine,
-        const ds4_bench_sequence *sequence,
+        const qualification_lifecycle_source *source,
         const ds4_tokens *prompt,
         const ds4_gpu_nvml_inventory_snapshot *pre_child,
         const uint8_t expected_build_identity[
             DS4_RUNTIME_BUILD_IDENTITY_BYTES],
         FILE *stream) {
+    const ds4_bench_sequence *sequence = NULL;
+    if (source && (!!source->streamed != !!source->resident)) {
+        sequence = source->resident ? &source->resident->sequence : source->streamed;
+    }
     if (!engine || !sequence || !prompt || !pre_child ||
         !expected_build_identity || !stream) {
         return qualification_lifecycle_failure(
@@ -984,8 +1092,7 @@ static int run_qualification_lifecycle(
                     "accepted timestamp", "monotonic clock failed");
                 break;
             }
-            ds4_bench_qualification_record record = {
-                .sequence = sequence,
+            qualification_lifecycle_record record = {
                 .event = DS4_BENCH_QUALIFICATION_EVENT_REQUEST_ACCEPTED,
                 .request_id = request.request_id,
                 .repetition_index = repetition_index,
@@ -994,8 +1101,8 @@ static int run_qualification_lifecycle(
                 .runtime_snapshot = &runtime_snapshot,
                 .request_metrics = NULL,
             };
-            if (!ds4_bench_qualification_emit_record(
-                    stream, &record, error, sizeof(error))) {
+            if (!qualification_lifecycle_emit(
+                    stream, source, &record, error, sizeof(error))) {
                 rc = qualification_lifecycle_failure(
                     "request_accepted", error);
                 break;
@@ -1072,8 +1179,7 @@ static int run_qualification_lifecycle(
                     "first-token timestamp", "monotonic clock failed");
                 break;
             }
-            record = (ds4_bench_qualification_record){
-                .sequence = sequence,
+            record = (qualification_lifecycle_record){
                 .event = DS4_BENCH_QUALIFICATION_EVENT_FIRST_TOKEN,
                 .request_id = request.request_id,
                 .repetition_index = repetition_index,
@@ -1082,8 +1188,8 @@ static int run_qualification_lifecycle(
                 .runtime_snapshot = &runtime_snapshot,
                 .request_metrics = NULL,
             };
-            if (!ds4_bench_qualification_emit_record(
-                    stream, &record, error, sizeof(error))) {
+            if (!qualification_lifecycle_emit(
+                    stream, source, &record, error, sizeof(error))) {
                 rc = qualification_lifecycle_failure("first_token", error);
                 break;
             }
@@ -1121,8 +1227,7 @@ static int run_qualification_lifecycle(
                     "completion timestamp", "monotonic clock failed");
                 break;
             }
-            record = (ds4_bench_qualification_record){
-                .sequence = sequence,
+            record = (qualification_lifecycle_record){
                 .event = DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE,
                 .request_id = request.request_id,
                 .repetition_index = repetition_index,
@@ -1131,8 +1236,8 @@ static int run_qualification_lifecycle(
                 .runtime_snapshot = &runtime_snapshot,
                 .request_metrics = &metrics,
             };
-            if (!ds4_bench_qualification_emit_record(
-                    stream, &record, error, sizeof(error))) {
+            if (!qualification_lifecycle_emit(
+                    stream, source, &record, error, sizeof(error))) {
                 rc = qualification_lifecycle_failure("request_complete", error);
                 break;
             }
@@ -1162,22 +1267,43 @@ int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
     if (cfg.qualification_sequence_path_set) {
-        ds4_bench_sequence sequence = {0};
+        const bool resident = cfg.qualification_resident_sequence;
+        ds4_bench_sequence streamed_sequence = {0};
+        ds4_bench_resident_sequence resident_sequence = {0};
         char sequence_error[256] = {0};
-        if (!ds4_bench_sequence_parse_file_trusted(
+        const bool parsed = resident
+            ? ds4_bench_resident_sequence_parse_file_trusted(
                 cfg.qualification_sequence_path,
                 cfg.qualification_manifest_sha256,
                 cfg.qualification_sequence_sha256,
-                &sequence,
-                sequence_error,
-                sizeof(sequence_error))) {
-            ds4_bench_sequence_free(&sequence);
+                &resident_sequence, sequence_error, sizeof(sequence_error))
+            : ds4_bench_sequence_parse_file_trusted(
+                cfg.qualification_sequence_path,
+                cfg.qualification_manifest_sha256,
+                cfg.qualification_sequence_sha256,
+                &streamed_sequence, sequence_error, sizeof(sequence_error));
+        if (!parsed) {
+            if (resident) ds4_bench_resident_sequence_free(&resident_sequence);
+            else ds4_bench_sequence_free(&streamed_sequence);
             fprintf(stderr,
                     "ds4-bench: qualification sequence rejected: %s\n",
                     sequence_error[0] ? sequence_error : "invalid sequence");
             return 2;
         }
 
+#if !defined(DS4_BENCH_QUALIFICATION_TEST_BACKEND)
+        /* The typed lifecycle is ready, but the resident native allocator and
+         * authenticated snapshot producer are not. Refuse before NVML, model
+         * access, or engine startup; do not rely on a later snapshot failure.
+         * Remove this gate only with verified native resident accounting. */
+        if (resident) {
+            ds4_bench_resident_sequence_free(&resident_sequence);
+            fprintf(stderr,
+                    "ds4-bench: resident runtime accounting is not implemented; "
+                    "refusing before GPU/model access\n");
+            return 2;
+        }
+#endif
         ds4_engine *qualification_engine = NULL;
         ds4_tokens qualification_prompt = {0};
         char *qualification_rendered = NULL;
@@ -1221,15 +1347,21 @@ int main(int argc, char **argv) {
             goto qualification_cleanup;
         }
 
+        const ds4_bench_sequence *sequence = resident
+            ? &resident_sequence.sequence : &streamed_sequence;
+        const qualification_lifecycle_source source = {
+            .streamed = resident ? NULL : &streamed_sequence,
+            .resident = resident ? &resident_sequence : NULL,
+        };
         const ds4_engine_options qualification_options = {
             .model_path = cfg.model_path,
             .runtime_build_info = ds4_build_info_get(),
             .backend = DS4_BACKEND_CUDA,
             .context_size = 32768,
             .prefill_chunk = 4096u,
-            .ssd_streaming_cache_bytes = sequence.cache_bytes,
-            .ssd_streaming_cache_bytes_set = true,
-            .ssd_streaming = true,
+            .ssd_streaming_cache_bytes = sequence->cache_bytes,
+            .ssd_streaming_cache_bytes_set = !resident,
+            .ssd_streaming = !resident,
             .placement_ctx_hint = 32768,
             .session_slots = 1u,
             .qualification_control_fd = cfg.qualification_control_fd,
@@ -1242,7 +1374,7 @@ int main(int argc, char **argv) {
             goto qualification_cleanup;
         }
         if (!qualification_copy_rendered_prompt(
-                &sequence, &qualification_rendered,
+                sequence, &qualification_rendered,
                 sequence_error, sizeof(sequence_error))) {
             fprintf(stderr,
                     "ds4-bench: qualification prompt rejected: %s\n",
@@ -1252,17 +1384,17 @@ int main(int argc, char **argv) {
         ds4_tokenize_rendered_chat(
             qualification_engine, qualification_rendered,
             &qualification_prompt);
-        if (sequence.prompt_tokens > (uint32_t)INT_MAX ||
-            qualification_prompt.len != (int)sequence.prompt_tokens) {
+        if (sequence->prompt_tokens > (uint32_t)INT_MAX ||
+            qualification_prompt.len != (int)sequence->prompt_tokens) {
             fprintf(stderr,
                     "ds4-bench: qualification prompt token count %d does not "
                     "match sequence prompt_tokens=%u\n",
                     qualification_prompt.len,
-                    sequence.prompt_tokens);
+                    sequence->prompt_tokens);
             goto qualification_cleanup;
         }
         qualification_rc = run_qualification_lifecycle(
-            qualification_engine, &sequence, &qualification_prompt,
+            qualification_engine, &source, &qualification_prompt,
             &pre_child, expected_build_identity, stdout);
 #else
         fprintf(stderr,
@@ -1277,7 +1409,8 @@ qualification_cleanup:
         }
         ds4_tokens_free(&qualification_prompt);
         free(qualification_rendered);
-        ds4_bench_sequence_free(&sequence);
+        if (resident) ds4_bench_resident_sequence_free(&resident_sequence);
+        else ds4_bench_sequence_free(&streamed_sequence);
         return qualification_rc;
     }
 

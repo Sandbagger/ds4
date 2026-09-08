@@ -1709,6 +1709,34 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Resident benchmark lifecycle groundwork (2026-09-08):**
+The explicit `ds4-bench --qualification-resident-sequence` selects the typed
+resident parser and emitter. It shares the existing one-engine/four-fresh-session
+lifecycle without changing the streamed record API or treating schema/profile
+strings as mode authority. All twelve accepted/first-token/completion records
+pass the real resident serializer and separate consumer in a fake-backend host
+composition; streamed composition still emits twelve valid streamed records.
+The shared Task 19 runner still generates one non-EOS token per repetition;
+this is a lifecycle smoke, not the full 512-token throughput workload.
+Parser/emitter/checkpoint/snapshot failures stop and free the current session,
+engine, and selected sequence. Fixed resident argv rejects even matching or
+ignored benchmark/streaming overrides and duplicate model/backend selectors.
+
+`test-laguna-resident-path` is now in `make test`: the lifecycle, both typed
+compositions, six frontend/aggregate test methods, production translation-unit
+compile, and resident plan pass. The real CPU-only frontend verifies an explicit
+production refusal before NVML/model/engine work until native resident
+allocation events and authenticated snapshots exist. The test-backend macro
+is not production readiness. The 27 existing bench/eval tests, trusted parser
+(57 checks), resident parser (193), and resident emitter (1188) also pass on the
+host. No new Linux/NVCC/GPU/model result is claimed for this increment.
+
+Reusable rule: a typed emitter validates/serializes observations; it does not
+create or authenticate them. Keep an unfinished native producer visibly
+unavailable even when fake-backend lifecycle and reservation tests are green.
+Task 20 still requires native ownership accounting, admitted resident execution,
+full schedule composition, gates/retries, and verified atomic publication.
+
 **Resident reservation-plan groundwork (2026-09-08):**
 `ds4_laguna_resident.{h,c}` now defines a separate 32K/4K/one-session
 reservation plan, not a rewritten compact-cache plan. It preserves exact

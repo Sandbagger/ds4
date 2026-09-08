@@ -39,4 +39,11 @@ __pycache__/
 .*.swp
 .DS_Store
 
+# Model-free qualification fixture executables.
 /tests/test_laguna_resident_plan
+/tests/test_bench_resident_frontend
+/tests/test_bench_qualification_composition
+/tests/test_bench_qualification_emitter
+/tests/test_bench_qualification_lifecycle
+/tests/test_bench_sequence_trusted
+/tests/test_eval_case_contract

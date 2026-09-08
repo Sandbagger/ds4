@@ -1709,6 +1709,25 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Resident reservation-plan groundwork (2026-09-08):**
+`ds4_laguna_resident.{h,c}` now defines a separate 32K/4K/one-session
+reservation plan, not a rewritten compact-cache plan. It preserves exact
+ledger/KV/graph geometry, admits device/managed/pinned owner envelopes, and
+reserves no compact expert cache. Model mapping and registration remain
+report-only; qualification totals add only owned allocations and measured
+source/host/CUDA external reports. The tracker starts with no observations;
+plan bounds must never populate current or peak measurements.
+
+The missing-header RED preceded implementation. `test-laguna-resident-plan`
+passes 608 host assertions, including real reference-tracker ownership,
+relations, retained peaks, independent invalid inputs and zeroed overflow
+outputs. Independent review found no blocking arithmetic/classification
+issue. Native callers must supply a builder-produced retained-model ledger;
+this helper validates scalar geometry, not model/array provenance. Resident
+native events must explicitly use its aggregate pinned11/device22/managed26
+IDs rather than forwarding absent compact pool/workspace IDs. No allocator
+hook, native resident snapshot, admitted run or GPU qualification is implied.
+
 **Snapshot-buffer repair (2026-09-07):** The recovered
 `test-session-snapshot-buffers` target exercises the production
 `ds4_session_save_snapshot` body with the host libc memory stream and a small

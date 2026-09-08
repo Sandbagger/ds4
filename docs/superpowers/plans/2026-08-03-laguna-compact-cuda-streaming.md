@@ -1709,6 +1709,26 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Bounded qualification decoder (2026-09-08):**
+The shared resident/streamed benchmark runner now executes up to the authenticated
+512-token cap. It uses greedy native argmax and `ds4_token_is_stop`, not the
+ordinary CSV benchmark's EOS-excluding policy. Later native stops complete with
+actual output counts; a stop before any output refuses instead of inventing a
+first-token record. Four fresh sessions still share one engine and twelve
+successful milestone records. Only the first output performs the first-token
+checkpoint; later decode failures stop before barrier/finish/completion.
+
+Root reviewed and corrected fixture oracles before RED (512 is a cap, not EOS
+suppression; a repetition-2/token-257 failure has eight milestones and three
+first-visible marks). RED preceded implementation. The host lifecycle now covers
+four full-length repetitions, EOS and a distinct native stop after three outputs,
+zero-output refusal, late-token failure, and exact typed cleanup. Both real
+emitter compositions, six frontend methods, the resident plan and existing
+27 bench/eval regressions pass. Independent source review found no correctness
+finding. The one-token smoke at `51ddbfa` is superseded, but production resident
+execution remains gated: native owner coverage, authenticated snapshots and
+admitted end-to-end qualification are not established by fake-backend tests.
+
 **Resident benchmark lifecycle groundwork (2026-09-08):**
 The explicit `ds4-bench --qualification-resident-sequence` selects the typed
 resident parser and emitter. It shares the existing one-engine/four-fresh-session
@@ -1716,8 +1736,9 @@ lifecycle without changing the streamed record API or treating schema/profile
 strings as mode authority. All twelve accepted/first-token/completion records
 pass the real resident serializer and separate consumer in a fake-backend host
 composition; streamed composition still emits twelve valid streamed records.
-The shared Task 19 runner still generates one non-EOS token per repetition;
-this is a lifecycle smoke, not the full 512-token throughput workload.
+At this historical `51ddbfa` milestone the shared Task 19 runner generated
+one non-EOS token per repetition; the bounded decoder increment above supersedes
+that smoke-only execution, not its native-accounting evidence limits.
 Parser/emitter/checkpoint/snapshot failures stop and free the current session,
 engine, and selected sequence. Fixed resident argv rejects even matching or
 ignored benchmark/streaming overrides and duplicate model/backend selectors.

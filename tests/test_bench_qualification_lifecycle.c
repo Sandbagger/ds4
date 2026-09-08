@@ -23,6 +23,11 @@
 #include <string.h>
 
 #define ARRAY_LEN(value) (sizeof(value) / sizeof((value)[0]))
+#define QUALIFICATION_OUTPUT_TOKENS 512
+#define LATE_DECODE_FAILURE_REPETITION 2
+#define LATE_DECODE_FAILURE_INDEX 257
+#define SHORT_NATIVE_STOP_REPETITION 2
+#define SHORT_NATIVE_STOP_INDEX 3
 
 /* Keep opaque production handles fake and never dereference them. */
 typedef union {
@@ -53,6 +58,8 @@ static unsigned char resident_sequence_input[] =
 static const uint32_t literal_prompt_tokens = 512u;
 /* Deliberately nonzero: a hard-coded common EOS value must not pass the fake. */
 static const int literal_eos_token = 17;
+/* Distinct model-native stop control; fake generated tokens start at 20. */
+static const int literal_native_stop_token = 19;
 static const uint64_t literal_cache_bytes = UINT64_C(8589934592);
 static const char literal_manifest_sha256[] =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -116,7 +123,9 @@ typedef struct {
 } call_record;
 
 typedef struct {
-    call_record calls[256];
+    /* Four repetitions x 512 tokens x four per-token operations, plus
+     * milestone/ownership calls.  Keep the full timeline, not a sampled log. */
+    call_record calls[16384];
     size_t call_count;
     int contract_failures;
     int engine_open_count;
@@ -143,6 +152,10 @@ typedef struct {
     int resident_emit_count;
     int sequence_free_count;
     int resident_sequence_free_count;
+    int decode_attempt_count[4];
+    int decode_success_count[4];
+    int completed_metrics_count;
+    ds4_runtime_request_metrics completed_metrics[4];
     bool resident_mode;
     bool inject_emitter_failure;
     bool inject_resident_parser_failure;
@@ -150,6 +163,14 @@ typedef struct {
     bool reject_streamed_cross_mode;
     bool inject_snapshot_failure;
     bool inject_checkpoint_failure;
+    bool inject_decode_failure;
+    int decode_failure_repetition;
+    int decode_failure_index;
+    bool inject_native_stop;
+    int native_stop_repetition;
+    int native_stop_index;
+    int native_stop_token;
+    bool decode_failed;
     bool emitter_failed;
     bool snapshot_failed;
     bool checkpoint_failed;
@@ -790,21 +811,55 @@ static int fake_token_eos(ds4_engine *engine) {
     return literal_eos_token;
 }
 
-static int fake_session_argmax_excluding(ds4_session *session, int excluded) {
-    const int repetition = session_rep(session);
-    record_pointer_call(CALL_TOKEN_CHOOSE, repetition, session, NULL);
-    state.choose_count++;
-    if (repetition < 0 || repetition >= 4 || session != state.sessions[repetition] ||
-        excluded != literal_eos_token) {
-        fail_contract("non-EOS chooser did not exclude the exact fake engine EOS token");
+static bool fake_token_is_stop(ds4_engine *engine, int token) {
+    if (engine != fake_engine) {
+        fail_contract("native-stop lookup did not use the open fake engine");
     }
-    return 42;
+    return token == literal_eos_token || token == literal_native_stop_token;
+}
+
+static int fake_decode_token(int repetition, int token_index) {
+    /* Keep every fake token inside the 512-entry fake vocabulary, away from
+     * both model-native stop ids, while making repetition/index visible
+     * to the eval seam. */
+    return 20 + ((repetition * 127 + token_index) % 492);
+}
+
+static bool fake_native_stop_at(int repetition, int token_index) {
+    return state.inject_native_stop &&
+        repetition == state.native_stop_repetition &&
+        token_index == state.native_stop_index;
+}
+
+static int fake_session_argmax_excluding(ds4_session *session, int excluded) {
+    (void)excluded;
+    record_pointer_call(CALL_UNEXPECTED, session_rep(session), session, NULL);
+    fail_contract("qualification lifecycle used EOS-excluding argmax instead of native-stop argmax");
+    return -1;
 }
 
 static int fake_session_argmax(ds4_session *session) {
-    record_pointer_call(CALL_UNEXPECTED, session_rep(session), session, NULL);
-    fail_contract("qualification lifecycle used ds4_session_argmax instead of ds4_session_argmax_excluding");
-    return 42;
+    const int repetition = session_rep(session);
+    const int token_index = repetition >= 0 && repetition < 4
+        ? state.decode_attempt_count[repetition] : -1;
+    const int token = fake_native_stop_at(repetition, token_index)
+        ? state.native_stop_token : fake_decode_token(repetition, token_index);
+    record_pointer_call(CALL_TOKEN_CHOOSE, repetition, session, NULL);
+    state.choose_count++;
+    if (state.call_count != 0u) {
+        call_record *call = &state.calls[state.call_count - 1u];
+        call->value = token_index < 0 ? 0u : (uint64_t)token_index;
+        call->token = token;
+    }
+    if (repetition < 0 || repetition >= 4 || session != state.sessions[repetition] ||
+        token_index < 0 || token_index >= QUALIFICATION_OUTPUT_TOKENS ||
+        (!fake_native_stop_at(repetition, token_index) &&
+         token != fake_decode_token(repetition, token_index)) ||
+        (fake_native_stop_at(repetition, token_index) &&
+         token != literal_eos_token && token != literal_native_stop_token)) {
+        fail_contract("native-stop chooser did not select the expected indexed token");
+    }
+    return token;
 }
 
 static int fake_session_sync_attributed(
@@ -826,16 +881,36 @@ static int fake_session_sync_attributed(
 static int fake_session_eval_attributed(
         ds4_session *session, int token,
         ds4_runtime_request_context *request, char *error, size_t error_size) {
-    (void)error;
-    (void)error_size;
     const int repetition = session_rep(session);
+    const int token_index = repetition >= 0 && repetition < 4
+        ? state.decode_attempt_count[repetition] : -1;
     record_pointer_call(CALL_SESSION_EVAL_ATTRIBUTED, repetition, session, request);
     state.eval_count++;
-    if (token == fake_token_eos(fake_engine) || token != 42 ||
-        repetition < 0 || request_rep(request) != repetition) {
-        fail_contract("attributed decode did not evaluate exactly one non-EOS token");
+    if (state.call_count != 0u) {
+        call_record *call = &state.calls[state.call_count - 1u];
+        call->value = token_index < 0 ? 0u : (uint64_t)token_index;
+        call->token = token;
+    }
+    if (fake_token_is_stop(fake_engine, token) ||
+        token != fake_decode_token(repetition, token_index) ||
+        repetition < 0 || request_rep(request) != repetition ||
+        token_index < 0 || token_index >= QUALIFICATION_OUTPUT_TOKENS) {
+        fail_contract("attributed decode did not evaluate the expected indexed non-EOS token");
         return 1;
     }
+    state.decode_attempt_count[repetition]++;
+    if (state.inject_decode_failure &&
+        repetition == state.decode_failure_repetition &&
+        token_index == state.decode_failure_index) {
+        state.decode_failed = true;
+        if (error && error_size != 0u) {
+            snprintf(error, error_size,
+                     "injected decode failure repetition=%d token_index=%d",
+                     repetition, token_index);
+        }
+        return 1;
+    }
+    state.decode_success_count[repetition]++;
     return 0;
 }
 
@@ -969,8 +1044,13 @@ static bool fake_request_add_generated(ds4_runtime_request_context *request,
     const int repetition = request_rep(request);
     record_pointer_call(CALL_GENERATED, repetition, NULL, request);
     state.generated_count++;
-    if (delta != 1u || repetition < 0) {
-        fail_contract("request accounting did not add exactly one generated token");
+    if (state.call_count != 0u) {
+        state.calls[state.call_count - 1u].value = request ? request->generated_tokens : 0u;
+    }
+    if (delta != 1u || repetition < 0 || !request ||
+        request->generated_tokens + delta !=
+            (uint64_t)state.decode_success_count[repetition]) {
+        fail_contract("request accounting did not add one token per successful decode");
         return false;
     }
     request->generated_tokens += delta;
@@ -982,10 +1062,19 @@ static bool fake_request_record_visible(ds4_runtime_request_context *request,
     const int repetition = request_rep(request);
     record_pointer_call(CALL_VISIBLE, repetition, NULL, request);
     state.visible_count++;
-    if (delta != 1u || timestamp == 0u || repetition < 0) {
-        fail_contract("request accounting did not add exactly one visible token");
+    if (state.call_count != 0u) {
+        state.calls[state.call_count - 1u].value = request
+            ? request->visible_generated_tokens : 0u;
+    }
+    if (delta != 1u || timestamp == 0u || repetition < 0 || !request ||
+        request->visible_generated_tokens + delta != request->generated_tokens) {
+        fail_contract("request accounting did not expose one token per generated decode");
         return false;
     }
+    if (!request->visible_decode_started) {
+        request->first_visible_decode_monotonic_ns = timestamp;
+    }
+    request->last_visible_decode_monotonic_ns = timestamp;
     request->visible_generated_tokens += delta;
     request->visible_decode_started = true;
     return true;
@@ -1003,8 +1092,10 @@ static bool fake_request_first_visible(ds4_runtime_request_context *request,
     const int repetition = request_rep(request);
     record_pointer_call(CALL_FIRST_VISIBLE, repetition, NULL, request);
     state.first_visible_count++;
-    if (repetition < 0 || timestamp == 0u || !request->visible_decode_started) {
-        fail_contract("first-visible emission was not bound after visible accounting");
+    if (repetition < 0 || timestamp == 0u || !request ||
+        !request->visible_decode_started || request->visible_generated_tokens != 1u ||
+        request->first_visible_emitted) {
+        fail_contract("first-visible emission was not bound to the first visible token");
         return false;
     }
     request->first_visible_emitted = true;
@@ -1042,9 +1133,11 @@ static bool fake_request_finish(
     record_pointer_call(CALL_REQUEST_FINISH, repetition, NULL, request);
     state.finish_count++;
     if (repetition < 0 || status != DS4_RUNTIME_REQUEST_COMPLETED ||
-        timestamp == 0u || !metrics || !request->prompt_tokens_set ||
-        request->generated_tokens != 1u || request->visible_generated_tokens != 1u) {
-        fail_contract("request finish did not complete one accounted request");
+        timestamp == 0u || !metrics || !request || !request->prompt_tokens_set ||
+        request->generated_tokens == 0u ||
+        request->visible_generated_tokens != request->generated_tokens ||
+        !request->visible_decode_started || !request->first_visible_emitted) {
+        fail_contract("request finish did not complete all accounted tokens");
         return false;
     }
     memset(metrics, 0, sizeof(*metrics));
@@ -1052,8 +1145,29 @@ static bool fake_request_finish(
              request->request_id);
     snprintf(metrics->instance_id, sizeof(metrics->instance_id), "%s",
              request->instance_id);
-    metrics->prompt_tokens = literal_prompt_tokens;
-    metrics->generated_tokens = 1u;
+    metrics->prompt_tokens = request->prompt_tokens;
+    metrics->generated_tokens = request->generated_tokens;
+    metrics->wall_time_ns = timestamp - request->accepted_monotonic_ns;
+    metrics->ttft_present = true;
+    metrics->ttft_ns = request->first_visible_emitted_monotonic_ns -
+        request->accepted_monotonic_ns;
+    const uint64_t prefill_elapsed =
+        request->prefill_complete_monotonic_ns -
+        request->prefill_started_monotonic_ns;
+    if (prefill_elapsed != 0u) {
+        metrics->prefill_tokens_per_second =
+            (double)request->prompt_tokens * 1000000000.0 /
+            (double)prefill_elapsed;
+    }
+    const uint64_t decode_elapsed =
+        request->last_visible_decode_monotonic_ns -
+        request->first_visible_decode_monotonic_ns;
+    if (decode_elapsed != 0u) {
+        metrics->visible_decode_tokens_per_second =
+            (double)(request->visible_generated_tokens - 1u) *
+            1000000000.0 / (double)decode_elapsed;
+    }
+    metrics->counters = request->counters;
     metrics->snapshot_seq = UINT64_C(99) + (uint64_t)state.snapshot_count +
         (uint64_t)(state.snapshot_count / 3) + 1u;
     metrics->terminal_status = status;
@@ -1151,8 +1265,16 @@ static bool fake_validate_emission(
             metrics->snapshot_seq == UINT64_MAX ||
             metrics->snapshot_seq + 1u != runtime_snapshot->snapshot_seq ||
             metrics->prompt_tokens != literal_prompt_tokens ||
-            metrics->generated_tokens != 1u) {
-            fail_contract("completion metrics did not match the enclosing runtime snapshot");
+            metrics->generated_tokens == 0u ||
+            !metrics->ttft_present || metrics->ttft_ns == 0u ||
+            metrics->ttft_ns > metrics->wall_time_ns ||
+            metrics->wall_time_ns == 0u ||
+            !(metrics->prefill_tokens_per_second > 0.0) ||
+            !(metrics->visible_decode_tokens_per_second > 0.0)) {
+            fail_contract("completion metrics did not carry the full 512-token lifecycle");
+        } else if (expected_repetition >= 0 && expected_repetition < 4) {
+            state.completed_metrics[expected_repetition] = *metrics;
+            state.completed_metrics_count++;
         }
     }
     if (state.inject_emitter_failure && !state.emitter_failed) {
@@ -1290,6 +1412,7 @@ static bool lifecycle_real_resident_emit_record(
 #define ds4_session_argmax fake_session_argmax
 #define ds4_session_payload_bytes fake_session_payload_bytes
 #define ds4_token_eos fake_token_eos
+#define ds4_token_is_stop fake_token_is_stop
 #define ds4_tokenize_text fake_tokenize_text
 #define ds4_tokenize_rendered_chat fake_tokenize_rendered_chat
 #define ds4_encode_chat_prompt fake_encode_chat_prompt
@@ -1427,14 +1550,28 @@ static void check_lifecycle_shape(bool resident) {
         fail_contract("expected one request context begin and prompt binding per repetition");
     }
     if (state.prefill_start_count != 4 || state.sync_count != 4 ||
-        state.prefill_complete_count != 4 || state.choose_count != 4 ||
-        state.eval_count != 4 || state.generated_count != 4 ||
-        state.visible_count != 4 || state.first_visible_count != 4 ||
-        state.barrier_count != 4 || state.finish_count != 4 ||
-        state.checkpoint_count != 12 || state.snapshot_count != 12) {
-        fail_contract("lifecycle operation counts did not match four one-token repetitions");
+        state.prefill_complete_count != 4 ||
+        state.choose_count != 4 * QUALIFICATION_OUTPUT_TOKENS ||
+        state.eval_count != 4 * QUALIFICATION_OUTPUT_TOKENS ||
+        state.generated_count != 4 * QUALIFICATION_OUTPUT_TOKENS ||
+        state.visible_count != 4 * QUALIFICATION_OUTPUT_TOKENS ||
+        state.first_visible_count != 4 || state.barrier_count != 4 ||
+        state.finish_count != 4 || state.checkpoint_count != 12 ||
+        state.snapshot_count != 12 || state.completed_metrics_count != 4) {
+        fail_contract("lifecycle operation counts did not match four 512-token repetitions");
     }
     for (int repetition = 0; repetition < 4; repetition++) {
+        const ds4_runtime_request_metrics *metrics =
+            &state.completed_metrics[repetition];
+        if (metrics->prompt_tokens != literal_prompt_tokens ||
+            metrics->generated_tokens != QUALIFICATION_OUTPUT_TOKENS ||
+            !metrics->ttft_present || metrics->ttft_ns == 0u ||
+            metrics->wall_time_ns == 0u || metrics->ttft_ns > metrics->wall_time_ns ||
+            !(metrics->prefill_tokens_per_second > 0.0) ||
+            !(metrics->visible_decode_tokens_per_second > 0.0) ||
+            metrics->terminal_status != DS4_RUNTIME_REQUEST_COMPLETED) {
+            fail_contract("full completion metrics were not retained for every repetition");
+        }
         const int create = nth_call(CALL_SESSION_CREATE, repetition, 0);
         const int request = nth_call(CALL_REQUEST_BEGIN, repetition, 0);
         const int prompt = nth_call(CALL_REQUEST_PROMPT, repetition, 0);
@@ -1475,6 +1612,59 @@ static void check_lifecycle_shape(bool resident) {
         require_call_order(generated, visible, "visible-token accounting must follow generated accounting");
         require_call_order(visible, first_visible, "first-visible emission must follow visible accounting");
         require_call_order(first_visible, first_checkpoint, "first-token checkpoint must follow first-visible accounting");
+        if (state.decode_attempt_count[repetition] != QUALIFICATION_OUTPUT_TOKENS ||
+            state.decode_success_count[repetition] != QUALIFICATION_OUTPUT_TOKENS) {
+            fail_contract("repetition did not attempt and complete exactly 512 decodes");
+        }
+        for (int token_index = 0; token_index < QUALIFICATION_OUTPUT_TOKENS; token_index++) {
+            const int indexed_choose = nth_call(CALL_TOKEN_CHOOSE, repetition, token_index);
+            const int indexed_eval = nth_call(CALL_SESSION_EVAL_ATTRIBUTED, repetition, token_index);
+            const int indexed_generated = nth_call(CALL_GENERATED, repetition, token_index);
+            const int indexed_visible = nth_call(CALL_VISIBLE, repetition, token_index);
+            if (indexed_choose < 0 || indexed_eval < 0 || indexed_generated < 0 ||
+                indexed_visible < 0 ||
+                state.calls[indexed_choose].value != (uint64_t)token_index ||
+                state.calls[indexed_eval].value != (uint64_t)token_index ||
+                state.calls[indexed_choose].token != fake_decode_token(repetition, token_index) ||
+                state.calls[indexed_eval].token != fake_decode_token(repetition, token_index) ||
+                state.calls[indexed_eval].token == literal_eos_token ||
+                state.calls[indexed_generated].value != (uint64_t)token_index ||
+                state.calls[indexed_visible].value != (uint64_t)token_index) {
+                fail_contract("per-token decode/accounting timeline was not indexed and non-EOS");
+            }
+            require_call_order(indexed_choose, indexed_eval,
+                               "indexed token evaluation must follow its choice");
+            require_call_order(indexed_eval, indexed_generated,
+                               "indexed generated accounting must follow evaluation");
+            require_call_order(indexed_generated, indexed_visible,
+                               "indexed visible accounting must follow generated accounting");
+            if (token_index == 0) {
+                require_call_order(prefill_complete, indexed_choose,
+                                   "first decode must follow prefill completion");
+            } else {
+                const int previous_visible = nth_call(CALL_VISIBLE, repetition, token_index - 1);
+                require_call_order(previous_visible, indexed_choose,
+                                   "each decode must follow the previous visible token");
+            }
+        }
+        const int last_choose = nth_call(CALL_TOKEN_CHOOSE, repetition,
+                                         QUALIFICATION_OUTPUT_TOKENS - 1);
+        const int last_eval = nth_call(CALL_SESSION_EVAL_ATTRIBUTED, repetition,
+                                       QUALIFICATION_OUTPUT_TOKENS - 1);
+        const int last_generated = nth_call(CALL_GENERATED, repetition,
+                                            QUALIFICATION_OUTPUT_TOKENS - 1);
+        const int last_visible = nth_call(CALL_VISIBLE, repetition,
+                                          QUALIFICATION_OUTPUT_TOKENS - 1);
+        require_call_order(first, last_choose,
+                           "remaining 511 decodes must follow the first-token milestone");
+        require_call_order(last_choose, last_eval,
+                           "last token evaluation must follow its choice");
+        require_call_order(last_eval, last_generated,
+                           "last generated accounting must follow its evaluation");
+        require_call_order(last_generated, last_visible,
+                           "last visible accounting must follow its generated accounting");
+        require_call_order(last_visible, barrier,
+                           "request barrier must follow all 512 visible tokens");
         require_call_order(first_checkpoint, first_snapshot, "first-token checkpoint must precede its runtime snapshot");
         require_call_order(first_snapshot, first, "first-token emission must follow its coherent snapshot");
         if (first_snapshot < 0 || first != first_snapshot + 1 ||
@@ -1579,6 +1769,135 @@ static int invoke_bench_streamed_resident_fixture(void) {
     return ds4_bench_test_cli_main((int)(ARRAY_LEN(argv) - 1u), argv);
 }
 
+static void check_native_stop_termination(
+        bool resident, int stop_token, const char *label) {
+    const int stopped_repetition = SHORT_NATIVE_STOP_REPETITION;
+    const int stopped_output_tokens = SHORT_NATIVE_STOP_INDEX;
+    const int expected_successes = 3 * QUALIFICATION_OUTPUT_TOKENS +
+        stopped_output_tokens;
+    const int expected_choices = expected_successes + 1;
+    const int expected_emit_count = 4 * 3;
+    const int expected_tokens[4] = {
+        QUALIFICATION_OUTPUT_TOKENS, QUALIFICATION_OUTPUT_TOKENS,
+        stopped_output_tokens, QUALIFICATION_OUTPUT_TOKENS,
+    };
+
+    reset_fake_state(false);
+    state.inject_native_stop = true;
+    state.native_stop_repetition = stopped_repetition;
+    state.native_stop_index = SHORT_NATIVE_STOP_INDEX;
+    state.native_stop_token = stop_token;
+
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    if (rc != 0) {
+        fprintf(stderr, "RED: %s native-stop path returned %d\n", label, rc);
+        fail_contract("model-native stop path did not complete the bounded run");
+    }
+    const int emit_count = resident ? state.resident_emit_count : state.emit_count;
+    if (state.session_create_count != 4 || state.session_free_count != 4 ||
+        state.request_begin_count != 4 || state.request_prompt_count != 4 ||
+        state.prefill_start_count != 4 || state.sync_count != 4 ||
+        state.prefill_complete_count != 4 || state.choose_count != expected_choices ||
+        state.eval_count != expected_successes ||
+        state.generated_count != expected_successes ||
+        state.visible_count != expected_successes || state.first_visible_count != 4 ||
+        state.barrier_count != 4 || state.finish_count != 4 ||
+        state.checkpoint_count != expected_emit_count ||
+        state.snapshot_count != expected_emit_count ||
+        state.completed_metrics_count != 4 || emit_count != expected_emit_count ||
+        state.emit_count != (resident ? 0 : expected_emit_count) ||
+        state.resident_emit_count != (resident ? expected_emit_count : 0) ||
+        state.engine_open_count != 1 || state.engine_close_count != 1 ||
+        state.sequence_free_count != (resident ? 0 : 1) ||
+        state.resident_sequence_free_count != (resident ? 1 : 0)) {
+        fail_contract("native-stop path changed bounded lifecycle counts");
+    }
+    for (int repetition = 0; repetition < 4; repetition++) {
+        if (state.decode_attempt_count[repetition] != expected_tokens[repetition] ||
+            state.decode_success_count[repetition] != expected_tokens[repetition] ||
+            state.completed_metrics[repetition].generated_tokens !=
+                (uint64_t)expected_tokens[repetition]) {
+            fail_contract("native-stop path did not report actual generated-token metrics");
+        }
+    }
+
+    const int stop_choose = nth_call(
+        CALL_TOKEN_CHOOSE, stopped_repetition, SHORT_NATIVE_STOP_INDEX);
+    const int stop_eval = nth_call(
+        CALL_SESSION_EVAL_ATTRIBUTED, stopped_repetition, SHORT_NATIVE_STOP_INDEX);
+    const int stop_generated = nth_call(
+        CALL_GENERATED, stopped_repetition, SHORT_NATIVE_STOP_INDEX);
+    const int stop_visible = nth_call(
+        CALL_VISIBLE, stopped_repetition, SHORT_NATIVE_STOP_INDEX);
+    const int previous_visible = nth_call(
+        CALL_VISIBLE, stopped_repetition, SHORT_NATIVE_STOP_INDEX - 1);
+    const int barrier = nth_call(CALL_REQUEST_BARRIER, stopped_repetition, 0);
+    if (stop_choose < 0 || state.calls[stop_choose].value !=
+            (uint64_t)SHORT_NATIVE_STOP_INDEX ||
+        state.calls[stop_choose].token != stop_token ||
+        !fake_token_is_stop(fake_engine, state.calls[stop_choose].token) ||
+        stop_eval >= 0 || stop_generated >= 0 || stop_visible >= 0) {
+        fail_contract("model-native stop was evaluated or accounted as output");
+    }
+    require_call_order(previous_visible, stop_choose,
+                       "model-native stop choice must follow the visible prefix");
+    require_call_order(stop_choose, barrier,
+                       "model-native stop choice must precede request barrier");
+    if (nth_call(CALL_TOKEN_CHOOSE, stopped_repetition,
+                 SHORT_NATIVE_STOP_INDEX + 1) >= 0) {
+        fail_contract("model-native stop did not terminate before the next choice");
+    }
+    for (size_t i = stop_choose >= 0 ? (size_t)stop_choose + 1u : 0u;
+         i < state.call_count; i++) {
+        const call_record *call = &state.calls[i];
+        if (call->repetition == stopped_repetition &&
+            (call->kind == CALL_TOKEN_CHOOSE ||
+             call->kind == CALL_SESSION_EVAL_ATTRIBUTED ||
+             call->kind == CALL_GENERATED || call->kind == CALL_VISIBLE)) {
+            fail_contract("model-native stop allowed token work after the stop choice");
+        }
+    }
+    if (state.completed_metrics[stopped_repetition].generated_tokens !=
+            (uint64_t)stopped_output_tokens ||
+        state.completed_metrics[stopped_repetition].terminal_status !=
+            DS4_RUNTIME_REQUEST_COMPLETED) {
+        fail_contract("native EOS/stop completion metrics did not carry the actual prefix");
+    }
+    for (int i = 0; i < 4; i++) {
+        for (int j = i + 1; j < 4; j++) {
+            if (state.sessions[i] == state.sessions[j]) {
+                fail_contract("native-stop repetitions reused a session");
+            }
+        }
+    }
+    all_failures += state.contract_failures;
+}
+
+static void check_native_stop_before_output(bool resident) {
+    reset_fake_state(false);
+    state.inject_native_stop = true;
+    state.native_stop_repetition = 0;
+    state.native_stop_index = 0;
+    state.native_stop_token = literal_eos_token;
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    const int choice = nth_call(CALL_TOKEN_CHOOSE, 0, 0);
+    if (rc == 0 || choice < 0 || state.calls[choice].token != literal_eos_token ||
+        state.choose_count != 1 || state.eval_count != 0 ||
+        state.generated_count != 0 || state.visible_count != 0 ||
+        state.first_visible_count != 0 || state.finish_count != 0 ||
+        state.barrier_count != 0 || state.checkpoint_count != 1 ||
+        state.snapshot_count != 1 || state.completed_metrics_count != 0 ||
+        state.session_create_count != 1 || state.session_free_count != 1 ||
+        state.engine_open_count != 1 || state.engine_close_count != 1 ||
+        state.emit_count != (resident ? 0 : 1) ||
+        state.resident_emit_count != (resident ? 1 : 0) ||
+        state.sequence_free_count != (resident ? 0 : 1) ||
+        state.resident_sequence_free_count != (resident ? 1 : 0)) {
+        fail_contract("native stop before output must refuse without a fabricated first token or completion");
+    }
+    all_failures += state.contract_failures;
+}
+
 static void check_happy_path(void) {
     reset_fake_state(false);
     const int rc = invoke_bench();
@@ -1633,6 +1952,103 @@ static void check_fail_closed_cleanup(void) {
             if (kind != CALL_SESSION_FREE && kind != CALL_ENGINE_CLOSE &&
                 kind != CALL_SEQUENCE_FREE) {
                 fail_contract("emission failure allowed lifecycle work after abort");
+            }
+        }
+    }
+    all_failures += state.contract_failures;
+}
+
+static void check_late_decode_failure(bool resident) {
+    reset_fake_state(false);
+    state.inject_decode_failure = true;
+    state.decode_failure_repetition = LATE_DECODE_FAILURE_REPETITION;
+    state.decode_failure_index = LATE_DECODE_FAILURE_INDEX;
+
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    if (rc == 0) fail_contract(resident
+        ? "resident later-token decode failure unexpectedly returned success"
+        : "streamed later-token decode failure unexpectedly returned success");
+    if (!state.decode_failed) {
+        fail_contract("later-token decode failure was not injected at its discriminating index");
+    }
+
+    const int expected_emit_count = 2 * 3 + 2;
+    const int expected_decode_attempts =
+        2 * QUALIFICATION_OUTPUT_TOKENS + LATE_DECODE_FAILURE_INDEX + 1;
+    const int expected_decode_successes =
+        2 * QUALIFICATION_OUTPUT_TOKENS + LATE_DECODE_FAILURE_INDEX;
+    const int emit_count = resident ? state.resident_emit_count : state.emit_count;
+    if (state.session_create_count != 3 || state.session_free_count != 3 ||
+        state.request_begin_count != 3 || state.request_prompt_count != 3 ||
+        state.prefill_start_count != 3 || state.sync_count != 3 ||
+        state.prefill_complete_count != 3 || state.choose_count != expected_decode_attempts ||
+        state.eval_count != expected_decode_attempts ||
+        state.generated_count != expected_decode_successes ||
+        state.visible_count != expected_decode_successes ||
+        state.first_visible_count != 3 || state.barrier_count != 2 ||
+        state.finish_count != 2 || state.checkpoint_count != expected_emit_count ||
+        state.snapshot_count != expected_emit_count || state.engine_open_count != 1 ||
+        state.engine_close_count != 1 ||
+        state.sequence_free_count != (resident ? 0 : 1) ||
+        state.resident_sequence_free_count != (resident ? 1 : 0) ||
+        state.completed_metrics_count != 2 || emit_count != expected_emit_count ||
+        state.emit_count != (resident ? 0 : expected_emit_count) ||
+        state.resident_emit_count != (resident ? expected_emit_count : 0)) {
+        fail_contract("later-token decode failure did not preserve the complete partial metric/timeline counts");
+    }
+    if (state.decode_attempt_count[0] != QUALIFICATION_OUTPUT_TOKENS ||
+        state.decode_attempt_count[1] != QUALIFICATION_OUTPUT_TOKENS ||
+        state.decode_attempt_count[2] != LATE_DECODE_FAILURE_INDEX + 1 ||
+        state.decode_attempt_count[3] != 0 ||
+        state.decode_success_count[0] != QUALIFICATION_OUTPUT_TOKENS ||
+        state.decode_success_count[1] != QUALIFICATION_OUTPUT_TOKENS ||
+        state.decode_success_count[2] != LATE_DECODE_FAILURE_INDEX ||
+        state.decode_success_count[3] != 0) {
+        fail_contract("later-token decode failure changed the successful-prefix counts");
+    }
+
+    const int failed_eval = nth_call(
+        CALL_SESSION_EVAL_ATTRIBUTED,
+        LATE_DECODE_FAILURE_REPETITION,
+        LATE_DECODE_FAILURE_INDEX);
+    if (failed_eval < 0 ||
+        state.calls[failed_eval].value != (uint64_t)LATE_DECODE_FAILURE_INDEX ||
+        state.calls[failed_eval].token !=
+            fake_decode_token(LATE_DECODE_FAILURE_REPETITION, LATE_DECODE_FAILURE_INDEX)) {
+        fail_contract("later-token failure did not identify the expected decode call");
+    }
+    const int failed_generated = nth_call(
+        CALL_GENERATED, LATE_DECODE_FAILURE_REPETITION, LATE_DECODE_FAILURE_INDEX);
+    const int failed_visible = nth_call(
+        CALL_VISIBLE, LATE_DECODE_FAILURE_REPETITION, LATE_DECODE_FAILURE_INDEX);
+    if (failed_generated >= 0 || failed_visible >= 0) {
+        fail_contract("failed decode was accounted or exposed as a visible token");
+    }
+    const int failed_session_free = nth_call(
+        CALL_SESSION_FREE, LATE_DECODE_FAILURE_REPETITION, 0);
+    const int engine_close = first_call(CALL_ENGINE_CLOSE, -1);
+    const int sequence_free = first_call(
+        resident ? CALL_RESIDENT_SEQUENCE_FREE : CALL_SEQUENCE_FREE, -1);
+    require_call_order(failed_eval, failed_session_free,
+                       "failed decode must release its current session");
+    require_call_order(failed_session_free, engine_close,
+                       "failed decode session must be released before engine close");
+    require_call_order(engine_close, sequence_free,
+                       "failed decode engine must close before typed sequence cleanup");
+    for (size_t i = failed_eval >= 0 ? (size_t)failed_eval + 1u : 0u;
+         i < state.call_count; i++) {
+        const enum call_kind kind = state.calls[i].kind;
+        if (kind != CALL_SESSION_FREE && kind != CALL_ENGINE_CLOSE &&
+            kind != (resident ? CALL_RESIDENT_SEQUENCE_FREE : CALL_SEQUENCE_FREE)) {
+            fail_contract("later-token decode failure allowed work after the terminal failed eval");
+        }
+    }
+    for (size_t i = 0; i < state.call_count; i++) {
+        if ((state.calls[i].kind == CALL_EMIT ||
+             state.calls[i].kind == CALL_RESIDENT_EMIT) &&
+            state.calls[i].repetition >= LATE_DECODE_FAILURE_REPETITION) {
+            if (state.calls[i].event == DS4_BENCH_QUALIFICATION_EVENT_REQUEST_COMPLETE) {
+                fail_contract("later-token decode failure emitted a completion success");
             }
         }
     }
@@ -1802,6 +2218,11 @@ int main(int argc, char **argv) {
         return rc;
     }
     check_happy_path();
+    check_native_stop_before_output(false);
+    check_native_stop_termination(false, literal_eos_token, "EOS");
+    check_native_stop_termination(false, literal_native_stop_token,
+                                  "distinct model-native stop");
+    check_late_decode_failure(false);
     check_fail_closed_cleanup();
     check_resident_cross_mode();
     check_resident_parser_failure();
@@ -1809,6 +2230,11 @@ int main(int argc, char **argv) {
     check_resident_midrun_failure(true);
     check_resident_midrun_failure(false);
     check_resident_happy_path();
+    check_native_stop_before_output(true);
+    check_native_stop_termination(true, literal_eos_token, "resident EOS");
+    check_native_stop_termination(true, literal_native_stop_token,
+                                  "resident distinct model-native stop");
+    check_late_decode_failure(true);
     if (all_failures != 0) {
         fprintf(stderr, "qualification lifecycle fake backend: %d failures\n",
                 all_failures);

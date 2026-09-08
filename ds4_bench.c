@@ -1044,6 +1044,7 @@ static int run_qualification_lifecycle(
         ds4_engine_laguna_external_checkpoint_observation observation;
         uint64_t timestamp = 0u;
         int rc = 0;
+        bool emitted_first_token = false;
         memset(&request, 0, sizeof(request));
         memset(&metrics, 0, sizeof(metrics));
         memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
@@ -1128,69 +1129,94 @@ static int run_qualification_lifecycle(
                 break;
             }
 
-            const int token = ds4_session_argmax_excluding(
-                session, ds4_token_eos(engine));
-            if (token < 0) {
-                rc = qualification_lifecycle_failure(
-                    "token selection", "backend returned no non-EOS token");
-                break;
-            }
-            if (ds4_session_eval_attributed(
-                    session, token, &request, error, sizeof(error)) != 0) {
-                rc = qualification_lifecycle_failure("attributed decode", error);
-                break;
-            }
-            if (!ds4_runtime_request_add_generated_tokens(&request, 1u)) {
-                rc = qualification_lifecycle_failure(
-                    "generated accounting", "request accounting rejected generated token");
-                break;
-            }
-            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
-                !ds4_runtime_request_record_visible_decoded(
-                    &request, 1u, timestamp)) {
-                rc = qualification_lifecycle_failure(
-                    "visible accounting", "request accounting rejected visible token");
-                break;
-            }
-            if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
-                !ds4_runtime_request_mark_first_visible_emitted(
-                    &request, timestamp)) {
-                rc = qualification_lifecycle_failure(
-                    "first-visible accounting", "request accounting rejected first visible token");
-                break;
-            }
+            /* The strict sequence parser fixes greedy sampling, native stops
+             * and this cap. A stop token is not another evaluated/output token. */
+            const uint32_t qualification_max_generated_tokens = 512u;
+            for (uint32_t generated_index = 0;
+                 generated_index < qualification_max_generated_tokens;
+                 generated_index++) {
+                const int token = ds4_session_argmax(session);
+                if (token < 0) {
+                    rc = qualification_lifecycle_failure(
+                        "token selection", "backend returned no token");
+                    break;
+                }
+                if (ds4_token_is_stop(engine, token)) {
+                    if (!emitted_first_token) {
+                        rc = qualification_lifecycle_failure(
+                            "token selection",
+                            "model-native stop before first visible token");
+                    }
+                    break;
+                }
+                if (ds4_session_eval_attributed(
+                        session, token, &request, error, sizeof(error)) != 0) {
+                    rc = qualification_lifecycle_failure("attributed decode", error);
+                    break;
+                }
+                if (!ds4_runtime_request_add_generated_tokens(&request, 1u)) {
+                    rc = qualification_lifecycle_failure(
+                        "generated accounting", "request accounting rejected generated token");
+                    break;
+                }
+                if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                    !ds4_runtime_request_record_visible_decoded(
+                        &request, 1u, timestamp)) {
+                    rc = qualification_lifecycle_failure(
+                        "visible accounting", "request accounting rejected visible token");
+                    break;
+                }
+                if (!emitted_first_token) {
+                    if (!qualification_next_timestamp(&last_timestamp, &timestamp) ||
+                        !ds4_runtime_request_mark_first_visible_emitted(
+                            &request, timestamp)) {
+                        rc = qualification_lifecycle_failure(
+                            "first-visible accounting",
+                            "request accounting rejected first visible token");
+                        break;
+                    }
 
-            memset(&observation, 0, sizeof(observation));
-            if (ds4_engine_laguna_external_checkpoint(
-                    engine, pre_child, expected_build_identity,
-                    &observation) != DS4_RUNTIME_STATUS_OK) {
-                rc = qualification_lifecycle_failure(
-                    "first-token checkpoint", "external attribution rejected the checkpoint");
-                break;
+                    memset(&observation, 0, sizeof(observation));
+                    if (ds4_engine_laguna_external_checkpoint(
+                            engine, pre_child, expected_build_identity,
+                            &observation) != DS4_RUNTIME_STATUS_OK) {
+                        rc = qualification_lifecycle_failure(
+                            "first-token checkpoint",
+                            "external attribution rejected the checkpoint");
+                        break;
+                    }
+                    memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
+                    if (!ds4_engine_runtime_snapshot(engine, &runtime_snapshot)) {
+                        rc = qualification_lifecycle_failure(
+                            "first-token snapshot", "runtime snapshot failed");
+                        break;
+                    }
+                    if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
+                        rc = qualification_lifecycle_failure(
+                            "first-token timestamp", "monotonic clock failed");
+                        break;
+                    }
+                    record = (qualification_lifecycle_record){
+                        .event = DS4_BENCH_QUALIFICATION_EVENT_FIRST_TOKEN,
+                        .request_id = request.request_id,
+                        .repetition_index = repetition_index,
+                        .monotonic_ns = timestamp,
+                        .session_payload_bytes = ds4_session_payload_bytes(session),
+                        .runtime_snapshot = &runtime_snapshot,
+                        .request_metrics = NULL,
+                    };
+                    if (!qualification_lifecycle_emit(
+                            stream, source, &record, error, sizeof(error))) {
+                        rc = qualification_lifecycle_failure("first_token", error);
+                        break;
+                    }
+                    emitted_first_token = true;
+                }
             }
-            memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
-            if (!ds4_engine_runtime_snapshot(engine, &runtime_snapshot)) {
+            if (rc != 0) break;
+            if (!emitted_first_token) {
                 rc = qualification_lifecycle_failure(
-                    "first-token snapshot", "runtime snapshot failed");
-                break;
-            }
-            if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
-                rc = qualification_lifecycle_failure(
-                    "first-token timestamp", "monotonic clock failed");
-                break;
-            }
-            record = (qualification_lifecycle_record){
-                .event = DS4_BENCH_QUALIFICATION_EVENT_FIRST_TOKEN,
-                .request_id = request.request_id,
-                .repetition_index = repetition_index,
-                .monotonic_ns = timestamp,
-                .session_payload_bytes = ds4_session_payload_bytes(session),
-                .runtime_snapshot = &runtime_snapshot,
-                .request_metrics = NULL,
-            };
-            if (!qualification_lifecycle_emit(
-                    stream, source, &record, error, sizeof(error))) {
-                rc = qualification_lifecycle_failure("first_token", error);
+                    "qualification output", "no visible output before completion");
                 break;
             }
 

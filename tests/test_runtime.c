@@ -1,4 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+/* Darwin exposes mkdtemp with its extension namespace, even with POSIX 2008. */
+#define _DARWIN_C_SOURCE 1
+#endif
 
 /* Pure-C external-attribution tests for compact Laguna qualification.
  *
@@ -47,7 +51,7 @@ static const char *program_path;
 static uint64_t stat_mtime_ns(const struct stat *status) {
 #if defined(__APPLE__)
     return (uint64_t)status->st_mtime * UINT64_C(1000000000) +
-           (uint64_t)status->st_mtimensec;
+           (uint64_t)status->st_mtimespec.tv_nsec;
 #else
     return (uint64_t)status->st_mtim.tv_sec * UINT64_C(1000000000) +
            (uint64_t)status->st_mtim.tv_nsec;
@@ -69,6 +73,160 @@ static bool identity_equal(
         const ds4_runtime_file_identity *b) {
     return a->device == b->device && a->inode == b->inode &&
            a->size_bytes == b->size_bytes && a->mtime_ns == b->mtime_ns;
+}
+
+enum {
+    RUNTIME_TEST_PRIVATE_PATH_CAPACITY = 4096,
+};
+
+typedef struct {
+    char path[RUNTIME_TEST_PRIVATE_PATH_CAPACITY];
+    dev_t device;
+    ino_t inode;
+    bool owned;
+} runtime_test_private_root;
+
+static runtime_test_private_root g_runtime_test_private_root;
+static bool g_runtime_test_private_root_attempted;
+
+static bool runtime_test_path_components_safe(const char *path) {
+    if (!path || path[0] != '/') return false;
+    const char *component = path;
+    while (*component) {
+        while (*component == '/') component++;
+        if (!*component) break;
+        const char *end = strchr(component, '/');
+        const size_t length = end ? (size_t)(end - component) :
+            strlen(component);
+        if ((length == 1u && component[0] == '.') ||
+            (length == 2u && component[0] == '.' && component[1] == '.')) {
+            return false;
+        }
+        component = end ? end : component + length;
+    }
+    return true;
+}
+
+static bool runtime_test_tmpdir_is_allowlisted(const char *candidate) {
+    if (!runtime_test_path_components_safe(candidate)) return false;
+    const size_t length = strlen(candidate);
+    if (length == 0u || length >= RUNTIME_TEST_PRIVATE_PATH_CAPACITY ||
+        candidate[length - 1u] == '/') {
+        return false;
+    }
+
+    static const char *const shared_roots[] = {
+        "/tmp", "/var/tmp", "/private/tmp",
+    };
+    for (size_t i = 0u;
+         i < sizeof(shared_roots) / sizeof(shared_roots[0]); i++) {
+        if (strcmp(candidate, shared_roots[i]) == 0) return true;
+    }
+
+    struct stat status;
+    return lstat(candidate, &status) == 0 && S_ISDIR(status.st_mode) &&
+           status.st_uid == geteuid() &&
+           (status.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static bool runtime_test_build_path(
+        char *out, size_t capacity, const char *base, const char *leaf) {
+    if (!out || capacity == 0u || !base || !leaf ||
+        !runtime_test_path_components_safe(base) || leaf[0] == '/' ||
+        strchr(leaf, '/')) {
+        return false;
+    }
+    const size_t base_length = strlen(base);
+    const char *separator =
+        base_length != 0u && base[base_length - 1u] == '/' ? "" : "/";
+    const int written = snprintf(out, capacity, "%s%s%s",
+                                 base, separator, leaf);
+    return written >= 0 && (size_t)written < capacity;
+}
+
+static bool runtime_test_private_root_prepare(void) {
+    if (g_runtime_test_private_root_attempted) {
+        return g_runtime_test_private_root.owned;
+    }
+    g_runtime_test_private_root_attempted = true;
+
+    const char *configured = getenv("TMPDIR");
+    const char *candidates[2] = {
+        runtime_test_tmpdir_is_allowlisted(configured) ? configured : NULL,
+        "/tmp",
+    };
+    for (size_t i = 0u; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        const char *base = candidates[i];
+        if (!base || (i != 0u && candidates[0] && strcmp(base, candidates[0]) == 0)) {
+            continue;
+        }
+        char template_path[RUNTIME_TEST_PRIVATE_PATH_CAPACITY];
+        if (!runtime_test_build_path(
+                template_path, sizeof(template_path), base,
+                "ds4-runtime-test-XXXXXX")) {
+            continue;
+        }
+        if (!mkdtemp(template_path)) continue;
+        const int copied = snprintf(
+            g_runtime_test_private_root.path,
+            sizeof(g_runtime_test_private_root.path), "%s", template_path);
+        if (copied < 0 || (size_t)copied >=
+                sizeof(g_runtime_test_private_root.path)) {
+            return false;
+        }
+        struct stat status;
+        if (lstat(g_runtime_test_private_root.path, &status) != 0 ||
+            !S_ISDIR(status.st_mode) || status.st_uid != geteuid() ||
+            (status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+            return false;
+        }
+        g_runtime_test_private_root.device = status.st_dev;
+        g_runtime_test_private_root.inode = status.st_ino;
+        g_runtime_test_private_root.owned = true;
+        return true;
+    }
+    return false;
+}
+
+static bool runtime_test_private_leaf_template(
+        char *out, size_t capacity, const char *leaf_template) {
+    if (!g_runtime_test_private_root.owned || !leaf_template ||
+        strchr(leaf_template, '/')) return false;
+    return runtime_test_build_path(
+        out, capacity, g_runtime_test_private_root.path, leaf_template);
+}
+
+static bool runtime_test_cleanup_owned_leaf(
+        const char *path, int fd, bool *owned) {
+    if (!owned || !*owned) return false;
+    struct stat fd_status;
+    struct stat path_status;
+    if (fd < 0 || fstat(fd, &fd_status) != 0 ||
+        lstat(path, &path_status) != 0 || !S_ISREG(path_status.st_mode) ||
+        fd_status.st_dev != path_status.st_dev ||
+        fd_status.st_ino != path_status.st_ino) {
+        *owned = false;
+        return false;
+    }
+    if (unlink(path) == 0) {
+        *owned = false;
+        return true;
+    }
+    return false;
+}
+
+static bool runtime_test_private_root_cleanup(void) {
+    if (!g_runtime_test_private_root.owned) return true;
+    struct stat status;
+    if (lstat(g_runtime_test_private_root.path, &status) == 0 &&
+        S_ISDIR(status.st_mode) &&
+        status.st_dev == g_runtime_test_private_root.device &&
+        status.st_ino == g_runtime_test_private_root.inode &&
+        rmdir(g_runtime_test_private_root.path) == 0) {
+        g_runtime_test_private_root.owned = false;
+        return true;
+    }
+    return false;
 }
 
 /* Eight VMAs deliberately exercise exact-inode matching and physical-domain
@@ -1299,8 +1457,18 @@ static void check_wire_json_golden(
 }
 
 static void test_runtime_wire_snapshot(void) {
-    char model_path[] = "/tmp/ds4-runtime-wire-XXXXXX";
-    const int model_fd = mkstemp(model_path);
+    char model_path[RUNTIME_TEST_PRIVATE_PATH_CAPACITY];
+    bool model_path_owned = false;
+    int model_fd = -1;
+    const bool private_model_path_ready =
+        runtime_test_private_root_prepare() &&
+        runtime_test_private_leaf_template(
+            model_path, sizeof(model_path), "ds4-runtime-wire-XXXXXX");
+    CHECK(private_model_path_ready,
+          "runtime wire fixture builds a private model path");
+    if (!private_model_path_ready) return;
+    model_fd = mkstemp(model_path);
+    model_path_owned = model_fd >= 0;
     CHECK(model_fd >= 0, "runtime wire fixture opens a retained model descriptor");
     if (model_fd < 0) return;
     static const char model_bytes[32] = "runtime-wire-opened-model-bytes";
@@ -1335,15 +1503,23 @@ static void test_runtime_wire_snapshot(void) {
     CHECK(identity_equal(&context.executable, &expected_executable),
           "runtime context records the running executable stat identity");
 
-    CHECK(unlink(model_path) == 0,
+    int replacement_fd = -1;
+    bool replacement_path_owned = false;
+    const bool removed_model_path = runtime_test_cleanup_owned_leaf(
+        model_path, model_fd, &model_path_owned);
+    CHECK(removed_model_path,
           "runtime wire fixture removes the opened model pathname");
-    const int replacement_fd = open(
-        model_path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-    CHECK(replacement_fd >= 0,
-          "runtime wire fixture replaces the model pathname with another inode");
-    if (replacement_fd >= 0) close(replacement_fd);
+    if (removed_model_path) {
+        replacement_fd = open(
+            model_path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+        replacement_path_owned = replacement_fd >= 0;
+        CHECK(replacement_fd >= 0,
+              "runtime wire fixture replaces the model pathname with another inode");
+    }
     struct stat replacement_status;
-    CHECK(stat(model_path, &replacement_status) == 0 &&
+    const int replacement_status_result = replacement_fd >= 0 ?
+        stat(model_path, &replacement_status) : -1;
+    CHECK(replacement_status_result == 0 &&
               (uint64_t)replacement_status.st_ino != context.model.inode,
           "replaced model pathname no longer identifies the retained opened file");
     CHECK(identity_equal(&context.model, &expected_model),
@@ -1632,8 +1808,13 @@ static void test_runtime_wire_snapshot(void) {
         fork_pipe[0] = -1;
     }
 
+    if (replacement_fd >= 0) {
+        runtime_test_cleanup_owned_leaf(
+            model_path, replacement_fd, &replacement_path_owned);
+        close(replacement_fd);
+    }
+    runtime_test_cleanup_owned_leaf(model_path, model_fd, &model_path_owned);
     close(model_fd);
-    unlink(model_path);
 }
 
 static void test_request_metrics_lifecycle(void) {
@@ -1652,8 +1833,19 @@ static void test_request_metrics_lifecycle(void) {
               strcmp(request_a.request_id, request_a.instance_id) != 0,
           "request UUIDs are unique and bind to one distinct process UUID");
 
-    char sequence_model_path[] = "/tmp/ds4-request-sequence-XXXXXX";
-    const int sequence_model_fd = mkstemp(sequence_model_path);
+    char sequence_model_path[RUNTIME_TEST_PRIVATE_PATH_CAPACITY];
+    bool sequence_model_path_owned = false;
+    int sequence_model_fd = -1;
+    const bool private_sequence_path_ready =
+        runtime_test_private_root_prepare() &&
+        runtime_test_private_leaf_template(
+            sequence_model_path, sizeof(sequence_model_path),
+            "ds4-request-sequence-XXXXXX");
+    CHECK(private_sequence_path_ready,
+          "request sequence fixture builds a private model path");
+    if (!private_sequence_path_ready) return;
+    sequence_model_fd = mkstemp(sequence_model_path);
+    sequence_model_path_owned = sequence_model_fd >= 0;
     CHECK(sequence_model_fd >= 0,
           "request sequence fixture opens one model descriptor");
     if (sequence_model_fd < 0) return;
@@ -1674,8 +1866,10 @@ static void test_request_metrics_lifecycle(void) {
               strcmp(runtime_before.instance_id, request_a.instance_id) == 0,
           "process and request records share one UUID and sequence namespace");
     if (!sequence_fixture_ready) {
+        runtime_test_cleanup_owned_leaf(
+            sequence_model_path, sequence_model_fd,
+            &sequence_model_path_owned);
         close(sequence_model_fd);
-        unlink(sequence_model_path);
         return;
     }
 
@@ -1912,8 +2106,10 @@ static void test_request_metrics_lifecycle(void) {
               memcmp(&completed, &metrics_before, sizeof(completed)) == 0,
           "small-buffer serialization fails without mutating request metrics");
 
+    runtime_test_cleanup_owned_leaf(
+        sequence_model_path, sequence_model_fd,
+        &sequence_model_path_owned);
     close(sequence_model_fd);
-    unlink(sequence_model_path);
 }
 
 static void test_request_metrics_saturation_and_validation(void) {
@@ -2414,12 +2610,18 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    int result = 2;
     if (strcmp(argv[2], "external-attribution") == 0) {
-        return run_external_attribution();
+        result = run_external_attribution();
+    } else if (strcmp(argv[2], "request-metrics") == 0) {
+        result = run_request_metrics();
+    } else {
+        usage(argv[0]);
+        return 2;
     }
-    if (strcmp(argv[2], "request-metrics") == 0) {
-        return run_request_metrics();
+    if (!runtime_test_private_root_cleanup()) {
+        fprintf(stderr, "FAIL: private runtime fixture cleanup not proved\n");
+        return 1;
     }
-    usage(argv[0]);
-    return 2;
+    return result;
 }

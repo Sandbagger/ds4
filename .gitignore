@@ -30,6 +30,7 @@
 /tests/test_sampling
 /tests/test_bench_resident_sequence
 /tests/test_bench_resident_qualification_emitter
+/tests/test_runtime
 /tests/test_runtime_model_source
 *.o
 *.dSYM/

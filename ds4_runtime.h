@@ -621,6 +621,13 @@ ds4_runtime_status ds4_runtime_tracker_init(
     ds4_runtime_tracker *tracker,
     const ds4_runtime_tracker_config *config);
 
+/* Latch a native ownership failure without inventing an allocation event.
+ * The first violation remains sticky; any cached external attribution becomes
+ * stale even when the failed operation never inserted a tracker record. */
+ds4_runtime_status ds4_runtime_tracker_latch_failure(
+    ds4_runtime_tracker *tracker,
+    ds4_runtime_violation violation);
+
 ds4_runtime_status ds4_runtime_tracker_allocate(
     ds4_runtime_tracker *tracker,
     uint64_t allocation_id,

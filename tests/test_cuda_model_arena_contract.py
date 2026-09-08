@@ -165,6 +165,10 @@ static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<uint64_t> g_arena_owner_ids;
 static uint64_t g_model_range_bytes;
 static int g_model_cache_full;
+/* This legacy geometry fixture has no resident observer attached. */
+static int g_model_range_release_failed;
+static int cuda_laguna_resident_observer_safe(void) { return 1; }
+#define cuda_laguna_resident_malloc(out, bytes, callsite) cudaMalloc(out, bytes)
 
 /* 0: virtual success with a tiny owned buffer; 1: ordinary failure;
  * 2: success reported with a null output pointer. */

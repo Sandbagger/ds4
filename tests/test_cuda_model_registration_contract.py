@@ -112,6 +112,10 @@ static int g_model_hmm_direct;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_cache_full;
+/* This transaction fixture has no observer or real range owner. */
+static int g_model_range_release_failed;
+static int fake_range_release_result = 1;
+static int cuda_laguna_resident_observer_safe(void) { return 1; }
 static int fake_register_calls;
 static int fake_unregister_calls;
 static int fake_lookup_calls;
@@ -129,7 +133,11 @@ public:
     bool allowed() const { return true; }
 };
 static void cuda_stream_selected_cache_release(void) { ++fake_cache_release_calls; }
-static void cuda_model_range_release_all(void) { ++fake_cache_release_calls; }
+static int cuda_model_range_release_all(void) {
+    ++fake_cache_release_calls;
+    if (!fake_range_release_result) g_model_range_release_failed = 1;
+    return fake_range_release_result;
+}
 static void cuda_q8_f16_cache_release_all(void) { ++fake_cache_release_calls; }
 static cudaError_t cudaFree(void *) { return cudaSuccess; }
 static cudaError_t cudaHostRegister(void *host, size_t bytes, unsigned flags) {
@@ -182,6 +190,8 @@ static void reset_state(void) {
     g_model_fd = -1;
     g_model_fd_host_base = nullptr;
     g_model_cache_full = 0;
+    g_model_range_release_failed = 0;
+    fake_range_release_result = 1;
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
@@ -226,6 +236,19 @@ static void emit(int r1, int r2 = -1) {
     auto live = fake_live_registrations.find(expected_live_host);
     std::printf("live_host_is_expected=%d\n", expected_live_host && live != fake_live_registrations.end());
     std::printf("live_size_is_expected=%d\n", live != fake_live_registrations.end() && live->second == static_cast<size_t>(expected_size));
+}
+static int scenario_range_teardown_failure(void) {
+    reset_state();
+    const void *old_host = reinterpret_cast<const void *>(0x1a00);
+    const void *old_device = reinterpret_cast<const void *>(0x2a00);
+    const void *new_host = reinterpret_cast<const void *>(0x1b00);
+    seed_registered(old_host, 2048, old_device);
+    expected_host = old_host; expected_device = old_device; expected_size = 2048;
+    fake_range_release_result = 0;
+    const int first = ds4_gpu_register_model_map_no_copy(new_host, 8192);
+    // The old identity must not turn a pending teardown into idempotent success.
+    const int second = ds4_gpu_register_model_map_no_copy(old_host, 2048);
+    emit(first, second); return 0;
 }
 static int scenario_register_success(void) {
     reset_state();
@@ -308,6 +331,7 @@ static int scenario_pending_replacement(bool release_succeeds) {
 int main(int argc, char **argv) {
     alarm(15);
     if (argc != 2) return 2;
+    if (std::strcmp(argv[1], "range-teardown-failure") == 0) return scenario_range_teardown_failure();
     if (std::strcmp(argv[1], "register-success") == 0) return scenario_register_success();
     if (std::strcmp(argv[1], "register-failure") == 0) return scenario_register_failure();
     if (std::strcmp(argv[1], "lookup-failure") == 0) return scenario_lookup_failure(false);
@@ -401,6 +425,12 @@ class ModelRegistrationContractTest(unittest.TestCase):
             cache_release_calls=3, live=1, registered=1, host_is_expected=1,
             size_is_expected=1, device_is_null=1, live_host_is_expected=1,
             live_size_is_expected=1)
+
+    def test_10_range_teardown_failure_stops_rebind_and_same_map_fast_success(self) -> None:
+        self._assert_fields(self._case("range-teardown-failure"), r1=0, r2=0,
+            register_calls=0, unregister_calls=1, lookup_calls=0,
+            physical_registers=1, live=0, cache_release_calls=2, registered=0,
+            host_is_expected=1, size_is_expected=1, device_is_expected=1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -500,6 +500,13 @@ static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_model_upload_stream;
 static cudaStream_t g_stream_selected_upload_stream;
 static uint64_t g_model_direct_align = 1;
+
+/* Legacy extracted fixtures have no attached observer.  Keep the actual
+ * production wrapper names visible in extracted bodies while routing their
+ * inactive-observer calls to the existing fake raw CUDA layer. */
+#define cuda_laguna_resident_malloc_host cudaMallocHost
+#define cuda_laguna_resident_free_host cudaFreeHost
+static int cuda_laguna_resident_observer_safe(void) { return 1; }
 """
 
 # Only actual extracted definitions are included.  In particular, a missing
@@ -2150,14 +2157,20 @@ class SourceWiringContractTest(unittest.TestCase):
         if body is None:
             return
         self.assertRegex(body, r"for\s*\(\s*size_t\s+i\s*=\s*0\s*;\s*i\s*<\s*4")
-        self.assertLess(body.find("cudaEventDestroy"), body.find("cudaFreeHost"))
-        self.assertNotRegex(body, r"\b(?:cudaMallocHost|cudaStreamCreate|malloc|calloc|realloc|new)\b")
+        event_destroy = body.find("cudaEventDestroy")
+        physical_free = body.find("cuda_laguna_resident_free_host")
+        self.assertGreaterEqual(event_destroy, 0)
+        self.assertGreaterEqual(physical_free, 0)
+        self.assertLess(event_destroy, physical_free)
+        self.assertNotRegex(body, r"\b(?:cudaMallocHost|cuda_laguna_resident_malloc_host|cudaStreamCreate|malloc|calloc|realloc|new)\b")
         self.assertRegex(body, r"(?:return\s+0|return\s+false)")
 
     def test_02_pools_preflight_zero_and_size_max_before_reuse_or_io(self) -> None:
-        for body, ready, label in (
-            (MODEL_POOL, "g_model_stage_bytes", "model"),
-            (SELECTED_POOL, "g_stream_selected_stage_bytes", "selected"),
+        for body, ready, label, allocator in (
+            (MODEL_POOL, "g_model_stage_bytes", "model",
+             "cuda_laguna_resident_malloc_host"),
+            (SELECTED_POOL, "g_stream_selected_stage_bytes", "selected",
+             "cudaMallocHost"),
         ):
             with self.subTest(pool=label):
                 code = self._body(body, f"missing actual {label} pool definition")
@@ -2166,7 +2179,7 @@ class SourceWiringContractTest(unittest.TestCase):
                 zero = re.search(r"bytes\s*==\s*0", code)
                 size = re.search(r"bytes\s*>\s*(?:\(\s*uint64_t\s*\)\s*)?SIZE_MAX", code)
                 reuse = code.find(ready + " >= bytes")
-                malloc = code.find("cudaMallocHost")
+                malloc = code.find(allocator)
                 self.assertIsNotNone(zero)
                 self.assertIsNotNone(size)
                 self.assertGreaterEqual(reuse, 0)
@@ -2180,15 +2193,18 @@ class SourceWiringContractTest(unittest.TestCase):
 
     def test_03_successful_nonnull_malloc_publishes_bytes_before_event_create(self) -> None:
         pools = (
-            (MODEL_POOL, "g_model_stage_raw", "g_model_stage_reserved_bytes", "g_model_stage_event"),
-            (SELECTED_POOL, "g_stream_selected_stage_raw", "g_stream_selected_stage_reserved_bytes", "g_stream_selected_stage_event"),
+            (MODEL_POOL, "g_model_stage_raw", "g_model_stage_reserved_bytes",
+             "g_model_stage_event", "cuda_laguna_resident_malloc_host"),
+            (SELECTED_POOL, "g_stream_selected_stage_raw",
+             "g_stream_selected_stage_reserved_bytes",
+             "g_stream_selected_stage_event", "cudaMallocHost"),
         )
-        for body, raw, reserved, event in pools:
+        for body, raw, reserved, event, allocator in pools:
             with self.subTest(raw=raw):
                 code = self._body(body, f"missing actual pool for {raw}")
                 if code is None:
                     continue
-                malloc = code.find("cudaMallocHost")
+                malloc = code.find(allocator)
                 publish = code.find(reserved + "[i] = bytes")
                 create = code.find("cudaEventCreateWithFlags")
                 self.assertGreaterEqual(malloc, 0)

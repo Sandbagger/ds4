@@ -1709,6 +1709,38 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Native resident owner events, bounded first slice (2026-09-08):**
+CUDA scratch, raw pinned model-stage reservations and device weight arenas now
+use event-time observation helpers. Sites 1/11/22 issue namespace `0x52` owners
+only after successful physical allocation. Capacity, ID and classification failures
+refuse before driver calls. Physical free precedes tracker retirement; failed
+free/rollback keeps the owner and a sticky violation. A never-returned allocation
+can retain a private teardown handle even if recording or the driver result fails.
+No failure can turn cached attribution back into a valid snapshot.
+
+Scratch growth refuses rather than returning a retained undersized slab. Arena
+release retires a successful prefix, retains failed/unvisited owners and blocks
+model rebinding until explicit cleanup succeeds. Raw stage alignment slack and
+full arena reservations are charged, not only their logical views. Compact and
+resident attachment are mutually exclusive, but this borrowed-tracker seam is
+**not engine attachment, admission, a complete owner inventory or authentication**.
+
+Test-first host evidence: 24 actual-observer/real-tracker methods under a fake
+CUDA driver, 57 legacy CUDA contract methods, 283 runtime assertions and 32 source
+sampler checks. The owned runtime fixtures preserve real retained-FD replacement
+and fork identity checks inside a private test directory. Independent fixture
+review plus root review kept async/CUDA and remaining-owner limits explicit;
+pinned release/relation controls distinguish report-only registration from owned
+charges. The new host target is in the resident/default aggregate.
+
+This is still partial integration: graph/KV/tensors, managed/registration/host
+owners, remaining caches, authenticated external capture, resident snapshots and
+admitted end-to-end execution are unfinished. Host tests do not prove a new full
+NVCC build, GPU execution, model correctness, memory fit or throughput. Production
+resident qualification keeps its pre-startup refusal. The reusable rule is:
+**record allocation events and retire only after physical release; a checkpoint
+inventory cannot recover transient or failed-owner peaks.**
+
 **Bounded qualification decoder (2026-09-08):**
 The shared resident/streamed benchmark runner now executes up to the authenticated
 512-token cap. It uses greedy native argmax and `ds4_token_is_stop`, not the

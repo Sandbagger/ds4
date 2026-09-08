@@ -408,6 +408,8 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
+/* Retry teardown before any model rebind after a partial range release. */
+static int g_model_range_release_failed;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_cache_suppressed;
@@ -3164,6 +3166,277 @@ static void cuda_laguna_compact_pause_creating_if_armed(
 static void cuda_laguna_compact_counter_add(
         uint64_t *counter, uint64_t amount);
 
+/* Resident native allocation observer.
+ * Observe native reservations at allocation/free time, including transient
+ * peaks and failed rollback owners. This is not admission or a snapshot
+ * producer. Current callers cover scratch, model staging and device arenas;
+ * graph, registrations and remaining owners still need explicit wiring.
+ * Begin/end require a quiescent caller. The tracker must outlive attachment;
+ * native operations are serialized with each other, not with arbitrary direct
+ * tracker mutations. Absent an observer, preserve the legacy CUDA calls.
+ */
+static std::atomic<ds4_runtime_tracker *> g_laguna_resident_tracker{NULL};
+static std::mutex g_laguna_resident_mutex;
+static const uint8_t cuda_laguna_resident_namespace = 0x52u;
+typedef struct {
+    void *base;
+    uint64_t record_id;
+    int pinned;
+} cuda_laguna_resident_retained_owner;
+/* At most one allocation can enter rollback: the first failure latches the
+ * tracker unsafe and prevents every later allocation. */
+static cuda_laguna_resident_retained_owner g_laguna_resident_retained;
+
+static cudaError_t cuda_laguna_resident_fail(
+        ds4_runtime_tracker *tracker, ds4_runtime_violation violation) {
+    (void)ds4_runtime_tracker_latch_failure(tracker, violation);
+    return cudaErrorInvalidValue;
+}
+
+static const ds4_runtime_callsite *cuda_laguna_resident_site(
+        const ds4_runtime_tracker *tracker, uint32_t id) {
+    if (!tracker || !tracker->callsites) return NULL;
+    for (size_t i = 0; i < tracker->callsite_count; i++) {
+        if (tracker->callsites[i].id == id) return &tracker->callsites[i];
+    }
+    return NULL;
+}
+
+static int cuda_laguna_resident_site_matches(
+        const ds4_runtime_callsite *site, int pinned) {
+    if (!site) return 0;
+    if (pinned) return
+        site->id == DS4_LAGUNA_CALLSITE_PINNED_STAGING_0 &&
+        site->domain == DS4_RUNTIME_DOMAIN_HOST &&
+        site->category == DS4_RUNTIME_CATEGORY_PINNED_STAGING;
+    return site->domain == DS4_RUNTIME_DOMAIN_CUDA_DEVICE &&
+        ((site->id == DS4_LAGUNA_CALLSITE_STATIC_SLAB &&
+          site->category == DS4_RUNTIME_CATEGORY_STATIC_WEIGHTS) ||
+         (site->id == DS4_LAGUNA_CALLSITE_OTHER_CUDA_KERNEL_TMP &&
+          site->category == DS4_RUNTIME_CATEGORY_OTHER_CUDA));
+}
+
+static ds4_runtime_allocation_record *cuda_laguna_resident_record(
+        ds4_runtime_tracker *tracker, uint64_t id, const void *base) {
+    if (!tracker) return NULL;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        ds4_runtime_allocation_record *r = &tracker->records[i];
+        if (r->live && (r->id >> 56) == cuda_laguna_resident_namespace &&
+            r->relation == DS4_RUNTIME_RELATION_OWNED_ALLOCATION &&
+            ((id != 0 && r->id == id) ||
+             (id == 0 && r->base == (uint64_t)(uintptr_t)base))) return r;
+    }
+    return NULL;
+}
+
+static int cuda_laguna_resident_has_relation(
+        const ds4_runtime_tracker *tracker, uint64_t owner_id) {
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *r = &tracker->records[i];
+        if (r->live && r->owner_id == owner_id &&
+            (r->relation == DS4_RUNTIME_RELATION_REGISTRATION ||
+             r->relation == DS4_RUNTIME_RELATION_MANAGED_HOST_VISIBLE)) return 1;
+    }
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_resident_observer_begin(
+        ds4_runtime_tracker *tracker) {
+    std::lock_guard<std::recursive_mutex> compact_guard(g_laguna_compact_mutex);
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    if (!tracker || !tracker->callsites || !tracker->records ||
+        tracker->record_capacity == 0 ||
+        tracker->record_count > tracker->record_capacity ||
+        tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        tracker->issued_sequence_high_water[cuda_laguna_resident_namespace] != 0 ||
+        g_laguna_resident_tracker.load(std::memory_order_relaxed) ||
+        g_laguna_resident_retained.base ||
+        g_laguna_compact_state.load(std::memory_order_acquire) != DS4_LAGUNA_COMPACT_IDLE ||
+        g_n_gpus > 1 || g_cuda_tmp || g_cuda_tmp_bytes ||
+        g_model_host_base || g_model_device_base || g_model_registered ||
+        g_model_device_owned || g_model_registered_size ||
+        !g_model_ranges.empty() || !g_model_arenas.empty() ||
+        !g_q8_f16_ranges.empty() || !g_q8_f32_ranges.empty() ||
+        g_model_range_bytes || g_model_range_release_failed ||
+        g_model_stage_bytes || g_stream_selected_stage_bytes ||
+        g_model_upload_stream || g_stream_selected_upload_stream) return 0;
+    for (size_t i = 0; i < 4; i++) {
+        if (g_model_stage_raw[i] || g_model_stage[i] || g_model_stage_event[i] ||
+            g_model_stage_reserved_bytes[i] || g_stream_selected_stage_raw[i] ||
+            g_stream_selected_stage[i] || g_stream_selected_stage_event[i] ||
+            g_stream_selected_stage_reserved_bytes[i]) return 0;
+    }
+    if (!cuda_laguna_resident_site_matches(cuda_laguna_resident_site(
+            tracker, DS4_LAGUNA_CALLSITE_STATIC_SLAB), 0) ||
+        !cuda_laguna_resident_site_matches(cuda_laguna_resident_site(
+            tracker, DS4_LAGUNA_CALLSITE_OTHER_CUDA_KERNEL_TMP), 0) ||
+        !cuda_laguna_resident_site_matches(cuda_laguna_resident_site(
+            tracker, DS4_LAGUNA_CALLSITE_PINNED_STAGING_0), 1)) return 0;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *r = &tracker->records[i];
+        if (r->live &&
+            (r->domain != DS4_RUNTIME_DOMAIN_HOST ||
+             r->category == DS4_RUNTIME_CATEGORY_PINNED_STAGING)) return 0;
+    }
+    g_laguna_resident_tracker.store(tracker, std::memory_order_release);
+    return 1;
+}
+
+static void cuda_laguna_resident_note_failure(void) {
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    (void)ds4_runtime_tracker_latch_failure(
+        g_laguna_resident_tracker.load(std::memory_order_relaxed),
+        DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+}
+
+static int cuda_laguna_resident_observer_safe(void) {
+    if (!g_laguna_resident_tracker.load(std::memory_order_acquire)) return 1;
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    ds4_runtime_tracker *tracker = g_laguna_resident_tracker.load(std::memory_order_relaxed);
+    return !tracker || tracker->violation == DS4_RUNTIME_VIOLATION_NONE;
+}
+
+static cudaError_t cuda_laguna_resident_allocate(
+        void **out, size_t bytes, uint32_t callsite_id, int pinned) {
+    if (!g_laguna_resident_tracker.load(std::memory_order_acquire))
+        return pinned ? cudaMallocHost(out, bytes) : cudaMalloc(out, bytes);
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    ds4_runtime_tracker *tracker =
+        g_laguna_resident_tracker.load(std::memory_order_relaxed);
+    if (!tracker) return pinned ? cudaMallocHost(out, bytes) : cudaMalloc(out, bytes);
+    if (!out || bytes == 0) return cuda_laguna_resident_fail(
+        tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    *out = NULL;
+    if (tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        g_laguna_resident_retained.base) return cudaErrorInvalidValue;
+    const ds4_runtime_callsite *site = cuda_laguna_resident_site(tracker, callsite_id);
+    if (!site) return cuda_laguna_resident_fail(tracker,
+        DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE);
+    if (!cuda_laguna_resident_site_matches(site, pinned))
+        return cuda_laguna_resident_fail(tracker,
+            DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE);
+    int slot_available = tracker->record_count < tracker->record_capacity;
+    for (size_t i = 0; !slot_available && i < tracker->record_count; i++)
+        slot_available = !tracker->records[i].live;
+    if (!slot_available) return cuda_laguna_resident_fail(
+        tracker, DS4_RUNTIME_VIOLATION_CAPACITY);
+    if (tracker->issued_sequence_high_water[cuda_laguna_resident_namespace] >=
+            UINT64_C(0x00ffffffffffffff)) return cuda_laguna_resident_fail(
+                tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+    void *base = NULL;
+    const cudaError_t allocated = pinned
+        ? cudaMallocHost(&base, bytes) : cudaMalloc(&base, bytes);
+    if (allocated != cudaSuccess) {
+        /* CUDA may surface earlier asynchronous errors. A nonnull result on
+         * an error is not a trustworthy success event, but it is a physical
+         * handle we must not discard. Quarantine a failed rollback and make
+         * every subsequent attribution unsafe until caller teardown. */
+        if (base) {
+            (void)ds4_runtime_tracker_latch_failure(
+                tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+            const cudaError_t released = pinned ? cudaFreeHost(base) : cudaFree(base);
+            if (released != cudaSuccess)
+                g_laguna_resident_retained = {base, 0, pinned};
+        }
+        return allocated;
+    }
+    if (!base) return cuda_laguna_resident_fail(
+        tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    uint64_t id = 0;
+    if (ds4_runtime_tracker_allocate_next(
+            tracker, cuda_laguna_resident_namespace, callsite_id,
+            (uint64_t)(uintptr_t)base, bytes, bytes, &id) == DS4_RUNTIME_STATUS_OK) {
+        *out = base;
+        return cudaSuccess;
+    }
+    /* A bound failure may already have inserted an owner. Keep its peak, and
+     * never erase ownership merely because returning this allocation failed. */
+    (void)ds4_runtime_tracker_latch_failure(
+        tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    const cudaError_t released = pinned ? cudaFreeHost(base) : cudaFree(base);
+    if (released == cudaSuccess) {
+        if (id != 0) (void)ds4_runtime_tracker_release(tracker, id);
+    } else {
+        g_laguna_resident_retained = {base, id, pinned};
+    }
+    return released != cudaSuccess ? released : cudaErrorInvalidValue;
+}
+
+static cudaError_t cuda_laguna_resident_malloc(
+        void **out, size_t bytes, uint32_t callsite_id) {
+    return cuda_laguna_resident_allocate(out, bytes, callsite_id, 0);
+}
+
+static cudaError_t cuda_laguna_resident_malloc_host(void **out, size_t bytes) {
+    return cuda_laguna_resident_allocate(out, bytes,
+        DS4_LAGUNA_CALLSITE_PINNED_STAGING_0, 1);
+}
+
+static cudaError_t cuda_laguna_resident_release(void *base, int pinned) {
+    if (!g_laguna_resident_tracker.load(std::memory_order_acquire))
+        return pinned ? cudaFreeHost(base) : cudaFree(base);
+    if (!base) return cudaSuccess;
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    ds4_runtime_tracker *tracker =
+        g_laguna_resident_tracker.load(std::memory_order_relaxed);
+    if (!tracker) return pinned ? cudaFreeHost(base) : cudaFree(base);
+    ds4_runtime_allocation_record *r = cuda_laguna_resident_record(tracker, 0, base);
+    const int retained = g_laguna_resident_retained.base == base;
+    if ((!r && !retained) ||
+        (r && !cuda_laguna_resident_site_matches(
+            cuda_laguna_resident_site(tracker, r->callsite_id), pinned)) ||
+        (retained && g_laguna_resident_retained.pinned != pinned))
+        return cuda_laguna_resident_fail(tracker, DS4_RUNTIME_VIOLATION_NOT_LIVE);
+    if (r && cuda_laguna_resident_has_relation(tracker, r->id))
+        return cuda_laguna_resident_fail(tracker, DS4_RUNTIME_VIOLATION_LIVE_RELATION);
+    const uint64_t id = r ? r->id : 0;
+    const cudaError_t result = pinned ? cudaFreeHost(base) : cudaFree(base);
+    if (result != cudaSuccess) {
+        (void)ds4_runtime_tracker_latch_failure(
+            tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+        return result;
+    }
+    if (id != 0) (void)ds4_runtime_tracker_release(tracker, id);
+    if (retained) memset(&g_laguna_resident_retained, 0, sizeof(g_laguna_resident_retained));
+    /* Release is allowed during unsafe teardown. A pre-existing sticky
+     * violation does not mean this successful physical free failed. */
+    return cudaSuccess;
+}
+
+static cudaError_t cuda_laguna_resident_free(void *base) {
+    return cuda_laguna_resident_release(base, 0);
+}
+
+static cudaError_t cuda_laguna_resident_free_host(void *base) {
+    return cuda_laguna_resident_release(base, 1);
+}
+
+extern "C" int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker) {
+    std::lock_guard<std::recursive_mutex> compact_guard(g_laguna_compact_mutex);
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    if (!tracker || tracker != g_laguna_resident_tracker.load(std::memory_order_relaxed))
+        return 0;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        const ds4_runtime_allocation_record *r = &tracker->records[i];
+        if (r->live && (r->id >> 56) == cuda_laguna_resident_namespace &&
+            r->id != g_laguna_resident_retained.record_id) return 0;
+    }
+    if (g_laguna_resident_retained.base) {
+        const cuda_laguna_resident_retained_owner owner = g_laguna_resident_retained;
+        if (owner.record_id && cuda_laguna_resident_has_relation(tracker, owner.record_id))
+            return 0;
+        /* This allocation never escaped the failing allocator. End owns its
+         * only retry handle, including failures before record insertion. */
+        const cudaError_t result = owner.pinned ? cudaFreeHost(owner.base) : cudaFree(owner.base);
+        if (result != cudaSuccess) return 0;
+        if (owner.record_id) (void)ds4_runtime_tracker_release(tracker, owner.record_id);
+        memset(&g_laguna_resident_retained, 0, sizeof(g_laguna_resident_retained));
+    }
+    g_laguna_resident_tracker.store(NULL, std::memory_order_release);
+    return 1;
+}
+/* End resident native allocation observer. */
+
 extern "C" int ds4_gpu_laguna_compact_create(
         ds4_gpu_laguna_compact **out,
         int model_fd,
@@ -3180,6 +3453,7 @@ extern "C" int ds4_gpu_laguna_compact_create(
 #else
     std::lock_guard<std::recursive_mutex> guard(g_laguna_compact_mutex);
 #endif
+    if (g_laguna_resident_tracker.load(std::memory_order_acquire)) return 0;
     int expected = DS4_LAGUNA_COMPACT_IDLE;
     if (!g_laguna_compact_state.compare_exchange_strong(
             expected, DS4_LAGUNA_COMPACT_CREATING,
@@ -5503,15 +5777,23 @@ __global__ static void dequant_q8_0_to_f32_kernel(
         uint64_t blocks);
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
+    if (!cuda_laguna_resident_observer_safe()) return NULL;
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
+        const cudaError_t release_error = cuda_laguna_resident_free(g_cuda_tmp);
+        if (release_error != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA temp release failed before growth: %s\n",
+                    cudaGetErrorString(release_error));
+            (void)cudaGetLastError();
+            return NULL;
+        }
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
     void *ptr = NULL;
-    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    cudaError_t err = cuda_laguna_resident_malloc(
+        &ptr, (size_t)bytes, DS4_LAGUNA_CALLSITE_OTHER_CUDA_KERNEL_TMP);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA temp alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "scratch", (double)bytes / 1048576.0, cudaGetErrorString(err));
@@ -6629,7 +6911,7 @@ static int cuda_stage_slots_release(void **raw, void **stage,
             events[i] = NULL;
         }
         if (raw[i]) {
-            cudaError_t err = cudaFreeHost(raw[i]);
+            cudaError_t err = cuda_laguna_resident_free_host(raw[i]);
             if (err != cudaSuccess) {
                 fprintf(stderr, "ds4: CUDA pinned staging release failed at slot %zu: %s\n",
                         i, cudaGetErrorString(err));
@@ -6663,6 +6945,7 @@ static int cuda_model_stage_release(void) {
 }
 
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
+    if (!cuda_laguna_resident_observer_safe()) return 0;
     if (bytes == 0 || bytes > SIZE_MAX) return 0;
     if (g_model_stage_bytes >= bytes) return 1;
     g_model_stage_bytes = 0;
@@ -6680,7 +6963,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     }
     for (size_t i = 0; i < 4; i++) {
         void *raw = NULL;
-        cudaError_t err = cudaMallocHost(&raw, (size_t)bytes);
+        cudaError_t err = cuda_laguna_resident_malloc_host(&raw, (size_t)bytes);
         if (err != cudaSuccess || !raw) {
             fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n",
                     err == cudaSuccess ? "null host pointer" : cudaGetErrorString(err));
@@ -6962,6 +7245,7 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return NULL;
+    if (!cuda_laguna_resident_observer_safe() || g_model_range_release_failed) return NULL;
     if (bytes == 0 || bytes > SIZE_MAX) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
@@ -6987,7 +7271,8 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
     if (chunk == 0 || chunk < aligned || chunk > SIZE_MAX) return NULL;
     void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
+    cudaError_t err = cuda_laguna_resident_malloc(
+        &dev, (size_t)chunk, DS4_LAGUNA_CALLSITE_STATIC_SLAB);
     if (err != cudaSuccess || !dev) {
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
@@ -7198,22 +7483,62 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
-static void cuda_model_range_release_all(void) {
-    for (const cuda_model_range &r : g_model_ranges) {
+static int cuda_model_range_release_all(void) {
+    for (cuda_model_range &r : g_model_ranges) {
+        cudaError_t released = cudaSuccess;
         if (r.host_registered && r.registered_base) {
-            (void)cudaHostUnregister(r.registered_base);
+            released = cudaHostUnregister(r.registered_base);
+            if (released == cudaSuccess) {
+                r.host_registered = 0;
+                r.registered_base = NULL;
+                r.registered_device_base = NULL;
+                r.registered_bytes = 0;
+                r.device_ptr = NULL;
+            }
         } else if (r.device_ptr && !r.arena_allocated) {
-            (void)cudaFree(r.device_ptr);
+            released = cuda_laguna_resident_free(r.device_ptr);
+            if (released == cudaSuccess) r.device_ptr = NULL;
+        }
+        if (released != cudaSuccess) {
+            g_model_range_release_failed = 1;
+            cuda_laguna_resident_note_failure();
+            fprintf(stderr, "ds4: CUDA model range release failed: %s\n",
+                    cudaGetErrorString(released));
+            (void)cudaGetLastError();
+            return 0;
         }
     }
-    for (const cuda_model_arena &a : g_model_arenas) {
-        if (a.device_ptr) (void)cudaFree(a.device_ptr);
+    for (cuda_model_arena &a : g_model_arenas) {
+        if (!a.device_ptr) continue;
+        const cudaError_t released = cuda_laguna_resident_free(a.device_ptr);
+        if (released != cudaSuccess) {
+            g_model_range_release_failed = 1;
+            cuda_laguna_resident_note_failure();
+            fprintf(stderr, "ds4: CUDA model arena release failed: %s\n",
+                    cudaGetErrorString(released));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        /* Successful prefix owners are retired, not double-freed on retry.
+         * Invalidate their borrowed views while preserving failed/unvisited
+         * arenas and range metadata until the whole release succeeds. */
+        const uint64_t base = (uint64_t)(uintptr_t)a.device_ptr;
+        for (cuda_model_range &r : g_model_ranges) {
+            const uint64_t view = (uint64_t)(uintptr_t)r.device_ptr;
+            if (r.arena_allocated && r.device_ptr &&
+                view >= base && view - base < a.bytes) r.device_ptr = NULL;
+        }
+        a.device_ptr = NULL;
+        a.bytes = 0;
+        a.used = 0;
     }
     g_model_arenas.clear();
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    g_model_range_release_failed = 0;
     cuda_model_load_progress_reset();
+    return 1;
 }
 
 static int cublas_ok(cublasStatus_t st, const char *what) {
@@ -7498,7 +7823,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 
     /* Continue with legacy global teardown below. */
 
-    cuda_model_range_release_all();
+    if (!cuda_model_range_release_all()) return;
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
@@ -7509,7 +7834,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
     if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
+        if (cuda_laguna_resident_free(g_cuda_tmp) != cudaSuccess) return;
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
@@ -8331,10 +8656,11 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return 0;
+    if (!cuda_laguna_resident_observer_safe() || g_model_range_release_failed) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
-    cuda_model_range_release_all();
+    if (!cuda_model_range_release_all()) return 0;
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
@@ -8431,6 +8757,7 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return 0;
+    if (!cuda_laguna_resident_observer_safe() || g_model_range_release_failed) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) {
         /* A failed rollback still owns a registration, not a usable device map. */
@@ -8451,7 +8778,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     }
 
     cuda_stream_selected_cache_release();
-    cuda_model_range_release_all();
+    if (!cuda_model_range_release_all()) return 0;
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;

@@ -1140,6 +1140,18 @@ static void invalidate_attributed_sample(ds4_runtime_tracker *tracker) {
     tracker->external_sample.attributed_generation = generation;
 }
 
+ds4_runtime_status ds4_runtime_tracker_latch_failure(
+        ds4_runtime_tracker *tracker,
+        ds4_runtime_violation violation) {
+    if (violation <= DS4_RUNTIME_VIOLATION_NONE ||
+        violation > DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION) {
+        violation = DS4_RUNTIME_VIOLATION_INVALID_CONFIG;
+    }
+    latch(tracker, violation);
+    invalidate_attributed_sample(tracker);
+    return status(tracker);
+}
+
 static ds4_runtime_allocation_record *append_record(
         ds4_runtime_tracker *tracker, uint64_t id) {
     const uint8_t producer_namespace = (uint8_t)(id >> 56);

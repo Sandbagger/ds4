@@ -43,6 +43,13 @@ typedef struct {
 } ds4_gpu_attention_decode_row;
 #endif
 
+/* CUDA native owner observation only, not resident qualification admission.
+ * The quiescent caller supplies a live tracker before native allocations and
+ * retains it until end succeeds. Current coverage is scratch/staging/arenas;
+ * this API cannot authorize or synthesize a complete resident snapshot. */
+int ds4_gpu_laguna_resident_observer_begin(ds4_runtime_tracker *tracker);
+int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker);
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 

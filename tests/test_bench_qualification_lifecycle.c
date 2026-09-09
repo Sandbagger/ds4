@@ -89,6 +89,7 @@ enum call_kind {
     CALL_NVML_CAPTURE,
     CALL_TOKENIZE_RENDERED,
     CALL_SESSION_CREATE,
+    CALL_SESSION_FREE_ATTEMPT,
     CALL_SESSION_FREE,
     CALL_REQUEST_BEGIN,
     CALL_REQUEST_PROMPT,
@@ -120,6 +121,11 @@ typedef struct {
     const ds4_runtime_request_metrics *metrics;
     uint64_t value;
     int token;
+    uintptr_t owner_slot;
+    ds4_session *owner_value_after;
+    bool owner_live_before;
+    bool owner_live_after;
+    bool release_refused;
 } call_record;
 
 typedef struct {
@@ -130,10 +136,18 @@ typedef struct {
     int contract_failures;
     int engine_open_count;
     int engine_close_count;
+    int engine_close_attempt_count;
     int tokenize_rendered_count;
     int nvml_capture_count;
     int session_create_count;
+    int session_create_failure_count;
     int session_free_count;
+    int checked_release_attempt_count;
+    int checked_release_refusal_count;
+    int checked_release_consumption_count;
+    int checked_release_refusal_budget;
+    int checked_release_refusal_repetition;
+    int legacy_session_free_attempt_count;
     int request_begin_count;
     int request_prompt_count;
     int prefill_start_count;
@@ -157,7 +171,12 @@ typedef struct {
     int completed_metrics_count;
     ds4_runtime_request_metrics completed_metrics[4];
     bool resident_mode;
+    bool fake_engine_live;
+    bool session_live[4];
+    bool trace_checked_release_attempts;
     bool inject_emitter_failure;
+    bool inject_session_create_failure;
+    int session_create_failure_repetition;
     bool inject_resident_parser_failure;
     bool reject_resident_cross_mode;
     bool reject_streamed_cross_mode;
@@ -182,17 +201,36 @@ typedef struct {
     int request_repetition[4];
     ds4_session *sessions[4];
     int session_repetition[4];
+    uintptr_t session_create_owner_slots[4];
+    bool rescue_active;
+    int rescue_attempt_count;
+    int rescue_consumption_count;
+    bool legacy_projection_active;
+    int observed_result;
+    int observed_failure_result_count;
 } fake_state;
 
 static fake_state state;
 static int all_failures;
+static bool fixture_reset_blocked;
+static int fixture_infrastructure_failures;
 
 static void expected_request_id(int repetition, char *buffer, size_t capacity) {
     snprintf(buffer, capacity,
              "123e4567-e89b-12d3-a456-4266141740%02d", repetition + 1);
 }
 
+static void fixture_infrastructure_failure(const char *message) {
+    fixture_reset_blocked = true;
+    fixture_infrastructure_failures++;
+    fprintf(stderr, "INFRASTRUCTURE: %s\n", message);
+}
+
 static void fail_contract(const char *message) {
+    if (fixture_reset_blocked) {
+        fixture_infrastructure_failure(message);
+        return;
+    }
     state.contract_failures++;
     fprintf(stderr, "FAIL: %s\n", message);
 }
@@ -213,6 +251,11 @@ static void record_call(enum call_kind kind, int repetition) {
         .metrics = NULL,
         .value = 0u,
         .token = 0,
+        .owner_slot = 0u,
+        .owner_value_after = NULL,
+        .owner_live_before = false,
+        .owner_live_after = false,
+        .release_refused = false,
     };
 }
 
@@ -228,6 +271,7 @@ static void record_pointer_call(enum call_kind kind,
 }
 
 static int session_index(const ds4_session *session) {
+    if (!session) return -1;
     for (int i = 0; i < state.session_create_count && i < 4; i++) {
         if (state.sessions[i] == session) return i;
     }
@@ -475,6 +519,12 @@ static bool pinned_resident_engine_options(const ds4_engine_options *options) {
            options->qualification_control_fd == 9;
 }
 
+static bool fake_any_live_session(void) {
+    for (int i = 0; i < state.session_create_count && i < 4; i++)
+        if (state.session_live[i]) return true;
+    return false;
+}
+
 static int fake_engine_open(ds4_engine **out, const ds4_engine_options *options) {
     record_call(CALL_ENGINE_OPEN, -1);
     state.engine_open_count++;
@@ -491,7 +541,12 @@ static int fake_engine_open(ds4_engine **out, const ds4_engine_options *options)
     if (state.engine_open_count != 1) {
         fail_contract("qualification lifecycle opened more than one engine");
     }
+    if (state.fake_engine_live) {
+        fail_contract("fake qualification engine was opened while already live");
+        return 1;
+    }
     *out = fake_engine;
+    state.fake_engine_live = true;
     return 0;
 }
 
@@ -508,13 +563,23 @@ static int fake_engine_create_with_gpu_config(
 
 static void fake_engine_close(ds4_engine *engine) {
     record_call(CALL_ENGINE_CLOSE, -1);
+    state.engine_close_attempt_count++;
+    if (engine != fake_engine) {
+        fail_contract("wrong engine");
+        return;
+    }
+    if (!state.fake_engine_live) {
+        fail_contract("closed dead engine");
+        return;
+    }
+    if (fake_any_live_session() || state.session_free_count != state.session_create_count) {
+        fail_contract("engine close while session live");
+        return;
+    }
+    state.fake_engine_live = false;
     state.engine_close_count++;
-    if (engine != fake_engine) fail_contract("wrong engine pointer closed");
     if (state.engine_close_count != 1) {
         fail_contract("qualification lifecycle closed the engine more than once");
-    }
-    if (state.session_free_count != state.session_create_count) {
-        fail_contract("engine closed before every created session was freed");
     }
 }
 
@@ -695,38 +760,121 @@ static ds4_runtime_status fake_engine_laguna_external_checkpoint(
 
 static int fake_session_create(ds4_session **out, ds4_engine *engine, int context_size) {
     record_call(CALL_SESSION_CREATE, state.session_create_count);
-    const int repetition = state.session_create_count;
-    state.session_create_count++;
-    if (!out || engine != fake_engine || context_size != 32768 || repetition >= 4) {
-        fail_contract("session create did not use the open engine and pinned context");
+    const int repetition = state.session_create_count++;
+    if (!out || engine != fake_engine || !state.fake_engine_live ||
+        context_size != 32768 || repetition >= 4) {
+        fail_contract("session create used invalid engine/context");
         return 1;
     }
     *out = (ds4_session *)(void *)&fake_session_storage[repetition];
     state.sessions[repetition] = *out;
     state.session_repetition[repetition] = repetition;
+    state.session_create_owner_slots[repetition] = (uintptr_t)(void *)out;
+    state.session_live[repetition] = true;
+    for (int i = 0; i < repetition; i++)
+        if (state.sessions[i] == *out) fail_contract("session pointer reused");
+    if (state.call_count != 0u) {
+        call_record *call = &state.calls[state.call_count - 1u];
+        call->session = *out;
+        call->owner_slot = (uintptr_t)(void *)out;
+    }
+    if (state.inject_session_create_failure &&
+        repetition == state.session_create_failure_repetition) {
+        state.session_create_failure_count++;
+        return 1;
+    }
     return 0;
 }
 
-static void fake_session_free(ds4_session *session) {
-    const int repetition = session_rep(session);
-    record_pointer_call(CALL_SESSION_FREE, repetition, session, NULL);
-    state.session_free_count++;
-    if (repetition < 0 || repetition >= 4) {
-        fail_contract("unknown session was freed");
-        return;
+static bool fake_owner_slot_is_known(ds4_session **owner) {
+    if (!owner) return false;
+    const uintptr_t slot = (uintptr_t)(void *)owner;
+    if (state.rescue_active || state.legacy_projection_active) return true;
+    for (int i = 0; i < state.session_create_count && i < 4; i++)
+        if (state.session_create_owner_slots[i] == slot) return true;
+    return false;
+}
+
+static int fake_session_free_checked(ds4_session **owner) {
+    if (!owner) return 0;
+    if (!fake_owner_slot_is_known(owner)) {
+        fail_contract("checked release rejected unknown owner slot");
+        return 0;
     }
-    for (int i = 0; i < repetition; i++) {
-        if (state.sessions[i] == session && i != repetition) {
-            fail_contract("session pointer was reused across repetitions");
+    ds4_session *session = *owner;
+    if (!session) return 1;
+    const int repetition = session_rep(session);
+    state.checked_release_attempt_count++;
+    call_record *attempt = NULL;
+    if (state.trace_checked_release_attempts) {
+        record_pointer_call(CALL_SESSION_FREE_ATTEMPT, repetition, session, NULL);
+        attempt = state.call_count != 0u
+            ? &state.calls[state.call_count - 1u] : NULL;
+        if (attempt) {
+            attempt->owner_slot = (uintptr_t)(void *)owner;
+            attempt->owner_value_after = session;
+            attempt->owner_live_before = repetition >= 0 && repetition < 4 &&
+                state.session_live[repetition];
         }
     }
-    int free_count = 0;
-    for (size_t i = 0; i + 1u < state.call_count; i++) {
-        if (state.calls[i].kind == CALL_SESSION_FREE &&
-            state.calls[i].session == session) free_count++;
+    bool consumable = repetition >= 0 && repetition < 4 &&
+        state.sessions[repetition] == session && state.session_live[repetition] &&
+        state.fake_engine_live;
+    if (consumable) {
+        for (size_t i = 0; i + 1u < state.call_count; i++) {
+            if (state.calls[i].kind == CALL_SESSION_FREE &&
+                state.calls[i].session == session) {
+                fail_contract("current session was freed more than once");
+                consumable = false;
+                break;
+            }
+        }
     }
-    if (free_count != 0) fail_contract("current session was freed more than once");
+    const bool targeted_refusal = consumable &&
+        repetition == state.checked_release_refusal_repetition &&
+        state.checked_release_refusal_budget > 0;
+    if (!consumable || targeted_refusal) {
+        if (targeted_refusal) state.checked_release_refusal_budget--;
+        state.checked_release_refusal_count++;
+        if (attempt) {
+            attempt->release_refused = true;
+            attempt->owner_live_after = repetition >= 0 && repetition < 4 &&
+                state.session_live[repetition];
+            attempt->owner_value_after = session;
+        }
+        return 0;
+    }
+
+    /* Emit the legacy free event while the owner is still live. */
+    record_pointer_call(CALL_SESSION_FREE, repetition, session, NULL);
+    call_record *free_call = state.call_count != 0u
+        ? &state.calls[state.call_count - 1u] : NULL;
+    if (free_call) {
+        free_call->owner_slot = (uintptr_t)(void *)owner;
+        free_call->owner_live_before = true;
+        free_call->owner_live_after = false;
+    }
+    *owner = NULL;
+    state.session_live[repetition] = false;
+    state.checked_release_consumption_count++;
+    state.session_free_count++;
+    if (attempt) {
+        attempt->owner_value_after = *owner;
+        attempt->owner_live_after = false;
+    }
+    if (free_call) free_call->owner_value_after = *owner;
+    return 1;
 }
+
+static void fake_session_free(ds4_session *session) {
+    state.legacy_session_free_attempt_count++;
+    ds4_session *local_owner = session;
+    const bool previous_legacy = state.legacy_projection_active;
+    state.legacy_projection_active = true;
+    (void)fake_session_free_checked(&local_owner);
+    state.legacy_projection_active = previous_legacy;
+}
+
 
 static void fill_fake_tokens(ds4_tokens *out) {
     if (!out) {
@@ -1397,6 +1545,7 @@ static bool lifecycle_real_resident_emit_record(
 #define ds4_engine_runtime_snapshot fake_engine_runtime_snapshot
 #define ds4_engine_laguna_external_checkpoint fake_engine_laguna_external_checkpoint
 #define ds4_session_create fake_session_create
+#define ds4_session_free_checked fake_session_free_checked
 #define ds4_session_free fake_session_free
 #define ds4_session_sync_attributed fake_session_sync_attributed
 #define ds4_session_eval_attributed fake_session_eval_attributed
@@ -1705,6 +1854,10 @@ static void check_lifecycle_shape(bool resident) {
 }
 
 static void reset_fake_state(bool inject_emitter_failure) {
+    if (fixture_reset_blocked || state.fake_engine_live || fake_any_live_session()) {
+        fixture_infrastructure_failure("refusing reset with live fake owner/engine");
+        exit(125);
+    }
     memset(&state, 0, sizeof(state));
     literal_sequence_input[sizeof(literal_input) - 1u] = 0x7fu;
     resident_sequence_input[sizeof(resident_literal_input) - 1u] = 0x7fu;
@@ -1712,6 +1865,7 @@ static void reset_fake_state(bool inject_emitter_failure) {
 }
 
 static int invoke_bench(void) {
+    if (fixture_reset_blocked) return 125;
     char *argv[] = {
         (char *)"ds4-bench",
         (char *)"--qualification-sequence", (char *)"/literal/sequence.txt",
@@ -1726,6 +1880,7 @@ static int invoke_bench(void) {
 }
 
 static int invoke_bench_resident(void) {
+    if (fixture_reset_blocked) return 125;
     char *argv[] = {
         (char *)"ds4-bench",
         (char *)"--qualification-resident-sequence",
@@ -1741,6 +1896,7 @@ static int invoke_bench_resident(void) {
 }
 
 static int invoke_bench_resident_streamed_fixture(void) {
+    if (fixture_reset_blocked) return 125;
     char *argv[] = {
         (char *)"ds4-bench",
         (char *)"--qualification-resident-sequence",
@@ -1756,6 +1912,7 @@ static int invoke_bench_resident_streamed_fixture(void) {
 }
 
 static int invoke_bench_streamed_resident_fixture(void) {
+    if (fixture_reset_blocked) return 125;
     char *argv[] = {
         (char *)"ds4-bench",
         (char *)"--qualification-sequence", (char *)"/literal/resident-sequence.txt",
@@ -1767,6 +1924,244 @@ static int invoke_bench_streamed_resident_fixture(void) {
         NULL,
     };
     return ds4_bench_test_cli_main((int)(ARRAY_LEN(argv) - 1u), argv);
+}
+
+static void observe_failure_result(int rc, const char *label) {
+    state.observed_result = rc;
+    if (rc != 0) state.observed_failure_result_count++;
+    else { fprintf(stderr, "RED: %s returned success\n", label);
+           fail_contract("failure-injection scenario returned success"); }
+}
+static int record_caller_expectation(bool ok, const char *message) {
+    if (ok) return 0;
+    fprintf(stderr, "RED: %s\n", message);
+    fail_contract(message);
+    return 1;
+}
+static bool fake_has_lifecycle_work(void) {
+    return state.request_begin_count || state.request_prompt_count || state.prefill_start_count ||
+        state.sync_count || state.prefill_complete_count || state.choose_count || state.eval_count ||
+        state.generated_count || state.visible_count || state.first_visible_count || state.barrier_count ||
+        state.finish_count || state.checkpoint_count || state.snapshot_count || state.emit_count ||
+        state.resident_emit_count;
+}
+static void rescue_live_sessions(void) {
+    for (int repetition = 0; repetition < state.session_create_count && repetition < 4; repetition++) {
+        if (!state.session_live[repetition]) continue;
+        if (!state.sessions[repetition]) {
+            fixture_infrastructure_failure("live fake owner has no known handle");
+            continue;
+        }
+        ds4_session *owner = state.sessions[repetition];
+        int owner_attempts = 0;
+        state.rescue_active = true;
+        while (state.session_live[repetition] && owner_attempts < 3) {
+            owner_attempts++;
+            state.rescue_attempt_count++;
+            const int attempts_before = state.checked_release_attempt_count;
+            const int consumptions_before = state.checked_release_consumption_count;
+            const int consumed = fake_session_free_checked(&owner);
+            const bool consumed_delta = state.checked_release_consumption_count != consumptions_before;
+            if (state.checked_release_attempt_count != attempts_before + 1 ||
+                (consumed != 0) != consumed_delta)
+                fixture_infrastructure_failure("rescue checked-release counter/return mismatch");
+            if (consumed_delta) state.rescue_consumption_count++;
+        }
+        state.rescue_active = false;
+        if (owner != NULL || state.session_live[repetition])
+            fixture_infrastructure_failure("bounded rescue left a fake owner live");
+    }
+    if (fake_any_live_session())
+        fixture_infrastructure_failure("known-owner rescue did not clear all fake owners");
+    if (state.fake_engine_live && !fake_any_live_session()) fake_engine_close(fake_engine);
+    if (state.fake_engine_live || fake_any_live_session())
+        fixture_infrastructure_failure("fake engine/owner teardown remained live");
+}
+static void check_retained_constructor_cleanup(bool resident, int refusal_budget, const char *label) {
+    reset_fake_state(false);
+    state.trace_checked_release_attempts = true;
+    state.inject_session_create_failure = true;
+    state.session_create_failure_repetition = 0;
+    state.checked_release_refusal_budget = refusal_budget;
+    state.checked_release_refusal_repetition = 0;
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    observe_failure_result(rc, label);
+    const int create = nth_call(CALL_SESSION_CREATE, 0, 0);
+    const int first = nth_call(CALL_SESSION_FREE_ATTEMPT, -1, 0);
+    const int second = nth_call(CALL_SESSION_FREE_ATTEMPT, -1, 1);
+    const int free = nth_call(CALL_SESSION_FREE, 0, 0);
+    const int close = first_call(CALL_ENGINE_CLOSE, -1);
+    const int sequence_free = first_call(resident ? CALL_RESIDENT_SEQUENCE_FREE : CALL_SEQUENCE_FREE, -1);
+    const int emit_count = resident ? state.resident_emit_count : state.emit_count;
+    if (rc == 0 || state.observed_failure_result_count != 1 || state.session_create_count != 1 ||
+        state.session_create_failure_count != 1 || create < 0 || state.sessions[0] == NULL ||
+        state.checked_release_attempt_count != 1 + refusal_budget ||
+        state.checked_release_refusal_count != refusal_budget || state.checked_release_consumption_count != 1 ||
+        state.session_free_count != 1 || state.legacy_session_free_attempt_count != 0 ||
+        state.engine_open_count != 1 || state.engine_close_attempt_count != 1 ||
+        state.engine_close_count != 1 || state.fake_engine_live || fake_any_live_session() ||
+        fake_has_lifecycle_work() || emit_count != 0 ||
+        state.sequence_free_count != (resident ? 0 : 1) ||
+        state.resident_sequence_free_count != (resident ? 1 : 0))
+        fail_contract("retained constructor cleanup counts/teardown were wrong");
+    require_call_order(create, first, "retained cleanup must follow failed create");
+    if (refusal_budget == 0) {
+        if (second >= 0) fail_contract("first retained cleanup unexpectedly retried");
+    } else {
+        require_call_order(first, second, "refused owner must hand back to main");
+    }
+    const int last = refusal_budget == 0 ? first : second;
+    require_call_order(last, free, "retained checked cleanup must precede free");
+    require_call_order(free, close, "engine close must follow retained free");
+    require_call_order(close, sequence_free, "typed sequence cleanup must follow engine close");
+    if (create >= 0 && first >= 0) {
+        const call_record *made = &state.calls[create];
+        const call_record *attempt = &state.calls[first];
+        if (!made->session || made->owner_slot == 0u || made->session != state.sessions[0] ||
+            attempt->owner_slot != made->owner_slot || !attempt->owner_live_before)
+            fail_contract("first retained cleanup did not use original owner slot");
+        if (refusal_budget == 0 &&
+            (attempt->release_refused || attempt->owner_live_after || attempt->owner_value_after != NULL))
+            fail_contract("first retained cleanup did not consume owner");
+    }
+    if (refusal_budget != 0 && first >= 0 && second >= 0) {
+        const call_record *attempt = &state.calls[first];
+        const call_record *retry = &state.calls[second];
+        if (attempt->owner_slot != retry->owner_slot || attempt->session != retry->session ||
+            !attempt->release_refused || !attempt->owner_live_before || !attempt->owner_live_after ||
+            attempt->owner_value_after != state.sessions[0] || retry->release_refused ||
+            !retry->owner_live_before || retry->owner_live_after || retry->owner_value_after != NULL)
+            fail_contract("retained main retry lost live owner handback");
+    }
+    rescue_live_sessions();
+    if (fake_any_live_session() || state.fake_engine_live)
+        fixture_infrastructure_failure("retained fixture ended live");
+    all_failures += state.contract_failures;
+}
+static void check_fourth_repetition_release_refusal(bool resident) {
+    reset_fake_state(false);
+    state.trace_checked_release_attempts = true;
+    state.checked_release_refusal_budget = 1;
+    state.checked_release_refusal_repetition = 3;
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    observe_failure_result(rc, resident ? "resident fourth cleanup" : "streamed fourth cleanup");
+    const int emit_count = resident ? state.resident_emit_count : state.emit_count;
+    if (rc == 0 || state.observed_failure_result_count != 1 || state.session_create_count != 4 ||
+        state.session_free_count != 4 || state.checked_release_attempt_count != 5 ||
+        state.checked_release_refusal_count != 1 || state.checked_release_consumption_count != 4 ||
+        state.legacy_session_free_attempt_count != 0 || emit_count != 12 ||
+        state.engine_close_attempt_count != 1 || state.engine_close_count != 1 ||
+        fake_any_live_session() || state.fake_engine_live)
+        fail_contract("fourth cleanup refusal changed lifecycle counts");
+    check_lifecycle_shape(resident);
+    const int final_complete = nth_call(resident ? CALL_RESIDENT_EMIT : CALL_EMIT, 3, 2);
+    const int refused = nth_call(CALL_SESSION_FREE_ATTEMPT, -1, 3);
+    const int retry = nth_call(CALL_SESSION_FREE_ATTEMPT, -1, 4);
+    const int final_free = nth_call(CALL_SESSION_FREE, 3, 0);
+    const int close = first_call(CALL_ENGINE_CLOSE, -1);
+    const int create = nth_call(CALL_SESSION_CREATE, 3, 0);
+    if (final_complete < 0 || refused < 0 || retry < 0 || final_free < 0 || create < 0) {
+        fail_contract("fourth cleanup refusal did not expose guarded timeline indexes");
+    } else {
+        const call_record *failure = &state.calls[refused];
+        const call_record *handback = &state.calls[retry];
+        const call_record *created = &state.calls[create];
+        if (failure->session != state.sessions[3] || handback->session != state.sessions[3] ||
+            !failure->release_refused || !failure->owner_live_before || !failure->owner_live_after ||
+            failure->owner_value_after != state.sessions[3] || handback->release_refused ||
+            !handback->owner_live_before || handback->owner_live_after || handback->owner_value_after != NULL ||
+            failure->owner_slot == 0u || failure->owner_slot != handback->owner_slot ||
+            failure->owner_slot != created->owner_slot)
+            fail_contract("fourth refusal lost live owner handback");
+        require_call_order(final_complete, refused, "fourth refusal must follow completion");
+        require_call_order(refused, retry, "main retry must follow fourth refusal");
+        require_call_order(retry, final_free, "fourth retry must precede free");
+    }
+    require_call_order(final_free, close, "engine close must follow fourth free");
+    if (refused >= 0) {
+        for (size_t i = (size_t)refused + 1u; i < state.call_count; i++) {
+            const enum call_kind kind = state.calls[i].kind;
+            if (kind != CALL_SESSION_FREE_ATTEMPT && kind != CALL_SESSION_FREE &&
+                kind != CALL_ENGINE_CLOSE && kind != (resident ? CALL_RESIDENT_SEQUENCE_FREE : CALL_SEQUENCE_FREE))
+                fail_contract("fourth refusal allowed work after terminal completion");
+        }
+    }
+    rescue_live_sessions();
+    if (fake_any_live_session() || state.fake_engine_live)
+        fixture_infrastructure_failure("fourth fixture ended live");
+    all_failures += state.contract_failures;
+}
+static void check_failed_constructor_refusal(bool resident) {
+    reset_fake_state(false);
+    state.trace_checked_release_attempts = true;
+    state.inject_session_create_failure = true;
+    state.session_create_failure_repetition = 0;
+    state.checked_release_refusal_budget = 2;
+    state.checked_release_refusal_repetition = 0;
+    const int rc = resident ? invoke_bench_resident() : invoke_bench();
+    observe_failure_result(rc, resident ? "resident failed constructor" : "streamed failed constructor");
+    const int create = nth_call(CALL_SESSION_CREATE, 0, 0);
+    const int first = nth_call(CALL_SESSION_FREE_ATTEMPT, -1, 0);
+    const int second = nth_call(CALL_SESSION_FREE_ATTEMPT, -1, 1);
+    const int first_free = nth_call(CALL_SESSION_FREE, -1, 0);
+    const int sequence_free = first_call(resident ? CALL_RESIDENT_SEQUENCE_FREE : CALL_SEQUENCE_FREE, -1);
+    const int emit_count = resident ? state.resident_emit_count : state.emit_count;
+    const int pre_attempts = state.checked_release_attempt_count;
+    const int pre_refusals = state.checked_release_refusal_count;
+    const int pre_consumptions = state.checked_release_consumption_count;
+    const int pre_close_attempts = state.engine_close_attempt_count;
+    const int pre_closes = state.engine_close_count;
+    const bool pre_engine_live = state.fake_engine_live;
+    int unmet = 0;
+    unmet += record_caller_expectation(rc != 0 && state.observed_failure_result_count == 1,
+                                       "failed constructor did not preserve failure result");
+    unmet += record_caller_expectation(create >= 0 && state.session_create_count == 1 &&
+                                       state.session_create_failure_count == 1 && state.sessions[0] != NULL &&
+                                       state.session_live[0], "failed constructor did not retain live witness");
+    unmet += record_caller_expectation(first >= 0 && second >= 0 && pre_attempts == 2 &&
+                                       pre_refusals == 2 && pre_consumptions == 0 && state.session_free_count == 0,
+                                       "failed constructor did not make two refusing attempts");
+    unmet += record_caller_expectation(first_free < 0,
+                                       "failed constructor consumed owner before rescue");
+    unmet += record_caller_expectation(pre_close_attempts == 0 && pre_closes == 0 && pre_engine_live,
+                                       "main attempted engine close while owner remained live");
+    unmet += record_caller_expectation(!fake_has_lifecycle_work() && emit_count == 0 &&
+                                       state.legacy_session_free_attempt_count == 0,
+                                       "failed constructor performed request/eval/emission work");
+    unmet += record_caller_expectation(sequence_free >= 0 &&
+                                       state.sequence_free_count == (resident ? 0 : 1) &&
+                                       state.resident_sequence_free_count == (resident ? 1 : 0),
+                                       "failed constructor missed typed sequence cleanup");
+    if (create >= 0 && first >= 0 && second >= 0) {
+        const call_record *made = &state.calls[create];
+        const call_record *one = &state.calls[first];
+        const call_record *two = &state.calls[second];
+        unmet += record_caller_expectation(made->owner_slot != 0u &&
+            one->owner_slot == made->owner_slot && two->owner_slot == made->owner_slot &&
+            one->owner_slot == two->owner_slot && one->session == state.sessions[0] &&
+            two->session == state.sessions[0], "failed cleanup lost original caller slot");
+        unmet += record_caller_expectation(one->release_refused && two->release_refused &&
+            one->owner_live_before && one->owner_live_after && two->owner_live_before &&
+            two->owner_live_after && one->owner_value_after == state.sessions[0] &&
+            two->owner_value_after == state.sessions[0], "checked refusal did not preserve live owner");
+    } else {
+        unmet += record_caller_expectation(false, "failed cleanup did not expose both attempts");
+    }
+    (void)unmet;
+    rescue_live_sessions();
+    const int rescue_attempts = state.rescue_attempt_count;
+    const int rescue_consumptions = state.rescue_consumption_count;
+    if (state.checked_release_attempt_count - pre_attempts != rescue_attempts ||
+        state.checked_release_refusal_count - pre_refusals != rescue_attempts - rescue_consumptions ||
+        state.checked_release_consumption_count - pre_consumptions != rescue_consumptions ||
+        rescue_attempts < 1 || rescue_attempts > 3 || rescue_consumptions != 1 ||
+        fake_any_live_session() || state.fake_engine_live)
+        fixture_infrastructure_failure("failed-constructor rescue counter/teardown mismatch");
+    const int expected_close_delta = pre_engine_live ? 1 : 0;
+    if (state.engine_close_attempt_count - pre_close_attempts != expected_close_delta ||
+        state.engine_close_count - pre_closes != expected_close_delta)
+        fixture_infrastructure_failure("post-rescue engine-close delta was not isolated");
+    all_failures += state.contract_failures;
 }
 
 static void check_native_stop_termination(
@@ -2210,6 +2605,7 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         if (strcmp(argv[1], "--probe-argv-rejection") != 0) return 2;
         reset_fake_state(false);
+        if (fixture_reset_blocked) return 125;
         const int rc = ds4_bench_test_cli_main(argc - 1, argv + 1);
         if (state.call_count != 0u) {
             fprintf(stderr, "argument rejection reached parser/backend\n");
@@ -2218,6 +2614,10 @@ int main(int argc, char **argv) {
         return rc;
     }
     check_happy_path();
+    check_retained_constructor_cleanup(false, 0, "streamed retained constructor");
+    check_retained_constructor_cleanup(false, 1, "streamed retained retry");
+    check_fourth_repetition_release_refusal(false);
+    check_failed_constructor_refusal(false);
     check_native_stop_before_output(false);
     check_native_stop_termination(false, literal_eos_token, "EOS");
     check_native_stop_termination(false, literal_native_stop_token,
@@ -2230,11 +2630,16 @@ int main(int argc, char **argv) {
     check_resident_midrun_failure(true);
     check_resident_midrun_failure(false);
     check_resident_happy_path();
+    check_retained_constructor_cleanup(true, 0, "resident retained constructor");
+    check_retained_constructor_cleanup(true, 1, "resident retained retry");
+    check_fourth_repetition_release_refusal(true);
+    check_failed_constructor_refusal(true);
     check_native_stop_before_output(true);
     check_native_stop_termination(true, literal_eos_token, "resident EOS");
     check_native_stop_termination(true, literal_native_stop_token,
                                   "resident distinct model-native stop");
     check_late_decode_failure(true);
+    if (fixture_infrastructure_failures) return 125;
     if (all_failures != 0) {
         fprintf(stderr, "qualification lifecycle fake backend: %d failures\n",
                 all_failures);

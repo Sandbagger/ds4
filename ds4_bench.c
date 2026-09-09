@@ -953,9 +953,9 @@ static bool qualification_copy_rendered_prompt(
     return true;
 }
 
-/* Execute one authenticated, fixed-shape benchmark sequence.  The caller
- * owns engine, prompt, rendered, and sequence; this runner owns each session
- * only until its repetition reaches a terminal milestone or aborts. */
+/* Execute one authenticated, fixed-shape benchmark sequence. The caller owns
+ * engine, prompt, rendered, sequence, and the session slot. Refused cleanup must
+ * leave the session reachable after this runner returns. */
 /* Mode is selected by the explicit CLI flag and retained as a typed owner.
  * Neither the schema/profile strings nor a borrowed nested sequence can choose
  * the emitter. Exactly one source pointer must be present. */
@@ -1016,6 +1016,7 @@ static bool qualification_lifecycle_emit(
 
 static int run_qualification_lifecycle(
         ds4_engine *engine,
+        ds4_session **session_owner,
         const qualification_lifecycle_source *source,
         const ds4_tokens *prompt,
         const ds4_gpu_nvml_inventory_snapshot *pre_child,
@@ -1026,7 +1027,8 @@ static int run_qualification_lifecycle(
     if (source && (!!source->streamed != !!source->resident)) {
         sequence = source->resident ? &source->resident->sequence : source->streamed;
     }
-    if (!engine || !sequence || !prompt || !pre_child ||
+    if (!engine || !session_owner || *session_owner ||
+        !sequence || !prompt || !pre_child ||
         !expected_build_identity || !stream) {
         return qualification_lifecycle_failure(
             "lifecycle", "invalid runner input");
@@ -1037,7 +1039,6 @@ static int run_qualification_lifecycle(
     for (uint32_t repetition_index = 0;
          repetition_index < 4;
          repetition_index++) {
-        ds4_session *session = NULL;
         ds4_runtime_request_context request;
         ds4_runtime_request_metrics metrics;
         ds4_runtime_wire_snapshot runtime_snapshot;
@@ -1052,11 +1053,12 @@ static int run_qualification_lifecycle(
         error[0] = '\0';
 
         do {
-            if (ds4_session_create(&session, engine, 32768) != 0) {
+            if (ds4_session_create(session_owner, engine, 32768) != 0) {
                 rc = qualification_lifecycle_failure(
                     "session create", "backend returned failure");
                 break;
             }
+            ds4_session *const session = *session_owner;
             if (!qualification_next_timestamp(&last_timestamp, &timestamp)) {
                 rc = qualification_lifecycle_failure(
                     "request timestamp", "monotonic clock failed");
@@ -1269,7 +1271,11 @@ static int run_qualification_lifecycle(
             }
         } while (false);
 
-        if (session) ds4_session_free(session);
+        if (*session_owner && !ds4_session_free_checked(session_owner)) {
+            const int cleanup_rc = qualification_lifecycle_failure(
+                "session cleanup", "backend retained session");
+            if (rc == 0) rc = cleanup_rc;
+        }
         if (rc != 0) return rc;
     }
     return 0;
@@ -1331,6 +1337,7 @@ int main(int argc, char **argv) {
         }
 #endif
         ds4_engine *qualification_engine = NULL;
+        ds4_session *qualification_session = NULL;
         ds4_tokens qualification_prompt = {0};
         char *qualification_rendered = NULL;
         int qualification_rc = 2;
@@ -1420,7 +1427,8 @@ int main(int argc, char **argv) {
             goto qualification_cleanup;
         }
         qualification_rc = run_qualification_lifecycle(
-            qualification_engine, &source, &qualification_prompt,
+            qualification_engine, &qualification_session, &source,
+            &qualification_prompt,
             &pre_child, expected_build_identity, stdout);
 #else
         fprintf(stderr,
@@ -1430,7 +1438,16 @@ int main(int argc, char **argv) {
 #endif
 
 qualification_cleanup:
-        if (qualification_engine) {
+        /* One final cleanup attempt keeps the borrowed engine live. A retry
+         * cannot erase the first failure, including after request_complete. */
+        if (qualification_session &&
+            !ds4_session_free_checked(&qualification_session)) {
+            fprintf(stderr,
+                    "ds4-bench: qualification session cleanup refused; "
+                    "retaining session and engine\n");
+            if (qualification_rc == 0) qualification_rc = 2;
+        }
+        if (qualification_engine && !qualification_session) {
             ds4_engine_close(qualification_engine);
         }
         ds4_tokens_free(&qualification_prompt);

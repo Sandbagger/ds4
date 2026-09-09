@@ -1709,6 +1709,53 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Qualification caller cleanup custody, actual-bench CPU controls:**
+The qualifying streamed and resident branches now keep the session output slot
+in `main`, outside the lifecycle helper and repetition. Failed constructor
+outputs are cleanup-only. The helper uses `ds4_session_free_checked` on that
+original slot, stops repetitions on refusal, and preserves the first failure.
+Main may make one additional checked attempt. It never calls engine close while
+the session remains. A successful retry cannot change the process result back
+to success, including after all twelve lifecycle records were emitted.
+
+The per-request stack data stays in its existing synchronous scope. The bounded
+request-lifetime review checked attribution and compact graph-end paths; this
+change does not move request storage or claim GPU quiescence. `request_complete`
+still means completed request work with a live-session snapshot. It is not a
+successful-cleanup or publication receipt. Parsing, authenticated admission,
+typed emitter selection, model-native stopping and the 512-token cap are unchanged.
+
+The baseline `96074e0b5dd0377a9a45702e19f5b9e607a6285b` has completed independent
+host and full CUDA compile-only seals. Against its unchanged production caller,
+the repaired `tests/test_bench_qualification_lifecycle.c` fixture reported 44
+caller-contract failures with no infrastructure failure. It exposed premature
+engine-close attempts and a success result after fourth-request cleanup refusal.
+The unchanged fixture passes after the caller fix. Its eight new cases cover
+both typed modes: failed-constructor cleanup consumption, one refusal then
+outer retry, late fourth-request refusal then retry, and two cleanup refusals.
+
+This fixture includes actual `ds4_bench.c` with opaque fake backend handles.
+It records caller expectations before bounded known-live witness rescue, counts
+attempts separately from refusals and consumption, and refuses engine-close
+side effects with live sessions. Unrecoverable fixture state returns 125 and
+cannot reset into another case. These are caller-flow controls, not actual core
+release, physical allocation, pthread, GPU or model evidence. Two source-test
+selectors now name checked release without weakening their ordering assertions.
+The fourteen working host targets and seven selected source methods passed
+(195 Python methods, separate native controls, and strict synthetic record
+compositions). Independent review found no bounded blocker. Exact-commit host
+and CUDA verification for this new caller revision are still separate steps.
+
+Other callers, checked engine-close status, partial construction and acquisition,
+bootstrap/source-context ownership, first-event allocation accounting, and final
+publication remain open. Production graph callers stay LEGACY; the resident
+qualification guard stays closed. No model or produced CUDA program was run.
+Cold plus three warm runs and the sixteen-slice verified publication remain due.
+
+Reusable rule: **put retryable cleanup custody in the outer caller, keep borrowed
+resources alive while an owner remains, and make the first failure sticky even
+when request records or a later cleanup attempt look successful.**
+
 **Post-success constructor unlock handoff, actual-core CPU controls:**
 `ds4_session_create` now passes its caller output slot to checked cleanup after
 successful construction followed by a reported tracker-unlock failure. It still

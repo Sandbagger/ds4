@@ -1367,7 +1367,7 @@ class BenchQualificationLifecycleSourceContractTest(unittest.TestCase):
                 continue
             _header, loop_body = loop
             code = _c_code_view(loop_body)
-            if "ds4_session_create(" in code and "ds4_session_free(" in code:
+            if "ds4_session_create(" in code and "ds4_session_free_checked(" in code:
                 runners.append((name, body, loop_body))
         self.assertEqual(
             len(runners),
@@ -1378,7 +1378,7 @@ class BenchQualificationLifecycleSourceContractTest(unittest.TestCase):
         loop_code = _c_code_view(loop_body)
         self.assertRegex(loop_code, r"\brepetition_index\b")
         self.assertIn("ds4_session_create(", loop_code)
-        self.assertIn("ds4_session_free(", loop_code)
+        self.assertIn("ds4_session_free_checked(", loop_code)
 
         main = _c_code_view(_function_body(BENCH_SOURCE, "int main(int argc, char **argv)"))
         opens = [

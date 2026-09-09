@@ -1452,17 +1452,37 @@ class ResidentFixture(unittest.TestCase):
         self.assertEqual(value(values, "final_violation"), value(values, "retained_violation"))
 
     def test_19_range_release_callers_stop_before_rebinding_or_more_cleanup(self) -> None:
-        for signature, returned in (("extern \"C\" void ds4_gpu_cleanup(", ""),
-                                    ("extern \"C\" int ds4_gpu_set_model_map(", "0"),
-                                    ("extern \"C\" int ds4_gpu_register_model_map_no_copy(", "0")):
+        cases = (
+            ("extern \"C\" int ds4_gpu_cleanup_checked(void)", False),
+            ("extern \"C\" int ds4_gpu_set_model_map(", True),
+            ("extern \"C\" int ds4_gpu_register_model_map_no_copy(", True),
+        )
+        for signature, model_rebind in cases:
             with self.subTest(caller=signature):
                 body = extract_definition(CUDA_SOURCE, signature)
                 self.assertIsNotNone(body)
-                self.assertRegex(body or "", r"if\s*\(\s*!cuda_model_range_release_all\(\)\s*\)\s*return\s*" + returned + r"\s*;")
-                if returned:
-                    self.assertIn("g_model_range_release_failed", body or "")
-                    self.assertLess((body or "").index("g_model_range_release_failed"),
-                                    (body or "").index("g_model_host_base == model_map"))
+                code = body or ""
+                if model_rebind:
+                    self.assertRegex(
+                        code,
+                        r"if\s*\(\s*!cuda_model_range_release_all\(\)\s*\)\s*return\s*0\s*;",
+                    )
+                    self.assertIn("g_model_range_release_failed", code)
+                    self.assertLess(
+                        code.index("g_model_range_release_failed"),
+                        code.index("g_model_host_base == model_map"),
+                    )
+                    continue
+
+                self.assertRegex(
+                    code,
+                    r"if\s*\(\s*!cuda_model_range_release_all\(\)\s*\)\s*goto\s+cleanup_refused\s*;",
+                )
+                label = code.index("cleanup_refused:")
+                latch = code.index("cuda_laguna_resident_note_failure();", label)
+                returned = code.index("return 0;", latch)
+                self.assertLess(label, latch)
+                self.assertLess(latch, returned)
 
     def test_20_owned_host_contract_is_in_resident_and_default_aggregates(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8").replace("\\\n", " ")

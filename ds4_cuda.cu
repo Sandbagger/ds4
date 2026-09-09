@@ -165,29 +165,64 @@ typedef struct {
 
 static cuda_stream_selected_cache g_stream_selected_cache;
 
+/* A negative valid flag is cleanup-only: invalidation must not revive it. */
 static void cuda_stream_selected_cache_invalidate(void) {
-    g_stream_selected_cache.valid = 0;
+    if (g_stream_selected_cache.valid >= 0)
+        g_stream_selected_cache.valid = 0;
 }
 
-static void cuda_stream_selected_cache_release(void) {
+static int cuda_ok(cudaError_t err, const char *what);
+static void cuda_laguna_resident_note_failure(void);
+
+static int cuda_stream_selected_cache_release(void) {
     const int tier = g_stream_selected_cache.logical_tier;
-    if (tier >= 0 && tier < g_n_gpus) {
-        (void)ds4_gpu_set_current_device(tier);
+    g_stream_selected_cache.valid = -1;
+    if (g_stream_selected_cache.gate_ptr || g_stream_selected_cache.up_ptr ||
+        g_stream_selected_cache.down_ptr || g_stream_selected_cache.slot_selected_ptr) {
+        /* Do not trust a cached logical selection across direct CUDA calls. */
+        g_current_logical_tier = -1;
+        if (tier < 0 || tier >= g_n_gpus ||
+            ds4_gpu_set_current_device(tier) != 0 ||
+            !cuda_ok(cudaDeviceSynchronize(), "selected cache release sync")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
     }
     if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
+        if (!cuda_ok(cudaFree(g_stream_selected_cache.gate_ptr), "selected gate release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        g_stream_selected_cache.gate_ptr = NULL;
+        g_stream_selected_cache.gate_capacity = 0;
     }
     if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
+        if (!cuda_ok(cudaFree(g_stream_selected_cache.up_ptr), "selected up release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        g_stream_selected_cache.up_ptr = NULL;
+        g_stream_selected_cache.up_capacity = 0;
     }
     if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
+        if (!cuda_ok(cudaFree(g_stream_selected_cache.down_ptr), "selected down release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        g_stream_selected_cache.down_ptr = NULL;
+        g_stream_selected_cache.down_capacity = 0;
     }
     if (g_stream_selected_cache.slot_selected_ptr) {
-        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
+        if (!cuda_ok(cudaFree(g_stream_selected_cache.slot_selected_ptr), "selected slots release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        g_stream_selected_cache.slot_selected_ptr = NULL;
+        g_stream_selected_cache.slot_selected_capacity = 0;
     }
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     g_stream_selected_cache.logical_tier = -1;
+    return 1;
 }
 
 typedef struct {
@@ -206,7 +241,7 @@ typedef struct {
 } cuda_score_split_graph_cache;
 
 static cuda_score_split_graph_cache g_score_split_graph[DS4_MAX_GPUS];
-static void attention_decode_score_split_graph_destroy_one(int logical_tier);
+static int attention_decode_score_split_graph_destroy_one(int logical_tier);
 
 typedef struct {
     cudaGraph_t     graph;
@@ -248,7 +283,7 @@ static int cuda_q4_mma_ok(void) {
 static int cuda_q4_mma_tile16_shmem_ok(int which_down);
 
 
-static void routed_moe_decode_graph_destroy_one(int logical_tier);
+static int routed_moe_decode_graph_destroy_one(int logical_tier);
 
 /* =========================================================================
  * Multi-GPU plumbing (device-aware CUDA).
@@ -6099,7 +6134,6 @@ extern "C" int ds4_gpu_test_laguna_compact_lookup(
         ctx, source_offset, bytes, expected_device, out_device_ptr);
 }
 
-static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -6516,13 +6550,64 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
-static void cuda_q8_f16_cache_release_all(void) {
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-        (void)cudaFree(r.device_ptr);
+static int cuda_q8_f16_cache_release_all(void) {
+    int previous_device = -1;
+    for (cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        if (!r.device_ptr) continue;
+        if (previous_device < 0 &&
+            !cuda_ok(cudaGetDevice(&previous_device), "q8 f16 release device query")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        g_current_logical_tier = -1;
+        if (r.device_id < 0 ||
+            !cuda_ok(cudaSetDevice(r.device_id), "q8 f16 release device") ||
+            !cuda_ok(cudaDeviceSynchronize(), "q8 f16 release sync") ||
+            !cuda_ok(cudaFree(r.device_ptr), "q8 f16 release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        r.device_ptr = NULL;
+    }
+    if (previous_device >= 0 &&
+        !cuda_ok(cudaSetDevice(previous_device), "q8 f16 release restore device")) {
+        cuda_laguna_resident_note_failure();
+        return 0;
     }
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
+    return 1;
+}
+
+static int cuda_q8_f32_cache_release_all(void) {
+    int previous_device = -1;
+    for (cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        if (!r.device_ptr) continue;
+        if (previous_device < 0 &&
+            !cuda_ok(cudaGetDevice(&previous_device), "q8 f32 release device query")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        g_current_logical_tier = -1;
+        if (r.device_id < 0 ||
+            !cuda_ok(cudaSetDevice(r.device_id), "q8 f32 release device") ||
+            !cuda_ok(cudaDeviceSynchronize(), "q8 f32 release sync") ||
+            !cuda_ok(cudaFree(r.device_ptr), "q8 f32 release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        r.device_ptr = NULL;
+    }
+    if (previous_device >= 0 &&
+        !cuda_ok(cudaSetDevice(previous_device), "q8 f32 release restore device")) {
+        cuda_laguna_resident_note_failure();
+        return 0;
+    }
+    g_q8_f32_ranges.clear();
+    g_q8_f32_by_offset.clear();
+    g_q8_f32_bytes = 0;
+    return 1;
 }
 
 static uint64_t cuda_parse_mib_env(const char *name, int *present) {
@@ -6707,8 +6792,11 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     }
     g_q8_f16_disabled_after_oom = 1;
     if (!g_q8_f16_ranges.empty()) {
-        (void)cudaDeviceSynchronize();
-        cuda_q8_f16_cache_release_all();
+        if (!cuda_ok(cudaDeviceSynchronize(), "q8 fp16 disable synchronize") ||
+            !cuda_q8_f16_cache_release_all()) {
+            cuda_laguna_resident_note_failure();
+            return;
+        }
     }
     (void)cudaGetLastError();
 }
@@ -8095,12 +8183,15 @@ extern "C" int ds4_gpu_init(void) {
     return ds4_gpu_init_multi(&cfg);
 }
 
-extern "C" void ds4_gpu_cleanup(void) {
+extern "C" int ds4_gpu_cleanup_checked(void) {
     g_laguna_compact_generic_cleanup_attempts.fetch_add(
         1u, std::memory_order_relaxed);
     const int compact_cleanup_required =
         g_laguna_compact_state.load(std::memory_order_acquire) !=
             DS4_LAGUNA_COMPACT_IDLE;
+    int entry_device = -1;
+    int close_error = 0;
+    int has_cuda_owners = 0;
     if (compact_cleanup_required) {
         const ds4_gpu_laguna_destroy_status destroy_status =
             cuda_laguna_compact_destroy_checked(
@@ -8109,35 +8200,88 @@ extern "C" void ds4_gpu_cleanup(void) {
             fprintf(stderr,
                     "ds4: CUDA cleanup retained compact Laguna ownership "
                     "after teardown failure\n");
-            return;
+            goto cleanup_refused;
         }
-    } else {
-        (void)cudaDeviceSynchronize();
+    }
+    if (g_n_gpus < 0 || g_n_gpus > DS4_MAX_GPUS) goto cleanup_refused;
+
+    /* An empty teardown must not require a CUDA context. Availability counters
+     * are not owner predicates: partially released stage slots still count. */
+    has_cuda_owners = g_n_gpus != 0 || g_cuda_tmp ||
+        g_stream_selected_cache.gate_ptr || g_stream_selected_cache.up_ptr ||
+        g_stream_selected_cache.down_ptr || g_stream_selected_cache.slot_selected_ptr ||
+        !g_model_ranges.empty() || !g_model_arenas.empty() ||
+        !g_q8_f16_ranges.empty() || !g_q8_f32_ranges.empty() ||
+        (g_model_device_owned && g_model_device_base) ||
+        (g_model_registered && g_model_host_base) ||
+        g_model_upload_stream || g_stream_selected_upload_stream || g_model_prefetch_stream;
+    for (int i = 0; i < DS4_MAX_GPUS; i++) {
+        const ds4_gpu_ctx *c = &g_gpu[i];
+        if (i >= g_n_gpus && (c->boundary_event || c->stream || c->cublas ||
+                c->scratch || g_score_split_graph[i].exec || g_score_split_graph[i].graph ||
+                g_moe_decode_graph[i].exec || g_moe_decode_graph[i].graph)) {
+            /* Do not invent missing logical-to-physical authority. */
+            goto cleanup_refused;
+        }
+        if (g_dev_cache[i].present) has_cuda_owners = 1;
+        for (int j = 0; j < DS4_MAX_GPUS; j++) {
+            if (g_xdev_bounce[i][j]) has_cuda_owners = 1;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        if (g_model_stage_raw[i] || g_model_stage_event[i] ||
+            g_stream_selected_stage_raw[i] || g_stream_selected_stage_event[i])
+            has_cuda_owners = 1;
     }
     g_current_logical_tier = -1;
+    if (has_cuda_owners) {
+        if (!cuda_ok(cudaGetDevice(&entry_device), "cleanup device query") ||
+            entry_device < 0 ||
+            !cuda_ok(cudaDeviceSynchronize(), "cleanup synchronize")) goto cleanup_refused;
+        /* The caller serializes mutations. Quiesce every represented device
+         * before releasing any generic owner, including physical-index caches. */
+        for (int i = 0; i < g_n_gpus; i++) {
+            if (g_gpu[i].device_id < 0 ||
+                !cuda_ok(cudaSetDevice(g_gpu[i].device_id), "cleanup device selection") ||
+                !cuda_ok(cudaDeviceSynchronize(), "cleanup device synchronize"))
+                goto cleanup_refused;
+        }
+        for (int d = 0; d < DS4_MAX_GPUS; d++) {
+            if (!g_dev_cache[d].present) continue;
+            if (!cuda_ok(cudaSetDevice(d), "cleanup cache device selection") ||
+                !cuda_ok(cudaDeviceSynchronize(), "cleanup cache device synchronize"))
+                goto cleanup_refused;
+        }
+    }
 
-    /* Multi-GPU teardown: events, streams, cublas handles, scratch
-     * slabs, per-pair bounce buffers. */
+    /* Keep the completed prefix cleared and failed/unvisited owners intact. */
     for (int i = 0; i < g_n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
-        (void)cudaSetDevice(c->device_id);
-        attention_decode_score_split_graph_destroy_one(i);
-        routed_moe_decode_graph_destroy_one(i);
+        if (!cuda_ok(cudaSetDevice(c->device_id), "cleanup context selection"))
+            goto cleanup_refused;
+        if (!attention_decode_score_split_graph_destroy_one(i) ||
+            !routed_moe_decode_graph_destroy_one(i)) goto cleanup_refused;
         if (c->boundary_event) {
-            (void)cudaEventDestroy((cudaEvent_t)c->boundary_event);
+            if (!cuda_ok(cudaEventDestroy((cudaEvent_t)c->boundary_event),
+                         "cleanup boundary event")) goto cleanup_refused;
             c->boundary_event = NULL;
         }
         if (c->stream) {
-            (void)cudaStreamDestroy((cudaStream_t)c->stream);
+            if (!cuda_ok(cudaStreamDestroy((cudaStream_t)c->stream),
+                         "cleanup context stream")) goto cleanup_refused;
             c->stream = NULL;
         }
         if (c->cublas) {
-            (void)cublasDestroy((cublasHandle_t)c->cublas);
+            const cublasStatus_t status = cublasDestroy((cublasHandle_t)c->cublas);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "ds4: CUDA cleanup cuBLAS release failed: %d\n", (int)status);
+                goto cleanup_refused;
+            }
             c->cublas = NULL;
             c->cublas_ready = 0;
         }
         if (c->scratch) {
-            (void)cudaFree(c->scratch);
+            if (!cuda_ok(cudaFree(c->scratch), "cleanup context scratch")) goto cleanup_refused;
             c->scratch = NULL;
             c->scratch_bytes = 0;
         }
@@ -8145,56 +8289,74 @@ extern "C" void ds4_gpu_cleanup(void) {
     for (int i = 0; i < DS4_MAX_GPUS; i++) {
         for (int j = 0; j < DS4_MAX_GPUS; j++) {
             if (g_xdev_bounce[i][j]) {
-                (void)cudaFreeHost(g_xdev_bounce[i][j]);
+                if (!cuda_ok(cudaFreeHost(g_xdev_bounce[i][j]), "cleanup bounce buffer"))
+                    goto cleanup_refused;
                 g_xdev_bounce[i][j] = NULL;
                 g_xdev_bounce_bytes[i][j] = 0;
             }
         }
     }
-    cuda_stream_selected_cache_release();
-    cuda_stream_selected_stage_release();
-    g_n_gpus = 0;
-    g_cublas_ready = 0;
+    if (entry_device >= 0 &&
+        !cuda_ok(cudaSetDevice(entry_device), "cleanup staging device")) goto cleanup_refused;
+    if (!cuda_stream_selected_cache_release()) goto cleanup_refused;
+    if (!cuda_stream_selected_stage_release()) goto cleanup_refused;
 
-    /* Per-device selective cache teardown (selective model cache). */
+    /* Selective caches are indexed by physical device, not logical tier. */
+    g_current_logical_tier = -1;
     for (int d = 0; d < DS4_MAX_GPUS; d++) {
         if (!g_dev_cache[d].present) continue;
-        int prev = -1;
-        (void)cudaGetDevice(&prev);
-        (void)cudaSetDevice(d);
-        if (g_dev_cache[d].base) (void)cudaFree(g_dev_cache[d].base);
+        if (!cuda_ok(cudaSetDevice(d), "cleanup selective cache device")) goto cleanup_refused;
+        if (g_dev_cache[d].base &&
+            !cuda_ok(cudaFree(g_dev_cache[d].base), "cleanup selective cache")) goto cleanup_refused;
         g_dev_cache[d].base = NULL;
         g_dev_cache[d].bytes = 0;
         g_dev_cache[d].present = 0;
-        if (prev >= 0) (void)cudaSetDevice(prev);
     }
     g_cache_ranges.clear();
+    if (entry_device >= 0 &&
+        !cuda_ok(cudaSetDevice(entry_device), "cleanup global device")) goto cleanup_refused;
 
-    /* Continue with legacy global teardown below. */
-
-    if (!cuda_model_range_release_all()) return;
-    cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
-    g_q8_f16_budget_notice_printed = 0;
-    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f32_ranges.clear();
-    g_q8_f32_by_offset.clear();
-    g_q8_f32_bytes = 0;
+    if (!cuda_model_range_release_all()) goto cleanup_refused;
+    if (!cuda_q8_f16_cache_release_all()) goto cleanup_refused;
+    if (!cuda_q8_f32_cache_release_all()) goto cleanup_refused;
     if (g_cuda_tmp) {
-        if (cuda_laguna_resident_free(g_cuda_tmp) != cudaSuccess) return;
+        if (cuda_laguna_resident_free(g_cuda_tmp) != cudaSuccess) goto cleanup_refused;
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
-    /* Preserve unresolved staging owners and byte records for a retry. */
-    (void)cuda_model_stage_release();
+    if (!cuda_model_stage_release()) goto cleanup_refused;
     if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
+        if (!cuda_ok(cudaFree((void *)g_model_device_base), "cleanup model device"))
+            goto cleanup_refused;
+        g_model_device_base = NULL;
+        g_model_device_owned = 0;
     }
     if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
+        if (!cuda_ok(cudaHostUnregister((void *)g_model_host_base), "cleanup model registration"))
+            goto cleanup_refused;
+        g_model_registered = 0;
     }
+    if (g_model_direct_fd >= 0) {
+        /* Linux consumes the descriptor number even on EIO/EINTR. Never retry
+         * that number after close returns: it may already name another file. */
+        const int closed = close(g_model_direct_fd);
+        close_error = closed == 0 ? 0 : errno;
+        g_model_direct_fd = -1;
+        if (closed != 0) {
+            fprintf(stderr, "ds4: CUDA cleanup direct model close failed: %s\n",
+                    strerror(close_error));
+            goto cleanup_refused;
+        }
+    }
+    if (g_model_prefetch_stream) {
+        if (!cuda_ok(cudaStreamDestroy(g_model_prefetch_stream), "cleanup model prefetch stream"))
+            goto cleanup_refused;
+        g_model_prefetch_stream = NULL;
+    }
+    if (entry_device >= 0 &&
+        !cuda_ok(cudaSetDevice(entry_device), "cleanup final device restore")) goto cleanup_refused;
+
+    /* Borrowed source and affinity metadata outlive every dependent owner. */
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
@@ -8204,20 +8366,28 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_hmm_direct = 0;
     g_model_fd = -1;
     g_model_fd_host_base = NULL;
-    if (g_model_direct_fd >= 0) {
-        (void)close(g_model_direct_fd);
-        g_model_direct_fd = -1;
-    }
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
     g_support_host_base = NULL;
     g_support_host_size = 0;
     g_support_offset_bias = 0;
-    if (g_model_prefetch_stream) {
-        (void)cudaStreamDestroy(g_model_prefetch_stream);
-        g_model_prefetch_stream = NULL;
-    }
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
+    g_n_gpus = 0;
+    g_cublas_ready = 0;
+    g_current_logical_tier = -1;
+    return 1;
+
+cleanup_refused:
+    g_current_logical_tier = -1;
+    cuda_laguna_resident_note_failure();
+    if (close_error) errno = close_error;
+    return 0;
+}
+
+extern "C" void ds4_gpu_cleanup(void) {
+    (void)ds4_gpu_cleanup_checked();
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -9016,23 +9186,31 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!cuda_laguna_resident_observer_safe() || g_model_range_release_failed) return 0;
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
-    cuda_stream_selected_cache_release();
+    if (!cuda_stream_selected_cache_release()) return 0;
     if (!cuda_model_range_release_all()) return 0;
-    cuda_q8_f16_cache_release_all();
+    if (!cuda_q8_f16_cache_release_all()) return 0;
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
-    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f32_ranges.clear();
-    g_q8_f32_by_offset.clear();
-    g_q8_f32_bytes = 0;
+    if (!cuda_q8_f32_cache_release_all()) return 0;
     if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
+        cudaError_t release_err = cudaFree((void *)g_model_device_base);
+        if (release_err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA prior model device release failed: %s\n",
+                    cudaGetErrorString(release_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_model_device_base = NULL;
         g_model_device_owned = 0;
     }
     if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
+        cudaError_t release_err = cudaHostUnregister((void *)g_model_host_base);
+        if (release_err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA prior host registration release failed: %s\n",
+                    cudaGetErrorString(release_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
         g_model_registered = 0;
     }
     g_model_host_base = model_map;
@@ -9134,19 +9312,21 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
         g_model_registered = 0;
     }
 
-    cuda_stream_selected_cache_release();
+    if (!cuda_stream_selected_cache_release()) return 0;
     if (!cuda_model_range_release_all()) return 0;
-    cuda_q8_f16_cache_release_all();
+    if (!cuda_q8_f16_cache_release_all()) return 0;
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
-    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f32_ranges.clear();
-    g_q8_f32_by_offset.clear();
-    g_q8_f32_bytes = 0;
+    if (!cuda_q8_f32_cache_release_all()) return 0;
     if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
+        cudaError_t release_err = cudaFree((void *)g_model_device_base);
+        if (release_err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA (no-copy) prior model device release failed: %s\n",
+                    cudaGetErrorString(release_err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_model_device_base = NULL;
         g_model_device_owned = 0;
     }
     g_model_host_base = model_map;
@@ -14227,12 +14407,30 @@ typedef struct {
     float    beta_slow;
 } cuda_attention_inv_rope_params;
 
-static void attention_decode_score_split_graph_destroy_one(int logical_tier) {
-    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) return;
+static int attention_decode_score_split_graph_destroy_one(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) {
+        cuda_laguna_resident_note_failure();
+        return 0;
+    }
     cuda_score_split_graph_cache *c = &g_score_split_graph[logical_tier];
-    if (c->exec) (void)cudaGraphExecDestroy(c->exec);
-    if (c->graph) (void)cudaGraphDestroy(c->graph);
+    /* A partial destroy is cleanup-only, never a launchable cache hit. */
+    c->valid = -1;
+    if (c->exec) {
+        if (!cuda_ok(cudaGraphExecDestroy(c->exec), "graph exec release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        c->exec = NULL;
+    }
+    if (c->graph) {
+        if (!cuda_ok(cudaGraphDestroy(c->graph), "graph release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        c->graph = NULL;
+    }
     memset(c, 0, sizeof(*c));
+    return 1;
 }
 
 static int attention_decode_score_split_graph_launch(
@@ -14273,8 +14471,9 @@ static int attention_decode_score_split_graph_launch(
         c->final_threads == final_threads &&
         c->fuses_inv_rope == (graph_inv_rope ? 1 : 0) &&
         (!graph_inv_rope || c->n_rot == inv_rope->n_rot);
-    if (c->valid && !shape_match) {
-        attention_decode_score_split_graph_destroy_one(logical_tier);
+    if (c->valid < 0 || (c->valid && !shape_match) ||
+        (!c->valid && (c->exec || c->graph))) {
+        if (!attention_decode_score_split_graph_destroy_one(logical_tier)) return -1;
         c = &g_score_split_graph[logical_tier];
     }
 
@@ -14345,7 +14544,7 @@ static int attention_decode_score_split_graph_launch(
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: attention score-split graph create failed: %s\n",
                     cudaGetErrorString(err));
-            attention_decode_score_split_graph_destroy_one(logical_tier);
+            (void)attention_decode_score_split_graph_destroy_one(logical_tier);
             return -1;
         }
         err = cudaGraphAddKernelNode(&c->score_node, c->graph, NULL, 0,
@@ -14365,7 +14564,7 @@ static int attention_decode_score_split_graph_launch(
             fprintf(stderr,
                     "ds4: attention score-split graph instantiate failed: %s\n",
                     cudaGetErrorString(err));
-            attention_decode_score_split_graph_destroy_one(logical_tier);
+            (void)attention_decode_score_split_graph_destroy_one(logical_tier);
             return -1;
         }
         c->n_head = n_head;
@@ -14391,7 +14590,7 @@ static int attention_decode_score_split_graph_launch(
             fprintf(stderr,
                     "ds4: attention score-split graph update failed: %s\n",
                     cudaGetErrorString(err));
-            attention_decode_score_split_graph_destroy_one(logical_tier);
+            (void)attention_decode_score_split_graph_destroy_one(logical_tier);
             return -1;
         }
     }
@@ -14400,7 +14599,7 @@ static int attention_decode_score_split_graph_launch(
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: attention score-split graph launch failed: %s\n",
                 cudaGetErrorString(err));
-        attention_decode_score_split_graph_destroy_one(logical_tier);
+        (void)attention_decode_score_split_graph_destroy_one(logical_tier);
         return -1;
     }
     return 1;
@@ -25761,12 +25960,30 @@ __global__ static void moe_down_q4K_sum3_slotwarp_kernel(
     }
 }
 
-static void routed_moe_decode_graph_destroy_one(int logical_tier) {
-    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) return;
+static int routed_moe_decode_graph_destroy_one(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) {
+        cuda_laguna_resident_note_failure();
+        return 0;
+    }
     cuda_moe_decode_graph_cache *c = &g_moe_decode_graph[logical_tier];
-    if (c->exec) (void)cudaGraphExecDestroy(c->exec);
-    if (c->graph) (void)cudaGraphDestroy(c->graph);
+    /* A partial destroy is cleanup-only, never a launchable cache hit. */
+    c->valid = -1;
+    if (c->exec) {
+        if (!cuda_ok(cudaGraphExecDestroy(c->exec), "graph exec release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        c->exec = NULL;
+    }
+    if (c->graph) {
+        if (!cuda_ok(cudaGraphDestroy(c->graph), "graph release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
+        c->graph = NULL;
+    }
     memset(c, 0, sizeof(*c));
+    return 1;
 }
 
 static int routed_moe_decode_q4_graph_launch(
@@ -25806,8 +26023,9 @@ static int routed_moe_decode_q4_graph_launch(
         c->expert_in_dim == expert_in_dim &&
         c->expert_mid_dim == expert_mid_dim &&
         c->out_dim == out_dim;
-    if (c->valid && !shape_match) {
-        routed_moe_decode_graph_destroy_one(logical_tier);
+    if (c->valid < 0 || (c->valid && !shape_match) ||
+        (!c->valid && (c->exec || c->graph))) {
+        if (!routed_moe_decode_graph_destroy_one(logical_tier)) return -1;
         c = &g_moe_decode_graph[logical_tier];
     }
 
@@ -25865,7 +26083,7 @@ static int routed_moe_decode_q4_graph_launch(
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: routed MoE decode graph create failed: %s\n",
                     cudaGetErrorString(err));
-            routed_moe_decode_graph_destroy_one(logical_tier);
+            (void)routed_moe_decode_graph_destroy_one(logical_tier);
             return -1;
         }
         err = cudaGraphAddKernelNode(&c->xq_node, c->graph, NULL, 0,
@@ -25888,7 +26106,7 @@ static int routed_moe_decode_q4_graph_launch(
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: routed MoE decode graph instantiate failed: %s\n",
                     cudaGetErrorString(err));
-            routed_moe_decode_graph_destroy_one(logical_tier);
+            (void)routed_moe_decode_graph_destroy_one(logical_tier);
             return -1;
         }
         c->n_expert = n_expert;
@@ -25915,7 +26133,7 @@ static int routed_moe_decode_q4_graph_launch(
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: routed MoE decode graph update failed: %s\n",
                     cudaGetErrorString(err));
-            routed_moe_decode_graph_destroy_one(logical_tier);
+            (void)routed_moe_decode_graph_destroy_one(logical_tier);
             return -1;
         }
     }
@@ -25924,7 +26142,7 @@ static int routed_moe_decode_q4_graph_launch(
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: routed MoE decode graph launch failed: %s\n",
                 cudaGetErrorString(err));
-        routed_moe_decode_graph_destroy_one(logical_tier);
+        (void)routed_moe_decode_graph_destroy_one(logical_tier);
         return -1;
     }
     return 1;
@@ -27381,7 +27599,7 @@ static int routed_moe_launch(
     const int use_stream_selected_cache =
         allow_streaming &&
         g_ssd_streaming_mode &&
-        g_stream_selected_cache.valid &&
+        g_stream_selected_cache.valid > 0 &&
         g_stream_selected_cache.logical_tier == logical_tier &&
         g_stream_selected_cache.model_map == model_map &&
         g_stream_selected_cache.layer == layer_index &&
@@ -29418,7 +29636,10 @@ static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
     if (*ptr && *capacity >= bytes) return 1;
     if (*ptr) {
-        (void)cudaFree(*ptr);
+        if (!cuda_ok(cudaFree(*ptr), "selected cache resize release")) {
+            cuda_laguna_resident_note_failure();
+            return 0;
+        }
         *ptr = NULL;
         *capacity = 0;
     }
@@ -29473,6 +29694,8 @@ static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t slot_count) {
+    if (g_stream_selected_cache.valid < 0 &&
+        !cuda_stream_selected_cache_release()) return 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
@@ -29526,7 +29749,7 @@ static int cuda_stream_selected_cache_begin_load(
          g_stream_selected_cache.up_ptr ||
          g_stream_selected_cache.down_ptr ||
          g_stream_selected_cache.slot_selected_ptr)) {
-        cuda_stream_selected_cache_release();
+        if (!cuda_stream_selected_cache_release()) return 0;
     }
     if (ds4_gpu_set_current_device(logical_tier) != 0 ||
         !cuda_stream_selected_ensure_bytes(
@@ -36601,9 +36824,9 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return;
+    if (!enabled && !cuda_stream_selected_cache_release()) return;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -36619,7 +36842,7 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
+    return g_stream_selected_cache.valid > 0 ?
         g_stream_selected_cache.compact_count : 0;
 }
 
@@ -36629,7 +36852,7 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_laguna_compact_legacy_permit compact_permit;
     if (!compact_permit.allowed()) return;
-    cuda_stream_selected_cache_release();
+    if (!cuda_stream_selected_cache_release()) return;
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(

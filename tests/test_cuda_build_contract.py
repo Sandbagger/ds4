@@ -4160,14 +4160,31 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertIn(release_binary, clean_recipe)
         self.assertIn(release_object, clean_recipe)
 
-    def test_noncompact_cleanup_keeps_best_effort_sync_policy(self) -> None:
-        body = function_body('extern "C" void ds4_gpu_cleanup(void)')
-        preamble, separator, _ = body.partition("g_current_logical_tier = -1;")
-        self.assertTrue(separator, "cleanup state reset moved or disappeared")
-        self.assertIn("compact_cleanup_required", preamble)
-        self.assertIn("cuda_laguna_compact_destroy_checked", preamble)
-        self.assertIn("(void)cudaDeviceSynchronize();", preamble)
-        self.assertNotIn("cleanup_sync_error", preamble)
+    def test_cleanup_checks_sync_before_releasing_owners(self) -> None:
+        body = function_body('extern "C" int ds4_gpu_cleanup_checked(void)')
+        self.assertIn("g_current_logical_tier = -1;", body)
+        self.assertIn("compact_cleanup_required", body)
+        self.assertIn("cuda_laguna_compact_destroy_checked", body)
+        compact_refusal = body.find("goto cleanup_refused;")
+        self.assertGreaterEqual(compact_refusal, 0)
+        sync = body.find("cudaDeviceSynchronize()")
+        self.assertGreaterEqual(sync, 0)
+        self.assertIn("cuda_ok", body[max(0, sync - 120):sync + 120])
+        self.assertNotIn("(void)cudaDeviceSynchronize();", body)
+        first_graph_release = body.find("attention_decode_score_split_graph_destroy_one(")
+        self.assertGreaterEqual(first_graph_release, 0)
+        self.assertLess(sync, first_graph_release)
+        self.assertLess(compact_refusal, first_graph_release)
+
+        legacy = function_body('extern "C" void ds4_gpu_cleanup(void)')
+        self.assertRegex(
+            legacy,
+            r"\(\s*void\s*\)\s*ds4_gpu_cleanup_checked\s*\(\s*\)\s*;",
+        )
+        self.assertNotIn("g_laguna_compact_generic_cleanup_attempts.fetch_add", legacy)
+        self.assertEqual(
+            body.count("g_laguna_compact_generic_cleanup_attempts.fetch_add"), 1,
+        )
 
     def test_failed_compact_create_uses_authoritative_cuda_ownership(self) -> None:
         declaration = "ds4_gpu_laguna_compact_ownership_pending("

@@ -2245,15 +2245,41 @@ class SourceWiringContractTest(unittest.TestCase):
         self.assertIn("cudaStreamDestroy", model)
         self.assertIn("cuda_stage_slots_release", selected)
         self.assertIn("cudaStreamDestroy", selected)
-        cleanup = extract_definition(CUDA_SOURCE, 'extern "C" void ds4_gpu_cleanup(')
-        cleanup_code = self._body(cleanup, "missing actual ds4_gpu_cleanup definition")
+        cleanup = extract_definition(
+            CUDA_SOURCE, 'extern "C" int ds4_gpu_cleanup_checked(void)'
+        )
+        cleanup_code = self._body(
+            cleanup, "missing actual ds4_gpu_cleanup_checked definition"
+        )
         if cleanup_code is None:
             return
         call = cleanup_code.find("cuda_model_stage_release(")
         guard = cleanup_code.find("compact_cleanup_required")
         self.assertEqual(cleanup_code.count("cuda_model_stage_release("), 1)
         self.assertGreater(call, guard)
-        self.assertNotRegex(cleanup_code, r"g_model_stage_(?:raw|event)\s*\[")
+        self.assertNotRegex(
+            cleanup_code, r"g_model_stage_(?:raw|event)\s*\[[^\]]+\]\s*=(?!=)"
+        )
+        self.assertNotRegex(
+            cleanup_code,
+            r"\b(?:cudaFreeHost|cudaEventDestroy)\s*\([^;]*g_model_stage_(?:raw|event)\s*\[",
+        )
+
+        legacy = extract_definition(
+            CUDA_SOURCE, 'extern "C" void ds4_gpu_cleanup(void)'
+        )
+        legacy_code = self._body(legacy, "missing actual ds4_gpu_cleanup definition")
+        if legacy_code is None:
+            return
+        self.assertRegex(
+            legacy_code,
+            r"\(\s*void\s*\)\s*ds4_gpu_cleanup_checked\s*\(\s*\)\s*;",
+        )
+        self.assertNotIn("cuda_model_stage_release(", legacy_code)
+        self.assertEqual(
+            len(re.findall(r"\bds4_gpu_cleanup_checked\s*\(\s*\)", legacy_code)),
+            1,
+        )
 
 
 if __name__ == "__main__":

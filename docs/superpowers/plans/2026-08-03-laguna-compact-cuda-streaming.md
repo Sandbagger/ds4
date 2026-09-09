@@ -1709,6 +1709,60 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Checked CUDA backend teardown, host-tested custody increment:**
+`ds4_gpu_cleanup_checked()` now reports 1 for completed represented teardown and
+0 for refusal or an unproved effect. Its declaration is CUDA-only, not a new
+Metal/ROCm/CPU promise. The legacy void entry makes one checked attempt. Callers
+must serialize backend mutation, retain remaining owners and borrowed sources,
+and preserve their first failure even after a later cleanup returns 1.
+
+The checked path gates compact cleanup, represented-device selection/sync and
+physical-cache devices before release. It clears only completed owner prefixes;
+failed and unvisited graphs, streams, events, handles, buffers, stage reservations,
+registrations and necessary count/affinity/source metadata survive refusal.
+Graph and selected-cache negative validity remains cleanup-only. Actual launch,
+invalidation and begin-load paths cannot revive retained owners. Aggregate stage
+availability may become zero while per-slot reserved ownership remains live.
+Selected-cache growth and both model-map setters now stop on failed releases
+before clearing or replacing owners; consumed device prefixes are not freed again.
+
+The Linux direct-FD slot is retired after `close` returns, including EIO/EINTR;
+the error still refuses teardown before the suffix. Retry never closes that old
+numeric descriptor again. This is a Linux-specific rule, not portable POSIX or
+real-kernel evidence from the fixture. The O_DIRECT-to-buffered fallback remains
+a separate unfinished acquisition/I/O audit. Generic cleanup does not detach the
+resident observer, whose HOST owners may still borrow it.
+
+Test-first controls extracted actual CUDA helper and caller bodies. The initial
+19-method baseline had 30 failures and seven checked-API-absence skips, then the
+unchanged fixture passed with no skips. Independent review led to new model-map
+RED (19 methods, 76 assertions) and resize RED (25 methods, one assertion).
+Both final fixtures pass unchanged: 44 methods, no failures/errors/skips. Their
+healthy controls, immutable first-call/retry observations and separate known-live
+witness rescue distinguish product assertions from setup/compile/sensor failures.
+The combined device-plus-registration seed is synthetic representability stress,
+not proof that normal model acquisition produces that state.
+
+Fourteen current working host targets plus eight selected source checks passed
+(230 Python methods, three actual-core constructor controls, and strict streamed
+and resident twelve-record synthetic compositions). Independent follow-up source
+review found no new discrepancy in the targeted gates. These results are CPU
+control-flow evidence, not native driver semantics or numerical/fit/performance
+qualification. Exact-commit host and full CUDA compile-only verification remain
+separate version-bound checks; the earlier `3711f489a5aef83ea9b747467bd173ef05cc6adc`
+host and CUDA seals are already complete and are not repeated for this increment.
+
+Engine close still needs outward checked status and source-before-backend ordering
+repair. Other callers, partial construction/acquisition, bootstrap first-event
+accounting and late-publication custody remain unfinished. Production graph callers
+stay LEGACY and the resident qualification guard stays closed. No model/GPU was
+run; cold plus three warm runs and sixteen-slice verified publication remain due.
+
+Reusable rule: **release physically before retiring an owner, retain completed
+prefixes and failed/unvisited custody, and separate cleanup completion from a safe
+request or publishable run. Prove refusal paths with healthy controls and preserve
+observations before fixture rescue.**
+
 **Qualification caller cleanup custody, actual-bench CPU controls:**
 The qualifying streamed and resident branches now keep the session output slot
 in `main`, outside the lifecycle helper and repetition. Failed constructor

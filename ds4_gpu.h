@@ -53,6 +53,13 @@ int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker);
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* CUDA only; callers serialize GPU mutations. Returns 1 for completed global
+ * teardown, or 0 with remaining owners retained. Keep sources/trackers alive
+ * while borrowed. This does not detach the observer or release other borrowers;
+ * the caller preserves its first failure even after a successful retry. */
+int ds4_gpu_cleanup_checked(void);
+#endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

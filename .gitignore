@@ -48,3 +48,4 @@ __pycache__/
 /tests/test_bench_qualification_lifecycle
 /tests/test_bench_sequence_trusted
 /tests/test_eval_case_contract
+/tests/test_session_constructor_handoff

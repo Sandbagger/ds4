@@ -409,6 +409,12 @@ int ds4_token_assistant(ds4_engine *e);
 struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
 
+/* A nonzero result is always failure. After successful construction, a
+ * tracker-unlock failure returns 2. If checked cleanup refuses, *out retains
+ * the original session for cleanup only; do not use it for evaluation.
+ * Keep the output slot and borrowed engine live until checked cleanup consumes
+ * it. A later successful cleanup does not erase the constructor failure.
+ * Other constructor failure paths do not gain a retained-owner guarantee. */
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 /* Checked cleanup: 1 consumes the session and clears *owner after its container
  * is freed; 0 retains the handle and remaining owners for cleanup retry.

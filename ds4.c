@@ -63956,8 +63956,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     }
     if (!unlock_ok) {
         (*out)->exact_cache_session_reserved = reserved;
-        ds4_session_free(*out);
-        *out = NULL;
+        (void)ds4_session_free_checked(out);
         return 2;
     }
     (*out)->exact_cache_session_reserved = reserved;

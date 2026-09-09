@@ -1709,6 +1709,60 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Post-success constructor unlock handoff, actual-core CPU controls:**
+`ds4_session_create` now passes its caller output slot to checked cleanup after
+successful construction followed by a reported tracker-unlock failure. It still
+returns 2. Successful cleanup clears the slot after physical free; refused
+cleanup leaves the original live session in that slot for cleanup only. Keep the
+slot and borrowed engine alive until checked cleanup consumes it. Do not use a
+failed output for evaluation or let later cleanup erase the constructor failure.
+Other constructor failure paths gain no retained-owner guarantee from this fix.
+
+`tests/test_session_constructor_handoff.c` includes the actual `ds4.c` translation
+unit and private engine/session ABI with `DS4_NO_GPU` and `DS4_TEST_HOOKS`. The
+existing no-allocation hook still performs one real session calloc. The fixture
+uses real libc and pthread effects, not copied constructor/release algorithms.
+Each of its three named cases is a fresh process with an alarm and zero core
+limit. The injected tracker unlock physically succeeds before reporting one
+synthetic error; the selected cleanup lock refuses without acquiring the mutex.
+These are control-flow signals, not genuine pthread failure states.
+
+Before the production edit, the unchanged checked-release baseline
+`95b5f029f817a0fdbac759b319795f9307790df6` passed `success` and
+`unlock-cleanup-consumed`, but `unlock-cleanup-retained` lost the live output.
+The fixture recorded that failure before using its known-live witness for actual
+checked test teardown. All control, retry, physical-free, mutex-destroy and
+cleanliness checks passed; the missing caller handoff alone returned 1. After
+the one-branch fix, all three cases return 0: the failed constructor keeps its
+cleanup-only output and checked retry consumes it exactly once.
+
+The fixture refuses every allocation after the first before libc, preserves
+sticky failures and current/live state until physical free, and refuses mutex
+destruction while an owner or reservation remains. Non-handoff sensor, setup,
+cleanup, compile and link defects are not feature RED. The isolated target
+`make test-session-constructor-handoff` now joins `test-laguna-resident-path`
+and `test`; its actual-header prerequisites avoid stale private-ABI builds.
+Working host validation passed the prior 13 targets plus this native target,
+seven selected source methods, and the synthetic record compositions. Independent
+review found no regression in the bounded change or fixture. These results are
+not an immutable or CUDA compile seal for the later constructor revision.
+The earlier checked-release baseline has its own completed host and full CUDA
+compile-only seals; no produced CUDA product, GPU or model was executed.
+
+Caller/engine custody remains open across the bounded 18-call audit. Callers
+avoid ordinary use after nonzero create, but can discard the owner or use legacy
+void cleanup. A retained container can coexist with an active count of zero after
+release-unlock refusal; count is not cleanup reachability. Partial graph failure,
+reservation acquisition/precontainer custody, fatal allocation errors, full
+engine/source-context/bootstrap ownership, first-event resident observation and
+late exit/publication propagation are separate unfinished work. Production graph
+callers remain LEGACY and the resident qualification guard remains closed.
+Cold plus three warm runs and the sixteen-slice verified publication remain due.
+
+Reusable rule: **a failed constructor must not erase the only cleanup owner.
+Prove the handoff with the actual ABI where possible, record a lost handoff before
+fixture rescue, and keep cleanup success distinct from successful execution.**
+
 **Checked session release, host-tested custody increment:**
 `ds4_session_free_checked(ds4_session **owner)` returns 0 while retaining the
 session handle and remaining cleanup state. It returns 1 and clears the caller

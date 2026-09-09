@@ -18,6 +18,32 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
  * Caller remains quiescent and retains the borrowed tracker through cleanup. */
 int ds4_gpu_laguna_resident_observer_attached(const ds4_runtime_tracker *tracker);
 
+/* Raw resident HOST payload, not a tensor descriptor or CUDA owner. No GPU
+ * initialization/query is needed. Observation is not admission or a snapshot.
+ * Keep this handle, tracker, records and callsites outside its payload and alive
+ * through cleanup; serialize direct tracker mutations with native operations. */
+typedef struct {
+    void *base;
+    uint64_t allocation_record_id;
+} ds4_gpu_laguna_resident_host_owner;
+
+/* Return1 on complete success,0 on refusal. Allocate requires a zero handle,
+ * positive checked count/item_bytes, and the identical safe attached tracker.
+ * Only LEDGER_ARRAYS and OTHER_HOST_ENGINE..OTHER_HOST_SERIALIZER are admitted.
+ * Physical allocation/free events precede publication/retirement respectively.
+ * A foreign/null tracker cannot mutate either tracker or a nonempty handle. */
+int ds4_gpu_laguna_resident_host_calloc(
+    ds4_runtime_tracker *tracker, uint32_t callsite_id,
+    uint64_t count, uint64_t item_bytes,
+    ds4_gpu_laguna_resident_host_owner *out);
+
+/* Null/zero handles are successful no-ops even unattached. Nonempty free requires
+ * attached identity and an authenticated live raw-host owner without relations.
+ * Refusal retains the handle; legitimate cleanup works while sticky-unsafe and
+ * clears it only after physical free and retirement. No generic fallback. */
+int ds4_gpu_laguna_resident_host_free(
+    ds4_runtime_tracker *tracker, ds4_gpu_laguna_resident_host_owner *owner);
+
 /* CUDA resident observation only, not admission or snapshot readiness.
  * The descriptor and device storage each have an observed physical owner.
  * Keep this caller-owned handle and the attached tracker alive through cleanup;

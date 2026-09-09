@@ -1709,6 +1709,51 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Explicit raw-host owners, host-tested increment:**
+`ds4_gpu_laguna_resident_host_calloc/free` now owns raw HOST payloads through a
+C-safe caller-held handle. Namespace `0x48` is distinct from a tensor descriptor's
+`0x52`, even when both records have HOST domain and OTHER_HOST category. Only
+ledger arrays and the seven explicit engine/model/bootstrap/vocab/session/tracker/
+serializer callsites are accepted. This primitive uses the existing resident lock
+and requires exact attached identity, but no initialized GPU or CUDA API call.
+It does not integrate any engine/parser/graph caller or infer admission.
+
+Checked multiplication, record storage/slot capacity and producer-ID preflights
+precede libc. Successful calloc is recorded at its actual base before publishing
+the handle. Over-bound insertion preserves the real transient peak; rollback
+physically frees before retiring its live record. Checked free authenticates the
+live ID, namespace, site/category/domain, size and base, and refuses live dependent
+relations before touching the payload. Legitimate free/retirement works while
+unsafe; observer end now refuses outstanding raw-host owners as well as tensors.
+C free has no failure return, so it does not need a private CUDA-style quarantine.
+Caller-owned handle/tracker/record/callsite storage must remain outside the payload
+and survive cleanup; arbitrary corruption or concurrent direct mutations are not
+supported. Early bootstrap authority and full source/context lifetime remain open.
+
+Root-reviewed RED preceded production edits: 14 methods/31 missing source/header/
+Make failures. First focused GREEN passes all 14 methods with actual C++ observer/
+host bodies, separate real runtime C, and a C11 header/link probe. Forwarding libc
+sensors use tiny real allocations, count every free-order violation and every fake
+CUDA boundary, and check zeroed contents, actual currents/peaks, classification,
+capacity/IDs/tombstones, identity, restored malformed handles, registration/retry,
+and checked final detachment. The other-producer namespace control uses a labeled
+HOST record setup through the actual runtime, not a tensor API or GPU execution.
+The 64-bit size branch is an overflow test, not claimed narrow-size_t execution.
+
+Independent source review found no blocking runtime defect. Root strengthened
+its two LOW oracle gaps: every site's record is checked individually, and every
+physical free checks the complete current total as well as a live record. All 14
+methods still pass. Prior host regressions and five selected source checks pass.
+Exact-commit host and full NVCC verification remain separate pending steps.
+No produced CUDA product, GPU or model was executed. The production qualification
+guard remains closed. There is no new proof of memory fit, numerical correctness,
+throughput or published qualification.
+
+Reusable rule: **bind writes to parsed full scope paths and stop on a missing
+expected parent; do not create a guessed worktree.** Static scaffold/configuration
+failures are not feature RED. Keep physical cleanup, record retirement and sticky
+qualification failure as separate facts, including when cleanup succeeds.
+
 **Explicit graph owner composition, host-tested increment:**
 The graph now selects `LEGACY` or `RESIDENT` explicitly. Both existing production
 allocation callers remain `LEGACY`; neither tracker presence nor a noncompact
@@ -1743,12 +1788,11 @@ A further actual-runtime legacy-retirement-refusal control brings the graph suit
 to 21 methods: aliases are already null before failed record retirement, retry
 does not repeat physical frees, and the first violation persists. The control's
 initial report-bound confound was retained and corrected before acceptance.
-Exact-commit verification is pending.
-
-The prior tensor revision `f47d094c45754ef393716e741226815db1de1242` has separate
-immutable host and full NVCC `sm_121` compile/four-link seals; those seals do not
-cover these uncommitted graph changes. No produced CUDA product, GPU or model was
-executed. Production resident qualification remains blocked on the remaining
+Exact graph revision `e2bc9c2dd8f76e519fb31157d4171258f28865af` now has immutable
+host and full NVCC `sm_121` compile/four-link seals. The prior tensor revision
+`f47d094c45754ef393716e741226815db1de1242` retains its own version-scoped seals.
+Neither seal covers the later raw-host increment above. No produced CUDA product,
+GPU or model was executed. Production resident qualification remains blocked on the remaining
 reachable owners, engine authority, authenticated snapshots and checked late
 failure through child exit/publication. This is not allocation fit, numerical
 correctness, throughput or published qualification evidence.

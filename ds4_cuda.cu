@@ -3182,6 +3182,7 @@ static std::mutex g_laguna_resident_mutex;
  * Even their attempted teardown cannot authorize a later observer attachment. */
 static bool g_laguna_resident_legacy_tensor_seen;
 static const uint8_t cuda_laguna_resident_namespace = 0x52u;
+static const uint8_t cuda_laguna_resident_host_namespace = 0x48u;
 typedef struct {
     void *base;
     uint64_t record_id;
@@ -3456,8 +3457,10 @@ extern "C" int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker
         return 0;
     for (size_t i = 0; i < tracker->record_count; i++) {
         const ds4_runtime_allocation_record *r = &tracker->records[i];
-        if (r->live && (r->id >> 56) == cuda_laguna_resident_namespace &&
-            r->id != g_laguna_resident_retained.record_id) return 0;
+        if (r->live &&
+            ((r->id >> 56) == cuda_laguna_resident_host_namespace ||
+             ((r->id >> 56) == cuda_laguna_resident_namespace &&
+              r->id != g_laguna_resident_retained.record_id))) return 0;
     }
     if (g_laguna_resident_retained.base) {
         const cuda_laguna_resident_retained_owner owner = g_laguna_resident_retained;
@@ -3474,6 +3477,141 @@ extern "C" int ds4_gpu_laguna_resident_observer_end(ds4_runtime_tracker *tracker
     return 1;
 }
 /* End resident native allocation observer. */
+
+/* Resident native host ownership. */
+static int cuda_laguna_resident_host_fail(
+        ds4_runtime_tracker *tracker, ds4_runtime_violation violation) {
+    (void)ds4_runtime_tracker_latch_failure(tracker, violation);
+    return 0;
+}
+
+static int cuda_laguna_resident_host_site(
+        const ds4_runtime_callsite *site) {
+    if (!site || site->domain != DS4_RUNTIME_DOMAIN_HOST) return 0;
+    if (site->id == DS4_LAGUNA_CALLSITE_LEDGER_ARRAYS)
+        return site->category == DS4_RUNTIME_CATEGORY_CACHE_METADATA_ADDRESS_TABLES;
+    return site->id >= DS4_LAGUNA_CALLSITE_OTHER_HOST_ENGINE &&
+        site->id <= DS4_LAGUNA_CALLSITE_OTHER_HOST_SERIALIZER &&
+        site->category == DS4_RUNTIME_CATEGORY_OTHER_HOST;
+}
+
+extern "C" int ds4_gpu_laguna_resident_host_calloc(
+        ds4_runtime_tracker *tracker, uint32_t callsite_id,
+        uint64_t count, uint64_t item_bytes,
+        ds4_gpu_laguna_resident_host_owner *out) {
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    /* Identity precedes every tracker read and all output mutation. This
+     * primitive needs no current device, CUDA initialization or CUDA call. */
+    if (!tracker || tracker !=
+            g_laguna_resident_tracker.load(std::memory_order_relaxed)) return 0;
+    if (!out || out->base || out->allocation_record_id ||
+        count == 0 || item_bytes == 0)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    if (tracker->violation != DS4_RUNTIME_VIOLATION_NONE ||
+        g_laguna_resident_retained.base) return 0;
+    if (!tracker->callsites || !tracker->records ||
+        tracker->record_capacity == 0 ||
+        tracker->record_count > tracker->record_capacity)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    if (count > UINT64_MAX / item_bytes)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+    const uint64_t bytes = count * item_bytes;
+    if (bytes > SIZE_MAX)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+    const ds4_runtime_callsite *site =
+        cuda_laguna_resident_site(tracker, callsite_id);
+    if (!site) return cuda_laguna_resident_host_fail(
+        tracker, DS4_RUNTIME_VIOLATION_UNKNOWN_CALLSITE);
+    if (!cuda_laguna_resident_host_site(site))
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_UNCLASSIFIED_CALLSITE);
+    int slot_available = tracker->record_count < tracker->record_capacity;
+    for (size_t i = 0; !slot_available && i < tracker->record_count; i++)
+        slot_available = !tracker->records[i].live;
+    if (!slot_available) return cuda_laguna_resident_host_fail(
+        tracker, DS4_RUNTIME_VIOLATION_CAPACITY);
+    if (tracker->issued_sequence_high_water[cuda_laguna_resident_host_namespace] >=
+            UINT64_C(0x00ffffffffffffff))
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_OVERFLOW);
+
+    void *base = calloc((size_t)count, (size_t)item_bytes);
+    if (!base) return cuda_laguna_resident_host_fail(
+        tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+    uint64_t id = 0;
+    if (ds4_runtime_tracker_allocate_next(
+            tracker, cuda_laguna_resident_host_namespace, callsite_id,
+            (uint64_t)(uintptr_t)base, bytes, bytes, &id) == DS4_RUNTIME_STATUS_OK) {
+        out->base = base;
+        out->allocation_record_id = id;
+        return 1;
+    }
+    /* A checked bound can fail after insertion. Preserve that real transient
+     * peak: physical free precedes retirement, even on sticky-unsafe rollback.
+     * C free has no failure status and needs no private quarantine. */
+    (void)ds4_runtime_tracker_latch_failure(
+        tracker, DS4_RUNTIME_VIOLATION_EXTERNAL_ATTRIBUTION);
+    free(base);
+    if (id) (void)ds4_runtime_tracker_release(tracker, id);
+    return 0;
+}
+
+extern "C" int ds4_gpu_laguna_resident_host_free(
+        ds4_runtime_tracker *tracker,
+        ds4_gpu_laguna_resident_host_owner *owner) {
+    std::lock_guard<std::mutex> guard(g_laguna_resident_mutex);
+    if (!owner || (!owner->base && !owner->allocation_record_id)) return 1;
+    if (!tracker || tracker !=
+            g_laguna_resident_tracker.load(std::memory_order_relaxed)) return 0;
+    if (!tracker->callsites || !tracker->records ||
+        tracker->record_capacity == 0 ||
+        tracker->record_count > tracker->record_capacity)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_INVALID_CONFIG);
+    const uint64_t id = owner->allocation_record_id;
+    if ((id >> 56) != cuda_laguna_resident_host_namespace)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_NOT_LIVE);
+    ds4_runtime_allocation_record *record = NULL;
+    for (size_t i = 0; i < tracker->record_count; i++) {
+        if (tracker->records[i].live && tracker->records[i].id == id) {
+            record = &tracker->records[i];
+            break;
+        }
+    }
+    /* Authenticate by live ID before using the payload address. A tensor's
+     * HOST descriptor belongs to namespace0x52, never this raw-host authority. */
+    if (!record || record->relation != DS4_RUNTIME_RELATION_OWNED_ALLOCATION ||
+        record->owner_id != 0 || record->domain != DS4_RUNTIME_DOMAIN_HOST ||
+        !owner->base || record->base != (uint64_t)(uintptr_t)owner->base ||
+        record->requested_bytes == 0 || record->requested_bytes > SIZE_MAX ||
+        record->requested_bytes != record->charged_bytes)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_NOT_LIVE);
+    const ds4_runtime_callsite *site =
+        cuda_laguna_resident_site(tracker, record->callsite_id);
+    if (!cuda_laguna_resident_host_site(site) ||
+        record->category != site->category)
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_NOT_LIVE);
+    if (cuda_laguna_resident_has_relation(tracker, id))
+        return cuda_laguna_resident_host_fail(
+            tracker, DS4_RUNTIME_VIOLATION_LIVE_RELATION);
+
+    /* Caller keeps handle/tracker/record/site storage outside this payload and
+     * serializes direct tracker mutations. These checks match runtime release;
+     * its sticky status does not undo an actual successful retirement. */
+    free(owner->base);
+    (void)ds4_runtime_tracker_release(tracker, id);
+    owner->base = NULL;
+    owner->allocation_record_id = 0;
+    return 1;
+}
+/* End resident native host ownership. */
 
 /* Resident native tensor ownership. */
 static int cuda_laguna_resident_tensor_fail(

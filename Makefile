@@ -57,7 +57,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-cuda-build-contract test-cuda-model-registration-contract test-cuda-model-stage-contract test-cuda-stage-pool-ownership-contract test-cuda-model-arena-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-model-source test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-resident-qualification-emitter test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-eval-case-contract test-bench-eval-contract test-session-snapshot-buffers test-bench-resident-args test-bench-resident-qualification-composition test-laguna-resident-plan test-laguna-resident-path test-cuda-resident-ownership-contract test-cuda-resident-tensor-contract test-cuda-resident-graph-contract test-cuda-resident-host-contract
+.PHONY: all help clean test test-cuda-build-contract test-cuda-model-registration-contract test-cuda-model-stage-contract test-cuda-stage-pool-ownership-contract test-cuda-model-arena-contract test-laguna-compact-python test-laguna-compact-contract test-laguna-runtime-identity test-laguna-server-contract test-metal-session-batch test-session-logits-only-policy test-session-request-attribution-api test-laguna-stream test-laguna-plan test-runtime test-runtime-model-source test-runtime-request test-qualification-control test-cuda-session-batch test-cuda-mixed-batch test-cuda-laguna-kernels test-cuda-laguna-model test-cuda-laguna-stream test-cuda-laguna-request-counters test-cuda-laguna-model-page-advice test-cuda-laguna-external-attribution test-cuda-laguna-qualification-control test-cuda-laguna-runtime-identity test-cuda-task18-server-failures test-cuda-laguna-resident test-cuda-laguna-streaming test-cuda-laguna-c7 dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm FORCE_BUILD_INFO test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-resident-qualification-emitter test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-eval-case-contract test-bench-eval-contract test-session-snapshot-buffers test-bench-resident-args test-bench-resident-qualification-composition test-laguna-resident-plan test-laguna-resident-path test-cuda-resident-ownership-contract test-cuda-resident-tensor-contract test-cuda-resident-graph-contract test-cuda-resident-host-contract test-session-checked-release
 
 tests/test_session_request_attribution_api.o: tests/test_session_request_attribution_api.c ds4.h ds4_runtime.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -519,7 +519,7 @@ tests/test_laguna_resident_plan: tests/test_laguna_resident_plan.o ds4_laguna_re
 test-laguna-resident-plan: tests/test_laguna_resident_plan
 	./tests/test_laguna_resident_plan
 
-test-laguna-resident-path: test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-resident-args test-bench-resident-qualification-composition test-bench-qualification-production-compile test-laguna-resident-plan test-cuda-resident-ownership-contract test-cuda-resident-tensor-contract test-cuda-resident-graph-contract test-cuda-resident-host-contract
+test-laguna-resident-path: test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-resident-args test-bench-resident-qualification-composition test-bench-qualification-production-compile test-laguna-resident-plan test-cuda-resident-ownership-contract test-cuda-resident-tensor-contract test-cuda-resident-graph-contract test-cuda-resident-host-contract test-session-checked-release
 
 # Model-free production translation-unit gate.  Compile ds4_bench.c directly,
 # without the lifecycle fake harness's preincluded production headers.
@@ -877,6 +877,9 @@ test-cuda-resident-tensor-contract:
 test-cuda-resident-graph-contract:
 	python3 tests/test_cuda_resident_graph_contract.py -v
 
+test-session-checked-release:
+	python3 tests/test_session_checked_release.py -v
+
 test-cuda-resident-host-contract:
 	python3 tests/test_cuda_resident_host_contract.py -v
 
@@ -1085,7 +1088,7 @@ test-laguna-runtime-identity: tests/test_runtime tests/test_qualification_contro
 	DS4_RUNTIME_SERVER_URL= uv run --with-requirements gguf-tools/quality-testing/requirements-compact-runtime.txt \
 		python tests/test_runtime_endpoint_contract.py -v
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-resident-path test-session-snapshot-buffers test-laguna-server-contract \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-cuda-build-contract test-laguna-compact-python test-laguna-resident-path test-session-checked-release test-session-snapshot-buffers test-laguna-server-contract \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_session_logits_only tests/test_laguna_stream tests/test_runtime test-runtime-model-source tests/test_runtime_cpp_link \
 	tests/test_plan_io tests/test_laguna_plan test-bench-sequence test-bench-sequence-trusted test-bench-resident-sequence test-bench-resident-qualification-emitter test-bench-qualification-emitter test-bench-qualification-lifecycle test-bench-qualification-composition test-bench-qualification-production-compile test-bench-eval-contract $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent

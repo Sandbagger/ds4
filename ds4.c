@@ -63964,15 +63964,33 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     return 0;
 }
 
-void ds4_session_free(ds4_session *s) {
-    if (!s) return;
+/* Session checked release. */
+static int ds4_session_release_exact_cache_reservation(ds4_session *s) {
+    if (!s) return 0;
+    if (!s->exact_cache_session_reserved) return 1;
+    ds4_engine *e = s->engine;
+    if (!e || !e->exact_cache_session_mutex_initialized) return 0;
+    if (pthread_mutex_lock(&e->exact_cache_session_mutex) != 0) return 0;
+    if (e->exact_cache_active_sessions == 0) {
+        (void)pthread_mutex_unlock(&e->exact_cache_session_mutex);
+        return 0;
+    }
+    e->exact_cache_active_sessions--;
+    s->exact_cache_session_reserved = false;
+    /* A failed unlock retains the container, but cannot spend this slot twice. */
+    return pthread_mutex_unlock(&e->exact_cache_session_mutex) == 0;
+}
+
+int ds4_session_free_checked(ds4_session **owner) {
+    if (!owner) return 0;
+    ds4_session *s = *owner;
+    if (!s) return 1;
 #ifdef DS4_TEST_HOOKS
     if (s->test_no_alloc) {
-        if (s->exact_cache_session_reserved) {
-            ds4_engine_release_exact_cache_session(s->engine);
-        }
+        if (!ds4_session_release_exact_cache_reservation(s)) return 0;
         free(s);
-        return;
+        *owner = NULL;
+        return 1;
     }
 #endif
     if (ds4_session_tp_leader(s) && s->tp_session_id != 0 &&
@@ -63991,6 +64009,7 @@ void ds4_session_free(ds4_session *s) {
     ds4_session_print_dspark_stats(s);
 #endif
     ds4_dist_session_free(s->distributed);
+    s->distributed = NULL;
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -64003,21 +64022,23 @@ void ds4_session_free(ds4_session *s) {
             if (!tracker_locked) {
                 fprintf(stderr,
                         "ds4: compact tracker lock failed during session free; retaining session\n");
-                return;
+                return 0;
             }
             const bool graph_freed = laguna_graph_free(&s->laguna_graph);
+            if (graph_freed) s->laguna_graph_ready = false;
             if (!ds4_engine_compact_tracker_unlock(s->engine)) {
                 fprintf(stderr,
                         "ds4: compact tracker unlock failed during session free; retaining session\n");
-                return;
+                return 0;
             }
             if (!graph_freed) {
                 fprintf(stderr,
                         "ds4: Laguna graph cleanup failed; retaining session\n");
-                return;
+                return 0;
             }
         } else if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
+            s->glm_graph_ready = false;
         } else {
             metal_graph_free(&s->graph);
         }
@@ -64026,22 +64047,35 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->logits);
+    s->logits = NULL;
     free(s->sample_probs);
+    s->sample_probs = NULL;
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
+    s->glm_mtp_hc = NULL;
     free(s->glm_mtp_logits0);
+    s->glm_mtp_logits0 = NULL;
 #endif
     free(s->mtp_logits);
+    s->mtp_logits = NULL;
 #ifndef DS4_NO_GPU
     free(s->spec_row_logits);
+    s->spec_row_logits = NULL;
     free(s->dspark_markov_bias);
+    s->dspark_markov_bias = NULL;
     free(s->dspark_conf_features);
+    s->dspark_conf_features = NULL;
 #endif
-    if (s->exact_cache_session_reserved) {
-        ds4_engine_release_exact_cache_session(s->engine);
-    }
+    if (!ds4_session_release_exact_cache_reservation(s)) return 0;
     free(s);
+    *owner = NULL;
+    return 1;
 }
+
+void ds4_session_free(ds4_session *s) {
+    (void)ds4_session_free_checked(&s);
+}
+/* End session checked release. */
 
 #ifdef DS4_TEST_HOOKS
 int ds4_test_session_limit_lifecycle(

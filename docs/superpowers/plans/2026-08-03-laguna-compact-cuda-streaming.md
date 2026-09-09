@@ -1709,6 +1709,59 @@ git commit -m "feat: report qualification-safe benchmark and eval evidence"
 
 ### Task 20: Run and publish canonical Laguna qualification
 
+**Checked session release, host-tested custody increment:**
+`ds4_session_free_checked(ds4_session **owner)` returns 0 while retaining the
+session handle and remaining cleanup state. It returns 1 and clears the caller
+slot only after physically freeing the container. NULL owner storage is refused;
+an empty slot is already consumed. The caller must keep the slot outside the
+payload, retain the borrowed engine, and serialize same-session operations.
+After any attempt the handle is cleanup-only. A later successful retry does not
+erase the first failure for eventual exit/publication.
+
+The existing C release body now uses one checked entry and a thin legacy void
+projection. Completed distributed/raw-pointer and graph-ready state is cleared
+before a later refusal. Existing backend helpers already zero their containers;
+they are not duplicated or refactored. Laguna lock/free/unlock refusals retain the
+session, including successful graph cleanup followed by failed unlock. Exact-cache
+reservation reconciliation remains last: missing authority/lock or zero-count
+refuses unchanged; a valid decrement and flag clear occur under the mutex before
+unlock. Failed unlock retains the container without allowing a second decrement.
+The old private void constructor/generation rollback helper is unchanged.
+
+Genuine missing-feature RED was 10 methods/18 failures/0 errors before production
+edits. The corrected fixture now passes all 10 methods. It compiles the actual
+marked C helper/release/wrapper, real public header and separate C caller, with
+**fake private session/engine shapes and backend/TP/distributed/lock effects**.
+Tiny real libc owners and forwarding sensors check physical-free-before-retirement,
+published handles, full current/live sums, allocation attempts, retained retries,
+and reservation state at fake unlock entry. This is not a combined real session,
+engine, graph and runtime execution, nor a real pthread failure model. Rejected
+fixture syntax/linkage/oracle/scoping defects are not feature RED.
+
+Prior host controls pass: 24 observer, 22 tensor, 21 graph, 14 raw-host, 57 legacy
+CUDA-ownership, six frontend, seven snapshot and 27 bench/eval methods; runtime,
+plan/parser/emitter checks and both twelve-record synthetic compositions also
+pass. Seven selected source checks preserve lock/mutation/unlock boundaries.
+The two existing free-body extractors now inspect the checked implementation;
+the graph refusal still requires a failure return before common cleanup.
+Independent review found no blocker within this bounded increment. These working
+host checks do not claim exact-version immutable/full-CUDA seals. The earlier
+raw-host baseline
+`39937a892c5242d5e3d2da3e72e5a66514dce2c3` already has its own immutable host and
+full NVCC `sm_121` compile/four-link seals; they do not cover this later change.
+
+This increment does not repair failed-constructor handoff, engine/source-context
+custody, late-exit/publication propagation or complete resident allocation
+coverage. Void backend leaves retain their existing coverage limits. The engine
+session count is not a list of reachable cleanup owners. Production graph callers
+remain LEGACY and the qualification guard remains closed. No produced CUDA
+product, GPU or model was executed; cold/three-warm and sixteen-slice published
+qualification are still outstanding.
+
+Reusable rule: **retryable cleanup needs an observable status, a surviving owner
+handle and explicit completed-prefix state. Test consumed state using observations
+made before physical free, never by dereferencing the consumed container.**
+
 **Explicit raw-host owners, host-tested increment:**
 `ds4_gpu_laguna_resident_host_calloc/free` now owns raw HOST payloads through a
 C-safe caller-held handle. Namespace `0x48` is distinct from a tensor descriptor's

@@ -1937,7 +1937,7 @@ class ResidentGraphFixture(unittest.TestCase):
         generator = source_definition(DS4_SOURCE, "static int generate_laguna_metal_argmax(")
         session_create = source_definition(DS4_SOURCE, "static int ds4_session_create_unchecked(")
         allocator = source_definition(DS4_SOURCE, "static bool laguna_graph_alloc(")
-        session_free = source_definition(DS4_SOURCE, "void ds4_session_free(")
+        session_free = source_definition(DS4_SOURCE, "int ds4_session_free_checked(")
         for body in (generator, session_create, allocator, session_free):
             self.assertTrue(body)
         for body in (generator, session_create):
@@ -1982,7 +1982,7 @@ class ResidentGraphFixture(unittest.TestCase):
         self.assertLess(unlock_at, failed_at)
         self.assertLess(failed_at, common_free_at)
         self.assertRegex(session_body[failed_at:common_free_at],
-                         r"(?s)if\s*\(.*?\)\s*\{?.*?return\s*;")
+                         r"(?s)if\s*\(.*?\)\s*\{?.*?return\s+0\s*;")
 
     def test_03_fixture_builds_with_real_runtime(self) -> None:
         self.assert_build()

@@ -410,6 +410,16 @@ struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
+/* Checked cleanup: 1 consumes the session and clears *owner after its container
+ * is freed; 0 retains the handle and remaining owners for cleanup retry.
+ * NULL owner storage returns 0; an empty slot returns 1. The slot must be valid,
+ * outside the session payload, and live through cleanup. Keep the borrowed
+ * engine alive and serialize same-session operations until release succeeds.
+ * After any attempt the session is cleanup-only. A later successful retry does
+ * not erase an earlier failure; callers must retain it for exit/publication.
+ * Success reports container consumption, not complete backend qualification. */
+int ds4_session_free_checked(ds4_session **owner);
+/* Legacy projection: cannot report retained cleanup to the caller. */
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);

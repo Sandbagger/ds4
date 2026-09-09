@@ -4083,7 +4083,7 @@ class CudaBuildContractTest(unittest.TestCase):
         self.assertGreater(create_unlock, create_mutation)
 
         free = source_function_body(
-            DS4_SOURCE, "void ds4_session_free(", "ds4.c"
+            DS4_SOURCE, "int ds4_session_free_checked(", "ds4.c"
         )
         free_lock = free.find(
             "ds4_engine_compact_tracker_lock(s->engine)"

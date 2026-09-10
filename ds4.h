@@ -296,6 +296,9 @@ ds4_runtime_status ds4_engine_laguna_external_checkpoint(
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg);
+/* Serialize close with every operation on this engine or its sessions.
+ * Live session containers retain the engine, even after giving up their cache
+ * reservations. Free all sessions successfully before closing the engine. */
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);

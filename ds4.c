@@ -36564,6 +36564,8 @@ struct ds4_engine {
     int exact_cache_context_limit;
     uint32_t exact_cache_session_limit;
     uint32_t exact_cache_active_sessions;
+    /* Container custody outlives a released exact-cache reservation. */
+    uint32_t session_container_count;
     pthread_mutex_t exact_cache_session_mutex;
     bool exact_cache_session_mutex_initialized;
 #ifdef DS4_TEST_HOOKS
@@ -63179,6 +63181,15 @@ void ds4_engine_close(ds4_engine *e) {
            sizeof(g_ds4_test_laguna_last_close_snapshot));
     g_ds4_test_laguna_last_close_snapshot_valid = false;
 #endif
+    if (__atomic_load_n(&e->session_container_count, __ATOMIC_ACQUIRE) != 0) {
+        fprintf(stderr,
+                "ds4: engine close requires all session containers to be freed "
+                "first; retaining engine\n");
+#ifdef DS4_TEST_HOOKS
+        g_ds4_test_laguna_compact_close_observation.engine_retained = true;
+#endif
+        return;
+    }
     if (e->laguna_compact_runtime &&
         e->exact_cache_session_mutex_initialized) {
         if (pthread_mutex_lock(&e->exact_cache_session_mutex) != 0) {
@@ -63586,6 +63597,21 @@ static void ds4_engine_release_exact_cache_session(ds4_engine *e) {
     pthread_mutex_unlock(&e->exact_cache_session_mutex);
 }
 
+/* Bind only a fresh, empty container. Engine close remains caller-serialized. */
+static int ds4_session_bind_engine(ds4_session *s, ds4_engine *e) {
+    uint32_t count =
+        __atomic_load_n(&e->session_container_count, __ATOMIC_RELAXED);
+    do {
+        if (count == UINT32_MAX) return 0;
+    } while (!__atomic_compare_exchange_n(
+        &e->session_container_count, &count, count + 1u, false,
+        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+    s->engine = e;
+    return 1;
+}
+
+static int ds4_session_free_container(ds4_session *s);
+
 static int ds4_session_create_unchecked(
         ds4_session **out,
         ds4_engine *e,
@@ -63594,7 +63620,10 @@ static int ds4_session_create_unchecked(
 #ifdef DS4_TEST_HOOKS
     if (e->test_session_create_no_alloc) {
         ds4_session *s = xcalloc(1, sizeof(*s));
-        s->engine = e;
+        if (!ds4_session_bind_engine(s, e)) {
+            free(s);
+            return 1;
+        }
         s->ctx_size = ctx_size;
         s->test_no_alloc = true;
         *out = s;
@@ -63614,7 +63643,10 @@ static int ds4_session_create_unchecked(
             return 1;
         }
         ds4_session *s = xcalloc(1, sizeof(*s));
-        s->engine = e;
+        if (!ds4_session_bind_engine(s, e)) {
+            free(s);
+            return 1;
+        }
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);
@@ -63635,7 +63667,10 @@ static int ds4_session_create_unchecked(
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
-    s->engine = e;
+    if (!ds4_session_bind_engine(s, e)) {
+        free(s);
+        return 1;
+    }
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         uint32_t prefill_rows = ds4_laguna_prefill_capacity(
@@ -63651,7 +63686,7 @@ static int ds4_session_create_unchecked(
                 (uint32_t)ctx_size,
                 prefill_rows,
                 tracker, DS4_LAGUNA_GRAPH_OWNER_LEGACY)) {
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
         s->laguna_graph_ready = true;
@@ -63678,7 +63713,7 @@ static int ds4_session_create_unchecked(
         }
         if (!normal_layers || layer_start > layer_end || layer_end >= normal_layers) {
             fprintf(stderr, "ds4: invalid GLM layer slice %u:%u\n", layer_start, layer_end);
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
         s->glm_graph.placement = e->multi_tier ? e->placement : NULL;
@@ -63693,7 +63728,7 @@ static int ds4_session_create_unchecked(
                                    layer_end,
                                    require_token_embd,
                                    require_output)) {
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
         s->prefill_cap = s->glm_graph.ctx_cap;
@@ -63725,7 +63760,7 @@ static int ds4_session_create_unchecked(
                         &e->model,
                         &e->weights)) {
                 glm_graph_free(&s->glm_graph);
-                free(s);
+                (void)ds4_session_free_container(s);
                 return 1;
             }
         }
@@ -63749,7 +63784,7 @@ static int ds4_session_create_unchecked(
                 free(s->glm_mtp_logits0);
                 free(s->logits);
                 free(s->sample_probs);
-                free(s);
+                (void)ds4_session_free_container(s);
                 return 1;
             }
         }
@@ -63766,7 +63801,7 @@ static int ds4_session_create_unchecked(
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
         fprintf(stderr, "ds4: no transformer layers are loaded\n");
-        free(s);
+        (void)ds4_session_free_container(s);
         return 1;
     }
     const bool need_spec_verifier =
@@ -63787,7 +63822,7 @@ static int ds4_session_create_unchecked(
                                    e->cuda_tensor_parallel,
                                    shared_prefill_workspace))
     {
-        free(s);
+        (void)ds4_session_free_container(s);
         return 1;
     }
     if (e->share_session_prefill_workspace &&
@@ -63801,7 +63836,7 @@ static int ds4_session_create_unchecked(
             fprintf(stderr,
                     "ds4: failed to complete shared prefill workspace allocation\n");
             metal_graph_free(&s->graph);
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
         const uint64_t workspace_bytes =
@@ -63835,7 +63870,7 @@ static int ds4_session_create_unchecked(
                 half * sizeof(float));
         if (!s->graph.tp_logits_half) {
             metal_graph_free(&s->graph);
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
     }
@@ -63845,7 +63880,7 @@ static int ds4_session_create_unchecked(
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
         metal_graph_free(&s->graph);
-        free(s);
+        (void)ds4_session_free_container(s);
         return 1;
     }
     if (e->support_kind == DS4_SUPPORT_DSPARK) {
@@ -63853,7 +63888,7 @@ static int ds4_session_create_unchecked(
                                                   &e->dspark_weights)) {
             fprintf(stderr, "ds4: failed to configure DSpark target-hidden capture\n");
             metal_graph_free(&s->graph);
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
         if (s->graph.dspark_capture_enabled) {
@@ -63910,7 +63945,7 @@ static int ds4_session_create_unchecked(
             free(s->spec_row_logits);
             free(s->dspark_markov_bias);
             free(s->dspark_conf_features);
-            free(s);
+            (void)ds4_session_free_container(s);
             return 1;
         }
     }
@@ -63964,6 +63999,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 }
 
 /* Session checked release. */
+/* The last pin must cover free itself; do not touch s after it is consumed. */
+static int ds4_session_free_container(ds4_session *s) {
+    ds4_engine *e = s->engine;
+    if (!e ||
+        __atomic_load_n(&e->session_container_count, __ATOMIC_ACQUIRE) == 0)
+        return 0;
+    free(s);
+    __atomic_fetch_sub(&e->session_container_count, 1u, __ATOMIC_RELEASE);
+    return 1;
+}
+
 static int ds4_session_release_exact_cache_reservation(ds4_session *s) {
     if (!s) return 0;
     if (!s->exact_cache_session_reserved) return 1;
@@ -63987,7 +64033,7 @@ int ds4_session_free_checked(ds4_session **owner) {
 #ifdef DS4_TEST_HOOKS
     if (s->test_no_alloc) {
         if (!ds4_session_release_exact_cache_reservation(s)) return 0;
-        free(s);
+        if (!ds4_session_free_container(s)) return 0;
         *owner = NULL;
         return 1;
     }
@@ -64066,7 +64112,7 @@ int ds4_session_free_checked(ds4_session **owner) {
     s->dspark_conf_features = NULL;
 #endif
     if (!ds4_session_release_exact_cache_reservation(s)) return 0;
-    free(s);
+    if (!ds4_session_free_container(s)) return 0;
     *owner = NULL;
     return 1;
 }
@@ -64204,7 +64250,10 @@ int ds4_test_session_create_policy(
 
     ds4_session *s = calloc(1, sizeof(*s));
     if (!s) return 1;
-    s->engine = &engine;
+    if (!ds4_session_bind_engine(s, &engine)) {
+        free(s);
+        return 1;
+    }
     s->ctx_size = ctx_size;
     s->prefill_cap = (uint32_t)ctx_size;
     s->logits = malloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));

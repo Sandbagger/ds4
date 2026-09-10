@@ -1,0 +1,1917 @@
+{
+  "schema": "laguna.heap-engine-session-metric-schema/v1",
+  "fixture": {
+    "sha256": "a35fbb7f2dc00f571028f995c65e4106b12e6bcfef996168f20a5e36d18c2d25"
+  },
+  "metric_count": 367,
+  "max_key_bytes": 44,
+  "capacity": 512,
+  "evidence_class": "static_emission_census_not_C_compile_or_native_execution",
+  "metrics": {
+    "case": {
+      "type": "string",
+      "value_expression": "name",
+      "availability": "defined"
+    },
+    "checked_release_calls": {
+      "type": "uint",
+      "value_expression": "f->checked_releases",
+      "availability": "defined"
+    },
+    "close1_after_active_available": {
+      "type": "bool",
+      "value_expression": "c->aaa",
+      "availability": "defined"
+    },
+    "close1_after_active_value": {
+      "type": "uint",
+      "value_expression": "c->ae_v",
+      "availability": "c->aaa",
+      "availability_key": "close1_after_active_available"
+    },
+    "close1_after_engine_live": {
+      "type": "bool",
+      "value_expression": "c->ae",
+      "availability": "defined"
+    },
+    "close1_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "c->ae_avail",
+      "availability": "defined"
+    },
+    "close1_after_engine_storage_available": {
+      "type": "bool",
+      "value_expression": "c->ae_storage_avail",
+      "availability": "defined"
+    },
+    "close1_after_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->are",
+      "availability": "defined"
+    },
+    "close1_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "c->ara",
+      "availability": "defined"
+    },
+    "close1_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "c->ara_v",
+      "availability": "c->ara",
+      "availability_key": "close1_after_reserved_available"
+    },
+    "close1_after_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->arm",
+      "availability": "defined"
+    },
+    "close1_after_sessions_live_available": {
+      "type": "bool",
+      "value_expression": "c->an_avail",
+      "availability": "defined"
+    },
+    "close1_after_sessions_live_value": {
+      "type": "uint",
+      "value_expression": "c->an",
+      "availability": "c->an_avail",
+      "availability_key": "close1_after_sessions_live_available"
+    },
+    "close1_before_active_available": {
+      "type": "bool",
+      "value_expression": "c->baa",
+      "availability": "defined"
+    },
+    "close1_before_active_value": {
+      "type": "uint",
+      "value_expression": "c->ba",
+      "availability": "c->baa",
+      "availability_key": "close1_before_active_available"
+    },
+    "close1_before_engine_live": {
+      "type": "bool",
+      "value_expression": "c->be",
+      "availability": "defined"
+    },
+    "close1_before_engine_live_available": {
+      "type": "bool",
+      "value_expression": "c->be_avail",
+      "availability": "defined"
+    },
+    "close1_before_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->bem",
+      "availability": "defined"
+    },
+    "close1_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "c->bra",
+      "availability": "defined"
+    },
+    "close1_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "c->bra_v",
+      "availability": "c->bra",
+      "availability_key": "close1_before_reserved_available"
+    },
+    "close1_before_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->brm",
+      "availability": "defined"
+    },
+    "close1_before_sessions_live_available": {
+      "type": "bool",
+      "value_expression": "c->bn_avail",
+      "availability": "defined"
+    },
+    "close1_before_sessions_live_value": {
+      "type": "uint",
+      "value_expression": "c->bn",
+      "availability": "c->bn_avail",
+      "availability_key": "close1_before_sessions_live_available"
+    },
+    "close1_call_available": {
+      "type": "bool",
+      "value_expression": "c->call",
+      "availability": "defined"
+    },
+    "close1_called": {
+      "type": "bool",
+      "value_expression": "c->called",
+      "availability": "defined"
+    },
+    "close1_recorded": {
+      "type": "bool",
+      "value_expression": "c->recorded",
+      "availability": "defined"
+    },
+    "close1_skipped": {
+      "type": "bool",
+      "value_expression": "c->skipped",
+      "availability": "defined"
+    },
+    "close1_source_free_marker": {
+      "type": "bool",
+      "value_expression": "c->source_free_marker",
+      "availability": "defined"
+    },
+    "close1_source_probe": {
+      "type": "bool",
+      "value_expression": "c->source_probe",
+      "availability": "defined"
+    },
+    "close2_after_active_available": {
+      "type": "bool",
+      "value_expression": "c->aaa",
+      "availability": "defined"
+    },
+    "close2_after_active_value": {
+      "type": "uint",
+      "value_expression": "c->ae_v",
+      "availability": "c->aaa",
+      "availability_key": "close2_after_active_available"
+    },
+    "close2_after_engine_live": {
+      "type": "bool",
+      "value_expression": "c->ae",
+      "availability": "defined"
+    },
+    "close2_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "c->ae_avail",
+      "availability": "defined"
+    },
+    "close2_after_engine_storage_available": {
+      "type": "bool",
+      "value_expression": "c->ae_storage_avail",
+      "availability": "defined"
+    },
+    "close2_after_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->are",
+      "availability": "defined"
+    },
+    "close2_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "c->ara",
+      "availability": "defined"
+    },
+    "close2_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "c->ara_v",
+      "availability": "c->ara",
+      "availability_key": "close2_after_reserved_available"
+    },
+    "close2_after_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->arm",
+      "availability": "defined"
+    },
+    "close2_after_sessions_live_available": {
+      "type": "bool",
+      "value_expression": "c->an_avail",
+      "availability": "defined"
+    },
+    "close2_after_sessions_live_value": {
+      "type": "uint",
+      "value_expression": "c->an",
+      "availability": "c->an_avail",
+      "availability_key": "close2_after_sessions_live_available"
+    },
+    "close2_before_active_available": {
+      "type": "bool",
+      "value_expression": "c->baa",
+      "availability": "defined"
+    },
+    "close2_before_active_value": {
+      "type": "uint",
+      "value_expression": "c->ba",
+      "availability": "c->baa",
+      "availability_key": "close2_before_active_available"
+    },
+    "close2_before_engine_live": {
+      "type": "bool",
+      "value_expression": "c->be",
+      "availability": "defined"
+    },
+    "close2_before_engine_live_available": {
+      "type": "bool",
+      "value_expression": "c->be_avail",
+      "availability": "defined"
+    },
+    "close2_before_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->bem",
+      "availability": "defined"
+    },
+    "close2_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "c->bra",
+      "availability": "defined"
+    },
+    "close2_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "c->bra_v",
+      "availability": "c->bra",
+      "availability_key": "close2_before_reserved_available"
+    },
+    "close2_before_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->brm",
+      "availability": "defined"
+    },
+    "close2_before_sessions_live_available": {
+      "type": "bool",
+      "value_expression": "c->bn_avail",
+      "availability": "defined"
+    },
+    "close2_before_sessions_live_value": {
+      "type": "uint",
+      "value_expression": "c->bn",
+      "availability": "c->bn_avail",
+      "availability_key": "close2_before_sessions_live_available"
+    },
+    "close2_call_available": {
+      "type": "bool",
+      "value_expression": "c->call",
+      "availability": "defined"
+    },
+    "close2_called": {
+      "type": "bool",
+      "value_expression": "c->called",
+      "availability": "defined"
+    },
+    "close2_recorded": {
+      "type": "bool",
+      "value_expression": "c->recorded",
+      "availability": "defined"
+    },
+    "close2_skipped": {
+      "type": "bool",
+      "value_expression": "c->skipped",
+      "availability": "defined"
+    },
+    "close2_source_free_marker": {
+      "type": "bool",
+      "value_expression": "c->source_free_marker",
+      "availability": "defined"
+    },
+    "close2_source_probe": {
+      "type": "bool",
+      "value_expression": "c->source_probe",
+      "availability": "defined"
+    },
+    "close3_after_active_available": {
+      "type": "bool",
+      "value_expression": "c->aaa",
+      "availability": "defined"
+    },
+    "close3_after_active_value": {
+      "type": "uint",
+      "value_expression": "c->ae_v",
+      "availability": "c->aaa",
+      "availability_key": "close3_after_active_available"
+    },
+    "close3_after_engine_live": {
+      "type": "bool",
+      "value_expression": "c->ae",
+      "availability": "defined"
+    },
+    "close3_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "c->ae_avail",
+      "availability": "defined"
+    },
+    "close3_after_engine_storage_available": {
+      "type": "bool",
+      "value_expression": "c->ae_storage_avail",
+      "availability": "defined"
+    },
+    "close3_after_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->are",
+      "availability": "defined"
+    },
+    "close3_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "c->ara",
+      "availability": "defined"
+    },
+    "close3_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "c->ara_v",
+      "availability": "c->ara",
+      "availability_key": "close3_after_reserved_available"
+    },
+    "close3_after_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->arm",
+      "availability": "defined"
+    },
+    "close3_after_sessions_live_available": {
+      "type": "bool",
+      "value_expression": "c->an_avail",
+      "availability": "defined"
+    },
+    "close3_after_sessions_live_value": {
+      "type": "uint",
+      "value_expression": "c->an",
+      "availability": "c->an_avail",
+      "availability_key": "close3_after_sessions_live_available"
+    },
+    "close3_before_active_available": {
+      "type": "bool",
+      "value_expression": "c->baa",
+      "availability": "defined"
+    },
+    "close3_before_active_value": {
+      "type": "uint",
+      "value_expression": "c->ba",
+      "availability": "c->baa",
+      "availability_key": "close3_before_active_available"
+    },
+    "close3_before_engine_live": {
+      "type": "bool",
+      "value_expression": "c->be",
+      "availability": "defined"
+    },
+    "close3_before_engine_live_available": {
+      "type": "bool",
+      "value_expression": "c->be_avail",
+      "availability": "defined"
+    },
+    "close3_before_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->bem",
+      "availability": "defined"
+    },
+    "close3_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "c->bra",
+      "availability": "defined"
+    },
+    "close3_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "c->bra_v",
+      "availability": "c->bra",
+      "availability_key": "close3_before_reserved_available"
+    },
+    "close3_before_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "c->brm",
+      "availability": "defined"
+    },
+    "close3_before_sessions_live_available": {
+      "type": "bool",
+      "value_expression": "c->bn_avail",
+      "availability": "defined"
+    },
+    "close3_before_sessions_live_value": {
+      "type": "uint",
+      "value_expression": "c->bn",
+      "availability": "c->bn_avail",
+      "availability_key": "close3_before_sessions_live_available"
+    },
+    "close3_call_available": {
+      "type": "bool",
+      "value_expression": "c->call",
+      "availability": "defined"
+    },
+    "close3_called": {
+      "type": "bool",
+      "value_expression": "c->called",
+      "availability": "defined"
+    },
+    "close3_recorded": {
+      "type": "bool",
+      "value_expression": "c->recorded",
+      "availability": "defined"
+    },
+    "close3_skipped": {
+      "type": "bool",
+      "value_expression": "c->skipped",
+      "availability": "defined"
+    },
+    "close3_source_free_marker": {
+      "type": "bool",
+      "value_expression": "c->source_free_marker",
+      "availability": "defined"
+    },
+    "close3_source_probe": {
+      "type": "bool",
+      "value_expression": "c->source_probe",
+      "availability": "defined"
+    },
+    "configured_backend_cuda": {
+      "type": "bool",
+      "value_expression": "true",
+      "availability": "defined"
+    },
+    "configured_cache_bytes_set": {
+      "type": "bool",
+      "value_expression": "true",
+      "availability": "defined"
+    },
+    "configured_compact_runtime": {
+      "type": "bool",
+      "value_expression": "true",
+      "availability": "defined"
+    },
+    "configured_context_tokens": {
+      "type": "uint",
+      "value_expression": "FX_CTX",
+      "availability": "defined"
+    },
+    "configured_model_fd": {
+      "type": "int",
+      "value_expression": "-1",
+      "availability": "defined"
+    },
+    "configured_mtp_model_fd": {
+      "type": "int",
+      "value_expression": "-1",
+      "availability": "defined"
+    },
+    "configured_session_limit": {
+      "type": "uint",
+      "value_expression": "f->configured_limit",
+      "availability": "defined"
+    },
+    "core_calloc_bytes": {
+      "type": "uint",
+      "value_expression": "f->core_calloc_bytes",
+      "availability": "defined"
+    },
+    "core_calloc_calls": {
+      "type": "uint",
+      "value_expression": "f->core_calloc_calls",
+      "availability": "defined"
+    },
+    "cumulative_heap_limit_ok": {
+      "type": "bool",
+      "value_expression": "f->engine_bytes<=FX_HEAP&&f->session_bytes_total<=FX_HEAP-f->engine_bytes",
+      "availability": "defined"
+    },
+    "engine_address_available": {
+      "type": "bool",
+      "value_expression": "f->engine_acquired",
+      "availability": "defined"
+    },
+    "engine_address_value": {
+      "type": "address",
+      "value_expression": "f->engine_addr",
+      "availability": "f->engine_acquired",
+      "availability_key": "engine_address_available"
+    },
+    "engine_allocated": {
+      "type": "bool",
+      "value_expression": "f->engine_acquired",
+      "availability": "defined"
+    },
+    "engine_bytes_available": {
+      "type": "bool",
+      "value_expression": "f->engine_acquired",
+      "availability": "defined"
+    },
+    "engine_bytes_value": {
+      "type": "uint",
+      "value_expression": "f->engine_bytes",
+      "availability": "f->engine_acquired",
+      "availability_key": "engine_bytes_available"
+    },
+    "engine_live_final": {
+      "type": "bool",
+      "value_expression": "f->engine_live",
+      "availability": "defined"
+    },
+    "engine_rescue_free_calls": {
+      "type": "uint",
+      "value_expression": "f->engine_rescue_free",
+      "availability": "defined"
+    },
+    "engine_size_limit_ok": {
+      "type": "bool",
+      "value_expression": "f->engine_bytes<=FX_OWNER",
+      "availability": "defined"
+    },
+    "engine_source_free_calls": {
+      "type": "uint",
+      "value_expression": "f->engine_source_free",
+      "availability": "defined"
+    },
+    "exact_mutex_address_available": {
+      "type": "bool",
+      "value_expression": "f->exact_init_attempted",
+      "availability": "defined"
+    },
+    "exact_mutex_address_value": {
+      "type": "address",
+      "value_expression": "f->exact_mutex_addr",
+      "availability": "f->exact_init_attempted",
+      "availability_key": "exact_mutex_address_available"
+    },
+    "exact_mutex_destroy_result_available": {
+      "type": "bool",
+      "value_expression": "f->exact_destroy_attempted",
+      "availability": "defined"
+    },
+    "exact_mutex_destroy_result_value": {
+      "type": "int",
+      "value_expression": "f->exact_destroy_rc",
+      "availability": "f->exact_destroy_attempted",
+      "availability_key": "exact_mutex_destroy_result_available"
+    },
+    "exact_mutex_init_result_available": {
+      "type": "bool",
+      "value_expression": "f->exact_init_attempted",
+      "availability": "defined"
+    },
+    "exact_mutex_init_result_value": {
+      "type": "int",
+      "value_expression": "f->exact_init_rc",
+      "availability": "f->exact_init_attempted",
+      "availability_key": "exact_mutex_init_result_available"
+    },
+    "exact_mutex_initialized": {
+      "type": "bool",
+      "value_expression": "f->exact_initialized",
+      "availability": "defined"
+    },
+    "exact_mutex_live_final": {
+      "type": "bool",
+      "value_expression": "f->exact_mutex_live",
+      "availability": "defined"
+    },
+    "exact_rescue_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->exact_rescue_destroy",
+      "availability": "defined"
+    },
+    "exact_source_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->exact_source_destroy",
+      "availability": "defined"
+    },
+    "fault_arm_count": {
+      "type": "uint",
+      "value_expression": "f->fault_arms",
+      "availability": "defined"
+    },
+    "fault_armed_final": {
+      "type": "bool",
+      "value_expression": "f->exact_fault_armed",
+      "availability": "defined"
+    },
+    "fault_selected_real_result_available": {
+      "type": "bool",
+      "value_expression": "f->fault_selections",
+      "availability": "defined"
+    },
+    "fault_selected_real_result_value": {
+      "type": "int",
+      "value_expression": "f->fault_real_rc",
+      "availability": "f->fault_selections",
+      "availability_key": "fault_selected_real_result_available"
+    },
+    "fault_selected_real_successes": {
+      "type": "uint",
+      "value_expression": "f->fault_real_successes",
+      "availability": "defined"
+    },
+    "fault_selected_return_result_available": {
+      "type": "bool",
+      "value_expression": "f->fault_selections",
+      "availability": "defined"
+    },
+    "fault_selected_return_result_value": {
+      "type": "int",
+      "value_expression": "f->fault_return_rc",
+      "availability": "f->fault_selections",
+      "availability_key": "fault_selected_return_result_available"
+    },
+    "fault_selection_count": {
+      "type": "uint",
+      "value_expression": "f->fault_selections",
+      "availability": "defined"
+    },
+    "fault_synthetic_refusal_count": {
+      "type": "uint",
+      "value_expression": "f->fault_synthetic",
+      "availability": "defined"
+    },
+    "first_release_after_active_available": {
+      "type": "bool",
+      "value_expression": "r->aaa",
+      "availability": "defined"
+    },
+    "first_release_after_active_value": {
+      "type": "uint",
+      "value_expression": "r->aaa_v",
+      "availability": "r->aaa",
+      "availability_key": "first_release_after_active_available"
+    },
+    "first_release_after_engine_live": {
+      "type": "bool",
+      "value_expression": "r->ae",
+      "availability": "defined"
+    },
+    "first_release_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "r->ae_avail",
+      "availability": "defined"
+    },
+    "first_release_after_owner_match": {
+      "type": "bool",
+      "value_expression": "r->aom",
+      "availability": "defined"
+    },
+    "first_release_after_owner_match_available": {
+      "type": "bool",
+      "value_expression": "r->aom_avail",
+      "availability": "defined"
+    },
+    "first_release_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->ara",
+      "availability": "defined"
+    },
+    "first_release_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->ara_v",
+      "availability": "r->ara",
+      "availability_key": "first_release_after_reserved_available"
+    },
+    "first_release_after_session_live": {
+      "type": "bool",
+      "value_expression": "r->as",
+      "availability": "defined"
+    },
+    "first_release_after_session_live_available": {
+      "type": "bool",
+      "value_expression": "r->as_avail",
+      "availability": "defined"
+    },
+    "first_release_attempted": {
+      "type": "bool",
+      "value_expression": "r->attempted",
+      "availability": "defined"
+    },
+    "first_release_before_active_available": {
+      "type": "bool",
+      "value_expression": "r->baa",
+      "availability": "defined"
+    },
+    "first_release_before_active_value": {
+      "type": "uint",
+      "value_expression": "r->ba",
+      "availability": "r->baa",
+      "availability_key": "first_release_before_active_available"
+    },
+    "first_release_before_engine_live": {
+      "type": "bool",
+      "value_expression": "r->be",
+      "availability": "defined"
+    },
+    "first_release_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->bra",
+      "availability": "defined"
+    },
+    "first_release_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->bra_v",
+      "availability": "r->bra",
+      "availability_key": "first_release_before_reserved_available"
+    },
+    "first_release_before_session_live": {
+      "type": "bool",
+      "value_expression": "r->bs",
+      "availability": "defined"
+    },
+    "first_release_call_available": {
+      "type": "bool",
+      "value_expression": "r->call",
+      "availability": "defined"
+    },
+    "first_release_rc_available": {
+      "type": "bool",
+      "value_expression": "r->rc_avail",
+      "availability": "defined"
+    },
+    "first_release_rc_value": {
+      "type": "int",
+      "value_expression": "r->rc",
+      "availability": "r->rc_avail",
+      "availability_key": "first_release_rc_available"
+    },
+    "first_release_semantic_mismatch": {
+      "type": "bool",
+      "value_expression": "r->semantic_mismatch",
+      "availability": "defined"
+    },
+    "first_snapshot_active_available": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->aa",
+      "availability": "defined"
+    },
+    "first_snapshot_active_value": {
+      "type": "uint",
+      "value_expression": "s->active",
+      "availability": "s->saved&&s->aa",
+      "availability_key": "first_snapshot_active_available"
+    },
+    "first_snapshot_copy_available": {
+      "type": "bool",
+      "value_expression": "f->first_snapshot_copy_valid",
+      "availability": "defined"
+    },
+    "first_snapshot_copy_bytes": {
+      "type": "uint",
+      "value_expression": "f->first_snapshot_copy_valid?sizeof(f->first_snapshot_copy):0",
+      "availability": "defined"
+    },
+    "first_snapshot_engine_live": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->eng",
+      "availability": "defined"
+    },
+    "first_snapshot_equal_after_rescue_available": {
+      "type": "bool",
+      "value_expression": "f->first_snapshot_equal_after_available",
+      "availability": "defined"
+    },
+    "first_snapshot_equal_after_rescue_value": {
+      "type": "bool",
+      "value_expression": "f->first_snapshot_equal_after",
+      "availability": "f->first_snapshot_equal_after_available",
+      "availability_key": "first_snapshot_equal_after_rescue_available"
+    },
+    "first_snapshot_equal_before_rescue_available": {
+      "type": "bool",
+      "value_expression": "f->first_snapshot_equal_before_available",
+      "availability": "defined"
+    },
+    "first_snapshot_equal_before_rescue_value": {
+      "type": "bool",
+      "value_expression": "f->first_snapshot_equal_before",
+      "availability": "f->first_snapshot_equal_before_available",
+      "availability_key": "first_snapshot_equal_before_rescue_available"
+    },
+    "first_snapshot_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->em",
+      "availability": "defined"
+    },
+    "first_snapshot_fault_arm_count": {
+      "type": "uint",
+      "value_expression": "s->saved?s->arms:0",
+      "availability": "defined"
+    },
+    "first_snapshot_fault_real_result_available": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->selection!=0",
+      "availability": "defined"
+    },
+    "first_snapshot_fault_real_result_value": {
+      "type": "int",
+      "value_expression": "s->fault_real_rc",
+      "availability": "s->saved&&s->selection!=0",
+      "availability_key": "first_snapshot_fault_real_result_available"
+    },
+    "first_snapshot_fault_real_successes": {
+      "type": "uint",
+      "value_expression": "s->saved?s->real_successes:0",
+      "availability": "defined"
+    },
+    "first_snapshot_fault_return_result_available": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->selection!=0",
+      "availability": "defined"
+    },
+    "first_snapshot_fault_return_result_value": {
+      "type": "int",
+      "value_expression": "s->fault_return_rc",
+      "availability": "s->saved&&s->selection!=0",
+      "availability_key": "first_snapshot_fault_return_result_available"
+    },
+    "first_snapshot_fault_selection_count": {
+      "type": "uint",
+      "value_expression": "s->saved?s->selection:0",
+      "availability": "defined"
+    },
+    "first_snapshot_fault_synthetic_refusal_count": {
+      "type": "uint",
+      "value_expression": "s->saved?s->synthetic:0",
+      "availability": "defined"
+    },
+    "first_snapshot_physical_exact_locks": {
+      "type": "uint",
+      "value_expression": "s->saved?s->exact_locks:0",
+      "availability": "defined"
+    },
+    "first_snapshot_physical_exact_unlocks": {
+      "type": "uint",
+      "value_expression": "s->saved?s->exact_unlocks:0",
+      "availability": "defined"
+    },
+    "first_snapshot_preserved": {
+      "type": "bool",
+      "value_expression": "f->first_snapshot_equal_after_available&&f->first_snapshot_equal_after",
+      "availability": "defined"
+    },
+    "first_snapshot_release_rc_available": {
+      "type": "bool",
+      "value_expression": "s->saved",
+      "availability": "defined"
+    },
+    "first_snapshot_release_rc_value": {
+      "type": "int",
+      "value_expression": "s->release_rc",
+      "availability": "s->saved",
+      "availability_key": "first_snapshot_release_rc_available"
+    },
+    "first_snapshot_reserved": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->rr&&s->reserved",
+      "availability": "defined"
+    },
+    "first_snapshot_reserved_available": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->rr",
+      "availability": "defined"
+    },
+    "first_snapshot_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->rm",
+      "availability": "defined"
+    },
+    "first_snapshot_saved": {
+      "type": "bool",
+      "value_expression": "s->saved",
+      "availability": "defined"
+    },
+    "first_snapshot_session_live": {
+      "type": "bool",
+      "value_expression": "s->saved&&s->ses",
+      "availability": "defined"
+    },
+    "first_snapshot_source_engine_free_calls": {
+      "type": "uint",
+      "value_expression": "s->saved?s->engine_frees:0",
+      "availability": "defined"
+    },
+    "first_snapshot_source_session_free_calls": {
+      "type": "uint",
+      "value_expression": "s->saved?s->session_frees:0",
+      "availability": "defined"
+    },
+    "native_cleanup_complete": {
+      "type": "bool",
+      "value_expression": "done",
+      "availability": "defined"
+    },
+    "native_observation_clean": {
+      "type": "bool",
+      "value_expression": "clean",
+      "availability": "defined"
+    },
+    "native_return_code": {
+      "type": "int",
+      "value_expression": "rc",
+      "availability": "defined"
+    },
+    "order_violations": {
+      "type": "uint",
+      "value_expression": "f->order_errors",
+      "availability": "defined"
+    },
+    "physical_exact_locks": {
+      "type": "uint",
+      "value_expression": "f->exact_locks",
+      "availability": "defined"
+    },
+    "physical_exact_unlocks": {
+      "type": "uint",
+      "value_expression": "f->exact_unlocks",
+      "availability": "defined"
+    },
+    "physical_free_calls": {
+      "type": "uint",
+      "value_expression": "f->physical_free_calls",
+      "availability": "defined"
+    },
+    "physical_runtime_locks": {
+      "type": "uint",
+      "value_expression": "f->runtime_locks",
+      "availability": "defined"
+    },
+    "physical_runtime_unlocks": {
+      "type": "uint",
+      "value_expression": "f->runtime_unlocks",
+      "availability": "defined"
+    },
+    "post_close_active_available": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_aa",
+      "availability": "defined"
+    },
+    "post_close_active_value": {
+      "type": "uint",
+      "value_expression": "f->post_close_active",
+      "availability": "f->post_close_saved&&f->post_close_aa",
+      "availability_key": "post_close_active_available"
+    },
+    "post_close_engine_live": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_eng",
+      "availability": "defined"
+    },
+    "post_close_engine_live_available": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_eng_avail",
+      "availability": "defined"
+    },
+    "post_close_engine_storage_available": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_eng_storage_avail",
+      "availability": "defined"
+    },
+    "post_close_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_em",
+      "availability": "defined"
+    },
+    "post_close_reserved": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_rr&&f->post_close_reserved",
+      "availability": "defined"
+    },
+    "post_close_reserved_available": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_rr",
+      "availability": "defined"
+    },
+    "post_close_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_rm",
+      "availability": "defined"
+    },
+    "post_close_saved": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved",
+      "availability": "defined"
+    },
+    "post_close_session_live": {
+      "type": "bool",
+      "value_expression": "f->post_close_saved&&f->post_close_ses",
+      "availability": "defined"
+    },
+    "post_retry_active_available": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_aa",
+      "availability": "defined"
+    },
+    "post_retry_active_value": {
+      "type": "uint",
+      "value_expression": "f->post_retry_active",
+      "availability": "f->post_retry_saved&&f->post_retry_aa",
+      "availability_key": "post_retry_active_available"
+    },
+    "post_retry_engine_live": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_eng",
+      "availability": "defined"
+    },
+    "post_retry_engine_live_available": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_eng_avail",
+      "availability": "defined"
+    },
+    "post_retry_engine_storage_available": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_eng_storage_avail",
+      "availability": "defined"
+    },
+    "post_retry_reserved": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_rr&&f->post_retry_reserved",
+      "availability": "defined"
+    },
+    "post_retry_reserved_available": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_rr",
+      "availability": "defined"
+    },
+    "post_retry_saved": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved",
+      "availability": "defined"
+    },
+    "post_retry_session_live": {
+      "type": "bool",
+      "value_expression": "f->post_retry_saved&&f->post_retry_ses",
+      "availability": "defined"
+    },
+    "pre_rescue_engine_live": {
+      "type": "bool",
+      "value_expression": "f->pre_rescue_saved&&f->pre_rescue_eng",
+      "availability": "defined"
+    },
+    "pre_rescue_engine_rescue_free_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_engine_rescue_free:0",
+      "availability": "defined"
+    },
+    "pre_rescue_engine_source_free_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_engine_source_free:0",
+      "availability": "defined"
+    },
+    "pre_rescue_exact_mutex_live": {
+      "type": "bool",
+      "value_expression": "f->pre_rescue_saved&&f->pre_rescue_exact_mutex_live",
+      "availability": "defined"
+    },
+    "pre_rescue_exact_rescue_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_exact_rescue_destroy:0",
+      "availability": "defined"
+    },
+    "pre_rescue_exact_source_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_exact_source_destroy:0",
+      "availability": "defined"
+    },
+    "pre_rescue_runtime_mutex_live": {
+      "type": "bool",
+      "value_expression": "f->pre_rescue_saved&&f->pre_rescue_runtime_mutex_live",
+      "availability": "defined"
+    },
+    "pre_rescue_runtime_rescue_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_runtime_rescue_destroy:0",
+      "availability": "defined"
+    },
+    "pre_rescue_runtime_source_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_runtime_source_destroy:0",
+      "availability": "defined"
+    },
+    "pre_rescue_saved": {
+      "type": "bool",
+      "value_expression": "f->pre_rescue_saved",
+      "availability": "defined"
+    },
+    "pre_rescue_sessions_live": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_sessions:0",
+      "availability": "defined"
+    },
+    "product_premature_engine_free": {
+      "type": "bool",
+      "value_expression": "f->product_premature_free",
+      "availability": "defined"
+    },
+    "product_source_free_marker_count": {
+      "type": "uint",
+      "value_expression": "f->product_source_marker_count",
+      "availability": "defined"
+    },
+    "product_source_probe_count": {
+      "type": "uint",
+      "value_expression": "f->product_source_probe_count",
+      "availability": "defined"
+    },
+    "real_destroy_failures": {
+      "type": "uint",
+      "value_expression": "f->real_destroy_failures",
+      "availability": "defined"
+    },
+    "real_lock_failures": {
+      "type": "uint",
+      "value_expression": "f->real_lock_failures",
+      "availability": "defined"
+    },
+    "real_unlock_failures": {
+      "type": "uint",
+      "value_expression": "f->real_unlock_failures",
+      "availability": "defined"
+    },
+    "release0_after_active_available": {
+      "type": "bool",
+      "value_expression": "r->aaa",
+      "availability": "defined"
+    },
+    "release0_after_active_value": {
+      "type": "uint",
+      "value_expression": "r->aaa_v",
+      "availability": "r->aaa",
+      "availability_key": "release0_after_active_available"
+    },
+    "release0_after_engine_live": {
+      "type": "bool",
+      "value_expression": "r->ae",
+      "availability": "defined"
+    },
+    "release0_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "r->ae_avail",
+      "availability": "defined"
+    },
+    "release0_after_owner_match": {
+      "type": "bool",
+      "value_expression": "r->aom",
+      "availability": "defined"
+    },
+    "release0_after_owner_match_available": {
+      "type": "bool",
+      "value_expression": "r->aom_avail",
+      "availability": "defined"
+    },
+    "release0_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->ara",
+      "availability": "defined"
+    },
+    "release0_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->ara_v",
+      "availability": "r->ara",
+      "availability_key": "release0_after_reserved_available"
+    },
+    "release0_after_session_live": {
+      "type": "bool",
+      "value_expression": "r->as",
+      "availability": "defined"
+    },
+    "release0_after_session_live_available": {
+      "type": "bool",
+      "value_expression": "r->as_avail",
+      "availability": "defined"
+    },
+    "release0_attempted": {
+      "type": "bool",
+      "value_expression": "r->attempted",
+      "availability": "defined"
+    },
+    "release0_before_active_available": {
+      "type": "bool",
+      "value_expression": "r->baa",
+      "availability": "defined"
+    },
+    "release0_before_active_value": {
+      "type": "uint",
+      "value_expression": "r->ba",
+      "availability": "r->baa",
+      "availability_key": "release0_before_active_available"
+    },
+    "release0_before_engine_live": {
+      "type": "bool",
+      "value_expression": "r->be",
+      "availability": "defined"
+    },
+    "release0_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->bra",
+      "availability": "defined"
+    },
+    "release0_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->bra_v",
+      "availability": "r->bra",
+      "availability_key": "release0_before_reserved_available"
+    },
+    "release0_before_session_live": {
+      "type": "bool",
+      "value_expression": "r->bs",
+      "availability": "defined"
+    },
+    "release0_call_available": {
+      "type": "bool",
+      "value_expression": "r->call",
+      "availability": "defined"
+    },
+    "release0_rc_available": {
+      "type": "bool",
+      "value_expression": "r->rc_avail",
+      "availability": "defined"
+    },
+    "release0_rc_value": {
+      "type": "int",
+      "value_expression": "r->rc",
+      "availability": "r->rc_avail",
+      "availability_key": "release0_rc_available"
+    },
+    "release0_semantic_mismatch": {
+      "type": "bool",
+      "value_expression": "r->semantic_mismatch",
+      "availability": "defined"
+    },
+    "release1_after_active_available": {
+      "type": "bool",
+      "value_expression": "r->aaa",
+      "availability": "defined"
+    },
+    "release1_after_active_value": {
+      "type": "uint",
+      "value_expression": "r->aaa_v",
+      "availability": "r->aaa",
+      "availability_key": "release1_after_active_available"
+    },
+    "release1_after_engine_live": {
+      "type": "bool",
+      "value_expression": "r->ae",
+      "availability": "defined"
+    },
+    "release1_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "r->ae_avail",
+      "availability": "defined"
+    },
+    "release1_after_owner_match": {
+      "type": "bool",
+      "value_expression": "r->aom",
+      "availability": "defined"
+    },
+    "release1_after_owner_match_available": {
+      "type": "bool",
+      "value_expression": "r->aom_avail",
+      "availability": "defined"
+    },
+    "release1_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->ara",
+      "availability": "defined"
+    },
+    "release1_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->ara_v",
+      "availability": "r->ara",
+      "availability_key": "release1_after_reserved_available"
+    },
+    "release1_after_session_live": {
+      "type": "bool",
+      "value_expression": "r->as",
+      "availability": "defined"
+    },
+    "release1_after_session_live_available": {
+      "type": "bool",
+      "value_expression": "r->as_avail",
+      "availability": "defined"
+    },
+    "release1_attempted": {
+      "type": "bool",
+      "value_expression": "r->attempted",
+      "availability": "defined"
+    },
+    "release1_before_active_available": {
+      "type": "bool",
+      "value_expression": "r->baa",
+      "availability": "defined"
+    },
+    "release1_before_active_value": {
+      "type": "uint",
+      "value_expression": "r->ba",
+      "availability": "r->baa",
+      "availability_key": "release1_before_active_available"
+    },
+    "release1_before_engine_live": {
+      "type": "bool",
+      "value_expression": "r->be",
+      "availability": "defined"
+    },
+    "release1_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->bra",
+      "availability": "defined"
+    },
+    "release1_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->bra_v",
+      "availability": "r->bra",
+      "availability_key": "release1_before_reserved_available"
+    },
+    "release1_before_session_live": {
+      "type": "bool",
+      "value_expression": "r->bs",
+      "availability": "defined"
+    },
+    "release1_call_available": {
+      "type": "bool",
+      "value_expression": "r->call",
+      "availability": "defined"
+    },
+    "release1_rc_available": {
+      "type": "bool",
+      "value_expression": "r->rc_avail",
+      "availability": "defined"
+    },
+    "release1_rc_value": {
+      "type": "int",
+      "value_expression": "r->rc",
+      "availability": "r->rc_avail",
+      "availability_key": "release1_rc_available"
+    },
+    "release1_semantic_mismatch": {
+      "type": "bool",
+      "value_expression": "r->semantic_mismatch",
+      "availability": "defined"
+    },
+    "rescue_engine_delta": {
+      "type": "uint",
+      "value_expression": "f->rescue_engine_delta",
+      "availability": "defined"
+    },
+    "rescue_engine_expected": {
+      "type": "uint",
+      "value_expression": "f->rescue_engine_expected",
+      "availability": "defined"
+    },
+    "rescue_exact_delta": {
+      "type": "uint",
+      "value_expression": "f->rescue_exact_delta",
+      "availability": "defined"
+    },
+    "rescue_exact_expected": {
+      "type": "uint",
+      "value_expression": "f->rescue_exact_expected",
+      "availability": "defined"
+    },
+    "rescue_final_residual_zero": {
+      "type": "bool",
+      "value_expression": "f->rescue_final_residual_zero",
+      "availability": "defined"
+    },
+    "rescue_proof_available": {
+      "type": "bool",
+      "value_expression": "f->rescue_proof_available",
+      "availability": "defined"
+    },
+    "rescue_proof_ok": {
+      "type": "bool",
+      "value_expression": "f->rescue_proof_ok",
+      "availability": "defined"
+    },
+    "rescue_runtime_delta": {
+      "type": "uint",
+      "value_expression": "f->rescue_runtime_delta",
+      "availability": "defined"
+    },
+    "rescue_runtime_expected": {
+      "type": "uint",
+      "value_expression": "f->rescue_runtime_expected",
+      "availability": "defined"
+    },
+    "rescue_source_effects_unchanged": {
+      "type": "bool",
+      "value_expression": "f->rescue_source_effects_unchanged",
+      "availability": "defined"
+    },
+    "retry_release_after_active_available": {
+      "type": "bool",
+      "value_expression": "r->aaa",
+      "availability": "defined"
+    },
+    "retry_release_after_active_value": {
+      "type": "uint",
+      "value_expression": "r->aaa_v",
+      "availability": "r->aaa",
+      "availability_key": "retry_release_after_active_available"
+    },
+    "retry_release_after_engine_live": {
+      "type": "bool",
+      "value_expression": "r->ae",
+      "availability": "defined"
+    },
+    "retry_release_after_engine_live_available": {
+      "type": "bool",
+      "value_expression": "r->ae_avail",
+      "availability": "defined"
+    },
+    "retry_release_after_owner_match": {
+      "type": "bool",
+      "value_expression": "r->aom",
+      "availability": "defined"
+    },
+    "retry_release_after_owner_match_available": {
+      "type": "bool",
+      "value_expression": "r->aom_avail",
+      "availability": "defined"
+    },
+    "retry_release_after_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->ara",
+      "availability": "defined"
+    },
+    "retry_release_after_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->ara_v",
+      "availability": "r->ara",
+      "availability_key": "retry_release_after_reserved_available"
+    },
+    "retry_release_after_session_live": {
+      "type": "bool",
+      "value_expression": "r->as",
+      "availability": "defined"
+    },
+    "retry_release_after_session_live_available": {
+      "type": "bool",
+      "value_expression": "r->as_avail",
+      "availability": "defined"
+    },
+    "retry_release_attempted": {
+      "type": "bool",
+      "value_expression": "r->attempted",
+      "availability": "defined"
+    },
+    "retry_release_before_active_available": {
+      "type": "bool",
+      "value_expression": "r->baa",
+      "availability": "defined"
+    },
+    "retry_release_before_active_value": {
+      "type": "uint",
+      "value_expression": "r->ba",
+      "availability": "r->baa",
+      "availability_key": "retry_release_before_active_available"
+    },
+    "retry_release_before_engine_live": {
+      "type": "bool",
+      "value_expression": "r->be",
+      "availability": "defined"
+    },
+    "retry_release_before_reserved_available": {
+      "type": "bool",
+      "value_expression": "r->bra",
+      "availability": "defined"
+    },
+    "retry_release_before_reserved_value": {
+      "type": "uint",
+      "value_expression": "r->bra_v",
+      "availability": "r->bra",
+      "availability_key": "retry_release_before_reserved_available"
+    },
+    "retry_release_before_session_live": {
+      "type": "bool",
+      "value_expression": "r->bs",
+      "availability": "defined"
+    },
+    "retry_release_call_available": {
+      "type": "bool",
+      "value_expression": "r->call",
+      "availability": "defined"
+    },
+    "retry_release_rc_available": {
+      "type": "bool",
+      "value_expression": "r->rc_avail",
+      "availability": "defined"
+    },
+    "retry_release_rc_value": {
+      "type": "int",
+      "value_expression": "r->rc",
+      "availability": "r->rc_avail",
+      "availability_key": "retry_release_rc_available"
+    },
+    "retry_release_semantic_mismatch": {
+      "type": "bool",
+      "value_expression": "r->semantic_mismatch",
+      "availability": "defined"
+    },
+    "runtime_mutex_address_available": {
+      "type": "bool",
+      "value_expression": "f->runtime_init_attempted",
+      "availability": "defined"
+    },
+    "runtime_mutex_address_value": {
+      "type": "address",
+      "value_expression": "f->runtime_mutex_addr",
+      "availability": "f->runtime_init_attempted",
+      "availability_key": "runtime_mutex_address_available"
+    },
+    "runtime_mutex_destroy_result_available": {
+      "type": "bool",
+      "value_expression": "f->runtime_destroy_attempted",
+      "availability": "defined"
+    },
+    "runtime_mutex_destroy_result_value": {
+      "type": "int",
+      "value_expression": "f->runtime_destroy_rc",
+      "availability": "f->runtime_destroy_attempted",
+      "availability_key": "runtime_mutex_destroy_result_available"
+    },
+    "runtime_mutex_init_result_available": {
+      "type": "bool",
+      "value_expression": "f->runtime_init_attempted",
+      "availability": "defined"
+    },
+    "runtime_mutex_init_result_value": {
+      "type": "int",
+      "value_expression": "f->runtime_init_rc",
+      "availability": "f->runtime_init_attempted",
+      "availability_key": "runtime_mutex_init_result_available"
+    },
+    "runtime_mutex_initialized": {
+      "type": "bool",
+      "value_expression": "f->runtime_initialized",
+      "availability": "defined"
+    },
+    "runtime_mutex_live_final": {
+      "type": "bool",
+      "value_expression": "f->runtime_mutex_live",
+      "availability": "defined"
+    },
+    "runtime_rescue_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->runtime_rescue_destroy",
+      "availability": "defined"
+    },
+    "runtime_source_destroy_calls": {
+      "type": "uint",
+      "value_expression": "f->runtime_source_destroy",
+      "availability": "defined"
+    },
+    "semantic_product_mismatch_count": {
+      "type": "uint",
+      "value_expression": "f->semantic_mismatches",
+      "availability": "defined"
+    },
+    "session0_active_after_create_available": {
+      "type": "bool",
+      "value_expression": "f->active_after_create_avail[i]",
+      "availability": "defined"
+    },
+    "session0_active_after_create_value": {
+      "type": "uint",
+      "value_expression": "f->active_after_create[i]",
+      "availability": "f->active_after_create_avail[i]",
+      "availability_key": "session0_active_after_create_available"
+    },
+    "session0_address_available": {
+      "type": "bool",
+      "value_expression": "f->acquired[i]",
+      "availability": "defined"
+    },
+    "session0_address_value": {
+      "type": "address",
+      "value_expression": "f->session_addr[i]",
+      "availability": "f->acquired[i]",
+      "availability_key": "session0_address_available"
+    },
+    "session0_backend_payload_empty": {
+      "type": "bool",
+      "value_expression": "f->payload_empty[i]",
+      "availability": "defined"
+    },
+    "session0_bytes_available": {
+      "type": "bool",
+      "value_expression": "f->acquired[i]",
+      "availability": "defined"
+    },
+    "session0_bytes_value": {
+      "type": "uint",
+      "value_expression": "f->session_bytes[i]",
+      "availability": "f->acquired[i]",
+      "availability_key": "session0_bytes_available"
+    },
+    "session0_create_attempted": {
+      "type": "bool",
+      "value_expression": "f->create_attempted[i]",
+      "availability": "defined"
+    },
+    "session0_create_rc_available": {
+      "type": "bool",
+      "value_expression": "f->create_attempted[i]",
+      "availability": "defined"
+    },
+    "session0_create_rc_value": {
+      "type": "int",
+      "value_expression": "f->create_rc[i]",
+      "availability": "f->create_attempted[i]",
+      "availability_key": "session0_create_rc_available"
+    },
+    "session0_create_success": {
+      "type": "bool",
+      "value_expression": "f->create_success[i]",
+      "availability": "defined"
+    },
+    "session0_engine_borrow_available": {
+      "type": "bool",
+      "value_expression": "f->borrow_avail[i]",
+      "availability": "defined"
+    },
+    "session0_engine_borrow_value": {
+      "type": "address",
+      "value_expression": "f->borrow_addr[i]",
+      "availability": "f->borrow_avail[i]",
+      "availability_key": "session0_engine_borrow_available"
+    },
+    "session0_live_final": {
+      "type": "bool",
+      "value_expression": "f->session_live[i]",
+      "availability": "defined"
+    },
+    "session0_pre_rescue_live": {
+      "type": "bool",
+      "value_expression": "f->pre_rescue_saved&&f->pre_rescue_session_live[i]",
+      "availability": "defined"
+    },
+    "session0_pre_rescue_rescue_free_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_session_rescue_free[i]:0",
+      "availability": "defined"
+    },
+    "session0_pre_rescue_source_free_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_session_source_free[i]:0",
+      "availability": "defined"
+    },
+    "session0_rescue_delta_available": {
+      "type": "bool",
+      "value_expression": "f->rescue_proof_available",
+      "availability": "defined"
+    },
+    "session0_rescue_delta_value": {
+      "type": "uint",
+      "value_expression": "f->rescue_session_delta[i]",
+      "availability": "f->rescue_proof_available",
+      "availability_key": "session0_rescue_delta_available"
+    },
+    "session0_rescue_expected": {
+      "type": "uint",
+      "value_expression": "f->rescue_session_expected[i]",
+      "availability": "defined"
+    },
+    "session0_rescue_free_calls": {
+      "type": "uint",
+      "value_expression": "f->session_rescue_free[i]",
+      "availability": "defined"
+    },
+    "session0_reserved_available": {
+      "type": "bool",
+      "value_expression": "f->reserved_avail[i]",
+      "availability": "defined"
+    },
+    "session0_reserved_value": {
+      "type": "uint",
+      "value_expression": "f->reserved[i]",
+      "availability": "f->reserved_avail[i]",
+      "availability_key": "session0_reserved_available"
+    },
+    "session0_source_free_calls": {
+      "type": "uint",
+      "value_expression": "f->session_source_free[i]",
+      "availability": "defined"
+    },
+    "session0_test_no_alloc": {
+      "type": "bool",
+      "value_expression": "f->test_no_alloc[i]",
+      "availability": "defined"
+    },
+    "session1_active_after_create_available": {
+      "type": "bool",
+      "value_expression": "f->active_after_create_avail[i]",
+      "availability": "defined"
+    },
+    "session1_active_after_create_value": {
+      "type": "uint",
+      "value_expression": "f->active_after_create[i]",
+      "availability": "f->active_after_create_avail[i]",
+      "availability_key": "session1_active_after_create_available"
+    },
+    "session1_address_available": {
+      "type": "bool",
+      "value_expression": "f->acquired[i]",
+      "availability": "defined"
+    },
+    "session1_address_value": {
+      "type": "address",
+      "value_expression": "f->session_addr[i]",
+      "availability": "f->acquired[i]",
+      "availability_key": "session1_address_available"
+    },
+    "session1_backend_payload_empty": {
+      "type": "bool",
+      "value_expression": "f->payload_empty[i]",
+      "availability": "defined"
+    },
+    "session1_bytes_available": {
+      "type": "bool",
+      "value_expression": "f->acquired[i]",
+      "availability": "defined"
+    },
+    "session1_bytes_value": {
+      "type": "uint",
+      "value_expression": "f->session_bytes[i]",
+      "availability": "f->acquired[i]",
+      "availability_key": "session1_bytes_available"
+    },
+    "session1_create_attempted": {
+      "type": "bool",
+      "value_expression": "f->create_attempted[i]",
+      "availability": "defined"
+    },
+    "session1_create_rc_available": {
+      "type": "bool",
+      "value_expression": "f->create_attempted[i]",
+      "availability": "defined"
+    },
+    "session1_create_rc_value": {
+      "type": "int",
+      "value_expression": "f->create_rc[i]",
+      "availability": "f->create_attempted[i]",
+      "availability_key": "session1_create_rc_available"
+    },
+    "session1_create_success": {
+      "type": "bool",
+      "value_expression": "f->create_success[i]",
+      "availability": "defined"
+    },
+    "session1_engine_borrow_available": {
+      "type": "bool",
+      "value_expression": "f->borrow_avail[i]",
+      "availability": "defined"
+    },
+    "session1_engine_borrow_value": {
+      "type": "address",
+      "value_expression": "f->borrow_addr[i]",
+      "availability": "f->borrow_avail[i]",
+      "availability_key": "session1_engine_borrow_available"
+    },
+    "session1_live_final": {
+      "type": "bool",
+      "value_expression": "f->session_live[i]",
+      "availability": "defined"
+    },
+    "session1_pre_rescue_live": {
+      "type": "bool",
+      "value_expression": "f->pre_rescue_saved&&f->pre_rescue_session_live[i]",
+      "availability": "defined"
+    },
+    "session1_pre_rescue_rescue_free_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_session_rescue_free[i]:0",
+      "availability": "defined"
+    },
+    "session1_pre_rescue_source_free_calls": {
+      "type": "uint",
+      "value_expression": "f->pre_rescue_saved?f->pre_rescue_session_source_free[i]:0",
+      "availability": "defined"
+    },
+    "session1_rescue_delta_available": {
+      "type": "bool",
+      "value_expression": "f->rescue_proof_available",
+      "availability": "defined"
+    },
+    "session1_rescue_delta_value": {
+      "type": "uint",
+      "value_expression": "f->rescue_session_delta[i]",
+      "availability": "f->rescue_proof_available",
+      "availability_key": "session1_rescue_delta_available"
+    },
+    "session1_rescue_expected": {
+      "type": "uint",
+      "value_expression": "f->rescue_session_expected[i]",
+      "availability": "defined"
+    },
+    "session1_rescue_free_calls": {
+      "type": "uint",
+      "value_expression": "f->session_rescue_free[i]",
+      "availability": "defined"
+    },
+    "session1_reserved_available": {
+      "type": "bool",
+      "value_expression": "f->reserved_avail[i]",
+      "availability": "defined"
+    },
+    "session1_reserved_value": {
+      "type": "uint",
+      "value_expression": "f->reserved[i]",
+      "availability": "f->reserved_avail[i]",
+      "availability_key": "session1_reserved_available"
+    },
+    "session1_source_free_calls": {
+      "type": "uint",
+      "value_expression": "f->session_source_free[i]",
+      "availability": "defined"
+    },
+    "session1_test_no_alloc": {
+      "type": "bool",
+      "value_expression": "f->test_no_alloc[i]",
+      "availability": "defined"
+    },
+    "session_alloc_count": {
+      "type": "uint",
+      "value_expression": "ns",
+      "availability": "defined"
+    },
+    "session_bytes_total": {
+      "type": "uint",
+      "value_expression": "f->session_bytes_total",
+      "availability": "defined"
+    },
+    "session_size_limit_ok": {
+      "type": "bool",
+      "value_expression": "sizeof(ds4_session)<=FX_OWNER",
+      "availability": "defined"
+    },
+    "setup_engine_empty": {
+      "type": "bool",
+      "value_expression": "f->setup_engine",
+      "availability": "defined"
+    },
+    "setup_instance_fd_clear": {
+      "type": "bool",
+      "value_expression": "f->setup_lock",
+      "availability": "defined"
+    },
+    "setup_ok": {
+      "type": "bool",
+      "value_expression": "f->setup_ok",
+      "availability": "defined"
+    },
+    "setup_profile_inactive": {
+      "type": "bool",
+      "value_expression": "f->setup_profile",
+      "availability": "defined"
+    },
+    "setup_runtime_tracker_unready": {
+      "type": "bool",
+      "value_expression": "f->setup_tracker",
+      "availability": "defined"
+    },
+    "setup_thread_pool_inactive": {
+      "type": "bool",
+      "value_expression": "f->setup_pool",
+      "availability": "defined"
+    },
+    "sticky_errors": {
+      "type": "uint",
+      "value_expression": "f->sticky",
+      "availability": "defined"
+    },
+    "unexpected_allocations": {
+      "type": "uint",
+      "value_expression": "f->unexpected_alloc",
+      "availability": "defined"
+    },
+    "unknown_free_calls": {
+      "type": "uint",
+      "value_expression": "f->unknown_free",
+      "availability": "defined"
+    },
+    "unknown_mutex_calls": {
+      "type": "uint",
+      "value_expression": "f->unknown_mutex",
+      "availability": "defined"
+    },
+    "void_engine_close_status": {
+      "type": "int",
+      "value_expression": "0",
+      "availability": "defined"
+    },
+    "void_engine_close_status_available": {
+      "type": "bool",
+      "value_expression": "false",
+      "availability": "defined"
+    }
+  }
+}
